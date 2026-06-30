@@ -934,8 +934,9 @@ pub fn build_table(
             .filter(|s| s.any_text)
             .map(|s| s.max_size)
             .fold(0.0_f64, f64::max);
-        let size_header =
-            body_has_text && body_max_size > 0.0 && first.max_size >= body_max_size * HEADER_FONT_RATIO;
+        let size_header = body_has_text
+            && body_max_size > 0.0
+            && first.max_size >= body_max_size * HEADER_FONT_RATIO;
         let shaded_header = first.all_shaded && body.iter().any(|s| s.any_text && !s.all_shaded);
         if first.any_text && (bold_header || size_header || shaded_header) {
             if let Some(first_row) = rows.first_mut() {
@@ -1082,13 +1083,7 @@ const SHADE_COVER: f64 = 0.6;
 /// (Y ascending), or `None` when no captured fill covers at least [`SHADE_COVER`]
 /// of it. The best (highest-coverage) shade wins so a full-cell tint beats a
 /// grazing one.
-fn cell_shading(
-    shadings: &[Shade],
-    cx0: f64,
-    cx1: f64,
-    cy0: f64,
-    cy1: f64,
-) -> Option<[f64; 3]> {
+fn cell_shading(shadings: &[Shade], cx0: f64, cx1: f64, cy0: f64, cy1: f64) -> Option<[f64; 3]> {
     let mut best: Option<(f64, [f64; 3])> = None;
     for s in shadings {
         let cov = s.coverage(cx0, cx1, cy0, cy1);
@@ -1139,7 +1134,11 @@ fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> V
         return vec![cell_paragraph_block(String::new(), None, None, align, ids)];
     }
     // Top→bottom (descending top edge) for deterministic reading order.
-    lines.sort_by(|a, b| b.top.partial_cmp(&a.top).unwrap_or(core::cmp::Ordering::Equal));
+    lines.sort_by(|a, b| {
+        b.top
+            .partial_cmp(&a.top)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
 
     let mut blocks: Vec<Block> = Vec::new();
     let mut text = String::new();
@@ -1513,7 +1512,9 @@ fn build_ruled_band(
     let shadings: Vec<Shade> = fills
         .iter()
         .copied()
-        .filter(|s| s.x1 >= x_lo - 1.0 && s.x0 <= x_hi + 1.0 && s.y1 >= y_bot - 1.0 && s.y0 <= y_top + 1.0)
+        .filter(|s| {
+            s.x1 >= x_lo - 1.0 && s.x0 <= x_hi + 1.0 && s.y1 >= y_bot - 1.0 && s.y0 <= y_top + 1.0
+        })
         .collect();
 
     // Each table owns only the paths whose rules lie in its band — plus the fills
@@ -2810,7 +2811,12 @@ mod tests {
         use crate::content::Bounds;
         VectorPath {
             index: 0,
-            bounds: Some(Bounds { x, y, width: w, height: h }),
+            bounds: Some(Bounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            }),
             segments: vec![
                 PathSeg::Move(x, y),
                 PathSeg::Line(x + w, y),
@@ -2857,7 +2863,11 @@ mod tests {
             panic!("expected table");
         };
         let cell = &t.rows[0].cells[0];
-        assert_eq!(cell.blocks.len(), 2, "blank-gap cell splits into two paragraphs");
+        assert_eq!(
+            cell.blocks.len(),
+            2,
+            "blank-gap cell splits into two paragraphs"
+        );
         assert_eq!(cell_para_text(cell, 0), "First paragraph");
         assert_eq!(cell_para_text(cell, 1), "Second paragraph");
     }
@@ -2962,7 +2972,11 @@ mod tests {
         };
         assert!(t.rows[0].is_header, "shaded leading row → header");
         assert!(!t.rows[1].is_header, "unshaded body row → not header");
-        assert_eq!(t.rows[0].cells[0].shading, Some(tint), "header cell carries shading");
+        assert_eq!(
+            t.rows[0].cells[0].shading,
+            Some(tint),
+            "header cell carries shading"
+        );
         assert_eq!(t.rows[1].cells[0].shading, None, "body cell has no shading");
     }
 
@@ -2973,7 +2987,10 @@ mod tests {
         // comma) shifts it right, to ≈ 0.773. Proof the per-glyph model (gap #75 #3)
         // is in effect rather than a uniform division.
         let x = decimal_sep_x("1234,5", 0.0, 1000.0).expect("comma is a decimal sep");
-        assert!(x > 760.0 && x < 785.0, "advance-weighted sep ≈ 773, got {x}");
+        assert!(
+            x > 760.0 && x < 785.0,
+            "advance-weighted sep ≈ 773, got {x}"
+        );
         // A wide glyph advances more than a narrow separator.
         assert!(char_advance('5') > char_advance(','));
     }
@@ -2992,7 +3009,7 @@ mod tests {
             vrule(350.0, 100.0, 140.0),
         ];
         let runs = vec![
-            run("ENFANT", 60.0, 116.0, 40.0), // x 60..100
+            run("ENFANT", 60.0, 116.0, 40.0),  // x 60..100
             run("S", 100.0, 116.0, 6.0),       // butts → join → "ENFANTS"
             run("MINEUR", 130.0, 116.0, 40.0), // gap 130-106 = 24 → space
             run("S", 170.0, 116.0, 6.0),       // butts → join → "MINEURS"
@@ -3235,7 +3252,10 @@ mod tests {
         // Both bands' paths are claimed, none leak back to the shape pass.
         let plan = plan_tables(&lines, &paths, &BTreeSet::new());
         for i in 0..paths.len() {
-            assert!(plan.uses_path(i), "rule path {i} should be owned by a table");
+            assert!(
+                plan.uses_path(i),
+                "rule path {i} should be owned by a table"
+            );
         }
     }
 
@@ -3309,12 +3329,7 @@ mod tests {
             x1: 250.0,
             path: 0,
         };
-        let v = |x: f64, y0: f64, y1: f64| VSeg {
-            x,
-            y0,
-            y1,
-            path: 0,
-        };
+        let v = |x: f64, y0: f64, y1: f64| VSeg { x, y0, y1, path: 0 };
 
         // One grid: rows 100/120/140, verticals bridge full height → ONE band.
         let h1 = vec![h(100.0), h(120.0), h(140.0)];
@@ -3326,14 +3341,7 @@ mod tests {
         );
 
         // Two grids: [100..140] and [300..340], 160-unit void → TWO bands.
-        let h2 = vec![
-            h(100.0),
-            h(120.0),
-            h(140.0),
-            h(300.0),
-            h(320.0),
-            h(340.0),
-        ];
+        let h2 = vec![h(100.0), h(120.0), h(140.0), h(300.0), h(320.0), h(340.0)];
         let v2 = vec![
             v(50.0, 100.0, 140.0),
             v(250.0, 100.0, 140.0),
@@ -3394,7 +3402,11 @@ mod tests {
         let cols = detect_columns(&edges, 20.0);
         assert_eq!(cols.len(), 2, "label + amount = 2 columns, got {cols:?}");
         assert_eq!(cols[0].align, Align::Left, "label column is left-aligned");
-        assert_eq!(cols[1].align, Align::Right, "amount column is right-aligned");
+        assert_eq!(
+            cols[1].align,
+            Align::Right,
+            "amount column is right-aligned"
+        );
         // The right column's anchor is its shared right edge.
         assert!(
             (cols[1].anchor - 540.0).abs() < 1.0,
@@ -3412,14 +3424,14 @@ mod tests {
         // not fused prose.
         let runs = vec![
             // Header row.
-            run("Libelle", 72.0, 700.0, 40.0), // right 112
+            run("Libelle", 72.0, 700.0, 40.0),  // right 112
             run("Montant", 490.0, 700.0, 50.0), // right 540
             // "Consulting services" 1.234,00
             run("Consulting services", 72.0, 684.0, 120.0), // right 192
             run("1.234,00", 480.0, 684.0, 60.0),            // right 540
             // "Travel" 99,50
-            run("Travel", 72.0, 668.0, 40.0),  // right 112
-            run("99,50", 505.0, 668.0, 35.0),  // right 540
+            run("Travel", 72.0, 668.0, 40.0), // right 112
+            run("99,50", 505.0, 668.0, 35.0), // right 540
             // "Software license" 12.345,67
             run("Software license", 72.0, 652.0, 100.0), // right 172
             run("12.345,67", 465.0, 652.0, 75.0),        // right 540
@@ -3467,15 +3479,15 @@ mod tests {
         // right-aligned amount (shared right edge 540). All three must be detected
         // with the correct per-column alignment.
         let runs = vec![
-            run("Item", 72.0, 700.0, 40.0),     // label, left @72
-            run("Qty", 260.0, 700.0, 30.0),     // qty, left @260
-            run("Total", 490.0, 700.0, 50.0),   // amount header, right 540
-            run("Apples", 72.0, 684.0, 60.0),   // left @72
-            run("3", 260.0, 684.0, 12.0),       // left @260
+            run("Item", 72.0, 700.0, 40.0),      // label, left @72
+            run("Qty", 260.0, 700.0, 30.0),      // qty, left @260
+            run("Total", 490.0, 700.0, 50.0),    // amount header, right 540
+            run("Apples", 72.0, 684.0, 60.0),    // left @72
+            run("3", 260.0, 684.0, 12.0),        // left @260
             run("1.234,00", 480.0, 684.0, 60.0), // right 540
-            run("Pears", 72.0, 668.0, 50.0),    // left @72
-            run("12", 260.0, 668.0, 22.0),      // left @260
-            run("99,50", 505.0, 668.0, 35.0),   // right 540
+            run("Pears", 72.0, 668.0, 50.0),     // left @72
+            run("12", 260.0, 668.0, 22.0),       // left @260
+            run("99,50", 505.0, 668.0, 35.0),    // right 540
         ];
         let lines = group_into_lines(&runs);
         let table = borderless_table(&lines).expect("three-column mixed table");
@@ -3573,10 +3585,19 @@ mod tests {
         // "1.234,00": the LAST separator (the comma) is the decimal point, not the
         // thousands dot.
         let x2 = decimal_sep_x("1.234,00", 400.0, 80.0).expect("last sep is the comma");
-        assert!(x2 > 440.0, "decimal sep is the comma (right of centre), got {x2}");
+        assert!(
+            x2 > 440.0,
+            "decimal sep is the comma (right of centre), got {x2}"
+        );
         // Non-decimal text returns None.
-        assert!(decimal_sep_x("Total", 0.0, 50.0).is_none(), "word: no separator");
-        assert!(decimal_sep_x("42", 0.0, 20.0).is_none(), "integer: no separator");
+        assert!(
+            decimal_sep_x("Total", 0.0, 50.0).is_none(),
+            "word: no separator"
+        );
+        assert!(
+            decimal_sep_x("42", 0.0, 20.0).is_none(),
+            "integer: no separator"
+        );
         assert!(
             decimal_sep_x("End of sentence.", 0.0, 90.0).is_none(),
             "trailing dot is not a decimal separator"
@@ -3605,13 +3626,21 @@ mod tests {
             (440.0, 545.0, Some(500.0)),
         ];
         let cols = detect_columns(&edges_with_dec, 20.0);
-        assert_eq!(cols.len(), 2, "label + decimal amount = 2 columns, got {cols:?}");
+        assert_eq!(
+            cols.len(),
+            2,
+            "label + decimal amount = 2 columns, got {cols:?}"
+        );
         assert_eq!(cols[0].align, Align::Left, "label column is left-aligned");
         assert!(!cols[0].decimal, "label column is not a decimal column");
         // The amount column is a decimal column anchored on the separator X (≈500),
         // reported as right-aligned (no Align::Decimal variant).
         assert!(cols[1].decimal, "amount column is detected as decimal");
-        assert_eq!(cols[1].align, Align::Right, "decimal column reports as Right");
+        assert_eq!(
+            cols[1].align,
+            Align::Right,
+            "decimal column reports as Right"
+        );
         assert!(
             (cols[1].anchor - 500.0).abs() < 1.0,
             "decimal anchor ≈ separator X 500, got {}",
@@ -3620,8 +3649,10 @@ mod tests {
 
         // Proof the decimal path is what saves it: drop the separator info and the
         // SAME scattered edges no longer yield an amount column at all (R8 alone).
-        let edges_no_dec: Vec<(f64, f64, Option<f64>)> =
-            edges_with_dec.iter().map(|&(l, r, _)| (l, r, None)).collect();
+        let edges_no_dec: Vec<(f64, f64, Option<f64>)> = edges_with_dec
+            .iter()
+            .map(|&(l, r, _)| (l, r, None))
+            .collect();
         let r8_only = detect_columns(&edges_no_dec, 20.0);
         assert!(
             r8_only.len() < 2,
@@ -3639,7 +3670,7 @@ mod tests {
         // Amounts placed so the decimal separator sits at X≈480 (8px/char widths).
         let runs = vec![
             // Header.
-            run("Libelle", 72.0, 700.0, 56.0), // right 128
+            run("Libelle", 72.0, 700.0, 56.0),  // right 128
             run("Montant", 440.0, 700.0, 56.0), // header over the amount column
             // "5,5"  (1 decimal)   x=468 w=24  right=492
             run("Service", 72.0, 684.0, 56.0),

@@ -1098,7 +1098,11 @@ mod tests {
         reserved.insert(0x26u32);
         let mut guarded = ToUnicode::parse(CMAP);
         guarded.infer_ascii_gaps(None, &reserved);
-        assert_eq!(guarded.decode(0x26), None, "reserved code must stay unmapped");
+        assert_eq!(
+            guarded.decode(0x26),
+            None,
+            "reserved code must stay unmapped"
+        );
         // Real entries (and non-reserved gaps) are unaffected.
         assert_eq!(guarded.decode(0x62), Some("b")); // real entry, untouched
         assert_eq!(guarded.decode(0x25), Some("%")); // non-reserved gap still fills

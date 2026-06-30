@@ -2370,7 +2370,10 @@ mod tests {
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), (a, b)| {
                 (l.min(a), h.max(b))
             });
-        assert!(lo >= 9.0 && hi <= 200.0, "text laid out near x=10 (lo={lo} hi={hi})");
+        assert!(
+            lo >= 9.0 && hi <= 200.0,
+            "text laid out near x=10 (lo={lo} hi={hi})"
+        );
     }
 
     #[test]
@@ -2393,13 +2396,15 @@ mod tests {
         let (sx, mx) = (min_x(&start), min_x(&middle));
         // The middle-anchored run starts to the LEFT of the start-anchored one by
         // ~half the run width (a few pt for "ABC" at 20px).
-        assert!(mx < sx - 5.0, "middle anchor shifts left (start={sx} middle={mx})");
+        assert!(
+            mx < sx - 5.0,
+            "middle anchor shifts left (start={sx} middle={mx})"
+        );
     }
 
     #[test]
     fn text_with_no_fill_draws_nothing() {
-        let svg =
-            r#"<svg viewBox="0 0 100 30"><text x="0" y="20" fill="none">x</text></svg>"#;
+        let svg = r#"<svg viewBox="0 0 100 30"><text x="0" y="20" fill="none">x</text></svg>"#;
         assert!(
             parse_svg(svg).is_none(),
             "fill:none text produces no primitives"
@@ -2417,7 +2422,10 @@ mod tests {
         // The 'B' (after dx=50) must sit well to the right of the 'A'.
         let xs: Vec<f64> = img.prims.iter().map(|p| prim_x_range(p).0).collect();
         let max_x = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        assert!(max_x > 55.0, "tspan dx shifts the glyph right (max_x={max_x})");
+        assert!(
+            max_x > 55.0,
+            "tspan dx shifts the glyph right (max_x={max_x})"
+        );
     }
 
     #[test]

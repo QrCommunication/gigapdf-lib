@@ -106,10 +106,7 @@ fn sole_code_child(pre: &Element) -> Option<&Element> {
 /// (case-insensitive).
 fn class_has(el: &Element, token: &str) -> bool {
     el.attr("class")
-        .map(|c| {
-            c.split_whitespace()
-                .any(|t| t.eq_ignore_ascii_case(token))
-        })
+        .map(|c| c.split_whitespace().any(|t| t.eq_ignore_ascii_case(token)))
         .unwrap_or(false)
 }
 
@@ -511,7 +508,11 @@ fn parse_statement(stmt: &str, nodes: &mut Vec<ParsedNode>, edges: &mut Vec<Pars
         let cur = ensure_node(nodes, spec);
         // Direction of arrow follows the (already-normalised) connector. A
         // reversed head (`<--`) is normalised in `tokenise_chain` by swapping.
-        let (from, to) = if conn.reversed { (cur, prev) } else { (prev, cur) };
+        let (from, to) = if conn.reversed {
+            (cur, prev)
+        } else {
+            (prev, cur)
+        };
         edges.push(ParsedEdge {
             from,
             to,
@@ -601,9 +602,7 @@ fn is_connector_start(b: &[u8], i: usize) -> bool {
         b'<' => i + 1 < b.len() && matches!(b[i + 1], b'-' | b'='),
         // `x--`/`o--` reversed-head forms only count as a connector when the
         // next char is a link char (so we don't eat node ids like `x1`).
-        b'x' | b'o' | b'X' | b'O' => {
-            i + 1 < b.len() && matches!(b[i + 1], b'-' | b'=')
-        }
+        b'x' | b'o' | b'X' | b'O' => i + 1 < b.len() && matches!(b[i + 1], b'-' | b'='),
         _ => false,
     }
 }
@@ -941,7 +940,12 @@ fn assign_ranks(g: &Graph) -> Vec<usize> {
 }
 
 /// Lay out the parsed graph into placed nodes + the bounding size.
-fn place(g: &Graph, measure: &dyn Measure, base: &Style, scale: f64) -> (Vec<PlacedNode>, f64, f64) {
+fn place(
+    g: &Graph,
+    measure: &dyn Measure,
+    base: &Style,
+    scale: f64,
+) -> (Vec<PlacedNode>, f64, f64) {
     let rank = assign_ranks(g);
     let max_rank = rank.iter().copied().max().unwrap_or(0);
 
@@ -1004,8 +1008,8 @@ fn place(g: &Graph, measure: &dyn Measure, base: &Style, scale: f64) -> (Vec<Pla
         layer_cross.push(cross);
     }
     let total_cross = layer_cross.iter().cloned().fold(0.0_f64, f64::max);
-    let total_main: f64 = layer_main.iter().sum::<f64>()
-        + rank_gap * (layers.len().saturating_sub(1)) as f64;
+    let total_main: f64 =
+        layer_main.iter().sum::<f64>() + rank_gap * (layers.len().saturating_sub(1)) as f64;
 
     // Main-axis position of each layer's centre line.
     let mut layer_main_center: Vec<f64> = Vec::with_capacity(layers.len());
@@ -1077,7 +1081,13 @@ fn place(g: &Graph, measure: &dyn Measure, base: &Style, scale: f64) -> (Vec<Pla
 /// Build an SVG string for the diagram geometry (boxes + edges + arrow-heads)
 /// and the list of text labels. Coordinates are in the diagram's own viewBox
 /// (points, top-down), 1:1 with the placed geometry.
-fn render_svg(g: &Graph, placed: &[PlacedNode], w: f64, h: f64, scale: f64) -> (String, Vec<Label>) {
+fn render_svg(
+    g: &Graph,
+    placed: &[PlacedNode],
+    w: f64,
+    h: f64,
+    scale: f64,
+) -> (String, Vec<Label>) {
     let mut svg = String::new();
     svg.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{:.2}\" height=\"{:.2}\" viewBox=\"0 0 {:.2} {:.2}\">",
@@ -1111,7 +1121,15 @@ fn render_svg(g: &Graph, placed: &[PlacedNode], w: f64, h: f64, scale: f64) -> (
         // no `stroke-dasharray`, so we synthesise the pattern ourselves).
         match e.line {
             Line::Dotted => {
-                dashed_line(&mut svg, x0, y0, lx1, ly1, stroke_w, (4.0 * scale, 3.0 * scale));
+                dashed_line(
+                    &mut svg,
+                    x0,
+                    y0,
+                    lx1,
+                    ly1,
+                    stroke_w,
+                    (4.0 * scale, 3.0 * scale),
+                );
             }
             Line::Thick => {
                 line(&mut svg, x0, y0, lx1, ly1, stroke_w * 2.0);
@@ -1124,9 +1142,15 @@ fn render_svg(g: &Graph, placed: &[PlacedNode], w: f64, h: f64, scale: f64) -> (
         // Head.
         match e.head {
             Head::Arrow => arrow_head(&mut svg, x0, y0, hx, hy, head_len, scale),
-            Head::Circle => {
-                circle(&mut svg, hx, hy, 3.5 * scale, "#ffffff", "#333333", stroke_w)
-            }
+            Head::Circle => circle(
+                &mut svg,
+                hx,
+                hy,
+                3.5 * scale,
+                "#ffffff",
+                "#333333",
+                stroke_w,
+            ),
             Head::Cross => cross_head(&mut svg, x0, y0, hx, hy, 5.0 * scale, stroke_w),
             Head::None => {}
         }
@@ -1372,7 +1396,12 @@ fn label_style(base: &Style, size: f64, bold: bool) -> Style {
 /// as a flowchart; returns `None` otherwise (not Mermaid, or a Mermaid kind we
 /// don't render) so the caller falls back to the normal block rendering with
 /// **no** behavioural change.
-pub fn try_build(el: &Element, base: &Style, avail_w: f64, measure: &dyn Measure) -> Option<Diagram> {
+pub fn try_build(
+    el: &Element,
+    base: &Style,
+    avail_w: f64,
+    measure: &dyn Measure,
+) -> Option<Diagram> {
     let src = mermaid_source(el)?;
     let g = parse_flowchart(&src)?;
     Some(build_graph(&g, base, avail_w, measure))
@@ -1488,10 +1517,8 @@ mod tests {
 
     #[test]
     fn parses_edge_styles_and_heads() {
-        let g = parse_flowchart(
-            "graph LR\n A-->B\n A---C\n A-.->D\n A==>E\n A--xF\n A--oG",
-        )
-        .expect("parsed");
+        let g = parse_flowchart("graph LR\n A-->B\n A---C\n A-.->D\n A==>E\n A--xF\n A--oG")
+            .expect("parsed");
         let find = |to_label: &str| {
             let idx = g.nodes.iter().position(|n| n.id == to_label).unwrap();
             g.edges.iter().find(|e| e.to == idx).unwrap()
@@ -1511,8 +1538,14 @@ mod tests {
         let g = parse_flowchart("graph TD\n A-->|yes|B\n A-- no -->C").expect("parsed");
         let b = g.nodes.iter().position(|n| n.id == "B").unwrap();
         let c = g.nodes.iter().position(|n| n.id == "C").unwrap();
-        assert_eq!(g.edges.iter().find(|e| e.to == b).unwrap().label.as_deref(), Some("yes"));
-        assert_eq!(g.edges.iter().find(|e| e.to == c).unwrap().label.as_deref(), Some("no"));
+        assert_eq!(
+            g.edges.iter().find(|e| e.to == b).unwrap().label.as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            g.edges.iter().find(|e| e.to == c).unwrap().label.as_deref(),
+            Some("no")
+        );
     }
 
     #[test]
@@ -1561,7 +1594,12 @@ mod tests {
         let d = build_graph(&g, &Style::default(), 400.0, &AverageMeasure);
         assert!(d.width > 0.0 && d.height > 0.0);
         // Three node titles among the labels.
-        let titles: Vec<&str> = d.labels.iter().filter(|l| l.bold).map(|l| l.text.as_str()).collect();
+        let titles: Vec<&str> = d
+            .labels
+            .iter()
+            .filter(|l| l.bold)
+            .map(|l| l.text.as_str())
+            .collect();
         assert!(titles.contains(&"A") && titles.contains(&"B") && titles.contains(&"C"));
         // The SVG image must carry vector primitives (boxes + edges + heads).
         // Down layout ⇒ the three boxes stack: B sits below A, C below B.
@@ -1632,10 +1670,7 @@ mod tests {
     /// Count whitespace-delimited occurrences of a single-token PDF operator on
     /// its own (i.e. appearing as a standalone token in the content stream).
     fn count_op(content: &str, op: &str) -> usize {
-        content
-            .split_whitespace()
-            .filter(|t| *t == op)
-            .count()
+        content.split_whitespace().filter(|t| *t == op).count()
     }
 
     #[test]
@@ -1647,7 +1682,10 @@ mod tests {
 
         // Three node boxes are filled+stroked paths (`B` terminator).
         let b_ops = count_op(&content, "B");
-        assert!(b_ops >= 3, "≥3 filled+stroked node boxes (B op), got {b_ops}");
+        assert!(
+            b_ops >= 3,
+            "≥3 filled+stroked node boxes (B op), got {b_ops}"
+        );
 
         // Arrow-heads are fill-only triangles (`f`); two directed edges ⇒ ≥2.
         let f_ops = count_op(&content, "f");
@@ -1663,7 +1701,10 @@ mod tests {
 
         // The three node titles render as text (`Tj`/`TJ` inside BT…ET).
         let text_ops = count_op(&content, "Tj") + count_op(&content, "TJ");
-        assert!(text_ops >= 3, "≥3 text runs for node titles, got {text_ops}");
+        assert!(
+            text_ops >= 3,
+            "≥3 text runs for node titles, got {text_ops}"
+        );
     }
 
     #[test]
@@ -1672,11 +1713,20 @@ mod tests {
         // render exactly as before — text only, NO diagram vector geometry. (A
         // black-text fill `rg` is emitted by text rendering, so the discriminator
         // is the path/fill ops a diagram would add: `B`, `f`, `re`, `m`.)
-        let content = page1_content(r#"<pre class="language-text">graph TD; A--&gt;B; B--&gt;C;</pre>"#);
-        assert_eq!(count_op(&content, "B"), 0, "no filled+stroked boxes\n{content}");
+        let content =
+            page1_content(r#"<pre class="language-text">graph TD; A--&gt;B; B--&gt;C;</pre>"#);
+        assert_eq!(
+            count_op(&content, "B"),
+            0,
+            "no filled+stroked boxes\n{content}"
+        );
         assert_eq!(count_op(&content, "f"), 0, "no filled arrow-heads");
         assert_eq!(count_op(&content, "re"), 0, "no rectangles");
-        assert_eq!(count_op(&content, "m"), 0, "no path moves (no vector geometry)");
+        assert_eq!(
+            count_op(&content, "m"),
+            0,
+            "no path moves (no vector geometry)"
+        );
         // It still renders its text verbatim.
         assert!(
             count_op(&content, "Tj") + count_op(&content, "TJ") >= 1,
@@ -1688,8 +1738,7 @@ mod tests {
     fn mermaid_flowchart_block_differs_from_plain_block() {
         // The same source under `class="mermaid"` vs `class="language-text"` must
         // diverge: only the mermaid one carries vector fills.
-        let mermaid =
-            page1_content(r#"<pre class="mermaid">graph LR; A--&gt;B; B--&gt;C;</pre>"#);
+        let mermaid = page1_content(r#"<pre class="mermaid">graph LR; A--&gt;B; B--&gt;C;</pre>"#);
         let plain =
             page1_content(r#"<pre class="language-text">graph LR; A--&gt;B; B--&gt;C;</pre>"#);
         assert!(

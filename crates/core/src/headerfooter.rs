@@ -218,7 +218,11 @@ impl HeaderFooterSpec {
             text: self.text.clone(),
             font_ref: None,
             size: self.font_size as f32,
-            color: [to_u8(self.color[0]), to_u8(self.color[1]), to_u8(self.color[2])],
+            color: [
+                to_u8(self.color[0]),
+                to_u8(self.color[1]),
+                to_u8(self.color[2]),
+            ],
             bold: false,
             italic: false,
         };
@@ -586,7 +590,9 @@ impl RunningHeaderFooter {
                 "differentFirstPage" | "different_first_page" => {
                     def.different_first_page = p.boolean()?
                 }
-                "differentOddEven" | "different_odd_even" => def.different_odd_even = p.boolean()?,
+                "differentOddEven" | "different_odd_even" => {
+                    def.different_odd_even = p.boolean()?
+                }
                 "headerBand" | "header_band" => def.header_band = p.number()? as f32,
                 "footerBand" | "footer_band" => def.footer_band = p.number()? as f32,
                 _ => p.skip_value()?,
@@ -1093,10 +1099,22 @@ mod tests {
     #[test]
     fn zone_for_selects_first_even_odd_and_default() {
         let def = sample_def(); // different_first_page + different_odd_even both on
-        assert_eq!(def.zone_for(1), def.first_page.as_ref().unwrap(), "page 1 → first");
-        assert_eq!(def.zone_for(2), def.even_page.as_ref().unwrap(), "page 2 → even");
+        assert_eq!(
+            def.zone_for(1),
+            def.first_page.as_ref().unwrap(),
+            "page 1 → first"
+        );
+        assert_eq!(
+            def.zone_for(2),
+            def.even_page.as_ref().unwrap(),
+            "page 2 → even"
+        );
         // odd_page is None → fall back to default for odd pages > 1.
-        assert_eq!(def.zone_for(3), &def.default, "page 3 → default (odd fallback)");
+        assert_eq!(
+            def.zone_for(3),
+            &def.default,
+            "page 3 → default (odd fallback)"
+        );
 
         // With both flags off, every page is the default zone.
         let plain = RunningHeaderFooter {
@@ -1137,12 +1155,25 @@ mod tests {
             band_height: 40.0,
         };
         let def = spec.to_running(true);
-        assert!(def.different_first_page, "hidden cover → different first page");
-        assert!(def.first_page.as_ref().unwrap().header.is_empty(), "cover is blank");
+        assert!(
+            def.different_first_page,
+            "hidden cover → different first page"
+        );
+        assert!(
+            def.first_page.as_ref().unwrap().header.is_empty(),
+            "cover is blank"
+        );
         assert_eq!(def.header_band, 40.0);
         assert_eq!(def.default.footer.len(), 0);
         match &def.default.header[..] {
-            [HFItem::Text { anchor, text, color, size, font_ref, .. }] => {
+            [HFItem::Text {
+                anchor,
+                text,
+                color,
+                size,
+                font_ref,
+                ..
+            }] => {
                 assert_eq!(*anchor, Align::Right);
                 assert_eq!(text, "P {{page}}");
                 assert_eq!(*color, [255, 0, 0]);

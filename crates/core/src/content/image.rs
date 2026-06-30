@@ -19,6 +19,7 @@
 use crate::filters::deflate::flate_encode;
 use crate::filters::inflate::flate_decode;
 use crate::filters::lzw::lzw_decode;
+use crate::raster::avif::decode_avif;
 use crate::raster::gif::decode_gif;
 use crate::raster::png_decode::decode_png;
 use crate::raster::webp::decode_webp;
@@ -59,9 +60,9 @@ pub struct PreparedImage {
 /// Detect the format from the magic bytes and prepare the image, or `None` when
 /// the bytes are an unsupported/malformed raster.
 ///
-/// Dispatch: JPEG → verbatim `/DCTDecode`; PNG / WebP / GIF / TIFF → decoded to
-/// RGBA and lowered to a `/DeviceRGB` stream (+ `/DeviceGray` `/SMask` when the
-/// source carries transparency).
+/// Dispatch: JPEG → verbatim `/DCTDecode`; PNG / WebP / GIF / TIFF / AVIF →
+/// decoded to RGBA and lowered to a `/DeviceRGB` stream (+ `/DeviceGray`
+/// `/SMask` when the source carries transparency).
 pub fn prepare_image(data: &[u8]) -> Option<PreparedImage> {
     if is_jpeg(data) {
         prepare_jpeg(data, None)
@@ -75,6 +76,9 @@ pub fn prepare_image(data: &[u8]) -> Option<PreparedImage> {
         prepare_rgba(w, h, &rgba)
     } else if is_tiff(data) {
         let (w, h, rgba) = decode_tiff(data)?;
+        prepare_rgba(w, h, &rgba)
+    } else if is_avif(data) {
+        let (w, h, rgba) = decode_avif(data)?;
         prepare_rgba(w, h, &rgba)
     } else {
         None
@@ -100,6 +104,32 @@ fn is_gif(data: &[u8]) -> bool {
 fn is_tiff(data: &[u8]) -> bool {
     // Little-endian (`II` 0x2A00) or big-endian (`MM` 0x002A) byte-order mark.
     data.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || data.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+}
+
+/// AVIF/HEIF-still detection: an ISO-BMFF `ftyp` box (at offset 4) carrying an
+/// AVIF brand (major or compatible). Mirrors the brand check in
+/// [`crate::convert::import`]'s `avif_dims` so the embedder and the importer
+/// agree on what counts as AVIF.
+fn is_avif(data: &[u8]) -> bool {
+    const AVIF_BRANDS: [&[u8; 4]; 4] = [b"avif", b"avis", b"mif1", b"miaf"];
+    if data.len() < 16 || &data[4..8] != b"ftyp" {
+        return false;
+    }
+    // Box length bounds the brand list; clamp to the buffer.
+    let box_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let end = box_len.clamp(16, data.len());
+    // major_brand at offset 8, then minor_version (4), then compatible_brands.
+    if AVIF_BRANDS.contains(&&[data[8], data[9], data[10], data[11]]) {
+        return true;
+    }
+    let mut o = 16;
+    while o + 4 <= end {
+        if AVIF_BRANDS.contains(&&[data[o], data[o + 1], data[o + 2], data[o + 3]]) {
+            return true;
+        }
+        o += 4;
+    }
+    false
 }
 
 /// Lower a decoded RGBA8 buffer (`width * height * 4` bytes, top-to-bottom) into
@@ -202,6 +232,8 @@ fn decode_smask_gray(source: &[u8]) -> Option<Vec<u8>> {
         decode_gif(source)?
     } else if is_tiff(source) {
         decode_tiff(source)?
+    } else if is_avif(source) {
+        decode_avif(source)?
     } else {
         return None;
     };
@@ -238,6 +270,17 @@ fn decode_smask_gray(source: &[u8]) -> Option<Vec<u8>> {
 // with Uncompressed (1) / LZW (5) / Deflate (8 or 32946) compression and the
 // horizontal-differencing predictor (2). Tiled TIFFs, JPEG-in-TIFF, CMYK,
 // floating-point and >8-bit samples are out of scope (→ `None`).
+
+/// Decode a baseline TIFF into `(width, height, rgba)`. `None` for unsupported
+/// or malformed input. Exposed `pub(crate)` so the image→PDF / watermark
+/// transcode path ([`crate::convert::reverse::embeddable_image`]) can reuse the
+/// same TIFF reader the embedder uses, keeping the two entry points in lockstep.
+pub(crate) fn decode_tiff_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if !is_tiff(data) {
+        return None;
+    }
+    decode_tiff(data)
+}
 
 /// Decode a baseline TIFF into `(width, height, rgba)`. `None` for unsupported
 /// or malformed input.
@@ -1042,5 +1085,32 @@ mod tests {
         let prep = prepare_jpeg_with_smask(&jpeg, b"not an image").expect("jpeg still embeds");
         assert!(prep.smask.is_none(), "undecodable mask → no smask");
         assert_eq!(prep.data, jpeg);
+    }
+
+    #[test]
+    fn is_avif_detects_real_fixture_and_rejects_others() {
+        let avif = include_bytes!("../raster/fixtures/av1test.avif");
+        assert!(is_avif(avif), "the AVIF fixture is detected");
+        // PNG / JPEG / GIF / WebP / TIFF / garbage are NOT AVIF.
+        assert!(!is_avif(&encode_png(2, 2, &[0u8; 16])));
+        assert!(!is_avif(&baseline_jpeg_16x8()));
+        assert!(!is_avif(b"GIF89a............"));
+        assert!(!is_avif(b"RIFF....WEBP........"));
+        assert!(!is_avif(b"not an image at all"));
+        assert!(!is_avif(b""));
+    }
+
+    #[test]
+    fn prepare_image_embeds_avif_via_rgba_path() {
+        // The 32×32 AVIF still fixture decodes to RGBA and lowers to a
+        // /DeviceRGB Flate stream (the embedder now accepts AVIF, matching the
+        // image→PDF / watermark transcode path).
+        let avif = include_bytes!("../raster/fixtures/av1test.avif");
+        let prep = prepare_image(avif).expect("AVIF must embed");
+        assert_eq!((prep.width, prep.height), (32, 32));
+        assert_eq!(prep.filter, ImageFilter::Flate);
+        assert_eq!(prep.color, ImageColor::Rgb);
+        let rgb = flate_decode(&prep.data).expect("flate");
+        assert_eq!(rgb.len(), 32 * 32 * 3, "full RGB plane");
     }
 }

@@ -682,7 +682,10 @@ mod tests {
         // so two distinct long-number footers do NOT collapse to one signature
         // (gap #75 #12).
         assert_eq!(normalize_text("Ref 12345678"), "ref 12345678");
-        assert_ne!(normalize_text("Ref 12345678"), normalize_text("Ref 87654321"));
+        assert_ne!(
+            normalize_text("Ref 12345678"),
+            normalize_text("Ref 87654321")
+        );
     }
 
     #[test]

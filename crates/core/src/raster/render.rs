@@ -1608,7 +1608,14 @@ fn paint_shading(
     // triangle to device space and barycentric-interpolating its colours, so they
     // take a separate path from the axial/radial per-pixel inverse map.
     if let ShadingKind::Mesh { triangles } = &shading.kind {
-        paint_mesh(canvas, triangles, &shading.to_device, clip, global_alpha, blend);
+        paint_mesh(
+            canvas,
+            triangles,
+            &shading.to_device,
+            clip,
+            global_alpha,
+            blend,
+        );
         return;
     }
     let Some(inv) = invert(&shading.to_device) else {

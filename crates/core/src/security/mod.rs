@@ -815,14 +815,62 @@ mod tests {
     fn each_flag_sets_exactly_its_bit() {
         let base = Permissions::none().to_p() as u32;
         let cases = [
-            (Permissions { print: true, ..Permissions::none() }, 1u32 << 2),
-            (Permissions { modify: true, ..Permissions::none() }, 1 << 3),
-            (Permissions { copy: true, ..Permissions::none() }, 1 << 4),
-            (Permissions { annotate: true, ..Permissions::none() }, 1 << 5),
-            (Permissions { fill_forms: true, ..Permissions::none() }, 1 << 8),
-            (Permissions { accessibility: true, ..Permissions::none() }, 1 << 9),
-            (Permissions { assemble: true, ..Permissions::none() }, 1 << 10),
-            (Permissions { print_high_res: true, ..Permissions::none() }, 1 << 11),
+            (
+                Permissions {
+                    print: true,
+                    ..Permissions::none()
+                },
+                1u32 << 2,
+            ),
+            (
+                Permissions {
+                    modify: true,
+                    ..Permissions::none()
+                },
+                1 << 3,
+            ),
+            (
+                Permissions {
+                    copy: true,
+                    ..Permissions::none()
+                },
+                1 << 4,
+            ),
+            (
+                Permissions {
+                    annotate: true,
+                    ..Permissions::none()
+                },
+                1 << 5,
+            ),
+            (
+                Permissions {
+                    fill_forms: true,
+                    ..Permissions::none()
+                },
+                1 << 8,
+            ),
+            (
+                Permissions {
+                    accessibility: true,
+                    ..Permissions::none()
+                },
+                1 << 9,
+            ),
+            (
+                Permissions {
+                    assemble: true,
+                    ..Permissions::none()
+                },
+                1 << 10,
+            ),
+            (
+                Permissions {
+                    print_high_res: true,
+                    ..Permissions::none()
+                },
+                1 << 11,
+            ),
         ];
         for (perm, bit) in cases {
             let bits = perm.to_p() as u32;
@@ -866,7 +914,10 @@ mod tests {
     #[test]
     fn no_print_clears_print_bit_in_p() {
         // A document encrypted with "no printing" has bit 3 cleared.
-        let p = Permissions { print: false, ..Permissions::all() };
+        let p = Permissions {
+            print: false,
+            ..Permissions::all()
+        };
         let bits = p.to_p() as u32;
         assert_eq!(bits & (1 << 2), 0, "bit 3 (print) must be 0");
         // The other permissions remain granted.
@@ -880,7 +931,10 @@ mod tests {
 
     #[test]
     fn copy_only_combination() {
-        let p = Permissions { copy: true, ..Permissions::none() };
+        let p = Permissions {
+            copy: true,
+            ..Permissions::none()
+        };
         let decoded = Permissions::from_p(p.to_p());
         assert!(decoded.copy);
         assert!(!decoded.print && !decoded.modify && !decoded.annotate);
@@ -892,10 +946,12 @@ mod tests {
     fn permissions_drive_encrypt_dictionary_p() {
         // The computed `/P` flows verbatim into the `/Encrypt` dict that the
         // AES-256 builder writes, and re-reads identically.
-        let no_print = Permissions { print: false, ..Permissions::all() };
+        let no_print = Permissions {
+            print: false,
+            ..Permissions::all()
+        };
         let fek = [0x33u8; 32];
-        let (_sec, dict) =
-            Security::new_aes_v3(b"user", b"owner", &fek, no_print.to_p(), true);
+        let (_sec, dict) = Security::new_aes_v3(b"user", b"owner", &fek, no_print.to_p(), true);
         let stored = dict.get(b"P").and_then(Object::as_i64).unwrap() as i32;
         assert_eq!(stored, no_print.to_p());
         assert!(!Permissions::from_p(stored).print);

@@ -1685,7 +1685,12 @@ mod tests {
 
     /// Reference cubic flattening matching Interp::curveto (8 steps), used to
     /// derive the EXPECTED points independently from absolute control points.
-    fn flatten(start: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64)) -> Vec<(f64, f64)> {
+    fn flatten(
+        start: (f64, f64),
+        p1: (f64, f64),
+        p2: (f64, f64),
+        p3: (f64, f64),
+    ) -> Vec<(f64, f64)> {
         let mut out = Vec::new();
         const STEPS: usize = 8;
         for i in 1..=STEPS {
@@ -1714,7 +1719,9 @@ mod tests {
     #[test]
     fn flex_emits_two_cubic_curves() {
         // flex (12 35): two curves with explicit relative deltas; fd ignored.
-        let ops = [10.0, 0.0, 20.0, 30.0, 10.0, 0.0, 10.0, 0.0, 20.0, -30.0, 10.0, 0.0, 50.0];
+        let ops = [
+            10.0, 0.0, 20.0, 30.0, 10.0, 0.0, 10.0, 0.0, 20.0, -30.0, 10.0, 0.0, 50.0,
+        ];
         let pts = run_flex(&ops, 35);
         // Curve 1 absolute control points from start (0,0).
         let c1 = flatten((0.0, 0.0), (10.0, 0.0), (30.0, 30.0), (40.0, 30.0));
@@ -1723,7 +1730,10 @@ mod tests {
         let mut expected = vec![(0.0, 0.0)];
         expected.extend(c1);
         expected.extend(c2);
-        assert!(approx_eq(&pts, &expected), "flex points\n got {pts:?}\n exp {expected:?}");
+        assert!(
+            approx_eq(&pts, &expected),
+            "flex points\n got {pts:?}\n exp {expected:?}"
+        );
         // End point must be exactly (80, 0): start + total dx, y returned to 0.
         assert_eq!(*pts.last().unwrap(), (80.0, 0.0));
     }
@@ -1754,15 +1764,23 @@ mod tests {
         let mut expected = vec![(0.0, 0.0)];
         expected.extend(c1);
         expected.extend(c2);
-        assert!(approx_eq(&pts, &expected), "hflex1 points\n got {pts:?}\n exp {expected:?}");
-        assert!((pts.last().unwrap().1).abs() < 1e-9, "hflex1 ends on starting y");
+        assert!(
+            approx_eq(&pts, &expected),
+            "hflex1 points\n got {pts:?}\n exp {expected:?}"
+        );
+        assert!(
+            (pts.last().unwrap().1).abs() < 1e-9,
+            "hflex1 ends on starting y"
+        );
     }
 
     #[test]
     fn flex1_closes_on_dominant_axis() {
         // flex1 (12 37): horizontal-dominant case → last point = (d6, -dy_total).
         // dx_total = 10+20+10+10+20 = 70, dy_total = 0+10+0+0+(-10) = 0 → |dx|>|dy|.
-        let ops = [10.0, 0.0, 20.0, 10.0, 10.0, 0.0, 10.0, 0.0, 20.0, -10.0, 10.0];
+        let ops = [
+            10.0, 0.0, 20.0, 10.0, 10.0, 0.0, 10.0, 0.0, 20.0, -10.0, 10.0,
+        ];
         let pts = run_flex(&ops, 37);
         let c1 = flatten((0.0, 0.0), (10.0, 0.0), (30.0, 10.0), (40.0, 10.0));
         // last delta = (d6=10, -dy_total=0) → from (50,10) by (50,? ) ... compute:
@@ -1771,7 +1789,10 @@ mod tests {
         let mut expected = vec![(0.0, 0.0)];
         expected.extend(c1);
         expected.extend(c2);
-        assert!(approx_eq(&pts, &expected), "flex1 points\n got {pts:?}\n exp {expected:?}");
+        assert!(
+            approx_eq(&pts, &expected),
+            "flex1 points\n got {pts:?}\n exp {expected:?}"
+        );
         assert_eq!(*pts.last().unwrap(), (80.0, 0.0));
     }
 
@@ -1788,7 +1809,10 @@ mod tests {
         let mut expected = vec![(0.0, 0.0)];
         expected.extend(c1);
         expected.extend(c2);
-        assert!(approx_eq(&pts, &expected), "flex1 vertical points\n got {pts:?}\n exp {expected:?}");
+        assert!(
+            approx_eq(&pts, &expected),
+            "flex1 vertical points\n got {pts:?}\n exp {expected:?}"
+        );
         assert_eq!(*pts.last().unwrap(), (0.0, 82.0));
     }
 

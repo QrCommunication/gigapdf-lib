@@ -1180,7 +1180,10 @@ mod tests {
         let stream = extract_av1_stream(avif).unwrap();
         let obus = split_obus(&stream).unwrap();
         let seq = parse_sequence_header(
-            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+            obus.iter()
+                .find(|o| o.kind == OBU_SEQUENCE_HEADER)
+                .unwrap()
+                .data,
         )
         .unwrap();
         let frame = obus

@@ -537,7 +537,13 @@ struct HGroup {
 }
 
 fn read_hgroup(r: &mut BitR, cache_bits: u32) -> Option<HGroup> {
-    let green_alphabet = 256 + 24 + if cache_bits > 0 { 1usize << cache_bits } else { 0 };
+    let green_alphabet = 256
+        + 24
+        + if cache_bits > 0 {
+            1usize << cache_bits
+        } else {
+            0
+        };
     Some(HGroup {
         green: read_tree(r, green_alphabet)?,
         red: read_tree(r, 256)?,
@@ -602,7 +608,11 @@ fn decode_vp8l_image(r: &mut BitR, width: u32, height: u32, allow_meta: bool) ->
         groups.push(read_hgroup(r, cache_bits)?);
     }
 
-    let cache_size = if cache_bits > 0 { 1usize << cache_bits } else { 0 };
+    let cache_size = if cache_bits > 0 {
+        1usize << cache_bits
+    } else {
+        0
+    };
     let mut cache = vec![0u32; cache_size];
     let mut out = vec![0u32; n];
 
@@ -752,7 +762,13 @@ fn select_pred(t: u32, l: u32, tl: u32) -> u32 {
 
 /// Undo the predictor transform: each pixel had its spatial prediction
 /// subtracted; add it back. `pred_img` is the sub-resolution mode image.
-fn apply_predictor(px: &mut [u32], width: u32, height: u32, bits: u32, pred_img: &[u32]) -> Option<()> {
+fn apply_predictor(
+    px: &mut [u32],
+    width: u32,
+    height: u32,
+    bits: u32,
+    pred_img: &[u32],
+) -> Option<()> {
     let w = width as usize;
     let xsize = sub_size(width, bits) as usize;
     for y in 0..height as usize {
@@ -806,7 +822,13 @@ fn predict(mode: u8, l: u32, t: u32, tl: u32, tr: u32) -> u32 {
 }
 
 /// Undo the colour transform: re-correlate red/blue from green per block.
-fn apply_color_transform(px: &mut [u32], width: u32, height: u32, bits: u32, cimg: &[u32]) -> Option<()> {
+fn apply_color_transform(
+    px: &mut [u32],
+    width: u32,
+    height: u32,
+    bits: u32,
+    cimg: &[u32],
+) -> Option<()> {
     let w = width as usize;
     let xsize = sub_size(width, bits) as usize;
     for y in 0..height as usize {
@@ -856,12 +878,7 @@ fn apply_subtract_green(px: &mut [u32]) {
 
 /// Undo colour-indexing: replace each (green) index by its palette entry,
 /// un-bundling packed pixels when the palette has ≤ 16 entries.
-fn apply_color_indexing(
-    px: &[u32],
-    width: u32,
-    height: u32,
-    palette: &[u32],
-) -> Option<Vec<u32>> {
+fn apply_color_indexing(px: &[u32], width: u32, height: u32, palette: &[u32]) -> Option<Vec<u32>> {
     let table_size = palette.len();
     let bits = if table_size <= 2 {
         3u32
@@ -1085,8 +1102,7 @@ mod tests {
         if with_meta {
             w.write(0, 1); // meta-huffman = 0
         }
-        let (mut fg, mut fr, mut fb, mut fa) =
-            ([0u32; 280], [0u32; 256], [0u32; 256], [0u32; 256]);
+        let (mut fg, mut fr, mut fb, mut fa) = ([0u32; 280], [0u32; 256], [0u32; 256], [0u32; 256]);
         for &p in pixels {
             fr[((p >> 16) & 0xff) as usize] += 1;
             fg[((p >> 8) & 0xff) as usize] += 1;
@@ -1151,13 +1167,9 @@ mod tests {
     fn decoded_argb(webp: &[u8], width: u32, height: u32) -> Vec<u32> {
         let (dw, dh, rgba) = decode_webp(webp).expect("decode");
         assert_eq!((dw, dh), (width, height));
-        rgba
-            .chunks_exact(4)
+        rgba.chunks_exact(4)
             .map(|c| {
-                ((c[3] as u32) << 24)
-                    | ((c[0] as u32) << 16)
-                    | ((c[1] as u32) << 8)
-                    | c[2] as u32
+                ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
             })
             .collect()
     }
@@ -1190,8 +1202,12 @@ mod tests {
         let (w, h) = (3u32, 2u32);
         // residuals (these are added to the spatial prediction)
         let resid = [
-            0xff01_0203u32, 0xff00_0001, 0xff00_0001, // row 0
-            0xff00_0102, 0xff00_0000, 0xff00_0000, // row 1
+            0xff01_0203u32,
+            0xff00_0001,
+            0xff00_0001, // row 0
+            0xff00_0102,
+            0xff00_0000,
+            0xff00_0000, // row 1
         ];
         // sub-image is 1×1 (ceil(3/4)=1, ceil(2/4)=1); green byte = mode 1.
         let pred = |bw: &mut BitW| {
@@ -1259,11 +1275,9 @@ mod tests {
         // 4 colours but a 32-entry palette forces no bundling (bits=0): each
         // pixel's green byte is a direct palette index.
         let (w, h) = (3u32, 2u32);
-        let palette: Vec<u32> = (0..20u32)
-            .map(|k| 0xff00_0000 | (k * 0x010203))
-            .collect();
+        let palette: Vec<u32> = (0..20u32).map(|k| 0xff00_0000 | (k * 0x010203)).collect();
         let size = palette.len() as u32; // 20 > 16 → unbundled
-        // palette delta-coded for transmission
+                                         // palette delta-coded for transmission
         let mut deltas = vec![palette[0]];
         for k in 1..palette.len() {
             // delta = entry - prev (component-wise, mod 256)
@@ -1345,8 +1359,7 @@ mod tests {
         ca: Vec<u16>,
     }
     fn group_codes(pixels: &[u32]) -> GroupCodes {
-        let (mut fg, mut fr, mut fb, mut fa) =
-            ([0u32; 280], [0u32; 256], [0u32; 256], [0u32; 256]);
+        let (mut fg, mut fr, mut fb, mut fa) = ([0u32; 280], [0u32; 256], [0u32; 256], [0u32; 256]);
         for &p in pixels {
             fr[((p >> 16) & 0xff) as usize] += 1;
             fg[((p >> 8) & 0xff) as usize] += 1;
@@ -1401,8 +1414,14 @@ mod tests {
         // routing are correct.
         let (w, h) = (8u32, 1u32);
         let main = [
-            0xff11_2233u32, 0xff44_5566, 0xff11_2233, 0xff44_5566, // block 0 → group 0
-            0xff77_8899, 0xffaa_bbcc, 0xff77_8899, 0xffaa_bbcc, // block 1 → group 1
+            0xff11_2233u32,
+            0xff44_5566,
+            0xff11_2233,
+            0xff44_5566, // block 0 → group 0
+            0xff77_8899,
+            0xffaa_bbcc,
+            0xff77_8899,
+            0xffaa_bbcc, // block 1 → group 1
         ];
         // Entropy image 2×1; group index = (red<<8 | green). Left=0, right=1.
         let entropy = [0x0000_0000u32, 0x0000_0100];
@@ -1415,12 +1434,12 @@ mod tests {
         bw.write(1, 1); // alpha used
         bw.write(0, 3); // version
         bw.write(0, 1); // no transforms
-        // Main image header.
+                        // Main image header.
         bw.write(0, 1); // colour cache present = 0
         bw.write(1, 1); // use meta-huffman = 1
         bw.write(0, 3); // huff_bits - 2 = 0 → block size 4
         emit_literal_body(&mut bw, false, &entropy); // entropy image (2×1)
-        // All group trees first…
+                                                     // All group trees first…
         write_group_trees(&mut bw, &g0);
         write_group_trees(&mut bw, &g1);
         // …then the raster pixel stream, each pixel via its routed group.
@@ -1443,19 +1462,19 @@ mod tests {
 
     /// 32×24 gradient, PREDICTOR transform (libwebp). RGB = (x·7, y·9, (x+y)·5).
     const GRAD_WEBP: &[u8] = &[
-        0x52, 0x49, 0x46, 0x46, 0x30, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x4c,
-        0x24, 0x00, 0x00, 0x00, 0x2f, 0x1f, 0xc0, 0x05, 0x00, 0xb9, 0x8c, 0xe8, 0x7f, 0xec, 0x22, 0xa2,
-        0xff, 0x01, 0x21, 0x01, 0xa1, 0xfa, 0xbf, 0x5a, 0x95, 0xe6, 0x40, 0x41, 0xda, 0x06, 0x2c, 0x6c,
-        0x77, 0x62, 0x02, 0x00, 0x5f, 0xeb, 0x7b, 0x03,
+        0x52, 0x49, 0x46, 0x46, 0x30, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x4c, 0x24, 0x00, 0x00, 0x00, 0x2f, 0x1f, 0xc0, 0x05, 0x00, 0xb9, 0x8c, 0xe8, 0x7f, 0xec,
+        0x22, 0xa2, 0xff, 0x01, 0x21, 0x01, 0xa1, 0xfa, 0xbf, 0x5a, 0x95, 0xe6, 0x40, 0x41, 0xda,
+        0x06, 0x2c, 0x6c, 0x77, 0x62, 0x02, 0x00, 0x5f, 0xeb, 0x7b, 0x03,
     ];
 
     /// 19×11 black/white checkerboard, COLOR_INDEXING transform with 3-bit
     /// pixel bundling (2-colour palette). Index = `(x·y) % 2`.
     const PAL2_WEBP: &[u8] = &[
-        0x52, 0x49, 0x46, 0x46, 0x2e, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x4c,
-        0x22, 0x00, 0x00, 0x00, 0x2f, 0x12, 0x80, 0x02, 0x00, 0x0f, 0x30, 0xff, 0xf3, 0x3f, 0xff, 0xf3,
-        0x1f, 0x78, 0x20, 0xc8, 0xb6, 0x69, 0xee, 0x4f, 0x32, 0xd3, 0x1b, 0x44, 0xf4, 0x9f, 0x60, 0x92,
-        0xa6, 0xda, 0x8e, 0x41, 0xed, 0x39,
+        0x52, 0x49, 0x46, 0x46, 0x2e, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x4c, 0x22, 0x00, 0x00, 0x00, 0x2f, 0x12, 0x80, 0x02, 0x00, 0x0f, 0x30, 0xff, 0xf3, 0x3f,
+        0xff, 0xf3, 0x1f, 0x78, 0x20, 0xc8, 0xb6, 0x69, 0xee, 0x4f, 0x32, 0xd3, 0x1b, 0x44, 0xf4,
+        0x9f, 0x60, 0x92, 0xa6, 0xda, 0x8e, 0x41, 0xed, 0x39,
     ];
 
     #[test]

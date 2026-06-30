@@ -750,15 +750,20 @@ fn is_caption_text(text: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    const CUES: [&str; 6] = ["figure", "fig.", "table", "tableau", "image", "illustration"];
+    const CUES: [&str; 6] = [
+        "figure",
+        "fig.",
+        "table",
+        "tableau",
+        "image",
+        "illustration",
+    ];
     let lower = t.to_ascii_lowercase();
     CUES.iter().any(|cue| {
         lower.strip_prefix(cue).is_some_and(|rest| {
             // A real cue is followed by a separator or number, not more letters
             // ("imagery"/"tabletop" must not match).
-            rest.chars()
-                .next()
-                .is_none_or(|c| !c.is_ascii_alphabetic())
+            rest.chars().next().is_none_or(|c| !c.is_ascii_alphabetic())
         })
     })
 }
@@ -1855,7 +1860,11 @@ mod tests {
         // (clamped under the deepest open level), never silently lost.
         let tree = fold_outline(&[flat("Top", 0, 0), flat("Way Deep", 5, 1)]);
         assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].children.len(), 1, "deep entry attaches, not dropped");
+        assert_eq!(
+            tree[0].children.len(),
+            1,
+            "deep entry attaches, not dropped"
+        );
         assert_eq!(tree[0].children[0].title, "Way Deep");
     }
 
@@ -1902,7 +1911,10 @@ mod tests {
         // same width and horizontally aligned.
         let image_frame = Rect::new(50.0, 100.0, 200.0, 100.0);
         let mut blocks = vec![
-            caption_para_block("Body paragraph far above", Rect::new(50.0, 10.0, 400.0, 12.0)),
+            caption_para_block(
+                "Body paragraph far above",
+                Rect::new(50.0, 10.0, 400.0, 12.0),
+            ),
             caption_para_block("Figure 1: the diagram", Rect::new(55.0, 205.0, 190.0, 12.0)),
         ];
         let alt = take_caption_for(&mut blocks, &image_frame);

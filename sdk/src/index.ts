@@ -469,11 +469,12 @@ export class GigaPdfEngine {
     );
   }
   /**
-   * Image (PNG/JPEG/GIF/WebP/AVIF) → one-page PDF, format auto-detected: the
-   * image is centred and scaled to fit on an A4 portrait page. PNG/JPEG embed
-   * directly; GIF/WebP/AVIF are transcoded to PNG first — all in pure Rust/WASM,
-   * no third-party image library. Empty array if the bytes are not a recognized
-   * image. To combine many images into a single document, pipe each result
+   * Image (PNG/JPEG/GIF/WebP/AVIF/TIFF) → one-page PDF, format auto-detected:
+   * the image is centred and scaled to fit on an A4 portrait page. PNG/JPEG
+   * embed directly; GIF/WebP/AVIF/TIFF are transcoded to PNG first — all in pure
+   * Rust/WASM, no third-party image library. Empty array if the bytes are not a
+   * recognized image. To combine many images into a single document, pipe each
+   * result
    * through {@link mergePdfs}.
    */
   imageToPdf(image: Uint8Array): Uint8Array {
@@ -3316,8 +3317,10 @@ export class GigaPdfDoc {
   }
 
   /**
-   * Embed a raster image (PNG or JPEG bytes) at `(x,y)` sized `(w,h)` in PDF
-   * user space. PNG alpha is honoured; `opacity` (0..1) sets an overall alpha.
+   * Embed a raster image at `(x,y)` sized `(w,h)` in PDF user space. Format
+   * auto-detected: **PNG, JPEG, GIF, WebP, AVIF, TIFF** (non-PNG/JPEG decoded to
+   * RGBA in pure Rust/WASM). PNG alpha is honoured; `opacity` (0..1) sets an
+   * overall alpha.
    */
   addImage(
     page: number,
@@ -3359,7 +3362,7 @@ export class GigaPdfDoc {
   }
   /**
    * Stamp an **image watermark** across pages from raw image bytes. Accepts the
-   * same five formats the engine decodes — **PNG, JPEG, WebP, GIF, AVIF**. The
+   * formats the engine decodes — **PNG, JPEG, WebP, GIF, AVIF, TIFF**. The
    * image is embedded **once** and referenced on every target page.
    *
    * `opts.pages` is a list of 1-based page numbers; omit it (or pass `[]`) to

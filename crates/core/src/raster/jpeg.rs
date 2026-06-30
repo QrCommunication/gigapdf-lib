@@ -682,7 +682,14 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                     // SOF9: arithmetic sequential — one interleaved scan decodes
                     // the whole image.
                     return decode_scan_arith(
-                        data, pos, width, height, &mut comps, &quant, &arith_dc, &arith_ac,
+                        data,
+                        pos,
+                        width,
+                        height,
+                        &mut comps,
+                        &quant,
+                        &arith_dc,
+                        &arith_ac,
                         restart_interval,
                     );
                 }
@@ -1279,11 +1286,28 @@ impl Progressive {
                 since_restart += 1;
                 if ah == 0 {
                     self.ac_first_arith(
-                        &mut mq, comps, &mut ac_stats, &mut sign_bin, arith_ac, ci, unit, ss, se, al,
+                        &mut mq,
+                        comps,
+                        &mut ac_stats,
+                        &mut sign_bin,
+                        arith_ac,
+                        ci,
+                        unit,
+                        ss,
+                        se,
+                        al,
                     )?;
                 } else {
                     self.ac_refine_arith(
-                        &mut mq, comps, &mut ac_stats, &mut sign_bin, ci, unit, ss, se, al,
+                        &mut mq,
+                        comps,
+                        &mut ac_stats,
+                        &mut sign_bin,
+                        ci,
+                        unit,
+                        ss,
+                        se,
+                        al,
                     )?;
                 }
             }
@@ -1827,7 +1851,7 @@ fn arith_decode_dc(
     }
     // Non-zero: sign, then magnitude category, then magnitude low bits.
     let sign = mq.decode(stats, base + 1); // 0 = positive, 1 = negative
-    // SP/SN entry bin: base+2 (positive) or base+3 (negative).
+                                           // SP/SN entry bin: base+2 (positive) or base+3 (negative).
     let mut st = base + 2 + sign as usize;
     let mut m: i32 = mq.decode(stats, st) as i32;
     if m != 0 {
@@ -2027,7 +2051,16 @@ fn decode_scan_arith(
                         blk[i] = coeffs[i] as f32 * q[i] as f32;
                     }
                     transform_2d(&mut blk, dct_iii);
-                    place_block(&mut planes[ci], &blk, mx * ch + bx, my * cv + by, sx, sy, w, h);
+                    place_block(
+                        &mut planes[ci],
+                        &blk,
+                        mx * ch + bx,
+                        my * cv + by,
+                        sx,
+                        sy,
+                        w,
+                        h,
+                    );
                 }
             }
         }
@@ -2459,8 +2492,8 @@ mod tests {
         } else {
             enc.encode(stats, st, 1);
             let cat = 32 - (sz as u32).leading_zeros(); // ≥ 1
-            // Size ladder at offset 20: (cat-1) ones then a zero brings the
-            // decoder's `m` (starting at 1) to 1 << (cat-1).
+                                                        // Size ladder at offset 20: (cat-1) ones then a zero brings the
+                                                        // decoder's `m` (starting at 1) to 1 << (cat-1).
             st = 20;
             for _ in 0..(cat - 1) {
                 enc.encode(stats, st, 1);
@@ -2515,7 +2548,7 @@ mod tests {
                 return;
             }
             enc.encode(stats, base_of(k), 0); // not EOB
-            // Advance over zeros: emit run-decision 0 for each zero, 1 at nonzero.
+                                              // Advance over zeros: emit run-decision 0 for each zero, 1 at nonzero.
             while coeffs[ZIGZAG[k]] == 0 {
                 enc.encode(stats, base_of(k) + 1, 0);
                 k += 1;

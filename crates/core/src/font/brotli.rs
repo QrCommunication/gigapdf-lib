@@ -155,7 +155,8 @@ impl PrefixCode {
 // ---------------------------------------------------------------------------
 
 /// Code lengths for the *code-length* code, in the order they are stored.
-const CODE_LENGTH_ORDER: [usize; 18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const CODE_LENGTH_ORDER: [usize; 18] =
+    [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Read one prefix code over an alphabet of `alphabet_size` symbols.
 fn read_prefix_code(br: &mut BitReader, alphabet_size: usize) -> Result<PrefixCode, ()> {
@@ -238,7 +239,7 @@ fn read_complex_prefix_code(
     // RFC 7932 Table: 0->0, 1->4, 2->3, 3->2, 4->0(2 codes path)… we read with the
     // canonical small code below.
     const CL_CODE_LENGTHS: [u8; 6] = [2, 2, 2, 3, 1, 4]; // symbol-length code for values {0,1,2,3,4,5}
-                                                          // The above encodes the fixed prefix used to read each code-length symbol.
+                                                         // The above encodes the fixed prefix used to read each code-length symbol.
     let cl_reader = build_code_length_reader(&CL_CODE_LENGTHS)?;
 
     for &sym in &CODE_LENGTH_ORDER[hskip..] {
@@ -602,8 +603,7 @@ impl<'a> Decoder<'a> {
         self.n_postfix = self.br.bits(2)?;
         self.n_direct = self.br.bits(4)? << self.n_postfix;
         let num_dist_short = 16;
-        let num_dist_codes =
-            num_dist_short + self.n_direct + (48u32 << self.n_postfix);
+        let num_dist_codes = num_dist_short + self.n_direct + (48u32 << self.n_postfix);
 
         // --- Literal context modes (one per literal block type) ---
         let mut context_modes = vec![0u8; l_state.num_types];

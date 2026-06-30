@@ -6,6 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.109.0] - 2026-06-30
+
+### Added — image conversion completeness
+
+- `imageToPdf` and direct image embedding now accept the full format set
+  uniformly: **PNG, JPEG, GIF, WebP, AVIF and TIFF**. AVIF works for direct
+  embedding (`addImage` / watermark) and TIFF works for `imageToPdf` — closing
+  the gaps where one entry point supported a format the other rejected.
+- New `image_conversion.test.ts` suite exercises every format → PDF through the
+  bundled production WASM binary (PNG, WebP, AVIF, TIFF), the non-image rejection
+  path, and `addImage`.
+
+### Added — conversion fidelity (both directions)
+
+- HTML `letter-spacing`, `visibility:hidden`/`display:none`, `<sup>`/`<sub>` and
+  `<colgroup><col width>`; Markdown inline `<sup>`/`<sub>`; ODT/DOCX tab stops;
+  RTF `\page` page breaks — all now round-trip through the model. See the engine
+  [`CHANGELOG.md`](../CHANGELOG.md) for the full list.
+
 ## [0.107.1] - 2026-06-27
 
 ### Fixed

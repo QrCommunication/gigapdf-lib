@@ -664,9 +664,7 @@ mod tests {
         let ordered: Vec<String> = order.iter().map(|&i| lines[i].text()).collect();
         assert_eq!(
             ordered,
-            vec![
-                "topL1", "topL2", "topR1", "topR2", "BANNER", "botL1", "botL2", "botR1", "botR2",
-            ],
+            vec!["topL1", "topL2", "topR1", "topR2", "BANNER", "botL1", "botL2", "botR1", "botR2",],
         );
     }
 
@@ -691,12 +689,21 @@ mod tests {
         let right_lo = lines.iter().find(|l| l.text() == "rightLo").unwrap();
         let hi_rank = layout.rank(right_hi.center_x(), right_hi.top());
         let lo_rank = layout.rank(right_lo.center_x(), right_lo.top());
-        assert!(hi_rank < shape_rank, "shape sorts after the higher right line");
-        assert!(shape_rank < lo_rank, "shape sorts before the lower right line");
+        assert!(
+            hi_rank < shape_rank,
+            "shape sorts after the higher right line"
+        );
+        assert!(
+            shape_rank < lo_rank,
+            "shape sorts before the lower right line"
+        );
         // And the title (region 0) outranks anything in the body region.
         let title = lines.iter().find(|l| l.text() == "TITLE").unwrap();
         let title_rank = layout.rank(title.center_x(), title.top());
-        assert!(title_rank < shape_rank, "the title is read before the shape");
+        assert!(
+            title_rank < shape_rank,
+            "the title is read before the shape"
+        );
     }
 
     #[test]

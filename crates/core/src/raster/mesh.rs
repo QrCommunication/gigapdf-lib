@@ -198,12 +198,8 @@ fn emit_triangle(out: &mut Vec<MeshVertex>, a: &Vert, b: &Vert, c: &Vert) {
 /// `0` starts a new triangle (the next two `0`-flag vertices complete it); `1`/`2`
 /// share an edge of the previous triangle, forming a strip/fan. Read continuously
 /// (no byte alignment between vertices).
-fn decode_free_form<F>(
-    reader: &mut BitReader,
-    p: &MeshParams,
-    color: &F,
-    out: &mut Vec<MeshVertex>,
-) where
+fn decode_free_form<F>(reader: &mut BitReader, p: &MeshParams, color: &F, out: &mut Vec<MeshVertex>)
+where
     F: Fn(&[f64]) -> [u8; 3],
 {
     // The two most-recently-emitted triangle vertices, kept to extend a strip/fan.
@@ -225,8 +221,12 @@ fn decode_free_form<F>(
                 // Start a fresh triangle: this vertex plus the next two (which the
                 // spec guarantees also carry flag 0). Read them now.
                 let (Some(v2), Some(v3)) = (
-                    reader.read(p.bits_per_flag).and(read_vertex(reader, p, color)),
-                    reader.read(p.bits_per_flag).and(read_vertex(reader, p, color)),
+                    reader
+                        .read(p.bits_per_flag)
+                        .and(read_vertex(reader, p, color)),
+                    reader
+                        .read(p.bits_per_flag)
+                        .and(read_vertex(reader, p, color)),
                 ) else {
                     return;
                 };
@@ -268,12 +268,8 @@ fn decode_free_form<F>(
 /// Type 5 — lattice-form Gouraud mesh. No flags: a regular grid of
 /// `VerticesPerRow` columns by however many rows the stream holds. Consecutive
 /// rows are joined into quads, each split into two triangles. Read continuously.
-fn decode_lattice<F>(
-    reader: &mut BitReader,
-    p: &MeshParams,
-    color: &F,
-    out: &mut Vec<MeshVertex>,
-) where
+fn decode_lattice<F>(reader: &mut BitReader, p: &MeshParams, color: &F, out: &mut Vec<MeshVertex>)
+where
     F: Fn(&[f64]) -> [u8; 3],
 {
     let vpr = p.vertices_per_row;

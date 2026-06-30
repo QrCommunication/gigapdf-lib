@@ -509,9 +509,9 @@ fn parse_list(lines: &[&str], defs: &Defs) -> (Block, usize) {
             ordered,
             marker,
             items,
-        
-        ..Default::default()
-}),
+
+            ..Default::default()
+        }),
         ..Block::default()
     };
     (block, i)
@@ -1040,7 +1040,7 @@ fn try_inline_html(
     }
 
     // A phrasing tag that maps to a style toggle (`b`, `strong`, `i`, `em`,
-    // `code`, `u`, `s`, `del`, `strike`, `mark`).
+    // `code`, `u`, `s`, `del`, `strike`, `mark`, `sup`, `sub`).
     let name = lower.split_whitespace().next().unwrap_or("");
     if let Some(apply) = inline_tag_style(name, style) {
         let (inner, next) = html_element_inner(chars, gt + 1, name);
@@ -1073,6 +1073,8 @@ fn inline_tag_style(name: &str, base: &CharStyle) -> Option<CharStyle> {
         "s" | "del" | "strike" => s.strike = true,
         "code" => return Some(mono_style()),
         "mark" => s.background = Some([1.0, 1.0, 0.0]),
+        "sup" => s.vertical_align = crate::model::VAlign::Super,
+        "sub" => s.vertical_align = crate::model::VAlign::Sub,
         _ => return None,
     }
     Some(s)
@@ -1266,6 +1268,23 @@ mod tests {
             .runs
             .iter()
             .any(|i| matches!(i, Inline::Run(r) if r.style.italic && r.text == "slant")));
+    }
+
+    #[test]
+    fn markdown_inline_html_sup_sub_styles() {
+        let doc = md_to_model("E = mc<sup>2</sup> and H<sub>2</sub>O");
+        let p = match &blocks(&doc)[0].kind {
+            BlockKind::Paragraph(p) => p,
+            other => panic!("expected paragraph, got {other:?}"),
+        };
+        assert!(
+            p.runs.iter().any(|i| matches!(i, Inline::Run(r) if r.text == "2" && r.style.vertical_align == crate::model::VAlign::Super)),
+            "HTML sup imported as run-level superscript"
+        );
+        assert!(
+            p.runs.iter().any(|i| matches!(i, Inline::Run(r) if r.text == "2" && r.style.vertical_align == crate::model::VAlign::Sub)),
+            "HTML sub imported as run-level subscript"
+        );
     }
 
     #[test]
@@ -1463,7 +1482,14 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                "heading", "paragraph", "heading", "list", "code", "rule", "quote", "table"
+                "heading",
+                "paragraph",
+                "heading",
+                "list",
+                "code",
+                "rule",
+                "quote",
+                "table"
             ]
         );
     }

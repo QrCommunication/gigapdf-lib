@@ -392,7 +392,8 @@ pub fn vector_paths_from_ops_with_pos(
             b"scn" | b"sc" => {
                 if let Some(rgb) = resolve_color(&st.fill_space, &n, resolver) {
                     st.fill = rgb;
-                } else if let Some(rgb) = pattern_operand(op).and_then(|p| resolver.resolve_pattern(p))
+                } else if let Some(rgb) =
+                    pattern_operand(op).and_then(|p| resolver.resolve_pattern(p))
                 {
                     st.fill = rgb;
                 }
@@ -400,7 +401,8 @@ pub fn vector_paths_from_ops_with_pos(
             b"SCN" | b"SC" => {
                 if let Some(rgb) = resolve_color(&st.stroke_space, &n, resolver) {
                     st.stroke = rgb;
-                } else if let Some(rgb) = pattern_operand(op).and_then(|p| resolver.resolve_pattern(p))
+                } else if let Some(rgb) =
+                    pattern_operand(op).and_then(|p| resolver.resolve_pattern(p))
                 {
                     st.stroke = rgb;
                 }
@@ -636,9 +638,16 @@ mod tests {
         // `1 0 0 rg` (red) then `/Pattern cs /P0 scn`: the resolver maps the
         // pattern to its representative green, so the fill is GREEN — not the
         // stale red, the visible bug this seam fixes.
-        let p = paths_with(b"1 0 0 rg /Pattern cs /P0 scn 0 0 10 10 re f", &GreenPattern);
+        let p = paths_with(
+            b"1 0 0 rg /Pattern cs /P0 scn 0 0 10 10 re f",
+            &GreenPattern,
+        );
         assert_eq!(p.len(), 1);
-        assert_eq!(p[0].fill, Some([0.0, 1.0, 0.0]), "pattern fill ≠ previous red");
+        assert_eq!(
+            p[0].fill,
+            Some([0.0, 1.0, 0.0]),
+            "pattern fill ≠ previous red"
+        );
     }
 
     #[test]
@@ -655,7 +664,10 @@ mod tests {
     #[test]
     fn unknown_pattern_keeps_previous_colour() {
         // An unknown pattern name the resolver can't map leaves the fill as-is.
-        let p = paths_with(b"1 0 0 rg /Pattern cs /PX scn 0 0 10 10 re f", &GreenPattern);
+        let p = paths_with(
+            b"1 0 0 rg /Pattern cs /PX scn 0 0 10 10 re f",
+            &GreenPattern,
+        );
         assert_eq!(p[0].fill, Some([1.0, 0.0, 0.0]));
     }
 }

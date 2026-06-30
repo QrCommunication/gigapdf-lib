@@ -246,12 +246,13 @@ pub fn image_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
 ///   fully decodes it to RGBA (any colour type, bit depth 1–16, interlaced)
 ///   and splits it into an RGB stream + alpha soft-mask, so transparency is
 ///   preserved for every PNG variant.
-/// * **GIF / WebP / AVIF** are decoded to RGBA and re-encoded as an RGBA PNG
-///   (colour type 6), keeping any alpha channel intact for the soft-mask path.
+/// * **GIF / WebP / AVIF / TIFF** are decoded to RGBA and re-encoded as an RGBA
+///   PNG (colour type 6), keeping any alpha channel intact for the soft-mask
+///   path.
 ///
 /// Exposed `pub(crate)` so the image-watermark path
 /// ([`Document::add_image_watermark`](crate::Document::add_image_watermark)) can
-/// accept the same five input formats this conversion does, without duplicating
+/// accept the same input formats this conversion does, without duplicating
 /// the format-detect/transcode logic or the raster decoders.
 pub(crate) fn embeddable_image(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     // PNG and JPEG are accepted by the embedder directly — read dimensions
@@ -264,11 +265,12 @@ pub(crate) fn embeddable_image(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         let (w, h, _) = super::import::image_dimensions(bytes)?;
         return Some((bytes.to_vec(), w, h));
     }
-    // GIF / WebP / AVIF: decode to RGBA, then re-encode as an RGBA (type 6) PNG
-    // so the embedder keeps the alpha channel as a soft mask.
+    // GIF / WebP / AVIF / TIFF: decode to RGBA, then re-encode as an RGBA
+    // (type 6) PNG so the embedder keeps the alpha channel as a soft mask.
     let (w, h, rgba) = crate::raster::gif::decode_gif(bytes)
         .or_else(|| crate::raster::webp::decode_webp(bytes))
-        .or_else(|| crate::raster::avif::decode_avif(bytes))?;
+        .or_else(|| crate::raster::avif::decode_avif(bytes))
+        .or_else(|| crate::content::image::decode_tiff_rgba(bytes))?;
     Some((crate::raster::png::encode_png(w, h, &rgba), w, h))
 }
 
@@ -315,11 +317,11 @@ pub fn to_rtf(paragraphs: &[String]) -> Vec<u8> {
 
 // ─────────────────────────────── model → RTF ───────────────────────────────
 
+use super::style::Generic;
 use crate::model::{
     Block, BlockKind, CharStyle, Document, Heading, ImageRef, Inline, LinkTarget, List, ListMarker,
     Paragraph, ResourceTable, Table,
 };
-use super::style::Generic;
 
 /// Serialize a unified [`Document`] to *rich* RTF with real paragraph breaks and
 /// character styling (bold/italic/underline/strike/size/colour/font), plus
@@ -359,7 +361,11 @@ pub fn rtf_from_model(doc: &Document) -> Vec<u8> {
     for (i, (name, generic)) in fonts.iter().enumerate() {
         let mut esc = String::new();
         rtf_escape(name, &mut esc);
-        font_tbl.push_str(&format!("{{\\f{}{} {esc};}}", i + 1, rtf_font_class(*generic)));
+        font_tbl.push_str(&format!(
+            "{{\\f{}{} {esc};}}",
+            i + 1,
+            rtf_font_class(*generic)
+        ));
     }
     font_tbl.push('}');
 
@@ -791,7 +797,15 @@ fn rtf_heading_from_model(
 ) {
     // Headings render bold; the level is conveyed by the bold styling + text.
     // A heading never contains images, so an empty resource table suffices.
-    rtf_para_from_model(&h.para, colors, fonts, &ResourceTable::default(), true, first, out);
+    rtf_para_from_model(
+        &h.para,
+        colors,
+        fonts,
+        &ResourceTable::default(),
+        true,
+        first,
+        out,
+    );
 }
 
 /// Width (in twips) of one nesting level's left indent. 360 twips = 0.25 inch,
@@ -1318,6 +1332,37 @@ mod tests {
     }
 
     #[test]
+    fn flow_to_pdf_starts_each_section_on_a_new_page() {
+        // Two non-empty sections ⇒ a page break between them: page 1 carries the
+        // first section's text, page 2 the second's.
+        let sections = vec![
+            vec!["Section one alpha".to_string()],
+            vec!["Section two beta".to_string()],
+        ];
+        let pdf = flow_to_pdf(&sections);
+        let doc = opens(&pdf);
+        assert!(doc.page_count() >= 2, "each section opens a new page");
+        let all = doc.to_text();
+        assert!(all.contains("Section one alpha"), "section 1 text present");
+        assert!(all.contains("Section two beta"), "section 2 text present");
+    }
+
+    #[test]
+    fn flow_to_pdf_wraps_long_paragraphs_onto_multiple_lines() {
+        // A single very long word-stream must wrap (and may spill to a 2nd page),
+        // never panicking and always preserving the words.
+        let long = (0..120)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pdf = flow_to_pdf(&[vec![long]]);
+        let doc = opens(&pdf);
+        let text = doc.to_text();
+        assert!(text.contains("word0"), "first word present");
+        assert!(text.contains("word119"), "last word present");
+    }
+
+    #[test]
     fn rtf_round_trips_text() {
         let rtf = to_rtf(&["Café déjà".to_string(), "Second \\ {brace}".to_string()]);
         let s = String::from_utf8(rtf).unwrap();
@@ -1503,9 +1548,9 @@ mod tests {
                 item("child", 1),
                 item("top-C", 0),
             ],
-        
-        ..Default::default()
-};
+
+            ..Default::default()
+        };
         let rtf =
             String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(list)))).unwrap();
 
@@ -1539,9 +1584,9 @@ mod tests {
             ordered: true,
             marker: ListMarker::default(), // Bullet('•')
             items: vec![item("a", 0), item("b", 1)],
-        
-        ..Default::default()
-};
+
+            ..Default::default()
+        };
         let rtf2 =
             String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(cycle)))).unwrap();
         assert!(
@@ -1570,9 +1615,9 @@ mod tests {
                     level: 0,
                 },
             ],
-        
-        ..Default::default()
-};
+
+            ..Default::default()
+        };
         let rtf =
             String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(list)))).unwrap();
         assert_eq!(
@@ -1835,7 +1880,10 @@ mod tests {
 
         // The font table lists the default plus one entry per distinct family, in
         // first-seen order (→ f1, f2, f3), each with the right generic class.
-        assert!(rtf.contains("{\\f0 Helvetica;}"), "default font slot: {rtf}");
+        assert!(
+            rtf.contains("{\\f0 Helvetica;}"),
+            "default font slot: {rtf}"
+        );
         assert!(
             rtf.contains("{\\f1\\froman Times New Roman;}"),
             "serif entry: {rtf}"
@@ -2174,5 +2222,128 @@ mod tests {
             !doc.page_image_elements(1).is_empty(),
             "transcoded AVIF embedded as an image"
         );
+    }
+
+    #[test]
+    fn image_to_pdf_transcodes_webp() {
+        // WebP (VP8 lossy fixture) → decoded to RGBA → re-encoded PNG → embedded.
+        let webp = include_bytes!("../raster/fixtures/vp8test.webp");
+        let pdf = image_to_pdf(webp).expect("webp → pdf");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert_eq!(doc.page_count(), 1);
+        assert!(
+            !doc.page_image_elements(1).is_empty(),
+            "transcoded WebP embedded as an image"
+        );
+    }
+
+    #[test]
+    fn image_to_pdf_transcodes_tiff() {
+        // A 2×1 uncompressed RGB TIFF (the format the PDF embedder already
+        // decodes) must now also flow through image_to_pdf via embeddable_image.
+        let strip = [255u8, 0, 0, 0, 255, 0]; // red, green
+        let tiff = make_rgb_tiff_le(2, 1, &strip);
+        let pdf = image_to_pdf(&tiff).expect("tiff → pdf");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert_eq!(doc.page_count(), 1);
+        assert!(
+            !doc.page_image_elements(1).is_empty(),
+            "transcoded TIFF embedded as an image"
+        );
+    }
+
+    #[test]
+    fn image_to_pdf_transcodes_gif() {
+        // A minimal 1×1 GIF87a (single global-palette pixel) → embedded.
+        let gif = tiny_gif_1x1();
+        let pdf = image_to_pdf(&gif).expect("gif → pdf");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert_eq!(doc.page_count(), 1);
+        assert!(
+            !doc.page_image_elements(1).is_empty(),
+            "transcoded GIF embedded as an image"
+        );
+    }
+
+    #[test]
+    fn image_to_pdf_embeds_a_jpeg_verbatim() {
+        // A real baseline JPEG passes through under /DCTDecode (no transcode).
+        let jpeg = baseline_jpeg_2x2();
+        let pdf = image_to_pdf(&jpeg).expect("jpeg → pdf");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert_eq!(doc.page_count(), 1);
+        assert!(
+            !doc.page_image_elements(1).is_empty(),
+            "JPEG embedded as an image"
+        );
+    }
+
+    /// A 2×1 uncompressed little-endian RGB TIFF, BitsPerSample inline = 8,
+    /// SamplesPerPixel = 3, PhotometricInterpretation = RGB. `strip` is the
+    /// row-major RGB byte buffer.
+    fn make_rgb_tiff_le(w: u16, h: u16, strip: &[u8]) -> Vec<u8> {
+        // II 42, IFD at offset 8.
+        let mut out: Vec<u8> = vec![b'I', b'I', 0x2A, 0x00, 8, 0, 0, 0];
+        let entries: [(u16, u16, u32, u32); 9] = [
+            (256, 3, 1, w as u32),
+            (257, 3, 1, h as u32),
+            (258, 3, 1, 8),
+            (259, 3, 1, 1), // uncompressed
+            (262, 3, 1, 2), // RGB
+            (273, 4, 1, 0), // StripOffsets — patched below
+            (277, 3, 1, 3),
+            (278, 3, 1, h as u32),
+            (279, 4, 1, strip.len() as u32),
+        ];
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        // Strip data goes right after the IFD: header(8) + count(2) +
+        // entries(12·n) + next-ifd(4).
+        let strip_off = 8 + 2 + entries.len() * 12 + 4;
+        for &(tag, ty, cnt, val) in &entries {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(&cnt.to_le_bytes());
+            let v = if tag == 273 { strip_off as u32 } else { val };
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        out.extend_from_slice(strip);
+        out
+    }
+
+    /// A minimal valid 1×1 GIF87a with a 2-colour global palette and one pixel.
+    fn tiny_gif_1x1() -> Vec<u8> {
+        let mut g = Vec::new();
+        g.extend_from_slice(b"GIF87a");
+        g.extend_from_slice(&1u16.to_le_bytes()); // width 1
+        g.extend_from_slice(&1u16.to_le_bytes()); // height 1
+        g.push(0x80); // global color table, 2 entries
+        g.push(0); // background color index
+        g.push(0); // pixel aspect ratio
+        g.extend_from_slice(&[0xFF, 0, 0]); // palette[0] = red
+        g.extend_from_slice(&[0, 0, 0]); // palette[1] = black
+        g.push(0x2C); // image separator
+        g.extend_from_slice(&[0, 0, 0, 0]); // left/top
+        g.extend_from_slice(&1u16.to_le_bytes()); // width 1
+        g.extend_from_slice(&1u16.to_le_bytes()); // height 1
+        g.push(0); // no local color table
+        g.push(0x02); // LZW minimum code size
+        g.push(0x02); // sub-block length
+        g.extend_from_slice(&[0x44, 0x01]); // LZW: clear, index 0, end
+        g.push(0x00); // block terminator
+        g.push(0x3B); // trailer
+        g
+    }
+
+    /// A real 2×2 baseline JPEG (encoded by the crate's own encoder via a PNG
+    /// round-trip is not available; instead reuse the raster jpeg test encoder).
+    fn baseline_jpeg_2x2() -> Vec<u8> {
+        // Encode a 2×2 solid image to JPEG using the in-crate encoder.
+        let rgba = [10u8, 20, 30, 255].repeat(4);
+        crate::raster::jpeg::encode_jpeg(2, 2, &rgba, 90)
     }
 }

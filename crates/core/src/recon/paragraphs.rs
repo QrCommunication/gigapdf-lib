@@ -388,8 +388,7 @@ pub(crate) fn coalesce_runs(runs: Vec<Inline>) -> Vec<Inline> {
                             && prev.style.background == run.style.background
                             && prev.style.vertical_align == run.style.vertical_align
                             && (prev.style.size_pt - run.style.size_pt).abs() < 0.5;
-                        (same
-                            && prev.source_index.is_none() == run.source_index.is_none())
+                        (same && prev.source_index.is_none() == run.source_index.is_none())
                             .then_some(prev)
                     } else {
                         None
@@ -646,7 +645,10 @@ mod tests {
         let lines = lines_of(&runs);
         let refs: Vec<&ReconLine> = lines.iter().collect();
         let lead = document_leading(&refs, 12.0);
-        assert!((lead - 16.0).abs() < 1.0, "document leading ≈ 16, got {lead}");
+        assert!(
+            (lead - 16.0).abs() < 1.0,
+            "document leading ≈ 16, got {lead}"
+        );
     }
 
     #[test]
@@ -658,14 +660,22 @@ mod tests {
         let lines = lines_of(&runs);
         let refs: Vec<&ReconLine> = lines.iter().collect();
         let body = 12.0;
-        assert_eq!(group_leading(&refs, body, 18.0), 18.0, "inherits document leading");
+        assert_eq!(
+            group_leading(&refs, body, 18.0),
+            18.0,
+            "inherits document leading"
+        );
         let legacy = group_leading(&refs, body, 0.0);
         assert!(
             (legacy - body * 1.2).abs() < 1e-9,
             "no document leading → 1.2×body, got {legacy}"
         );
         // The fallback is still floored at the body size.
-        assert_eq!(group_leading(&refs, body, 5.0), body, "floored at body size");
+        assert_eq!(
+            group_leading(&refs, body, 5.0),
+            body,
+            "floored at body size"
+        );
     }
 
     #[test]
@@ -948,10 +958,14 @@ mod tests {
             Some(crate::model::VAlign::Baseline),
             "merged same-size run is not a super/subscript"
         );
-        assert!(p.runs.iter().any(|r| match r {
-            crate::model::Inline::Run(ir) => ir.text.contains("normal") && ir.text.contains("text"),
-            _ => false,
-        }), "coalesced run carries both texts");
+        assert!(
+            p.runs.iter().any(|r| match r {
+                crate::model::Inline::Run(ir) =>
+                    ir.text.contains("normal") && ir.text.contains("text"),
+                _ => false,
+            }),
+            "coalesced run carries both texts"
+        );
     }
 
     // ── #2 paragraph spacing / indents ───────────────────────────────────────

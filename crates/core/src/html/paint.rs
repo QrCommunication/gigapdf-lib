@@ -822,8 +822,8 @@ fn paint(
                     radius_v,
                     shadow,
                 } => {
-                    let rounded = radius.iter().any(|r| *r > 0.0)
-                        || radius_v.iter().any(|r| *r > 0.0);
+                    let rounded =
+                        radius.iter().any(|r| *r > 0.0) || radius_v.iter().any(|r| *r > 0.0);
 
                     // Outset drop shadow first (painted behind the box): the box
                     // grown by `spread`, offset by `(dx, dy)`, in the shadow colour
@@ -1171,7 +1171,17 @@ fn paint(
                     opacity,
                 } => {
                     paint_styled_border(
-                        doc, page, page_h, *x, *y, *w, *h, *horizontal, *width, *color, *style,
+                        doc,
+                        page,
+                        page_h,
+                        *x,
+                        *y,
+                        *w,
+                        *h,
+                        *horizontal,
+                        *width,
+                        *color,
+                        *style,
                         *opacity,
                     );
                 }
@@ -1289,7 +1299,14 @@ fn paint_text_decorations(
 /// byte-identical to the previous circular-only path. A corner whose horizontal
 /// **or** vertical radius is zero degenerates to a straight `L` to the corner
 /// point, so a box with one rounded corner still renders correctly.
-fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, radius: [f64; 4], radius_v: [f64; 4]) -> String {
+fn rounded_rect_path(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radius: [f64; 4],
+    radius_v: [f64; 4],
+) -> String {
     let [tlh, trh, brh, blh] = radius;
     let [tlv, trv, brv, blv] = radius_v;
     // A corner is rounded only when BOTH its radii are positive.
@@ -1436,10 +1453,26 @@ fn paint_hard_outset_shadow(
     // Grow the corner radii by spread so the shadow's corners track the box.
     let grow = |arr: [f64; 4]| {
         [
-            if arr[0] > 0.0 { (arr[0] + sh.spread).max(0.0) } else { 0.0 },
-            if arr[1] > 0.0 { (arr[1] + sh.spread).max(0.0) } else { 0.0 },
-            if arr[2] > 0.0 { (arr[2] + sh.spread).max(0.0) } else { 0.0 },
-            if arr[3] > 0.0 { (arr[3] + sh.spread).max(0.0) } else { 0.0 },
+            if arr[0] > 0.0 {
+                (arr[0] + sh.spread).max(0.0)
+            } else {
+                0.0
+            },
+            if arr[1] > 0.0 {
+                (arr[1] + sh.spread).max(0.0)
+            } else {
+                0.0
+            },
+            if arr[2] > 0.0 {
+                (arr[2] + sh.spread).max(0.0)
+            } else {
+                0.0
+            },
+            if arr[3] > 0.0 {
+                (arr[3] + sh.spread).max(0.0)
+            } else {
+                0.0
+            },
         ]
     };
     let rh = grow(radius);
@@ -2279,11 +2312,7 @@ fn conic_angle(from_deg: f64, t: f64) -> f64 {
 /// Sample a gradient colour ramp (stops + their resolved `0..=1` offsets) at
 /// position `t`, linearly interpolating between the bracketing stops. Clamps to
 /// the end colours outside the stop range.
-fn sample_ramp(
-    stops: &[super::css::GradientStop],
-    offsets: &[f64],
-    t: f64,
-) -> [f64; 3] {
+fn sample_ramp(stops: &[super::css::GradientStop], offsets: &[f64], t: f64) -> [f64; 3] {
     if stops.is_empty() {
         return [0.0, 0.0, 0.0];
     }
@@ -3127,8 +3156,9 @@ mod tests {
     fn solid_border_stays_one_filled_rect_per_side() {
         // The legacy path is unchanged: an all-four-sides solid border emits
         // exactly four filled rectangles — never the styled-border segments.
-        let n =
-            rect_op_count(r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#);
+        let n = rect_op_count(
+            r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#,
+        );
         assert_eq!(n, 4, "solid border = one filled rect per side (got {n})");
     }
 
@@ -3139,8 +3169,9 @@ mod tests {
         let dashed = rect_op_count(
             r#"<div style="border:2pt dashed #000000;width:100pt;height:40pt"></div>"#,
         );
-        let solid =
-            rect_op_count(r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#);
+        let solid = rect_op_count(
+            r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#,
+        );
         assert!(
             dashed > solid * 3,
             "dashed border splits into many segments (dashed={dashed} vs solid={solid})"
@@ -3166,7 +3197,10 @@ mod tests {
         let n = rect_op_count(
             r#"<div style="border-top:6pt double #000000;width:90pt;height:30pt"></div>"#,
         );
-        assert_eq!(n, 2, "double border = two parallel lines per side (got {n})");
+        assert_eq!(
+            n, 2,
+            "double border = two parallel lines per side (got {n})"
+        );
     }
 
     #[test]
@@ -3327,7 +3361,11 @@ mod tests {
         let pdf = render(html, &[], 300.0, 200.0, 12.0);
         assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
         // The sector fan adds many path prims, so the stream is sizeable.
-        assert!(pdf.len() > 600, "non-trivial conic output ({} bytes)", pdf.len());
+        assert!(
+            pdf.len() > 600,
+            "non-trivial conic output ({} bytes)",
+            pdf.len()
+        );
     }
 
     #[test]
@@ -3417,8 +3455,7 @@ mod tests {
             "the shadow image carries a soft mask (the Gaussian alpha)"
         );
         let doc = Document::open(&pdf).expect("re-open");
-        let content =
-            String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
+        let content = String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
         assert!(
             content.contains(" Do"),
             "the shadow image is painted via a `Do` op\n{content}"
@@ -3443,8 +3480,7 @@ mod tests {
             "a sharp (zero-blur) shadow does NOT rasterise to an image"
         );
         let doc = Document::open(&pdf).expect("re-open");
-        let content =
-            String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
+        let content = String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
         assert!(
             content.contains("1 0 0 rg") && content.contains(" re"),
             "the crisp shadow is a red filled rectangle\n{content}"
@@ -3485,7 +3521,10 @@ mod tests {
         let centre = buf[40 * w + 40];
         // Sample outward along the +x axis from the centre.
         let samples: Vec<f32> = (0..=30).map(|d| buf[40 * w + (40 + d)]).collect();
-        assert!(centre > 0.0, "impulse spreads to a positive peak ({centre})");
+        assert!(
+            centre > 0.0,
+            "impulse spreads to a positive peak ({centre})"
+        );
         // Peak is at the centre and the profile never increases moving outward.
         for win in samples.windows(2) {
             assert!(

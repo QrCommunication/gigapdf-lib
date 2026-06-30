@@ -1174,7 +1174,10 @@ fn tokenize_selector(s: &str) -> Vec<SelTok> {
                 flush(&mut cur, &mut toks);
                 // Replace a trailing descendant (from surrounding whitespace)
                 // with the explicit combinator.
-                if matches!(toks.last(), Some(SelTok::Combinator(Combinator::Descendant))) {
+                if matches!(
+                    toks.last(),
+                    Some(SelTok::Combinator(Combinator::Descendant))
+                ) {
                     toks.pop();
                 }
                 toks.push(SelTok::Combinator(match ch {
@@ -1191,10 +1194,7 @@ fn tokenize_selector(s: &str) -> Vec<SelTok> {
             c => {
                 // A space between two compounds (no explicit combinator) is a
                 // descendant relationship.
-                if prev_ws
-                    && cur.is_empty()
-                    && matches!(toks.last(), Some(SelTok::Compound(_)))
-                {
+                if prev_ws && cur.is_empty() && matches!(toks.last(), Some(SelTok::Compound(_))) {
                     toks.push(SelTok::Combinator(Combinator::Descendant));
                 }
                 prev_ws = false;
@@ -1981,7 +1981,8 @@ fn parse_track_size(tok: &str, em: f64) -> TrackSize {
             );
         }
     }
-    if t.eq_ignore_ascii_case("auto") || t.eq_ignore_ascii_case("min-content")
+    if t.eq_ignore_ascii_case("auto")
+        || t.eq_ignore_ascii_case("min-content")
         || t.eq_ignore_ascii_case("max-content")
     {
         return TrackSize::Auto;
@@ -2588,8 +2589,7 @@ fn apply_font_family(style: &mut Style, v: &str) {
         .trim_matches(['"', '\'']);
     style.font_family = first.to_string();
     let lower = first.to_ascii_lowercase();
-    style.generic_serif =
-        lower == "serif" || lower.contains("times") || lower.contains("georgia");
+    style.generic_serif = lower == "serif" || lower.contains("times") || lower.contains("georgia");
     style.generic_mono = lower == "monospace"
         || lower.contains("courier")
         || lower.contains("mono")
@@ -2606,7 +2606,10 @@ fn apply_font_weight(style: &mut Style, v: &str) {
         // Relative keywords: step one weight band from the inherited value.
         "bolder" => (style.font_weight + 300).min(900),
         "lighter" => style.font_weight.saturating_sub(300).max(100),
-        n => n.parse::<u16>().map(|w| w.clamp(1, 1000)).unwrap_or(style.font_weight),
+        n => n
+            .parse::<u16>()
+            .map(|w| w.clamp(1, 1000))
+            .unwrap_or(style.font_weight),
     };
     style.font_weight = weight;
     style.bold = weight >= 600;
@@ -3408,7 +3411,11 @@ fn parse_corner_radius(v: &str, em: f64) -> (f64, f64) {
         .and_then(|t| parse_len_px(t, em))
         .unwrap_or(0.0)
         .max(0.0);
-    let vert = it.next().and_then(|t| parse_len_px(t, em)).unwrap_or(h).max(0.0);
+    let vert = it
+        .next()
+        .and_then(|t| parse_len_px(t, em))
+        .unwrap_or(h)
+        .max(0.0);
     (h, vert)
 }
 
@@ -3949,7 +3956,11 @@ pub fn parse_color_alpha(v: &str) -> Option<([f64; 3], f64)> {
 /// One `rgb()` channel → 0..=1. Accepts `0-255` integers/floats and `%`.
 fn parse_rgb_component(t: &str) -> Option<f64> {
     if let Some(p) = t.strip_suffix('%') {
-        return p.trim().parse::<f64>().ok().map(|n| (n / 100.0).clamp(0.0, 1.0));
+        return p
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n / 100.0).clamp(0.0, 1.0));
     }
     t.parse::<f64>().ok().map(|n| (n / 255.0).clamp(0.0, 1.0))
 }
@@ -4004,7 +4015,10 @@ fn parse_angle_deg(t: &str) -> Option<f64> {
 /// A `%` value → 0..=1 (used for HSL saturation/lightness).
 fn parse_percent_unit(t: &str) -> Option<f64> {
     let p = t.strip_suffix('%')?;
-    p.trim().parse::<f64>().ok().map(|n| (n / 100.0).clamp(0.0, 1.0))
+    p.trim()
+        .parse::<f64>()
+        .ok()
+        .map(|n| (n / 100.0).clamp(0.0, 1.0))
 }
 
 /// Convert HSL (`h` in degrees, `s`/`l` in 0..=1) to linear-free sRGB 0..=1.
@@ -4012,7 +4026,11 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [f64; 3] {
     if s == 0.0 {
         return [l, l, l]; // achromatic (grey)
     }
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let hk = h / 360.0;
     let hue = |mut t: f64| {
@@ -4271,9 +4289,16 @@ mod tests {
         // discarded (which made the property fall back to black/no-fill).
         assert!(approx(
             parse_color("cornflowerblue").unwrap(),
-            [0x64 as f64 / 255.0, 0x95 as f64 / 255.0, 0xed as f64 / 255.0],
+            [
+                0x64 as f64 / 255.0,
+                0x95 as f64 / 255.0,
+                0xed as f64 / 255.0
+            ],
         ));
-        assert!(approx(parse_color("crimson").unwrap(), [0.863, 0.078, 0.235]));
+        assert!(approx(
+            parse_color("crimson").unwrap(),
+            [0.863, 0.078, 0.235]
+        ));
         assert!(approx(parse_color("gold").unwrap(), [1.0, 0.843, 0.0]));
         assert!(approx(parse_color("darkblue").unwrap(), [0.0, 0.0, 0.545]));
         assert_eq!(parse_color("rebeccapurple"), Some([0.4, 0.2, 0.6]));
@@ -4287,23 +4312,47 @@ mod tests {
     #[test]
     fn rgba_keeps_colour_and_ignores_alpha() {
         // `rgba(...)` returns the RGB (alpha dropped, but the colour is kept).
-        assert!(approx(parse_color("rgba(255, 0, 0, 0.5)").unwrap(), [1.0, 0.0, 0.0]));
+        assert!(approx(
+            parse_color("rgba(255, 0, 0, 0.5)").unwrap(),
+            [1.0, 0.0, 0.0]
+        ));
         // Space-separated + slash-alpha form.
-        assert!(approx(parse_color("rgb(0 128 0 / 50%)").unwrap(), [0.0, 0.502, 0.0]));
+        assert!(approx(
+            parse_color("rgb(0 128 0 / 50%)").unwrap(),
+            [0.0, 0.502, 0.0]
+        ));
         // Percentage channels.
-        assert!(approx(parse_color("rgb(100%, 0%, 0%)").unwrap(), [1.0, 0.0, 0.0]));
+        assert!(approx(
+            parse_color("rgb(100%, 0%, 0%)").unwrap(),
+            [1.0, 0.0, 0.0]
+        ));
     }
 
     #[test]
     fn hsl_and_hsla_convert_to_rgb() {
         // hsl(0,100%,50%) = red, hsl(120,100%,50%) = green, hsl(240,…) = blue.
-        assert!(approx(parse_color("hsl(0, 100%, 50%)").unwrap(), [1.0, 0.0, 0.0]));
-        assert!(approx(parse_color("hsl(120, 100%, 50%)").unwrap(), [0.0, 1.0, 0.0]));
-        assert!(approx(parse_color("hsl(240, 100%, 50%)").unwrap(), [0.0, 0.0, 1.0]));
+        assert!(approx(
+            parse_color("hsl(0, 100%, 50%)").unwrap(),
+            [1.0, 0.0, 0.0]
+        ));
+        assert!(approx(
+            parse_color("hsl(120, 100%, 50%)").unwrap(),
+            [0.0, 1.0, 0.0]
+        ));
+        assert!(approx(
+            parse_color("hsl(240, 100%, 50%)").unwrap(),
+            [0.0, 0.0, 1.0]
+        ));
         // Saturation 0 → grey at the lightness level.
-        assert!(approx(parse_color("hsl(0, 0%, 50%)").unwrap(), [0.5, 0.5, 0.5]));
+        assert!(approx(
+            parse_color("hsl(0, 0%, 50%)").unwrap(),
+            [0.5, 0.5, 0.5]
+        ));
         // hsla keeps the colour, drops alpha.
-        assert!(approx(parse_color("hsla(0,100%,50%,0.3)").unwrap(), [1.0, 0.0, 0.0]));
+        assert!(approx(
+            parse_color("hsla(0,100%,50%,0.3)").unwrap(),
+            [1.0, 0.0, 0.0]
+        ));
     }
 
     #[test]
@@ -4311,7 +4360,10 @@ mod tests {
         // `#rgba` / `#rrggbbaa` — the alpha nibble/byte is validated then dropped.
         assert_eq!(parse_color("#ff0000ff"), Some([1.0, 0.0, 0.0]));
         assert_eq!(parse_color("#f00f"), Some([1.0, 0.0, 0.0]));
-        assert!(approx(parse_color("#aabbccdd").unwrap(), [0.667, 0.733, 0.8]));
+        assert!(approx(
+            parse_color("#aabbccdd").unwrap(),
+            [0.667, 0.733, 0.8]
+        ));
         // A malformed 5-digit hex is still rejected.
         assert_eq!(parse_color("#12345"), None);
     }
@@ -4560,8 +4612,16 @@ mod tests {
         let s = inline_style(
             "border:1pt solid #000000;border-bottom:1pt dotted #000000;border-left-style:double",
         );
-        assert_eq!(s.border_style_edges[0], BorderStyle::Solid, "top stays solid");
-        assert_eq!(s.border_style_edges[2], BorderStyle::Dotted, "bottom dotted");
+        assert_eq!(
+            s.border_style_edges[0],
+            BorderStyle::Solid,
+            "top stays solid"
+        );
+        assert_eq!(
+            s.border_style_edges[2],
+            BorderStyle::Dotted,
+            "bottom dotted"
+        );
         assert_eq!(s.border_style_edges[3], BorderStyle::Double, "left double");
     }
 
@@ -4621,7 +4681,10 @@ mod tests {
         // A one-stop (invalid) gradient is ignored; a separately declared solid
         // colour still applies (gradient parsing never clobbers it).
         let s = inline_style("background:#112233;background-image:linear-gradient(red)");
-        assert!(s.background_gradient.is_none(), "one-stop gradient rejected");
+        assert!(
+            s.background_gradient.is_none(),
+            "one-stop gradient rejected"
+        );
         let bg = s.background.expect("solid background preserved");
         assert!(
             approx(bg, [17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0]),
@@ -4635,14 +4698,20 @@ mod tests {
         let s = inline_style("background:radial-gradient(#ff0000, #0000ff)");
         match s.background_gradient.as_ref().expect("radial gradient") {
             CssGradient::Radial(g) => {
-                assert!((g.cx - 0.5).abs() < 1e-9 && (g.cy - 0.5).abs() < 1e-9, "centred");
+                assert!(
+                    (g.cx - 0.5).abs() < 1e-9 && (g.cy - 0.5).abs() < 1e-9,
+                    "centred"
+                );
                 assert_eq!(g.stops.len(), 2);
                 assert_eq!(g.stops[0].color, [1.0, 0.0, 0.0]);
                 assert_eq!(g.stops[1].color, [0.0, 0.0, 1.0]);
             }
             other => panic!("expected radial, got {other:?}"),
         }
-        assert!(s.background.is_none(), "gradient leaves solid background unset");
+        assert!(
+            s.background.is_none(),
+            "gradient leaves solid background unset"
+        );
     }
 
     #[test]
@@ -4670,7 +4739,11 @@ mod tests {
         let s = inline_style("background:conic-gradient(from 90deg at 50% 50%, red, lime, blue)");
         match s.background_gradient.as_ref().expect("conic") {
             CssGradient::Conic(g) => {
-                assert!((g.from_deg - 90.0).abs() < 1e-9, "from 90deg, got {}", g.from_deg);
+                assert!(
+                    (g.from_deg - 90.0).abs() < 1e-9,
+                    "from 90deg, got {}",
+                    g.from_deg
+                );
                 assert!((g.cx - 0.5).abs() < 1e-9 && (g.cy - 0.5).abs() < 1e-9);
                 assert_eq!(g.stops.len(), 3);
             }
@@ -4738,7 +4811,10 @@ mod tests {
         assert_eq!(top.color, [1.0, 0.0, 0.0]);
         assert_eq!(s.box_shadow_extra.len(), 1, "one extra layer");
         let extra = s.box_shadow_extra[0];
-        assert_eq!((extra.dx, extra.dy, extra.blur, extra.spread), (4.0, 4.0, 8.0, 1.0));
+        assert_eq!(
+            (extra.dx, extra.dy, extra.blur, extra.spread),
+            (4.0, 4.0, 8.0, 1.0)
+        );
         assert_eq!(extra.color, [0.0, 0.0, 1.0]);
     }
 
@@ -4757,7 +4833,10 @@ mod tests {
     fn position_sticky_parses_as_sticky() {
         assert_eq!(inline_style("position:sticky").position, Position::Sticky);
         // The other schemes are unchanged.
-        assert_eq!(inline_style("position:relative").position, Position::Relative);
+        assert_eq!(
+            inline_style("position:relative").position,
+            Position::Relative
+        );
         assert_eq!(inline_style("position:fixed").position, Position::Fixed);
         assert_eq!(inline_style("position:static").position, Position::Static);
     }
@@ -4785,7 +4864,11 @@ mod tests {
             column_count: 3,
             ..Style::default()
         };
-        assert_eq!(inherit(&parent).column_count, 0, "column-count does not inherit");
+        assert_eq!(
+            inherit(&parent).column_count,
+            0,
+            "column-count does not inherit"
+        );
     }
 
     #[test]
@@ -4913,7 +4996,14 @@ mod tests {
             }
         }
         let mut out = None;
-        walk(&nodes, &sheet, &Style::default(), &mut Vec::new(), tag, &mut out);
+        walk(
+            &nodes,
+            &sheet,
+            &Style::default(),
+            &mut Vec::new(),
+            tag,
+            &mut out,
+        );
         out.expect("target element not found")
     }
 
@@ -5082,10 +5172,7 @@ mod tests {
         );
         assert_eq!(present, GREEN_LIME, "[data-x] presence matched");
 
-        let absent = color_of_first(
-            "<style>[data-x] { color: lime }</style><p>x</p>",
-            "p",
-        );
+        let absent = color_of_first("<style>[data-x] { color: lime }</style><p>x</p>", "p");
         assert_eq!(absent, [0.0, 0.0, 0.0], "missing attribute not matched");
 
         // `[type=text]` exact-value test (quoted or not).
@@ -5111,10 +5198,7 @@ mod tests {
         );
         assert_eq!(by_class, RED, "class selector still works");
 
-        let by_id = color_of_first(
-            "<style>#a { color: lime }</style><p id=\"a\">x</p>",
-            "p",
-        );
+        let by_id = color_of_first("<style>#a { color: lime }</style><p id=\"a\">x</p>", "p");
         assert_eq!(by_id, GREEN_LIME, "id selector still works");
 
         // Compound child: `.box > p.note` exercises classes on both sides.
@@ -5131,7 +5215,10 @@ mod tests {
     fn margin_auto_flags_parse() {
         // `margin: 0 auto` sets both horizontal-auto flags (centring intent).
         let s = inline_style("margin: 0 auto");
-        assert!(s.margin_left_auto && s.margin_right_auto, "0 auto → both auto");
+        assert!(
+            s.margin_left_auto && s.margin_right_auto,
+            "0 auto → both auto"
+        );
         // Longhands.
         assert!(inline_style("margin-left: auto").margin_left_auto);
         assert!(inline_style("margin-right: auto").margin_right_auto);
@@ -5289,7 +5376,11 @@ mod tests {
                     @media screen { p { color: blue } }</style><p>x</p>",
             "p",
         );
-        assert_eq!(c, [1.0, 0.0, 0.0], "print rule applies, screen rule dropped");
+        assert_eq!(
+            c,
+            [1.0, 0.0, 0.0],
+            "print rule applies, screen rule dropped"
+        );
     }
 
     #[test]
@@ -5299,14 +5390,8 @@ mod tests {
         // parsed (a naive "first }" would stop mid-group and lose `h1`).
         let css = "@media print { p { color: red } span { color: lime } } \
                    h1 { color: blue }";
-        let p = color_of_first(
-            &format!("<style>{css}</style><p>x</p>"),
-            "p",
-        );
-        let h1 = color_of_first(
-            &format!("<style>{css}</style><h1>x</h1>"),
-            "h1",
-        );
+        let p = color_of_first(&format!("<style>{css}</style><p>x</p>"), "p");
+        let h1 = color_of_first(&format!("<style>{css}</style><h1>x</h1>"), "h1");
         assert_eq!(p, [1.0, 0.0, 0.0], "nested print rule applies");
         assert_eq!(h1, [0.0, 0.0, 1.0], "rule after the @media group survives");
     }
@@ -5338,8 +5423,15 @@ mod tests {
         // line-height and family all land in their longhands.
         let s = inline_style("font: italic bold 18pt/24pt \"Times New Roman\"");
         assert!(s.italic, "italic from the style token");
-        assert!(s.bold && s.font_weight == 700, "bold weight from the prefix");
-        assert!((s.font_size - 18.0).abs() < 0.01, "size 18pt ({})", s.font_size);
+        assert!(
+            s.bold && s.font_weight == 700,
+            "bold weight from the prefix"
+        );
+        assert!(
+            (s.font_size - 18.0).abs() < 0.01,
+            "size 18pt ({})",
+            s.font_size
+        );
         // line-height: 24pt against an 18pt font → ratio ~1.333.
         assert!(
             (s.line_height - 24.0 / 18.0).abs() < 0.05,
@@ -5358,7 +5450,10 @@ mod tests {
         assert!(s.bold);
         assert!((s.font_size - 14.0).abs() < 0.01);
         assert_eq!(s.font_family, "Arial");
-        assert!(!s.generic_serif && !s.generic_mono, "Arial is the sans bucket");
+        assert!(
+            !s.generic_serif && !s.generic_mono,
+            "Arial is the sans bucket"
+        );
         // `font` resets the style/weight longhands first: a plain `font: 12pt x`
         // after an italic/bold context clears them.
         let mut st = Style::default();
@@ -5366,7 +5461,10 @@ mod tests {
         apply_one(&mut st, "font-weight", "bold");
         apply_one(&mut st, "font", "12pt serif");
         assert!(!st.italic, "font shorthand reset italic");
-        assert!(!st.bold && st.font_weight == 400, "font shorthand reset weight");
+        assert!(
+            !st.bold && st.font_weight == 400,
+            "font shorthand reset weight"
+        );
     }
 
     #[test]
@@ -5398,7 +5496,11 @@ mod tests {
             clear: Clear::Both,
             ..Style::default()
         };
-        assert_eq!(inherit(&parent).clear, Clear::None, "clear does not inherit");
+        assert_eq!(
+            inherit(&parent).clear,
+            Clear::None,
+            "clear does not inherit"
+        );
     }
 
     // ── CSS-2 quick-win 3: grid-column / grid-row start lines ───────────────
@@ -5424,7 +5526,10 @@ mod tests {
             ..Style::default()
         };
         let child = inherit(&parent);
-        assert_eq!(child.grid_col_start, 0, "grid-column-start does not inherit");
+        assert_eq!(
+            child.grid_col_start, 0,
+            "grid-column-start does not inherit"
+        );
         assert_eq!(child.grid_row_start, 0, "grid-row-start does not inherit");
     }
 
@@ -5502,7 +5607,11 @@ mod tests {
     #[test]
     fn grid_column_span_parses() {
         assert_eq!(inline_style("grid-column: span 2").grid_col_span, 2);
-        assert_eq!(inline_style("grid-column: span 3").grid_col_start, 0, "span only ⇒ auto start");
+        assert_eq!(
+            inline_style("grid-column: span 3").grid_col_start,
+            0,
+            "span only ⇒ auto start"
+        );
         // `start / end` line form ⇒ span = end − start.
         let s = inline_style("grid-column: 1 / 3");
         assert_eq!(s.grid_col_start, 1);
@@ -5532,7 +5641,10 @@ mod tests {
         let s = inline_style("flex: 1");
         assert!((s.flex_grow - 1.0).abs() < 1e-9);
         assert!((s.flex_shrink - 1.0).abs() < 1e-9);
-        assert!(matches!(s.flex_basis, Some(Len::Pt(b)) if b.abs() < 1e-9), "basis 0");
+        assert!(
+            matches!(s.flex_basis, Some(Len::Pt(b)) if b.abs() < 1e-9),
+            "basis 0"
+        );
     }
 
     #[test]
@@ -5576,7 +5688,10 @@ mod tests {
         };
         let child = inherit(&parent);
         assert!((child.flex_grow).abs() < 1e-9, "flex-grow resets");
-        assert!((child.flex_shrink - 1.0).abs() < 1e-9, "flex-shrink resets to 1");
+        assert!(
+            (child.flex_shrink - 1.0).abs() < 1e-9,
+            "flex-shrink resets to 1"
+        );
         assert!(child.flex_basis.is_none(), "flex-basis resets to auto");
         assert_eq!(child.grid_col_span, 1, "grid span resets to 1");
         assert!(child.grid_template_columns.is_empty(), "track list resets");

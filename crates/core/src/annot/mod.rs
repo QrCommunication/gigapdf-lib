@@ -821,7 +821,8 @@ pub(crate) fn rebuild(dict: &Dictionary) -> Option<Built> {
             // FreeText text colour: `/C` when present, else the `/DA` colour.
             let color = stroke.unwrap_or(da_color);
             let font = da_font.unwrap_or_else(|| "Helv".to_string());
-            let (appearance, resources) = free_text_default(rect, &text, size, color, quadding, &font);
+            let (appearance, resources) =
+                free_text_default(rect, &text, size, color, quadding, &font);
             built_from_appearance(appearance, resources)
         }
         b"Stamp" => {
@@ -830,7 +831,8 @@ pub(crate) fn rebuild(dict: &Dictionary) -> Option<Built> {
                 Some(Object::String(bytes, _)) => crate::font::decode_pdf_text(bytes),
                 _ => String::new(),
             };
-            let (appearance, resources) = stamp_default(rect, &label, stroke.unwrap_or([1.0, 0.0, 0.0]));
+            let (appearance, resources) =
+                stamp_default(rect, &label, stroke.unwrap_or([1.0, 0.0, 0.0]));
             built_from_appearance(appearance, resources)
         }
         b"Text" => built_from_appearance(
@@ -846,23 +848,29 @@ pub(crate) fn rebuild(dict: &Dictionary) -> Option<Built> {
             Dictionary::new(),
         ),
         b"Squiggly" => built_from_appearance(
-            squiggly_default(rect, &read_flat_nums(dict, b"QuadPoints"), stroke.unwrap_or(black)),
+            squiggly_default(
+                rect,
+                &read_flat_nums(dict, b"QuadPoints"),
+                stroke.unwrap_or(black),
+            ),
             Dictionary::new(),
         ),
         b"Redact" => built_from_appearance(
             redaction_default(rect, stroke.unwrap_or([1.0, 0.0, 0.0]), fill),
             Dictionary::new(),
         ),
-        b"3D" => {
-            built_from_appearance(annot_3d_default(rect, stroke.unwrap_or(black)), Dictionary::new())
-        }
+        b"3D" => built_from_appearance(
+            annot_3d_default(rect, stroke.unwrap_or(black)),
+            Dictionary::new(),
+        ),
         b"RichMedia" | b"Movie" => built_from_appearance(
             media_play_default(rect, stroke.unwrap_or(black)),
             Dictionary::new(),
         ),
-        b"Sound" => {
-            built_from_appearance(sound_default(rect, stroke.unwrap_or(black)), Dictionary::new())
-        }
+        b"Sound" => built_from_appearance(
+            sound_default(rect, stroke.unwrap_or(black)),
+            Dictionary::new(),
+        ),
         _ => return None,
     })
 }
@@ -1355,7 +1363,10 @@ mod tests {
         assert_eq!(stamp_name_for_label("FOR COMMENT"), b"ForComment");
         assert_eq!(stamp_name_for_label("Top  Secret"), b"TopSecret");
         assert_eq!(stamp_name_for_label("sign here"), b"SignHere");
-        assert_eq!(stamp_name_for_label("preliminary results"), b"PreliminaryResults");
+        assert_eq!(
+            stamp_name_for_label("preliminary results"),
+            b"PreliminaryResults"
+        );
     }
 
     #[test]
@@ -1427,8 +1438,14 @@ mod tests {
             2.0,
         );
         let out = s(built.appearance);
-        assert!(out.contains(" c\n"), "≥3-point ink must use cubic Béziers:\n{out}");
-        assert!(!out.contains(" l\n"), "smoothed ink must not emit straight segments");
+        assert!(
+            out.contains(" c\n"),
+            "≥3-point ink must use cubic Béziers:\n{out}"
+        );
+        assert!(
+            !out.contains(" l\n"),
+            "smoothed ink must not emit straight segments"
+        );
     }
 
     #[test]
@@ -1446,17 +1463,31 @@ mod tests {
 
     #[test]
     fn squiggly_is_a_sinusoid_not_a_zigzag() {
-        let out = s(squiggly_default([0.0, 0.0, 120.0, 12.0], &[], [0.0, 0.0, 0.0]));
-        assert!(out.contains(" c\n"), "squiggly must use Bézier curves:\n{out}");
+        let out = s(squiggly_default(
+            [0.0, 0.0, 120.0, 12.0],
+            &[],
+            [0.0, 0.0, 0.0],
+        ));
+        assert!(
+            out.contains(" c\n"),
+            "squiggly must use Bézier curves:\n{out}"
+        );
         // A zigzag would draw straight `l` segments; a sinusoid never does.
-        assert!(!out.contains(" l\n"), "squiggly must not be a faceted zigzag");
+        assert!(
+            !out.contains(" l\n"),
+            "squiggly must not be a faceted zigzag"
+        );
     }
 
     // ── sub-item 6: Redaction + media placeholders ──────────────────────────
 
     #[test]
     fn redaction_draws_a_box() {
-        let out = s(redaction_default([0.0, 0.0, 50.0, 20.0], [1.0, 0.0, 0.0], None));
+        let out = s(redaction_default(
+            [0.0, 0.0, 50.0, 20.0],
+            [1.0, 0.0, 0.0],
+            None,
+        ));
         assert!(out.contains(" re\n"), "redaction must outline a rectangle");
         // With an interior colour it fills then strokes.
         let filled = s(redaction_default(
@@ -1475,7 +1506,10 @@ mod tests {
             sound_default([0.0, 0.0, 60.0, 60.0], [0.2; 3]),
         ] {
             let out = s(bytes);
-            assert!(out.contains(" re\n"), "media placeholder draws a frame:\n{out}");
+            assert!(
+                out.contains(" re\n"),
+                "media placeholder draws a frame:\n{out}"
+            );
         }
     }
 
@@ -1507,7 +1541,10 @@ mod tests {
             .and_then(|h| h.get(b"BaseFont"))
             .and_then(Object::as_name)
             .unwrap();
-        assert_eq!(basefont, b"Times-Bold", "FreeText AP references the /DA font");
+        assert_eq!(
+            basefont, b"Times-Bold",
+            "FreeText AP references the /DA font"
+        );
     }
 
     #[test]

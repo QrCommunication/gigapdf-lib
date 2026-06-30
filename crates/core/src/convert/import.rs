@@ -169,6 +169,7 @@ pub(crate) fn image_dimensions(b: &[u8]) -> Option<(u32, u32, &'static str)> {
         .or_else(|| gif_dims(b).map(|(w, h)| (w, h, "gif")))
         .or_else(|| webp_dims(b).map(|(w, h)| (w, h, "webp")))
         .or_else(|| avif_dims(b).map(|(w, h)| (w, h, "avif")))
+        .or_else(|| tiff_dims(b).map(|(w, h)| (w, h, "tiff")))
 }
 
 /// PNG: signature + IHDR width/height (big-endian) from the first chunk.
@@ -338,6 +339,63 @@ fn avif_dims(b: &[u8]) -> Option<(u32, u32)> {
 
 /// `ftyp` brands that mark an AVIF / HEIF-still container we accept.
 const AVIF_BRANDS: [&[u8]; 5] = [b"avif", b"avis", b"mif1", b"miaf", b"MA1B"];
+
+/// TIFF: read `ImageWidth` (tag 256) and `ImageLength` (tag 257) from the first
+/// IFD. Honours both byte orders (`II`/`MM`) and the SHORT (3) / LONG (4) tag
+/// value types real encoders use. A cheap header walk — no strip decode. `None`
+/// for a non-TIFF or malformed directory. Mirrors the baseline-TIFF support in
+/// [`crate::content::image`] so `image_to_model` recognizes everything the
+/// embedder can render.
+fn tiff_dims(b: &[u8]) -> Option<(u32, u32)> {
+    let le = match b.get(..4)? {
+        [0x49, 0x49, 0x2A, 0x00] => true,  // "II", little-endian
+        [0x4D, 0x4D, 0x00, 0x2A] => false, // "MM", big-endian
+        _ => return None,
+    };
+    let rd_u16 = |o: usize| -> Option<u16> {
+        let s = b.get(o..o + 2)?;
+        Some(if le {
+            u16::from_le_bytes([s[0], s[1]])
+        } else {
+            u16::from_be_bytes([s[0], s[1]])
+        })
+    };
+    let rd_u32 = |o: usize| -> Option<u32> {
+        let s = b.get(o..o + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+
+    let ifd = rd_u32(4)? as usize;
+    let count = rd_u16(ifd)? as usize;
+    let mut width: Option<u32> = None;
+    let mut height: Option<u32> = None;
+    for i in 0..count {
+        // Each entry is 12 bytes: tag(2) type(2) count(4) value/offset(4).
+        let e = ifd + 2 + i * 12;
+        let tag = rd_u16(e)?;
+        let ty = rd_u16(e + 2)?;
+        // The value sits left-justified in the 4-byte field: SHORT in the first
+        // two bytes, LONG in all four.
+        let val = match ty {
+            3 => rd_u16(e + 8)? as u32, // SHORT
+            4 => rd_u32(e + 8)?,        // LONG
+            _ => continue,
+        };
+        match tag {
+            256 => width = Some(val),
+            257 => height = Some(val),
+            _ => {}
+        }
+    }
+    match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
+}
 
 /// 64-bit FNV-1a content hash — a stable, dependency-free resource key.
 fn fnv1a(data: &[u8]) -> u64 {
@@ -569,6 +627,73 @@ mod tests {
             other => panic!("expected image, got {other:?}"),
         };
         assert_eq!(doc.resources.images[&img_key].format, "avif");
+    }
+
+    /// Build a minimal little-endian TIFF header whose first IFD declares
+    /// `ImageWidth` (256) and `ImageLength` (257) as SHORTs — enough for the
+    /// header-only `tiff_dims` probe (no strip data needed).
+    fn tiny_tiff_le(width: u16, height: u16) -> Vec<u8> {
+        let mut b: Vec<u8> = vec![b'I', b'I', 0x2A, 0x00, 8, 0, 0, 0]; // header, IFD @8
+        b.extend_from_slice(&2u16.to_le_bytes()); // 2 entries
+        let entry = |tag: u16, val: u16, out: &mut Vec<u8>| {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&3u16.to_le_bytes()); // type SHORT
+            out.extend_from_slice(&1u32.to_le_bytes()); // count 1
+            out.extend_from_slice(&(val as u32).to_le_bytes()); // value (left-justified)
+        };
+        entry(256, width, &mut b);
+        entry(257, height, &mut b);
+        b.extend_from_slice(&0u32.to_le_bytes()); // next-IFD offset = 0
+        b
+    }
+
+    #[test]
+    fn image_dimensions_probe_tiff_ifd() {
+        // Little-endian TIFF: width/height read from the IFD tag values.
+        let tiff = tiny_tiff_le(12, 9);
+        assert_eq!(image_dimensions(&tiff), Some((12, 9, "tiff")));
+        // image_to_model wraps it, tagging the resource "tiff".
+        let doc = image_to_model(&tiff).expect("tiff → model");
+        let img_key = match &doc.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Image(i) => i.resource,
+            other => panic!("expected image, got {other:?}"),
+        };
+        assert_eq!(doc.resources.images[&img_key].format, "tiff");
+    }
+
+    #[test]
+    fn image_dimensions_probe_tiff_big_endian() {
+        // Big-endian ("MM") TIFF header + one LONG ImageWidth, one SHORT length.
+        let mut b: Vec<u8> = vec![b'M', b'M', 0x00, 0x2A, 0, 0, 0, 8];
+        b.extend_from_slice(&2u16.to_be_bytes()); // 2 entries
+                                                  // ImageWidth (256) as LONG (type 4)
+        b.extend_from_slice(&256u16.to_be_bytes());
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&20u32.to_be_bytes());
+        // ImageLength (257) as SHORT (type 3), value left-justified
+        b.extend_from_slice(&257u16.to_be_bytes());
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&15u16.to_be_bytes());
+        b.extend_from_slice(&[0, 0]); // pad the value field to 4 bytes
+        b.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(image_dimensions(&b), Some((20, 15, "tiff")));
+    }
+
+    #[test]
+    fn image_dimensions_probe_webp_fixture() {
+        // The VP8 (lossy) WebP fixture: canvas dimensions from the RIFF header.
+        let webp = include_bytes!("../raster/fixtures/vp8test.webp");
+        let dims = image_dimensions(webp).expect("webp dims");
+        assert_eq!(dims.2, "webp");
+        assert!(dims.0 > 0 && dims.1 > 0, "non-zero canvas");
+        let doc = image_to_model(webp).expect("webp → model");
+        let img_key = match &doc.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Image(i) => i.resource,
+            other => panic!("expected image, got {other:?}"),
+        };
+        assert_eq!(doc.resources.images[&img_key].format, "webp");
     }
 
     // ── text / RTF → model ──

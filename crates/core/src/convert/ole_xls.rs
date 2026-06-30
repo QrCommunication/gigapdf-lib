@@ -84,7 +84,10 @@ impl<'a> RecordReader<'a> {
         if self.pos + 4 > self.buf.len() {
             return None;
         }
-        Some(u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]))
+        Some(u16::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+        ]))
     }
 
     /// Read the next record (folding in any trailing `CONTINUE` records), or
@@ -119,7 +122,11 @@ impl<'a> RecordReader<'a> {
         if segments.len() == 1 {
             segments.clear();
         }
-        Some(Record { typ, data, segments })
+        Some(Record {
+            typ,
+            data,
+            segments,
+        })
     }
 }
 
@@ -132,7 +139,12 @@ fn u16_at(b: &[u8], o: usize) -> Option<u16> {
     Some(u16::from_le_bytes([*b.get(o)?, *b.get(o + 1)?]))
 }
 fn u32_at(b: &[u8], o: usize) -> Option<u32> {
-    Some(u32::from_le_bytes([*b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?]))
+    Some(u32::from_le_bytes([
+        *b.get(o)?,
+        *b.get(o + 1)?,
+        *b.get(o + 2)?,
+        *b.get(o + 3)?,
+    ]))
 }
 fn f64_at(b: &[u8], o: usize) -> Option<f64> {
     let s = b.get(o..o + 8)?;
@@ -158,7 +170,11 @@ struct SstCursor<'a> {
 
 impl<'a> SstCursor<'a> {
     fn new(buf: &'a [u8], breaks: &'a [usize]) -> Self {
-        SstCursor { buf, breaks, pos: 0 }
+        SstCursor {
+            buf,
+            breaks,
+            pos: 0,
+        }
     }
 
     fn remaining(&self) -> usize {
@@ -651,7 +667,10 @@ struct ParsedCell {
 /// Parse one worksheet substream (from its `BOF` to the matching `EOF`) into a
 /// fully-styled [`Sheet`].
 fn parse_worksheet(stream: &[u8], bs: &BoundSheet, g: &Globals) -> Sheet {
-    let mut sheet = Sheet { name: bs.name.clone(), ..Sheet::default() };
+    let mut sheet = Sheet {
+        name: bs.name.clone(),
+        ..Sheet::default()
+    };
 
     // Seek to this sheet's BOF; a corrupt offset yields an empty (named) sheet.
     if bs.bof_offset >= stream.len() {
@@ -663,8 +682,7 @@ fn parse_worksheet(stream: &[u8], bs: &BoundSheet, g: &Globals) -> Sheet {
         // A worksheet substream BOF (accept a missing/loose `dt`); a BOF that
         // explicitly declares a different substream isn't a worksheet.
         Some(r)
-            if r.typ == REC_BOF
-                && bof_substream(&r.data).is_none_or(|dt| dt == BOF_WORKSHEET) => {}
+            if r.typ == REC_BOF && bof_substream(&r.data).is_none_or(|dt| dt == BOF_WORKSHEET) => {}
         _ => return sheet,
     }
 
@@ -681,7 +699,12 @@ fn parse_worksheet(stream: &[u8], bs: &BoundSheet, g: &Globals) -> Sheet {
             REC_LABELSST => {
                 if let Some((row, col, xf, sst_idx)) = parse_labelsst(&rec.data) {
                     let text = g.sst.get(sst_idx).cloned().unwrap_or_default();
-                    cells.push(ParsedCell { row, col, xf, value: CellValue::Text(text) });
+                    cells.push(ParsedCell {
+                        row,
+                        col,
+                        xf,
+                        value: CellValue::Text(text),
+                    });
                 }
             }
             REC_LABEL => {
@@ -691,24 +714,44 @@ fn parse_worksheet(stream: &[u8], bs: &BoundSheet, g: &Globals) -> Sheet {
             }
             REC_NUMBER => {
                 if let Some((row, col, xf, n)) = parse_number(&rec.data) {
-                    cells.push(ParsedCell { row, col, xf, value: CellValue::Number(n) });
+                    cells.push(ParsedCell {
+                        row,
+                        col,
+                        xf,
+                        value: CellValue::Number(n),
+                    });
                 }
             }
             REC_RK => {
                 if let Some((row, col, xf, n)) = parse_rk(&rec.data) {
-                    cells.push(ParsedCell { row, col, xf, value: CellValue::Number(n) });
+                    cells.push(ParsedCell {
+                        row,
+                        col,
+                        xf,
+                        value: CellValue::Number(n),
+                    });
                 }
             }
             REC_MULRK => parse_mulrk(&rec.data, &mut cells),
             REC_BLANK => {
                 if let Some((row, col, xf)) = parse_blank(&rec.data) {
-                    cells.push(ParsedCell { row, col, xf, value: CellValue::Empty });
+                    cells.push(ParsedCell {
+                        row,
+                        col,
+                        xf,
+                        value: CellValue::Empty,
+                    });
                 }
             }
             REC_MULBLANK => parse_mulblank(&rec.data, &mut cells),
             REC_BOOLERR => {
                 if let Some((row, col, xf, value)) = parse_boolerr(&rec.data) {
-                    cells.push(ParsedCell { row, col, xf, value });
+                    cells.push(ParsedCell {
+                        row,
+                        col,
+                        xf,
+                        value,
+                    });
                 }
             }
             REC_FORMULA => {
@@ -716,14 +759,24 @@ fn parse_worksheet(stream: &[u8], bs: &BoundSheet, g: &Globals) -> Sheet {
                     if awaits_string {
                         pending_string = Some((row, col, xf));
                     } else {
-                        cells.push(ParsedCell { row, col, xf, value });
+                        cells.push(ParsedCell {
+                            row,
+                            col,
+                            xf,
+                            value,
+                        });
                     }
                 }
             }
             REC_STRING => {
                 if let Some((row, col, xf)) = pending_string.take() {
                     let text = parse_string_record(&rec.data, &seg_breaks(&rec));
-                    cells.push(ParsedCell { row, col, xf, value: CellValue::Text(text) });
+                    cells.push(ParsedCell {
+                        row,
+                        col,
+                        xf,
+                        value: CellValue::Text(text),
+                    });
                 }
             }
             REC_MERGEDCELLS => parse_mergedcells(&rec.data, &mut sheet.merges),
@@ -734,7 +787,7 @@ fn parse_worksheet(stream: &[u8], bs: &BoundSheet, g: &Globals) -> Sheet {
                 }
             }
             REC_INDEX => {} // row-block index: not needed (we stream records)
-            _ => {} // drawings/charts/conditional formats/etc.: skipped
+            _ => {}         // drawings/charts/conditional formats/etc.: skipped
         }
     }
 
@@ -761,7 +814,12 @@ fn parse_label(d: &[u8]) -> Option<ParsedCell> {
     let nchars = u16_at(d, 6)? as usize;
     let wide = u8_at(d, 8)? & 0x01 != 0;
     let text = read_short_string(d.get(9..)?, nchars, wide);
-    Some(ParsedCell { row, col, xf, value: CellValue::Text(text) })
+    Some(ParsedCell {
+        row,
+        col,
+        xf,
+        value: CellValue::Text(text),
+    })
 }
 
 fn parse_number(d: &[u8]) -> Option<(usize, usize, u16, f64)> {
@@ -831,7 +889,12 @@ fn parse_mulblank(d: &[u8], out: &mut Vec<ParsedCell>) {
             Some(v) => v,
             None => break,
         };
-        out.push(ParsedCell { row, col: first_col + i, xf, value: CellValue::Empty });
+        out.push(ParsedCell {
+            row,
+            col: first_col + i,
+            xf,
+            value: CellValue::Empty,
+        });
     }
 }
 
@@ -888,7 +951,12 @@ fn parse_mergedcells(d: &[u8], out: &mut Vec<MergeRange>) {
     };
     let mut o = 2usize;
     for _ in 0..count {
-        match (u16_at(d, o), u16_at(d, o + 2), u16_at(d, o + 4), u16_at(d, o + 6)) {
+        match (
+            u16_at(d, o),
+            u16_at(d, o + 2),
+            u16_at(d, o + 4),
+            u16_at(d, o + 6),
+        ) {
             (Some(r0), Some(r1), Some(c0), Some(c1)) => {
                 out.push(MergeRange {
                     r0: r0 as usize,
@@ -977,14 +1045,20 @@ fn build_rows(
             }
             None => Vec::new(),
         };
-        rows.push(SheetRow { cells: cells_vec, height: row_h.get(&r).copied() });
+        rows.push(SheetRow {
+            cells: cells_vec,
+            height: row_h.get(&r).copied(),
+        });
     }
     rows
 }
 
 /// Resolve a [`ParsedCell`]'s XF index into a fully-styled [`SheetCell`].
 fn materialize_cell(pc: &ParsedCell, g: &Globals) -> SheetCell {
-    let mut cell = SheetCell { value: pc.value.clone(), ..SheetCell::default() };
+    let mut cell = SheetCell {
+        value: pc.value.clone(),
+        ..SheetCell::default()
+    };
 
     let Some(xf) = g.xfs.get(pc.xf as usize) else {
         return cell; // unknown XF ⇒ plain cell (still valid)
@@ -1007,7 +1081,10 @@ fn materialize_cell(pc: &ParsedCell, g: &Globals) -> SheetCell {
     // Border (a single uniform style; BIFF8 per-edge styles collapse to one
     // model border, matching the XLSX importer's single `BorderStyle`).
     if xf.has_border {
-        cell.border = Some(BorderStyle { width: 1.0, color: [0.0, 0.0, 0.0] });
+        cell.border = Some(BorderStyle {
+            width: 1.0,
+            color: [0.0, 0.0, 0.0],
+        });
     }
 
     cell
@@ -1103,7 +1180,12 @@ fn build_document(sheets: Vec<Sheet>) -> Document {
     let geometry = PageGeometry {
         width: A4_H,
         height: A4_W,
-        margins: Margins { top: MARGIN, right: MARGIN, bottom: MARGIN, left: MARGIN },
+        margins: Margins {
+            top: MARGIN,
+            right: MARGIN,
+            bottom: MARGIN,
+            left: MARGIN,
+        },
         column_count: 1,
     };
     let block = Block {
@@ -1115,7 +1197,10 @@ fn build_document(sheets: Vec<Sheet>) -> Document {
             geometry,
             header: None,
             footer: None,
-            pages: vec![Page { blocks: vec![block], absolute: false }],
+            pages: vec![Page {
+                blocks: vec![block],
+                absolute: false,
+            }],
         }],
         ..Document::default()
     }
@@ -1203,7 +1288,11 @@ mod tests {
             put_u32(fat, 4, ENDOFCHAIN); // sector 1 directory
             for k in 0..nsectors {
                 let sec = stream_first + k as u32;
-                let next = if k + 1 < nsectors { sec + 1 } else { ENDOFCHAIN };
+                let next = if k + 1 < nsectors {
+                    sec + 1
+                } else {
+                    ENDOFCHAIN
+                };
                 put_u32(fat, sec as usize * 4, next);
             }
             for sec in total..(512 / 4) {
@@ -1214,7 +1303,17 @@ mod tests {
         // Directory (sector 1): Root (no mini stream) + the stream.
         {
             let dir = &mut sectors[1];
-            dir_entry(dir, 0, "Root Entry", OBJ_ROOT, NOSTREAM, NOSTREAM, 1, ENDOFCHAIN, 0);
+            dir_entry(
+                dir,
+                0,
+                "Root Entry",
+                OBJ_ROOT,
+                NOSTREAM,
+                NOSTREAM,
+                1,
+                ENDOFCHAIN,
+                0,
+            );
             dir_entry(
                 dir,
                 1,
@@ -1274,7 +1373,8 @@ mod tests {
         fn rec(&mut self, typ: u16, data: &[u8]) -> usize {
             let off = self.buf.len();
             self.buf.extend_from_slice(&typ.to_le_bytes());
-            self.buf.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            self.buf
+                .extend_from_slice(&(data.len() as u16).to_le_bytes());
             self.buf.extend_from_slice(data);
             off
         }
@@ -1587,7 +1687,10 @@ mod tests {
         b.eof();
         let xls = build_cfb("Book", &b.buf);
         let doc = xls_to_model(&xls).expect("Book stream → model");
-        assert_eq!(first_sheet(&doc).rows[0].cells[0].value, CellValue::Number(5.0));
+        assert_eq!(
+            first_sheet(&doc).rows[0].cells[0].value,
+            CellValue::Number(5.0)
+        );
     }
 
     #[test]

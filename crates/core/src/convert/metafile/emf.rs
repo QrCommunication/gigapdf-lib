@@ -720,8 +720,8 @@ fn create_brush(gdi: &mut Gdi, b: &[u8]) {
     let color = Rgba::from_colorref(rd_u32(b, 8).unwrap_or(0));
     let hatch_raw = rd_u32(b, 12).unwrap_or(0); // lbHatch (HS_* selector)
     let brush = match style_raw {
-        0 => Brush::solid(color),                                   // BS_SOLID
-        1 => Brush::null(),                                         // BS_NULL
+        0 => Brush::solid(color),                                    // BS_SOLID
+        1 => Brush::null(),                                          // BS_NULL
         2 => Brush::hatched(color, HatchStyle::from_u32(hatch_raw)), // BS_HATCHED
         _ => Brush::solid(color),
     };
@@ -1180,7 +1180,11 @@ mod tests {
         body.extend_from_slice(&rd);
         record(&mut recs, EMR_EXTSELECTCLIPRGN, &body);
         // Null pen, solid blue brush, full-canvas rectangle.
-        record(&mut recs, EMR_CREATEBRUSHINDIRECT, &solid_brush(1, 0x00FF_0000));
+        record(
+            &mut recs,
+            EMR_CREATEBRUSHINDIRECT,
+            &solid_brush(1, 0x00FF_0000),
+        );
         record(&mut recs, EMR_SELECTOBJECT, &select(0x8000_0008)); // NULL_PEN stock
         record(&mut recs, EMR_SELECTOBJECT, &select(1));
         let mut rectb = Vec::new();
@@ -1205,7 +1209,11 @@ mod tests {
         let (w, h) = (100i32, 40i32);
         let mut recs = Vec::new();
         // Brush handle 1.
-        record(&mut recs, EMR_CREATEBRUSHINDIRECT, &solid_brush(1, 0x0000_0000));
+        record(
+            &mut recs,
+            EMR_CREATEBRUSHINDIRECT,
+            &solid_brush(1, 0x0000_0000),
+        );
         // EMR_FILLRGN: rclBounds(16), cbRgnData(4), ihBrush(4), RGNDATA.
         let rd = rgndata(&[(0, 0, 30, 40), (70, 0, 100, 40)]);
         let mut body = Vec::new();
@@ -1222,7 +1230,11 @@ mod tests {
 
         assert!(px(&m, 10, 20).3 > 0, "left rect painted");
         assert!(px(&m, 90, 20).3 > 0, "right rect painted");
-        assert_eq!(px(&m, 50, 20).3, 0, "gap between rects empty (union, not bbox)");
+        assert_eq!(
+            px(&m, 50, 20).3,
+            0,
+            "gap between rects empty (union, not bbox)"
+        );
     }
 
     // ── #176/#180 SETROP2 ────────────────────────────────────────────────────
@@ -1234,7 +1246,11 @@ mod tests {
         let mut rop = Vec::new();
         pu32(&mut rop, 16); // R2_WHITE
         record(&mut recs, EMR_SETROP2, &rop);
-        record(&mut recs, EMR_CREATEBRUSHINDIRECT, &solid_brush(1, 0x0000_00FF)); // red
+        record(
+            &mut recs,
+            EMR_CREATEBRUSHINDIRECT,
+            &solid_brush(1, 0x0000_00FF),
+        ); // red
         record(&mut recs, EMR_SELECTOBJECT, &select(0x8000_0008)); // NULL_PEN
         record(&mut recs, EMR_SELECTOBJECT, &select(1));
         let mut rectb = Vec::new();
@@ -1247,7 +1263,10 @@ mod tests {
         let m = decode(&emf_with(w, h, &recs)).expect("decode");
         let c = px(&m, 30, 30);
         assert!(c.3 > 0, "centre painted");
-        assert!(c.0 > 220 && c.1 > 220 && c.2 > 220, "R2_WHITE → white, got {c:?}");
+        assert!(
+            c.0 > 220 && c.1 > 220 && c.2 > 220,
+            "R2_WHITE → white, got {c:?}"
+        );
     }
 
     // ── #181 adaptive Bézier ─────────────────────────────────────────────────
@@ -1261,7 +1280,9 @@ mod tests {
             Pt { x: 20.0, y: 0.0 },
             Pt { x: 30.0, y: 0.0 },
         );
-        assert!(cubic_is_flat(straight.0, straight.1, straight.2, straight.3, 0.25));
+        assert!(cubic_is_flat(
+            straight.0, straight.1, straight.2, straight.3, 0.25
+        ));
         // A sharply bowed cubic is NOT flat.
         let curved = (
             Pt { x: 0.0, y: 0.0 },

@@ -820,8 +820,14 @@ mod tests {
         // Drive only the op-owner mapping + MCID assignment (no Document needed):
         // mirror `rewrite_page_content`'s assignment loop on two synthetic shows.
         let ops = [
-            Operation { operator: b"Tj".to_vec(), operands: Vec::new() },
-            Operation { operator: b"Tj".to_vec(), operands: Vec::new() },
+            Operation {
+                operator: b"Tj".to_vec(),
+                operands: Vec::new(),
+            },
+            Operation {
+                operator: b"Tj".to_vec(),
+                operands: Vec::new(),
+            },
         ];
         let mut op_owner: BTreeMap<usize, (LeafId, Vec<u8>)> = BTreeMap::new();
         for el in &elements {
@@ -841,7 +847,11 @@ mod tests {
                 next_mcid += 1;
             }
         }
-        assert_eq!(leaf_mcids.get(&7), Some(&vec![0, 1]), "leaf 7 owns MCIDs 0 and 1");
+        assert_eq!(
+            leaf_mcids.get(&7),
+            Some(&vec![0, 1]),
+            "leaf 7 owns MCIDs 0 and 1"
+        );
     }
 
     /// End-to-end: tagging a real reconstructed document produces a catalog with
@@ -863,15 +873,24 @@ mod tests {
             let s = String::from_utf8_lossy(&out);
 
             // Catalog flags for a Tagged PDF.
-            assert!(s.contains("/StructTreeRoot"), "{level:?}: StructTreeRoot ref");
+            assert!(
+                s.contains("/StructTreeRoot"),
+                "{level:?}: StructTreeRoot ref"
+            );
             assert!(s.contains("/MarkInfo"), "{level:?}: MarkInfo present");
             assert!(s.contains("/Marked true"), "{level:?}: Marked true");
             assert!(s.contains("/Lang"), "{level:?}: document /Lang");
 
             // The structure tree and standard roles.
-            assert!(s.contains("/Document"), "{level:?}: Document struct element");
+            assert!(
+                s.contains("/Document"),
+                "{level:?}: Document struct element"
+            );
             assert!(s.contains("/StructElem"), "{level:?}: StructElem objects");
-            assert!(s.contains("/ParentTree"), "{level:?}: ParentTree number tree");
+            assert!(
+                s.contains("/ParentTree"),
+                "{level:?}: ParentTree number tree"
+            );
 
             // Marked content actually wraps text in the page stream. The content
             // stream is uncompressed here, so the operators appear verbatim.

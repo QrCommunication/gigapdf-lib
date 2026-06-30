@@ -23,9 +23,9 @@ use crate::convert::zip::ZipWriter;
 use crate::convert::PlacedShape;
 use crate::model::CellVAlign;
 use crate::model::{
-    Align, Block, BlockKind, Blockquote, BorderStyle, Cell, CharStyle, CodeBlock, Document, Heading,
-    ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, ParaBorder, Paragraph, Row, Section,
-    Shape, Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
+    Align, Block, BlockKind, Blockquote, BorderStyle, Cell, CharStyle, CodeBlock, Document,
+    Heading, ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, ParaBorder, Paragraph,
+    Row, Section, Shape, Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
 };
 use crate::model::{
     CellValue, NamedStyle, PageGeometry, ParagraphStyle, PlaceholderRole, StyleId, StyleTable,
@@ -605,13 +605,19 @@ fn docx_sect_pr(section: &Section, hf: Option<&SectionHf>) -> String {
     let geom = section.geometry;
     let header_ref = match hf {
         Some(h) if h.header.is_some() => {
-            format!("<w:headerReference w:type=\"default\" r:id=\"rIdHdr{}\"/>", h.number)
+            format!(
+                "<w:headerReference w:type=\"default\" r:id=\"rIdHdr{}\"/>",
+                h.number
+            )
         }
         _ => String::new(),
     };
     let footer_ref = match hf {
         Some(h) if h.footer.is_some() => {
-            format!("<w:footerReference w:type=\"default\" r:id=\"rIdFtr{}\"/>", h.number)
+            format!(
+                "<w:footerReference w:type=\"default\" r:id=\"rIdFtr{}\"/>",
+                h.number
+            )
         }
         _ => String::new(),
     };
@@ -619,10 +625,7 @@ fn docx_sect_pr(section: &Section, hf: Option<&SectionHf>) -> String {
     // one text column. A `space` of 720 twips (0.5″) approximates the standard
     // gutter between columns when the source PDF's gutter can't be measured.
     let cols = if geom.column_count > 1 {
-        format!(
-            "<w:cols w:num=\"{}\" w:space=\"720\"/>",
-            geom.column_count
-        )
+        format!("<w:cols w:num=\"{}\" w:space=\"720\"/>", geom.column_count)
     } else {
         String::new()
     };
@@ -696,7 +699,11 @@ w:cs=\"Courier New\"/><w:sz w:val=\"20\"/></w:rPr><w:t xml:space=\"preserve\">{t
 /// level (cloning the blocks and shifting `indent_left_pt`) rather than by XML
 /// surgery, so nested structure (lists/tables/quotes) is preserved.
 fn docx_blockquote(bq: &Blockquote, ctx: &mut DocxCtx, out: &mut String) {
-    let indented: Vec<Block> = bq.blocks.iter().map(|b| indent_block_left(b, 24.0)).collect();
+    let indented: Vec<Block> = bq
+        .blocks
+        .iter()
+        .map(|b| indent_block_left(b, 24.0))
+        .collect();
     out.push_str(&docx_blocks(&indented, ctx));
 }
 
@@ -778,12 +785,20 @@ fn docx_runs(runs: &[Inline], ctx: &mut DocxCtx, out: &mut String) {
                 if run.text.is_empty() {
                     continue;
                 }
-                let mut t = String::new();
-                esc(&run.text, &mut t);
-                out.push_str(&format!(
-                    "<w:r>{rpr}<w:t xml:space=\"preserve\">{t}</w:t></w:r>",
-                    rpr = docx_rpr(&run.style)
-                ));
+                let rpr = docx_rpr(&run.style);
+                for part in run.text.split_inclusive('\t') {
+                    let text = part.trim_end_matches('\t');
+                    if !text.is_empty() {
+                        let mut t = String::new();
+                        esc(text, &mut t);
+                        out.push_str(&format!(
+                            "<w:r>{rpr}<w:t xml:space=\"preserve\">{t}</w:t></w:r>"
+                        ));
+                    }
+                    if part.ends_with('\t') {
+                        out.push_str(&format!("<w:r>{rpr}<w:tab/></w:r>"));
+                    }
+                }
             }
             Inline::LineBreak => out.push_str("<w:r><w:br/></w:r>"),
             Inline::Image(img) => out.push_str(&docx_inline_image(img, ctx)),
@@ -1515,7 +1530,8 @@ fn docx_numbering_xml(markers: &[ListMarker]) -> String {
 /// The template uses the sentinel `%N`, replaced per level with `%<level>` for
 /// ordered lists; bullet lists embed the literal bullet character.
 fn docx_list_format(marker: ListMarker) -> (&'static str, String, &'static str) {
-    let bullet_font = "<w:rPr><w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/></w:rPr>";
+    let bullet_font =
+        "<w:rPr><w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/></w:rPr>";
     match marker {
         ListMarker::Decimal => ("decimal", "%N.".to_string(), ""),
         ListMarker::LowerAlpha => ("lowerLetter", "%N.".to_string(), ""),
@@ -1815,7 +1831,10 @@ impl XlsxStyler {
             if f.underline {
                 s.push_str("<u/>");
             }
-            s.push_str(&format!("<sz val=\"{}\"/>", num(f.size_centi as f64 / 100.0)));
+            s.push_str(&format!(
+                "<sz val=\"{}\"/>",
+                num(f.size_centi as f64 / 100.0)
+            ));
             if !f.color.is_empty() {
                 s.push_str(&format!("<color rgb=\"FF{}\"/>", f.color));
             }
@@ -3002,9 +3021,7 @@ fn pptx_bullet(marker: ListMarker) -> String {
         ListMarker::Bullet(c) => {
             let mut b = String::new();
             esc(&c.to_string(), &mut b);
-            format!(
-                "<a:buFont typeface=\"Arial\"/><a:buChar char=\"{b}\"/>"
-            )
+            format!("<a:buFont typeface=\"Arial\"/><a:buChar char=\"{b}\"/>")
         }
         ListMarker::Decimal => "<a:buAutoNum type=\"arabicPeriod\"/>".to_string(),
         ListMarker::LowerAlpha => "<a:buAutoNum type=\"alphaLcPeriod\"/>".to_string(),
@@ -3776,8 +3793,11 @@ fn odt_block(block: &Block, ctx: &mut OdfCtx, out: &mut String) {
         BlockKind::TextBox(tb) => out.push_str(&odt_blocks(&tb.blocks, ctx)),
         BlockKind::CodeBlock(cb) => out.push_str(&odt_code(cb, ctx)),
         BlockKind::Blockquote(bq) => {
-            let indented: Vec<Block> =
-                bq.blocks.iter().map(|b| indent_block_left(b, 24.0)).collect();
+            let indented: Vec<Block> = bq
+                .blocks
+                .iter()
+                .map(|b| indent_block_left(b, 24.0))
+                .collect();
             out.push_str(&odt_blocks(&indented, ctx));
         }
         BlockKind::HorizontalRule => out.push_str(&odt_hr(ctx)),
@@ -3897,7 +3917,15 @@ fn odt_runs(runs: &[Inline], ctx: &mut OdfCtx, out: &mut String) {
                 let sname = format!("T{sid}");
                 ctx.auto.push_str(&odf_span_style(&sname, &run.style));
                 out.push_str(&format!("<text:span text:style-name=\"{sname}\">"));
-                esc(&run.text, out);
+                for part in run.text.split_inclusive('\t') {
+                    let text = part.trim_end_matches('\t');
+                    if !text.is_empty() {
+                        esc(text, out);
+                    }
+                    if part.ends_with('\t') {
+                        out.push_str("<text:tab/>");
+                    }
+                }
                 out.push_str("</text:span>");
             }
             Inline::LineBreak => out.push_str("<text:line-break/>"),
@@ -5321,14 +5349,26 @@ fn indent_block_left(block: &Block, pt: f64) -> Block {
         BlockKind::Heading(h) => h.para.style.indent_left_pt += pt,
         BlockKind::List(list) => {
             for item in &mut list.items {
-                item.blocks = item.blocks.iter().map(|ib| indent_block_left(ib, pt)).collect();
+                item.blocks = item
+                    .blocks
+                    .iter()
+                    .map(|ib| indent_block_left(ib, pt))
+                    .collect();
             }
         }
         BlockKind::TextBox(tb) => {
-            tb.blocks = tb.blocks.iter().map(|ib| indent_block_left(ib, pt)).collect();
+            tb.blocks = tb
+                .blocks
+                .iter()
+                .map(|ib| indent_block_left(ib, pt))
+                .collect();
         }
         BlockKind::Blockquote(bq) => {
-            bq.blocks = bq.blocks.iter().map(|ib| indent_block_left(ib, pt)).collect();
+            bq.blocks = bq
+                .blocks
+                .iter()
+                .map(|ib| indent_block_left(ib, pt))
+                .collect();
         }
         // Code/rule/table/image/shape/sheet/slide keep their own geometry.
         _ => {}
@@ -5889,11 +5929,7 @@ impl<'a> MdWriter<'a> {
             .map(|r| r.format.as_str())
             .filter(|f| !f.is_empty())
             .unwrap_or("png");
-        let alt = img
-            .alt
-            .as_deref()
-            .map(md_escape)
-            .unwrap_or_default();
+        let alt = img.alt.as_deref().map(md_escape).unwrap_or_default();
         format!("![{}](image-{}.{})", alt, img.resource, ext)
     }
 }
@@ -5937,7 +5973,9 @@ fn yaml_scalar(s: &str) -> String {
     let needs_quote = s.is_empty()
         || s.starts_with(' ')
         || s.ends_with(' ')
-        || s.starts_with(['!', '&', '*', '?', '|', '>', '%', '@', '`', '"', '\'', '#', '-'])
+        || s.starts_with([
+            '!', '&', '*', '?', '|', '>', '%', '@', '`', '"', '\'', '#', '-',
+        ])
         || s.contains(": ")
         || s.contains(" #")
         || s.contains('\n')
@@ -6087,8 +6125,9 @@ fn code_span(text: &str) -> String {
         }
     }
     let fence = "`".repeat(longest + 1);
-    let needs_pad =
-        text.starts_with('`') || text.ends_with('`') || (longest > 0 && text == "`".repeat(text.len()));
+    let needs_pad = text.starts_with('`')
+        || text.ends_with('`')
+        || (longest > 0 && text == "`".repeat(text.len()));
     if needs_pad {
         format!("{fence} {text} {fence}")
     } else {
@@ -7117,8 +7156,9 @@ fn epub_nav(doc: &Document, chapters: &[EpubChapter]) -> String {
         nav_heading_tree(&ch.headings, &ch.file, &mut list);
         list.push_str("</li>");
     }
-    let body =
-        format!("<nav epub:type=\"toc\" id=\"toc\"><h1>Table of Contents</h1><ol>{list}</ol></nav>");
+    let body = format!(
+        "<nav epub:type=\"toc\" id=\"toc\"><h1>Table of Contents</h1><ol>{list}</ol></nav>"
+    );
     epub_xhtml_doc(&lang, "Table of Contents", &body)
 }
 
@@ -7366,9 +7406,9 @@ mod tests {
                         level: 0,
                     },
                 ],
-            
-            ..Default::default()
-}),
+
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let span_cell = Cell {
@@ -7601,9 +7641,9 @@ mod tests {
                 width: 595.276,
                 height: 841.89,
                 margins: Margins::uniform(72.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             header: Some(vec![para("SEC1 HEADER")]),
             footer: None,
             pages: vec![Page {
@@ -7616,9 +7656,9 @@ mod tests {
                 width: 792.0,
                 height: 612.0,
                 margins: Margins::uniform(36.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             header: None,
             footer: Some(vec![para("SEC2 FOOTER")]),
             pages: vec![Page {
@@ -7634,7 +7674,11 @@ mod tests {
         let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
 
         // Exactly two section properties total.
-        assert_eq!(xml.matches("<w:sectPr>").count(), 2, "one w:sectPr per section: {xml}");
+        assert_eq!(
+            xml.matches("<w:sectPr>").count(),
+            2,
+            "one w:sectPr per section: {xml}"
+        );
         // Section 1's sectPr rides a section-break paragraph's pPr; section 2's is
         // the trailing body-level sectPr.
         assert!(
@@ -7664,16 +7708,34 @@ mod tests {
         assert!(hdr.contains("SEC1 HEADER"), "section 1 header part: {hdr}");
         let ftr = String::from_utf8(entry(&bytes, "word/footer2.xml").unwrap()).unwrap();
         assert!(ftr.contains("SEC2 FOOTER"), "section 2 footer part: {ftr}");
-        assert!(entry(&bytes, "word/footer1.xml").is_none(), "no spurious footer1 part");
-        assert!(entry(&bytes, "word/header2.xml").is_none(), "no spurious header2 part");
+        assert!(
+            entry(&bytes, "word/footer1.xml").is_none(),
+            "no spurious footer1 part"
+        );
+        assert!(
+            entry(&bytes, "word/header2.xml").is_none(),
+            "no spurious header2 part"
+        );
         // Content-types + rels declare the right parts.
         let ct = String::from_utf8(entry(&bytes, "[Content_Types].xml").unwrap()).unwrap();
-        assert!(ct.contains("/word/header1.xml"), "header1 content-type override");
-        assert!(ct.contains("/word/footer2.xml"), "footer2 content-type override");
+        assert!(
+            ct.contains("/word/header1.xml"),
+            "header1 content-type override"
+        );
+        assert!(
+            ct.contains("/word/footer2.xml"),
+            "footer2 content-type override"
+        );
         let rels =
             String::from_utf8(entry(&bytes, "word/_rels/document.xml.rels").unwrap()).unwrap();
-        assert!(rels.contains("Id=\"rIdHdr1\""), "rIdHdr1 relationship: {rels}");
-        assert!(rels.contains("Id=\"rIdFtr2\""), "rIdFtr2 relationship: {rels}");
+        assert!(
+            rels.contains("Id=\"rIdHdr1\""),
+            "rIdHdr1 relationship: {rels}"
+        );
+        assert!(
+            rels.contains("Id=\"rIdFtr2\""),
+            "rIdFtr2 relationship: {rels}"
+        );
     }
 
     /// A paragraph whose single run carries a yellow highlight.
@@ -7785,9 +7847,9 @@ mod tests {
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -8117,7 +8179,8 @@ mod tests {
             CellValue::Text("mid".to_string()),
             Some(CellVAlign::Middle),
         )]);
-        let content = String::from_utf8(entry(&ods_from_model(&doc), "content.xml").unwrap()).unwrap();
+        let content =
+            String::from_utf8(entry(&ods_from_model(&doc), "content.xml").unwrap()).unwrap();
         assert!(
             content.contains("style:vertical-align=\"middle\""),
             "Middle → style:vertical-align=middle: {content}"
@@ -8154,7 +8217,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let content = String::from_utf8(entry(&odt_from_model(&doc), "content.xml").unwrap()).unwrap();
+        let content =
+            String::from_utf8(entry(&odt_from_model(&doc), "content.xml").unwrap()).unwrap();
         assert!(
             content.contains("style:vertical-align=\"bottom\""),
             "Bottom → style:vertical-align=bottom: {content}"
@@ -8285,9 +8349,9 @@ mod tests {
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             shapes: vec![table],
             placeholders: Vec::new(),
             notes: None,
@@ -8329,9 +8393,9 @@ mod tests {
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -8371,9 +8435,9 @@ mod tests {
                     width: 960.0,
                     height: 540.0,
                     margins: crate::model::Margins::uniform(0.0),
-                
-                ..Default::default()
-},
+
+                    ..Default::default()
+                },
                 shapes: Vec::new(),
                 placeholders: vec![crate::model::Placeholder {
                     role: crate::model::PlaceholderRole::Title,
@@ -8675,9 +8739,9 @@ style:family=\"paragraph\""
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Body,
@@ -8715,9 +8779,9 @@ style:family=\"paragraph\""
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -8861,9 +8925,9 @@ style:family=\"paragraph\""
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             shapes: vec![table],
             placeholders: Vec::new(),
             notes: None,
@@ -8974,9 +9038,9 @@ style:family=\"paragraph\""
                         level: 1,
                     },
                 ],
-            
-            ..Default::default()
-}),
+
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mk = |t: &str| Cell {
@@ -9023,17 +9087,29 @@ style:family=\"paragraph\""
         let s = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
 
         // List items keep their bullet + nesting level.
-        assert!(s.contains("<a:buChar char=\"•\"/>"), "list bullet preserved: {s}");
-        assert!(s.contains("lvl=\"1\""), "nested list item carries its level: {s}");
+        assert!(
+            s.contains("<a:buChar char=\"•\"/>"),
+            "list bullet preserved: {s}"
+        );
+        assert!(
+            s.contains("lvl=\"1\""),
+            "nested list item carries its level: {s}"
+        );
         // The table is a real DrawingML table, hoisted to a graphicFrame.
         assert!(s.contains("<p:graphicFrame>"), "table → graphicFrame: {s}");
-        assert!(s.contains("<a:tbl>"), "real DrawingML table (not flattened): {s}");
+        assert!(
+            s.contains("<a:tbl>"),
+            "real DrawingML table (not flattened): {s}"
+        );
         assert_eq!(s.matches("<a:gridCol").count(), 2, "two grid columns");
         // The heading text survives as a (bold) paragraph, list/cell text too.
         for t in ["Agenda", "alpha", "beta", "H1", "D2"] {
             assert!(s.contains(t), "text {t} preserved: {s}");
         }
-        assert!(s.contains("<a:rPr") && s.contains(" b=\"1\""), "heading run is bold: {s}");
+        assert!(
+            s.contains("<a:rPr") && s.contains(" b=\"1\""),
+            "heading run is bold: {s}"
+        );
     }
 
     #[test]
@@ -9049,7 +9125,10 @@ style:family=\"paragraph\""
             content.contains("<text:h ") && content.contains("Agenda"),
             "heading kept as text:h: {content}"
         );
-        assert!(content.contains("<table:table"), "real ODF table (not flattened): {content}");
+        assert!(
+            content.contains("<table:table"),
+            "real ODF table (not flattened): {content}"
+        );
         assert_eq!(
             content.matches("<table:table-row>").count(),
             2,
@@ -9080,9 +9159,9 @@ style:family=\"paragraph\""
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             // A free text-box shape (not a placeholder) must stay role-less.
             shapes: vec![Block {
                 frame: Some(crate::model::Rect::new(40.0, 460.0, 880.0, 40.0)),
@@ -9330,7 +9409,10 @@ style:family=\"paragraph\""
         let bytes = xlsx_from_model(&sheet_doc(styled_sheet()));
         let styles = String::from_utf8(entry(&bytes, "xl/styles.xml").unwrap()).unwrap();
         // A real font record (bold Arial 14) — not the hardcoded Calibri-only table.
-        assert!(styles.contains("<name val=\"Arial\"/>"), "font family: {styles}");
+        assert!(
+            styles.contains("<name val=\"Arial\"/>"),
+            "font family: {styles}"
+        );
         assert!(styles.contains("<b/>"), "bold font");
         assert!(styles.contains("<sz val=\"14\"/>"), "14pt size");
         assert!(styles.contains("rgb=\"FFCC0000\""), "red font colour");
@@ -9358,7 +9440,10 @@ style:family=\"paragraph\""
         assert!(content.contains("fo:font-weight=\"bold\""), "bold");
         assert!(content.contains("fo:font-size=\"14pt\""), "14pt size");
         assert!(content.contains("fo:color=\"#CC0000\""), "red colour");
-        assert!(content.contains("fo:border=\"1pt solid #000000\""), "border");
+        assert!(
+            content.contains("fo:border=\"1pt solid #000000\""),
+            "border"
+        );
         assert!(
             content.contains("fo:text-align=\"center\""),
             "center alignment"
@@ -9410,7 +9495,10 @@ style:family=\"paragraph\""
             content.contains("table:number-columns-spanned=\"2\""),
             "merge re-exported to ODS as a spanned cell: {content}"
         );
-        assert!(content.contains("<table:covered-table-cell/>"), "covered cell");
+        assert!(
+            content.contains("<table:covered-table-cell/>"),
+            "covered cell"
+        );
     }
 
     /// A one-cell sheet carrying a formula and its cached numeric result.
@@ -9652,9 +9740,9 @@ style:family=\"paragraph\""
                 width: 595.0,
                 height: 842.0,
                 margins: Margins::uniform(72.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             header: None,
             footer: None,
             pages: vec![Page {
@@ -9667,9 +9755,9 @@ style:family=\"paragraph\""
                 width: 842.0,
                 height: 595.0,
                 margins: Margins::uniform(36.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             header: None,
             footer: None,
             pages: vec![Page {
@@ -9685,8 +9773,14 @@ style:family=\"paragraph\""
         let styles = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
 
         // Two page layouts (pm1 + pm2) and two master pages (Standard + Master2).
-        assert!(styles.contains("style:name=\"pm1\""), "first page layout: {styles}");
-        assert!(styles.contains("style:name=\"pm2\""), "second page layout: {styles}");
+        assert!(
+            styles.contains("style:name=\"pm1\""),
+            "first page layout: {styles}"
+        );
+        assert!(
+            styles.contains("style:name=\"pm2\""),
+            "second page layout: {styles}"
+        );
         assert!(
             styles.contains("<style:master-page style:name=\"Standard\""),
             "canonical Standard master: {styles}"
@@ -9697,13 +9791,17 @@ style:family=\"paragraph\""
         );
         // The two layouts carry their own geometry + orientation.
         assert!(
-            styles.contains("fo:page-width=\"595pt\" fo:page-height=\"842pt\" \
-style:print-orientation=\"portrait\""),
+            styles.contains(
+                "fo:page-width=\"595pt\" fo:page-height=\"842pt\" \
+style:print-orientation=\"portrait\""
+            ),
             "section 1 A4 portrait layout: {styles}"
         );
         assert!(
-            styles.contains("fo:page-width=\"842pt\" fo:page-height=\"595pt\" \
-style:print-orientation=\"landscape\""),
+            styles.contains(
+                "fo:page-width=\"842pt\" fo:page-height=\"595pt\" \
+style:print-orientation=\"landscape\""
+            ),
             "section 2 A4 landscape layout: {styles}"
         );
 
@@ -9778,15 +9876,24 @@ style:print-orientation=\"landscape\""),
             styles.contains("<borders count=\"1\">"),
             "default border table unchanged: {styles}"
         );
-        assert!(!styles.contains("<alignment"), "no alignment for a plain cell");
+        assert!(
+            !styles.contains("<alignment"),
+            "no alignment for a plain cell"
+        );
         let sheet = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
         assert!(!sheet.contains("ht="), "no row height for a plain row");
 
         let ods = ods_from_model(&sheet_doc(plain));
         let content = String::from_utf8(entry(&ods, "content.xml").unwrap()).unwrap();
-        assert!(!content.contains("fo:font-family"), "no font props by default");
+        assert!(
+            !content.contains("fo:font-family"),
+            "no font props by default"
+        );
         assert!(!content.contains("fo:border"), "no border by default");
-        assert!(!content.contains("style:row-height"), "no row height by default");
+        assert!(
+            !content.contains("style:row-height"),
+            "no row height by default"
+        );
     }
 
     #[test]
@@ -9815,7 +9922,10 @@ style:print-orientation=\"landscape\""),
             "col1 140pt → 20ch: {ws}"
         );
         // Zero-width middle column is skipped (no `min="2"`); col 3 → 10ch.
-        assert!(!ws.contains("min=\"2\""), "default column not emitted: {ws}");
+        assert!(
+            !ws.contains("min=\"2\""),
+            "default column not emitted: {ws}"
+        );
         assert!(
             ws.contains("<col min=\"3\" max=\"3\" width=\"10\" customWidth=\"1\"/>"),
             "col3 70pt → 10ch: {ws}"
@@ -9839,7 +9949,10 @@ style:print-orientation=\"landscape\""),
         };
         let xlsx = xlsx_from_model(&sheet_doc(sheet));
         let ws = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
-        assert!(!ws.contains("<cols>"), "no cols block for default widths: {ws}");
+        assert!(
+            !ws.contains("<cols>"),
+            "no cols block for default widths: {ws}"
+        );
     }
 
     #[test]
@@ -10342,7 +10455,10 @@ style:print-orientation=\"landscape\""),
 
         // Each heading carries a stable, document-ordered anchor id.
         let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
-        assert!(chap.contains("<h1 id=\"sec1-h1\">Chapter One</h1>"), "{chap}");
+        assert!(
+            chap.contains("<h1 id=\"sec1-h1\">Chapter One</h1>"),
+            "{chap}"
+        );
         assert!(chap.contains("<h2 id=\"sec1-h2\">Section A</h2>"), "{chap}");
         assert!(
             chap.contains("<h3 id=\"sec1-h3\">Subsection A.1</h3>"),
@@ -10729,8 +10845,13 @@ style:print-orientation=\"landscape\""),
             resource: 5,
             alt: Some("alt".to_string()),
         });
-        let mut doc =
-            md_doc(vec![md_para(vec![url_link, run(" "), page_link, run(" "), img])]);
+        let mut doc = md_doc(vec![md_para(vec![
+            url_link,
+            run(" "),
+            page_link,
+            run(" "),
+            img,
+        ])]);
         doc.resources = resources;
         let md = markdown_from_model(&doc);
         assert!(md.contains("[site](https://example.com)"), "url link: {md}");
@@ -10749,9 +10870,9 @@ style:print-orientation=\"landscape\""),
                     blocks: vec![para("sub")],
                     level: 1,
                 }],
-            
-            ..Default::default()
-}),
+
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let outer = Block {
@@ -10768,9 +10889,9 @@ style:print-orientation=\"landscape\""),
                         level: 0,
                     },
                 ],
-            
-            ..Default::default()
-}),
+
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let md = markdown_from_model(&md_doc(vec![outer]));
@@ -10908,7 +11029,10 @@ style:print-orientation=\"landscape\""),
     #[test]
     fn markdown_code_block_emits_fenced_block_with_lang() {
         let md = markdown_from_model(&md_doc(vec![code_blk(Some("rust"), "fn main() {}")]));
-        assert!(md.contains("```rust\nfn main() {}\n```"), "fenced + lang: {md}");
+        assert!(
+            md.contains("```rust\nfn main() {}\n```"),
+            "fenced + lang: {md}"
+        );
     }
 
     #[test]
@@ -10927,11 +11051,7 @@ style:print-orientation=\"landscape\""),
 
     #[test]
     fn markdown_horizontal_rule_emits_dash_break() {
-        let md = markdown_from_model(&md_doc(vec![
-            para("before"),
-            rule_blk(),
-            para("after"),
-        ]));
+        let md = markdown_from_model(&md_doc(vec![para("before"), rule_blk(), para("after")]));
         assert!(md.contains("\n---\n"), "thematic break: {md}");
     }
 
@@ -10960,7 +11080,8 @@ style:print-orientation=\"landscape\""),
 
         // HorizontalRule survives.
         assert!(
-            b.iter().any(|x| matches!(&x.kind, BlockKind::HorizontalRule)),
+            b.iter()
+                .any(|x| matches!(&x.kind, BlockKind::HorizontalRule)),
             "a rule round-trips: {md}"
         );
 
@@ -10998,7 +11119,10 @@ style:print-orientation=\"landscape\""),
             quote_blk(vec![md_para(vec![run("cite")])]),
         ]);
         let html = crate::convert::web::html_from_model(&doc);
-        assert!(html.contains("<pre><code class=\"language-rust\">"), "code: {html}");
+        assert!(
+            html.contains("<pre><code class=\"language-rust\">"),
+            "code: {html}"
+        );
         assert!(html.contains("let x = 1;"), "code text: {html}");
         assert!(html.contains("<hr/>"), "rule: {html}");
         assert!(html.contains("<blockquote>"), "quote open: {html}");
@@ -11053,7 +11177,10 @@ style:print-orientation=\"landscape\""),
         let mut out = String::new();
         let mut toc = EpubToc::new(1);
         xhtml_blocks(&doc.sections[0].pages[0].blocks, &doc, &mut out, &mut toc);
-        assert!(out.contains("<pre><code class=\"language-js\">"), "code: {out}");
+        assert!(
+            out.contains("<pre><code class=\"language-js\">"),
+            "code: {out}"
+        );
         assert!(out.contains("console.log(1)"), "code text: {out}");
         assert!(out.contains("<hr/>"), "rule: {out}");
         assert!(out.contains("<blockquote>"), "quote: {out}");
@@ -11073,9 +11200,15 @@ style:print-orientation=\"landscape\""),
             .get("word/document.xml")
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .expect("document.xml present");
-        assert!(document.contains("Courier New"), "code uses a mono font: {document}");
+        assert!(
+            document.contains("Courier New"),
+            "code uses a mono font: {document}"
+        );
         assert!(document.contains("x = 1"), "code text present");
-        assert!(document.contains("<w:pBdr>"), "rule emits a paragraph border");
+        assert!(
+            document.contains("<w:pBdr>"),
+            "rule emits a paragraph border"
+        );
         assert!(document.contains("docx quote"), "quote text present");
     }
 
@@ -11129,9 +11262,9 @@ style:print-orientation=\"landscape\""),
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -11272,8 +11405,7 @@ style:print-orientation=\"landscape\""),
             "generator: {meta}"
         );
 
-        let manifest =
-            String::from_utf8(entry(bytes, "META-INF/manifest.xml").unwrap()).unwrap();
+        let manifest = String::from_utf8(entry(bytes, "META-INF/manifest.xml").unwrap()).unwrap();
         assert!(
             manifest.contains("manifest:full-path=\"meta.xml\""),
             "meta.xml in manifest: {manifest}"
@@ -11348,9 +11480,9 @@ style:print-orientation=\"landscape\""),
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Body,
@@ -11393,9 +11525,9 @@ style:print-orientation=\"landscape\""),
                     indent_right_pt: 9.0,
                     first_line_pt: 24.0,
                     line_height: LineHeight::Multiple(1.5),
-                
-                ..Default::default()
-},
+
+                    ..Default::default()
+                },
                 runs: vec![run("spaced")],
                 ..Default::default()
             }),
@@ -11490,8 +11622,7 @@ style:print-orientation=\"landscape\""),
             Some(png.as_slice()),
             "picture part embedded"
         );
-        let manifest =
-            String::from_utf8(entry(&bytes, "META-INF/manifest.xml").unwrap()).unwrap();
+        let manifest = String::from_utf8(entry(&bytes, "META-INF/manifest.xml").unwrap()).unwrap();
         assert!(
             manifest.contains("full-path=\"Pictures/img1.png\"")
                 && manifest.contains("media-type=\"image/png\""),
@@ -11553,9 +11684,9 @@ style:print-orientation=\"landscape\""),
                 ordered: false,
                 marker: ListMarker::Bullet('•'),
                 items: vec![item("top", 0), item("nested", 1), item("back", 0)],
-            
-            ..Default::default()
-}),
+
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let doc = Document {
@@ -11868,4 +11999,3 @@ style:print-orientation=\"landscape\""),
         );
     }
 }
-

@@ -41,9 +41,9 @@ use crate::model::style::{
     StyleTable, TabStop, VAlign,
 };
 use crate::model::{
-    Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, Comment, DocMeta, Document,
-    Heading, ImageRef, ImageResource, Inline, InlineRun, LinkTarget, List, ListItem, ListMarker,
-    OutlineNode, Page, Paragraph, ResourceTable, Row, Section, Shape, Table, TextBox,
+    Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, Comment, DocMeta,
+    Document, Heading, ImageRef, ImageResource, Inline, InlineRun, LinkTarget, List, ListItem,
+    ListMarker, OutlineNode, Page, Paragraph, ResourceTable, Row, Section, Shape, Table, TextBox,
 };
 
 /// Current envelope version. Bump on any incompatible layout change.
@@ -2511,9 +2511,9 @@ mod tests {
                 color: None,
                 background: None,
                 vertical_align: VAlign::Baseline,
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             source_index: Some(0),
         });
         let run_b = Inline::Run(InlineRun {
@@ -2529,9 +2529,9 @@ mod tests {
                 color: blue,
                 background: Some([1.0, 1.0, 0.0]),
                 vertical_align: VAlign::Super,
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             source_index: None,
         });
         let link = Inline::Link {
@@ -2653,9 +2653,9 @@ mod tests {
                     level: 1,
                 },
             ],
-        
-        ..Default::default()
-};
+
+            ..Default::default()
+        };
 
         let shape = Shape {
             segments: vec![
@@ -2742,9 +2742,9 @@ mod tests {
                     width: 960.0,
                     height: 540.0,
                     margins: Margins::uniform(36.0),
-                
-                ..Default::default()
-},
+
+                    ..Default::default()
+                },
                 shapes: vec![Block {
                     id: BlockId(300),
                     frame: Some(Rect::new(50.0, 50.0, 400.0, 100.0)),
@@ -2967,9 +2967,9 @@ mod tests {
                     width: 595.27,
                     height: 841.89,
                     margins: Margins::symmetric(72.0, 54.0),
-                
-                ..Default::default()
-},
+
+                    ..Default::default()
+                },
                 header: Some(vec![Block {
                     id: BlockId(900),
                     frame: None,
@@ -3058,9 +3058,9 @@ mod tests {
                     bottom: 1234567.89,
                     left: 0.0,
                 },
-            
-            ..Default::default()
-},
+
+                ..Default::default()
+            },
             header: None,
             footer: None,
             pages: vec![],

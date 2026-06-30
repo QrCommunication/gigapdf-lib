@@ -776,10 +776,7 @@ impl ComplexShaper {
 
         // ── GSUB ─────────────────────────────────────────────────────────────
         if let Some(gsub_base) = self.gsub {
-            let gsub = Gsub {
-                d,
-                base: gsub_base,
-            };
+            let gsub = Gsub { d, base: gsub_base };
             // Arabic joining features (init/medi/fina/isol) for cursive scripts:
             // decide the form of each glyph from the Unicode joining classes,
             // then apply only the matching single-substitution feature per glyph.
@@ -811,8 +808,7 @@ impl ComplexShaper {
 
         // ── GPOS ─────────────────────────────────────────────────────────────
         if let Some(gpos) = self.gpos {
-            let features: [[u8; 4]; 5] =
-                [*b"dist", *b"kern", *b"curs", *b"mark", *b"mkmk"];
+            let features: [[u8; 4]; 5] = [*b"dist", *b"kern", *b"curs", *b"mark", *b"mkmk"];
             let lookups = self.feature_lookups(d, gpos, script, &features);
             for lk in lookups {
                 self.apply_gpos_lookup(d, lk, &mut buf);
@@ -870,7 +866,8 @@ impl ComplexShaper {
             .into_iter()
             .filter_map(|li| {
                 let li = li as usize;
-                (li < lookup_count).then(|| lookup_list + be16(d, lookup_list + 2 + li * 2) as usize)
+                (li < lookup_count)
+                    .then(|| lookup_list + be16(d, lookup_list + 2 + li * 2) as usize)
             })
             .collect()
     }
@@ -1012,7 +1009,10 @@ impl ComplexShaper {
         for st in 0..subtable_count {
             let sub_off = lookup_off + be16(d, lookup_off + 6 + st * 2) as usize;
             let (eff_type, eff_off) = if lookup_type == 7 && be16(d, sub_off) == 1 {
-                (be16(d, sub_off + 2), sub_off + be32(d, sub_off + 4) as usize)
+                (
+                    be16(d, sub_off + 2),
+                    sub_off + be32(d, sub_off + 4) as usize,
+                )
             } else {
                 (lookup_type, sub_off)
             };
@@ -1904,13 +1904,9 @@ impl ComplexShaper {
                 if mark_class >= mark_class_count {
                     continue;
                 }
-                if let Some(base_anchor) = ligature_anchor_record(
-                    d,
-                    lig_array,
-                    lig_idx,
-                    mark_class,
-                    mark_class_count,
-                ) {
+                if let Some(base_anchor) =
+                    ligature_anchor_record(d, lig_array, lig_idx, mark_class, mark_class_count)
+                {
                     self.attach_mark(buf, i, lig_pos, mark_anchor, base_anchor);
                 }
             }
@@ -2082,7 +2078,10 @@ fn parse_anchor(d: &[u8], off: usize) -> Option<Anchor> {
 /// Whether an OpenType script tag is a cursive (Arabic-style joining) script we
 /// run the joining pass for.
 fn is_cursive_script(script: [u8; 4]) -> bool {
-    matches!(&script, b"arab" | b"syrc" | b"mong" | b"nko " | b"rohg" | b"adlm")
+    matches!(
+        &script,
+        b"arab" | b"syrc" | b"mong" | b"nko " | b"rohg" | b"adlm"
+    )
 }
 
 /// Pick the OpenType script tag a text run should be **complex-shaped** under, or
@@ -2133,8 +2132,9 @@ pub fn detect_complex_script(text: &str) -> Option<[u8; 4]> {
 fn cursive_script_of(u: u32) -> Option<[u8; 4]> {
     match u {
         // Arabic + Arabic Supplement + Arabic Extended-A + presentation forms.
-        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF
-        | 0xFE70..=0xFEFF => Some(*b"arab"),
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => {
+            Some(*b"arab")
+        }
         // Syriac.
         0x0700..=0x074F => Some(*b"syrc"),
         // Thaana.
@@ -2162,14 +2162,49 @@ fn joining_type(u: u32) -> Join {
         0x0640 => Join::Causing,
         // Right-joining Arabic letters: Alef forms, Dal, Thal, Reh, Zain, Waw,
         // Alef Maksura, Teh Marbuta, and a few others.
-        0x0622 | 0x0623 | 0x0624 | 0x0625 | 0x0627 | 0x0629 | 0x062F | 0x0630 | 0x0631
-        | 0x0632 | 0x0648 | 0x0671..=0x0673 | 0x0675..=0x0677 | 0x0688..=0x0699 | 0x06C0
-        | 0x06C3..=0x06CB | 0x06CD | 0x06CF | 0x06D2 | 0x06D3 | 0x06EE | 0x06EF => Join::Right,
+        0x0622
+        | 0x0623
+        | 0x0624
+        | 0x0625
+        | 0x0627
+        | 0x0629
+        | 0x062F
+        | 0x0630
+        | 0x0631
+        | 0x0632
+        | 0x0648
+        | 0x0671..=0x0673
+        | 0x0675..=0x0677
+        | 0x0688..=0x0699
+        | 0x06C0
+        | 0x06C3..=0x06CB
+        | 0x06CD
+        | 0x06CF
+        | 0x06D2
+        | 0x06D3
+        | 0x06EE
+        | 0x06EF => Join::Right,
         // Dual-joining: the bulk of Arabic letters (Beh..Yeh range), plus the
         // common extended/Persian/Urdu letters.
-        0x0620 | 0x0626 | 0x0628 | 0x062A..=0x062E | 0x0633..=0x063F | 0x0641..=0x0647
-        | 0x0649 | 0x064A | 0x066E | 0x066F | 0x0678..=0x0687 | 0x069A..=0x06BF | 0x06CC
-        | 0x06CE | 0x06D0 | 0x06D1 | 0x06FA..=0x06FC | 0x06FF | 0x0750..=0x077F => Join::Dual,
+        0x0620
+        | 0x0626
+        | 0x0628
+        | 0x062A..=0x062E
+        | 0x0633..=0x063F
+        | 0x0641..=0x0647
+        | 0x0649
+        | 0x064A
+        | 0x066E
+        | 0x066F
+        | 0x0678..=0x0687
+        | 0x069A..=0x06BF
+        | 0x06CC
+        | 0x06CE
+        | 0x06D0
+        | 0x06D1
+        | 0x06FA..=0x06FC
+        | 0x06FF
+        | 0x0750..=0x077F => Join::Dual,
         _ => Join::Isolated,
     }
 }
@@ -2223,7 +2258,8 @@ fn is_combining_mark(u: u32) -> bool {
 /// the same lookup resolver as the general path.
 const INDIC_GSUB_FEATURES: &[[u8; 4]] = &[
     // Localised forms first (a font may swap to language-specific glyphs).
-    *b"locl", *b"ccmp", // Mandatory Indic shaping features (conjunct formation, reph/half forms).
+    *b"locl",
+    *b"ccmp", // Mandatory Indic shaping features (conjunct formation, reph/half forms).
     *b"nukt", *b"akhn", *b"rphf", *b"rkrf", *b"pref", *b"blwf", *b"abvf", *b"half", *b"pstf",
     *b"vatu", *b"cjct", // Presentation features.
     *b"pres", *b"abvs", *b"blws", *b"psts", *b"haln", *b"calt", *b"liga", *b"clig",
@@ -2334,14 +2370,15 @@ fn indic_category(u: u32) -> IndicCat {
 /// after the base consonant in logical order but drawn before it. The set is
 /// per-script (Telugu/Kannada have none; their matras are above/post).
 fn is_indic_pre_base_matra(u: u32) -> bool {
-    matches!(u,
+    matches!(
+        u,
         0x093F                       // Devanagari I
         | 0x09BF | 0x09C7 | 0x09C8   // Bengali I, E, AI
         | 0x0A3F                     // Gurmukhi I
         | 0x0ABF                     // Gujarati I
         | 0x0B47                     // Oriya E
         | 0x0BC6 | 0x0BC7 | 0x0BC8   // Tamil E, EE, AI
-        | 0x0D46 | 0x0D47 | 0x0D48   // Malayalam E, EE, AI
+        | 0x0D46 | 0x0D47 | 0x0D48 // Malayalam E, EE, AI
     )
 }
 
@@ -2396,9 +2433,7 @@ fn reorder_syllable(
     // ── Reph detection: syllable begins with Ra + Halant, and the syllable has
     // more after it (so the Ra is a reph, not a standalone Ra+virama cluster).
     let ra = indic_ra(unicodes[start]);
-    let has_reph = ra
-        && cats.get(start + 1) == Some(&IndicCat::Halant)
-        && end > start + 2;
+    let has_reph = ra && cats.get(start + 1) == Some(&IndicCat::Halant) && end > start + 2;
     // The portion to reorder excludes a detected reph from base-finding (the reph
     // is repositioned separately at the end).
     let body_start = if has_reph { start + 2 } else { start };
@@ -2822,12 +2857,7 @@ mod tests {
     // coverage [next], substituting input via a nested type-1.2 lookup.
     // Layout: two lookups (0 = chain, 1 = single A→B); feature `calt` references
     // lookup 0; lookup 0's SubstLookupRecord points at lookup 1.
-    fn gsub_chain_format3(
-        trigger: u16,
-        next: u16,
-        from: u16,
-        to: u16,
-    ) -> Vec<u8> {
+    fn gsub_chain_format3(trigger: u16, next: u16, from: u16, to: u16) -> Vec<u8> {
         let mut b = Vec::new();
         let script_list_off = 10u16;
         let script_table_off = script_list_off + 2 + 6;
@@ -2875,7 +2905,7 @@ mod tests {
         b.extend_from_slice(&0u16.to_be_bytes());
         b.extend_from_slice(&1u16.to_be_bytes());
         b.extend_from_slice(&0u16.to_be_bytes()); // lookupListIndex 0
-        // LookupList
+                                                  // LookupList
         b.extend_from_slice(&2u16.to_be_bytes());
         b.extend_from_slice(&(lookup0_off - lookup_list_off).to_be_bytes());
         b.extend_from_slice(&(lookup1_off - lookup_list_off).to_be_bytes());
@@ -2894,7 +2924,7 @@ mod tests {
         b.extend_from_slice(&1u16.to_be_bytes()); // substCount
         b.extend_from_slice(&0u16.to_be_bytes()); // seqIndex
         b.extend_from_slice(&1u16.to_be_bytes()); // lookupListIndex 1
-        // input coverage (trigger)
+                                                  // input coverage (trigger)
         b.extend_from_slice(&1u16.to_be_bytes());
         b.extend_from_slice(&1u16.to_be_bytes());
         b.extend_from_slice(&trigger.to_be_bytes());
@@ -3096,10 +3126,10 @@ mod tests {
         // mark-to-base attachment.
         assert_eq!(detect_complex_script("e\u{0301}"), Some(*b"latn")); // e + acute
         assert_eq!(detect_complex_script("a\u{0308}o"), Some(*b"latn")); // a + diaeresis
-        // Arabic (and presentation forms) → `arab`, even mixed with Latin.
+                                                                         // Arabic (and presentation forms) → `arab`, even mixed with Latin.
         assert_eq!(detect_complex_script("\u{0628}\u{0627}"), Some(*b"arab")); // beh alef
         assert_eq!(detect_complex_script("ab \u{0645}"), Some(*b"arab")); // meem in a run
-        // Hebrew → `hebr`.
+                                                                          // Hebrew → `hebr`.
         assert_eq!(detect_complex_script("\u{05E9}\u{05DC}"), Some(*b"hebr"));
         // Cursive scripts win over a bare combining mark earlier in scan order
         // is irrelevant (first triggering char wins): a leading mark + Arabic still
@@ -3210,11 +3240,23 @@ mod tests {
         let adv = |_g: u16| 500;
         // Run [5, 7, 9] → [5, 70, 71, 72, 9]; cluster of the new glyphs is the
         // source glyph's cluster (1).
-        let out = cs.shape(&[5, 7, 9], &[b'a' as u32, b'b' as u32, b'c' as u32], *b"latn", &adv);
+        let out = cs.shape(
+            &[5, 7, 9],
+            &[b'a' as u32, b'b' as u32, b'c' as u32],
+            *b"latn",
+            &adv,
+        );
         let gids: Vec<u16> = out.iter().map(|g| g.gid).collect();
-        assert_eq!(gids, vec![5, 70, 71, 72, 9], "multiple subst expanded the run");
+        assert_eq!(
+            gids,
+            vec![5, 70, 71, 72, 9],
+            "multiple subst expanded the run"
+        );
         assert_eq!(out[1].cluster, 1);
-        assert_eq!(out[3].cluster, 1, "expanded glyphs share the source cluster");
+        assert_eq!(
+            out[3].cluster, 1,
+            "expanded glyphs share the source cluster"
+        );
         // Advances were reseeded from hmtx for every glyph (including the new ones).
         assert!(out.iter().all(|g| g.x_advance == 500));
     }
@@ -3349,7 +3391,7 @@ mod tests {
         b.extend_from_slice(&(look_cov_off - rcs_off).to_be_bytes());
         b.extend_from_slice(&1u16.to_be_bytes()); // glyphCount
         b.extend_from_slice(&to.to_be_bytes()); // substitute[0]
-        // input coverage
+                                                // input coverage
         b.extend_from_slice(&1u16.to_be_bytes());
         b.extend_from_slice(&1u16.to_be_bytes());
         b.extend_from_slice(&from.to_be_bytes());
@@ -3369,7 +3411,10 @@ mod tests {
         let cs = ComplexShaper::new(&ttf).expect("has layout");
         let adv = |_g: u16| 500;
         let out = cs.shape(&[40, 41], &[b'a' as u32, b'b' as u32], *b"latn", &adv);
-        assert_eq!(out[0].gid, 140, "reverse-chain fired with lookahead present");
+        assert_eq!(
+            out[0].gid, 140,
+            "reverse-chain fired with lookahead present"
+        );
         assert_eq!(out[1].gid, 41);
         // Without the lookahead glyph → no substitution.
         let out2 = cs.shape(&[40, 42], &[b'a' as u32, b'c' as u32], *b"latn", &adv);
@@ -3433,7 +3478,7 @@ mod tests {
         b.extend_from_slice(&1u16.to_be_bytes());
         b.extend_from_slice(&(coverage_off - curs_off).to_be_bytes());
         b.extend_from_slice(&2u16.to_be_bytes()); // entryExitCount
-        // EntryExitRecord[0] for glyph 50: entry=none, exit=anchorA
+                                                  // EntryExitRecord[0] for glyph 50: entry=none, exit=anchorA
         b.extend_from_slice(&0u16.to_be_bytes());
         b.extend_from_slice(&(anchor_a_off - curs_off).to_be_bytes());
         // EntryExitRecord[1] for glyph 51: entry=anchorB, exit=none
@@ -3464,7 +3509,10 @@ mod tests {
         let adv = |_g: u16| 500;
         let out = cs.shape(&[50, 51], &[b'a' as u32, b'b' as u32], *b"latn", &adv);
         // glyph 51 entry y (30) aligns to glyph 50 exit y (100): y_offset = 100-30.
-        assert_eq!(out[1].y_offset, 70, "next glyph baseline shifted to exit anchor");
+        assert_eq!(
+            out[1].y_offset, 70,
+            "next glyph baseline shifted to exit anchor"
+        );
         // glyph 50 advance becomes exit.x (400) - entry.x (0) = 400.
         assert_eq!(out[0].x_advance, 400, "advance closed to the exit anchor");
     }
@@ -3554,7 +3602,11 @@ mod tests {
         let mut buf = indic_buf(&uni);
         reorder_indic(&uni, &mut buf);
         let gids: Vec<u16> = buf.iter().map(|g| g.gid).collect();
-        assert_eq!(gids, vec![0x0915, 0x0020, 0x0916], "no reorder without a matra/reph");
+        assert_eq!(
+            gids,
+            vec![0x0915, 0x0020, 0x0916],
+            "no reorder without a matra/reph"
+        );
     }
 
     #[test]
@@ -3575,7 +3627,7 @@ mod tests {
         assert_eq!(detect_complex_script("\u{0B95}"), Some(*b"tml2"));
         assert_eq!(detect_complex_script("\u{0C15}"), Some(*b"tel2"));
         assert_eq!(detect_complex_script("\u{0995}"), Some(*b"bng2")); // Bengali
-        // …and an Indic matra (a combining mark) must NOT fall through to `latn`.
+                                                                       // …and an Indic matra (a combining mark) must NOT fall through to `latn`.
         assert_eq!(detect_complex_script("\u{093F}"), Some(*b"dev2"));
         // Latin stays on the fast path (byte-identical guarantee for plain text).
         assert_eq!(detect_complex_script("Hello"), None);
@@ -3583,7 +3635,11 @@ mod tests {
         assert!(is_indic_script(*b"dev2"));
         assert!(!is_indic_script(*b"latn"));
         // Khmer/Myanmar are deliberately not Indic-reordered here.
-        assert_eq!(detect_complex_script("\u{1780}"), None, "Khmer not reordered");
+        assert_eq!(
+            detect_complex_script("\u{1780}"),
+            None,
+            "Khmer not reordered"
+        );
     }
 
     #[test]

@@ -166,8 +166,17 @@ fn decode_frames(data: &[u8], stop_at: Option<usize>) -> Option<GifAnimation> {
                     None
                 };
                 composite(
-                    &mut canvas, screen_w, screen_h, left, top, iw, ih, interlaced, &indices,
-                    &palette, transparent,
+                    &mut canvas,
+                    screen_w,
+                    screen_h,
+                    left,
+                    top,
+                    iw,
+                    ih,
+                    interlaced,
+                    &indices,
+                    &palette,
+                    transparent,
                 );
                 frames.push(GifFrame {
                     width: screen_w as u32,
@@ -258,7 +267,15 @@ fn composite(
 }
 
 /// Clear a sub-rectangle of the canvas to the transparent background (0,0,0,0).
-fn clear_rect(canvas: &mut [u8], w: usize, h: usize, left: usize, top: usize, iw: usize, ih: usize) {
+fn clear_rect(
+    canvas: &mut [u8],
+    w: usize,
+    h: usize,
+    left: usize,
+    top: usize,
+    iw: usize,
+    ih: usize,
+) {
     for y in top..(top + ih).min(h) {
         for x in left..(left + iw).min(w) {
             let p = (y * w + x) * 4;
@@ -558,12 +575,20 @@ mod tests {
         let f0 = &anim.frames[0].rgba;
         assert_eq!(&f0[0..4], &[255, 0, 0, 255], "f0 (0,0) red");
         let right = 2 * 4; // byte offset of pixel (x=2, y=0) on a 4-wide screen
-        assert_eq!(&f0[right..right + 4], &[0, 0, 0, 0], "f0 right half transparent");
+        assert_eq!(
+            &f0[right..right + 4],
+            &[0, 0, 0, 0],
+            "f0 right half transparent"
+        );
 
         // Frame 1 composites onto the canvas: left still red, right now green.
         let f1 = &anim.frames[1].rgba;
         assert_eq!(&f1[0..4], &[255, 0, 0, 255], "f1 left stays red (kept)");
-        assert_eq!(&f1[right..right + 4], &[0, 255, 0, 255], "f1 right now green");
+        assert_eq!(
+            &f1[right..right + 4],
+            &[0, 255, 0, 255],
+            "f1 right now green"
+        );
     }
 
     #[test]

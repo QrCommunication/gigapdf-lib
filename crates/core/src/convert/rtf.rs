@@ -90,12 +90,15 @@ struct Para {
     runs: Vec<Run>,
 }
 
-/// A top-level recovered block: a flowing paragraph, a table, or an image.
+/// A top-level recovered block: a flowing paragraph, a table, an image, or a hard page break.
 #[derive(Debug, Clone)]
 enum RtfBlock {
     Para(Para),
     /// Rows of cells; each cell is its own list of paragraphs.
     Table(Vec<Vec<Vec<Para>>>),
+    /// `\page`: hard page boundary. In the model path this starts a new page;
+    /// in the HTML/PDF path it becomes a CSS page break.
+    PageBreak,
     /// An embedded picture extracted from a `{\pict …}` group: the decoded raw
     /// image bytes (PNG or JPEG), the IANA subtype ("png" / "jpeg"), and the
     /// display size in CSS points (from `\picwgoal`/`\pichgoal`, else `\picw`/
@@ -572,6 +575,10 @@ impl<'a> Parser<'a> {
 
             // ── breaks ──
             "par" | "sect" => self.flush_para(),
+            "page" => {
+                self.flush_para();
+                self.blocks.push(RtfBlock::PageBreak);
+            }
             "line" => self.push_char('\n'),
             "tab" => self.push_char('\t'),
 
@@ -871,10 +878,11 @@ impl<'a> Parser<'a> {
                     while q < b.len() && b[q].is_ascii_digit() {
                         q += 1;
                     }
-                    let np: Option<i64> = self.src[ns..q]
-                        .parse()
-                        .ok()
-                        .map(|n: i64| if neg { -n } else { n });
+                    let np: Option<i64> =
+                        self.src[ns..q]
+                            .parse()
+                            .ok()
+                            .map(|n: i64| if neg { -n } else { n });
 
                     match w {
                         "pngblip" => {
@@ -1387,6 +1395,9 @@ pub fn rtf_to_html(rtf: &str) -> String {
             RtfBlock::Para(para) => para_html(&parser, para, &mut html),
             RtfBlock::Table(rows) => table_html(&parser, rows, &mut html),
             RtfBlock::Image(pic) => image_html(pic, &mut html),
+            RtfBlock::PageBreak => {
+                html.push_str("<div style=\"page-break-before:always;break-before:page\"></div>");
+            }
         }
     }
     html.push_str("</body></html>");
@@ -1418,8 +1429,12 @@ pub fn rtf_to_model(rtf: &str) -> Document {
     let rtf_blocks = parser.drive();
 
     let mut images: BTreeMap<u64, ImageResource> = BTreeMap::new();
-    let mut blocks: Vec<Block> = Vec::new();
+    let mut pages: Vec<Page> = vec![Page {
+        blocks: Vec::new(),
+        absolute: false,
+    }];
     for rb in &rtf_blocks {
+        let blocks = &mut pages.last_mut().expect("at least one page").blocks;
         match rb {
             RtfBlock::Para(para) => {
                 blocks.push(model_block(BlockKind::Paragraph(para_to_model(
@@ -1440,6 +1455,10 @@ pub fn rtf_to_model(rtf: &str) -> Document {
                     alt: None,
                 })));
             }
+            RtfBlock::PageBreak => pages.push(Page {
+                blocks: Vec::new(),
+                absolute: false,
+            }),
         }
     }
 
@@ -1448,10 +1467,7 @@ pub fn rtf_to_model(rtf: &str) -> Document {
             geometry: crate::model::PageGeometry::default(),
             header: None,
             footer: None,
-            pages: vec![Page {
-                blocks,
-                absolute: false,
-            }],
+            pages,
         }],
         ..Document::default()
     };
@@ -1786,7 +1802,9 @@ mod tests {
     #[test]
     fn pngblip_pict_becomes_data_uri_img() {
         // A real 2×2 PNG produced by the crate's own encoder.
-        let rgba = vec![0u8, 0, 255, 255, /*…*/ 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255];
+        let rgba = vec![
+            0u8, 0, 255, 255, /*…*/ 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255,
+        ];
         let png = crate::raster::encode_png(2, 2, &rgba);
         let expected_b64 = super::super::base64(&png);
         // \picwgoal 1440 twips = 72pt ; \pichgoal 720 twips = 36pt.
@@ -1812,7 +1830,10 @@ mod tests {
         let before = html.find("before").expect("before text");
         let img = html.find("<img").expect("img tag");
         let after = html.find("after").expect("after text");
-        assert!(before < img && img < after, "image lands in flow order: {html}");
+        assert!(
+            before < img && img < after,
+            "image lands in flow order: {html}"
+        );
         // The raw hex payload must NOT leak as visible body text.
         assert!(
             !html.contains(&hex_encode(&png)),
@@ -2287,6 +2308,32 @@ mod tests {
 
     fn blocks(doc: &Document) -> &[crate::model::Block] {
         &doc.sections[0].pages[0].blocks
+    }
+
+    #[test]
+    fn rtf_page_control_word_splits_model_pages_and_html() {
+        let rtf = r"{\rtf1 before\page after}";
+        let doc = rtf_to_model(rtf);
+        assert_eq!(
+            doc.sections[0].pages.len(),
+            2,
+            "hard page break creates a second page"
+        );
+        let p0 = match &doc.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Paragraph(p) => para_text(p),
+            other => panic!("first page block not paragraph: {other:?}"),
+        };
+        let p1 = match &doc.sections[0].pages[1].blocks[0].kind {
+            BlockKind::Paragraph(p) => para_text(p),
+            other => panic!("second page block not paragraph: {other:?}"),
+        };
+        assert_eq!(p0, "before");
+        assert_eq!(p1, "after");
+        let html = rtf_to_html(rtf);
+        assert!(
+            html.contains("break-before:page"),
+            "HTML carries a page break marker: {html}"
+        );
     }
 
     /// The headline test: an RTF with a bold run, a coloured run, a 2-cell table

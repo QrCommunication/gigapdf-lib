@@ -469,8 +469,8 @@ fn create_brush_indirect(gdi: &mut Gdi, p: &[u8]) {
     let color = Rgba::from_colorref(colorref(p, 1));
     let hatch_raw = u16w(p, 3) as u32; // lbHatch (the HS_* selector for BS_HATCHED)
     let brush = match style_raw {
-        0 => Brush::solid(color),                                  // BS_SOLID
-        1 => Brush::null(),                                        // BS_NULL/HOLLOW
+        0 => Brush::solid(color),                                    // BS_SOLID
+        1 => Brush::null(),                                          // BS_NULL/HOLLOW
         2 => Brush::hatched(color, HatchStyle::from_u32(hatch_raw)), // BS_HATCHED
         _ => Brush::solid(color),
     };

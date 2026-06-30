@@ -1522,5 +1522,4 @@ mod tests {
             "no shapes ⇒ identical ODS output"
         );
     }
-
 }

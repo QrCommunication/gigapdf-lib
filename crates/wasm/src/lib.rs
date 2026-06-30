@@ -24,10 +24,9 @@ use gigapdf_core::{
     Action, AfRelationship, Annotation, Bookmark, CollectionConfig, Color, ContentElement,
     Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec,
     GradientStop, HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem,
-    RunningHeaderFooter,
-    PageBox, PageLabelRange, PageLabelStyle, PageTransition, Permissions, SearchMatch,
-    TextLayerRun, TextLine, TextRun, TransitionDimension, TransitionDirection, TransitionMotion,
-    TransitionStyle, ViewerPreferences,
+    PageBox, PageLabelRange, PageLabelStyle, PageTransition, Permissions, RunningHeaderFooter,
+    SearchMatch, TextLayerRun, TextLine, TextRun, TransitionDimension, TransitionDirection,
+    TransitionMotion, TransitionStyle, ViewerPreferences,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -1479,7 +1478,9 @@ pub extern "C" fn gp_set_element_opacity(
     index: usize,
     fill_alpha: f64,
 ) -> i32 {
-    edit(handle, |doc| doc.set_element_opacity(page, index, fill_alpha))
+    edit(handle, |doc| {
+        doc.set_element_opacity(page, index, fill_alpha)
+    })
 }
 
 /// Change the paint order (z-order) of element `index` on `page`: `to_front != 0`
@@ -1493,7 +1494,9 @@ pub extern "C" fn gp_reorder_element(
     index: usize,
     to_front: i32,
 ) -> i32 {
-    edit(handle, |doc| doc.reorder_element(page, index, to_front != 0))
+    edit(handle, |doc| {
+        doc.reorder_element(page, index, to_front != 0)
+    })
 }
 
 /// Parse a small `{fill,stroke,strokeWidth,dash,fillAlpha,strokeAlpha}` JSON
@@ -1844,12 +1847,22 @@ pub extern "C" fn gp_add_filled_rectangle(
     opacity: f64,
 ) -> i32 {
     let color = match unsafe {
-        color_arg(kind, comps_ptr, comps_count, name_ptr, name_len, profile_ptr, profile_len)
+        color_arg(
+            kind,
+            comps_ptr,
+            comps_count,
+            name_ptr,
+            name_len,
+            profile_ptr,
+            profile_len,
+        )
     } {
         Some(c) => c,
         None => return -2,
     };
-    edit(handle, |doc| doc.add_filled_rectangle(page, [x, y, w, h], &color, opacity))
+    edit(handle, |doc| {
+        doc.add_filled_rectangle(page, [x, y, w, h], &color, opacity)
+    })
 }
 
 /// Fill a polygon through flat `[x0,y0,…]` `points` with a colour in any space.
@@ -1875,12 +1888,22 @@ pub extern "C" fn gp_add_filled_polygon(
         unsafe { std::slice::from_raw_parts(points_ptr, points_count) }
     };
     let color = match unsafe {
-        color_arg(kind, comps_ptr, comps_count, name_ptr, name_len, profile_ptr, profile_len)
+        color_arg(
+            kind,
+            comps_ptr,
+            comps_count,
+            name_ptr,
+            name_len,
+            profile_ptr,
+            profile_len,
+        )
     } {
         Some(c) => c,
         None => return -2,
     };
-    edit(handle, |doc| doc.add_filled_polygon(page, points, &color, opacity))
+    edit(handle, |doc| {
+        doc.add_filled_polygon(page, points, &color, opacity)
+    })
 }
 
 /// Draw a base-14 text run in any colour space. `font` is the base-14 name.
@@ -1911,7 +1934,15 @@ pub extern "C" fn gp_add_text_color(
     let text = unsafe { str_arg(text_ptr, text_len) };
     let font = unsafe { str_arg(font_ptr, font_len) };
     let color = match unsafe {
-        color_arg(kind, comps_ptr, comps_count, name_ptr, name_len, profile_ptr, profile_len)
+        color_arg(
+            kind,
+            comps_ptr,
+            comps_count,
+            name_ptr,
+            name_len,
+            profile_ptr,
+            profile_len,
+        )
     } {
         Some(c) => c,
         None => return -2,
@@ -2120,7 +2151,9 @@ pub extern "C" fn gp_add_image_watermark(
         opacity,
         tile: tile != 0,
     };
-    edit(handle, |doc| doc.add_image_watermark(data, &opts).map(|_| ()))
+    edit(handle, |doc| {
+        doc.add_image_watermark(data, &opts).map(|_| ())
+    })
 }
 
 /// Draw SVG markup (`src_ptr`, `src_len` UTF-8) on a page, fitting its viewBox
@@ -2618,7 +2651,11 @@ pub extern "C" fn gp_set_calculation_order(
 /// Delete a form field by name. Returns `1` if removed, `0` if not found, `-1`
 /// null handle.
 #[no_mangle]
-pub extern "C" fn gp_remove_field(handle: *mut Document, name_ptr: *const u8, name_len: usize) -> i32 {
+pub extern "C" fn gp_remove_field(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
     let name = unsafe { str_arg(name_ptr, name_len) };
     match unsafe { handle.as_mut() } {
         Some(doc) => match doc.remove_field(name) {
@@ -3422,14 +3459,22 @@ pub extern "C" fn gp_page_label(
 /// page. Idempotent (re-baking replaces the prior header). Returns `0` on
 /// success, `-1` null handle, `-2` malformed JSON, `-3` bake error.
 #[no_mangle]
-pub extern "C" fn gp_set_header(handle: *mut Document, json_ptr: *const u8, json_len: usize) -> i32 {
+pub extern "C" fn gp_set_header(
+    handle: *mut Document,
+    json_ptr: *const u8,
+    json_len: usize,
+) -> i32 {
     set_header_footer(handle, json_ptr, json_len, true)
 }
 
 /// Bake a running **footer** from a JSON spec onto every in-range page. The
 /// footer twin of [`gp_set_header`].
 #[no_mangle]
-pub extern "C" fn gp_set_footer(handle: *mut Document, json_ptr: *const u8, json_len: usize) -> i32 {
+pub extern "C" fn gp_set_footer(
+    handle: *mut Document,
+    json_ptr: *const u8,
+    json_len: usize,
+) -> i32 {
     set_header_footer(handle, json_ptr, json_len, false)
 }
 
@@ -3774,9 +3819,7 @@ pub extern "C" fn gp_decode_png(ptr: *const u8, len: usize, out_len: *mut usize)
         Vec::new()
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-        frame_image(
-            gigapdf_core::raster::decode_png(bytes).map(|d| (d.width, d.height, d.rgba)),
-        )
+        frame_image(gigapdf_core::raster::decode_png(bytes).map(|d| (d.width, d.height, d.rgba)))
     };
     unsafe { bytes_into_host(out, out_len) }
 }
@@ -4153,11 +4196,7 @@ pub extern "C" fn gp_model_from_pdf(handle: *const Document, out_len: *mut usize
 /// `(ptr, len)` into the unified model, returned as JSON. Null on unrecognized
 /// or empty input.
 #[no_mangle]
-pub extern "C" fn gp_model_from_office(
-    ptr: *const u8,
-    len: usize,
-    out_len: *mut usize,
-) -> *mut u8 {
+pub extern "C" fn gp_model_from_office(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
     if ptr.is_null() || len == 0 {
         return std::ptr::null_mut();
     }
@@ -5345,7 +5384,16 @@ pub extern "C" fn gp_add_line(
     end_arrow: u32,
 ) -> i32 {
     edit(handle, |doc| {
-        doc.add_line_annotation(page, x1, y1, x2, y2, unpack_rgb(rgb), line_width, end_arrow != 0)
+        doc.add_line_annotation(
+            page,
+            x1,
+            y1,
+            x2,
+            y2,
+            unpack_rgb(rgb),
+            line_width,
+            end_arrow != 0,
+        )
     })
 }
 
@@ -6124,7 +6172,11 @@ pub extern "C" fn gp_remove_link(handle: *mut Document, page: u32, link_index: u
 /// empty for a plain heading; a `GoTo` action becomes `/Dest`). An empty buffer
 /// clears the outline. `0` on success, `<0` on error.
 #[no_mangle]
-pub extern "C" fn gp_set_bookmarks(handle: *mut Document, text_ptr: *const u8, text_len: usize) -> i32 {
+pub extern "C" fn gp_set_bookmarks(
+    handle: *mut Document,
+    text_ptr: *const u8,
+    text_len: usize,
+) -> i32 {
     let text = unsafe { str_arg(text_ptr, text_len) };
     let mut items: Vec<Bookmark> = Vec::new();
     for line in text.split('\n') {
@@ -6493,7 +6545,14 @@ fn annotations_json(annots: &[Annotation]) -> String {
         json_escape(&a.modified, &mut out);
         out.push_str(",\"name\":");
         json_escape(&a.name, &mut out);
-        out.push_str(&format!(",\"opacity\":{}", if a.opacity.is_finite() { a.opacity } else { 1.0 }));
+        out.push_str(&format!(
+            ",\"opacity\":{}",
+            if a.opacity.is_finite() {
+                a.opacity
+            } else {
+                1.0
+            }
+        ));
         out.push_str(",\"color\":");
         out.push_str(&num_array_json(&a.color));
         out.push_str(",\"quadPoints\":");

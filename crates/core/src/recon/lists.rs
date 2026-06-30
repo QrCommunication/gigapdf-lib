@@ -475,9 +475,9 @@ pub fn build_list(
         ordered: first_marker.ordered(),
         marker: first_marker.to_list_marker(),
         items: Vec::new(),
-    
-    ..Default::default()
-};
+
+        ..Default::default()
+    };
 
     // Bucket each marker line's start-X into a nesting level (0 = shallowest).
     // Continuation lines get `None` (they inherit their parent item's level).

@@ -762,10 +762,11 @@ network). `data:` image URIs need no entry. Full element/property/selector list:
 ## Image → PDF
 
 Wrap a raster image in a one-page PDF. The format is auto-detected — **PNG,
-JPEG, GIF, WebP, AVIF** — and the image is placed on an A4 page, centred and
-shrunk to fit (never upscaled). PNG keeps every color-type and bit-depth, Adam7
-interlacing and transparency (via `/SMask`); GIF/WebP/AVIF are transcoded to PNG
-before embedding. An unrecognized format returns an empty `Uint8Array`.
+JPEG, GIF, WebP, AVIF, TIFF** — and the image is placed on an A4 page, centred
+and shrunk to fit (never upscaled). PNG keeps every color-type and bit-depth,
+Adam7 interlacing and transparency (via `/SMask`); GIF/WebP/AVIF/TIFF are
+transcoded to PNG before embedding. An unrecognized format returns an empty
+`Uint8Array`.
 
 ```ts
 const pdf = giga.imageToPdf(imageBytes); // one A4 page
@@ -789,7 +790,7 @@ const album = giga.mergePdfs(pages); // one PDF, one image per page
 
 `addImageWatermark(data, opts?)` stamps a raster image across pages — e.g. a logo
 or a "DRAFT" badge. The source is auto-detected (**PNG / JPEG / WebP / GIF /
-AVIF**), embedded **once** and referenced on every target page, so a 50-page
+AVIF / TIFF**), embedded **once** and referenced on every target page, so a 50-page
 watermark adds one image XObject, not fifty. It returns `false` if the bytes
 aren't a decodable image.
 

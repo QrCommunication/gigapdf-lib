@@ -1079,7 +1079,11 @@ enum ShowAtom {
 /// next-line variants) yields only glyph atoms; a `TJ` array interleaves kerns.
 /// The `kind` of the first string operand is returned so re-emitted strings keep
 /// the same on-wire form (`Hex` for 2-byte CID, `Literal`/`Hex` as original).
-fn run_atoms(operands: &[Operation], pos: usize, decoder: &TextDecoder) -> (Vec<ShowAtom>, StringKind) {
+fn run_atoms(
+    operands: &[Operation],
+    pos: usize,
+    decoder: &TextDecoder,
+) -> (Vec<ShowAtom>, StringKind) {
     let op = &operands[pos];
     let mut atoms = Vec::new();
     let mut kind = StringKind::Literal;
@@ -1090,17 +1094,26 @@ fn run_atoms(operands: &[Operation], pos: usize, decoder: &TextDecoder) -> (Vec<
             while i + 1 < bytes.len() {
                 let code = [bytes[i], bytes[i + 1]];
                 let utf16 = decoder.decode(&code).encode_utf16().count();
-                atoms.push(ShowAtom::Glyph { bytes: code.to_vec(), utf16 });
+                atoms.push(ShowAtom::Glyph {
+                    bytes: code.to_vec(),
+                    utf16,
+                });
                 i += 2;
             }
         } else {
             for &b in bytes {
                 let utf16 = decoder.decode(&[b]).encode_utf16().count();
-                atoms.push(ShowAtom::Glyph { bytes: vec![b], utf16 });
+                atoms.push(ShowAtom::Glyph {
+                    bytes: vec![b],
+                    utf16,
+                });
             }
         }
     };
-    let handle_object = |atoms: &mut Vec<ShowAtom>, kind: &mut StringKind, first: &mut bool, obj: &Object| {
+    let handle_object = |atoms: &mut Vec<ShowAtom>,
+                         kind: &mut StringKind,
+                         first: &mut bool,
+                         obj: &Object| {
         match obj {
             Object::String(bytes, k) => {
                 if *first {
@@ -1164,10 +1177,16 @@ fn emit_atoms(atoms: &[ShowAtom], kind: StringKind) -> Operation {
     // A single string with no kern can be a plain `Tj`; otherwise `TJ`.
     if array.len() == 1 {
         if let Some(Object::String(_, _)) = array.first() {
-            return Operation { operator: b"Tj".to_vec(), operands: array };
+            return Operation {
+                operator: b"Tj".to_vec(),
+                operands: array,
+            };
         }
     }
-    Operation { operator: b"TJ".to_vec(), operands: vec![Object::Array(array)] }
+    Operation {
+        operator: b"TJ".to_vec(),
+        operands: vec![Object::Array(array)],
+    }
 }
 
 /// A per-character-range style override for [`set_text_run_style`]. Every field
@@ -1244,7 +1263,10 @@ fn text_run_tf(operations: &[Operation], index: usize) -> (Option<Vec<u8>>, Opti
 
 /// An operator with no operands.
 fn op0(operator: &[u8]) -> Operation {
-    Operation { operator: operator.to_vec(), operands: Vec::new() }
+    Operation {
+        operator: operator.to_vec(),
+        operands: Vec::new(),
+    }
 }
 
 /// The `[start, end)` advance fractions of an atom slice within the whole run,
@@ -1261,17 +1283,34 @@ fn slice_fraction(atoms: &[ShowAtom], a: usize, b: usize, decoder: &TextDecoder)
     let total: f64 = atoms.iter().map(adv).sum::<f64>().max(f64::EPSILON);
     let before: f64 = atoms[..a].iter().map(adv).sum();
     let within: f64 = atoms[a..b].iter().map(adv).sum();
-    ((before / total).clamp(0.0, 1.0), ((before + within) / total).clamp(0.0, 1.0))
+    (
+        (before / total).clamp(0.0, 1.0),
+        ((before + within) / total).clamp(0.0, 1.0),
+    )
 }
 
 /// Push a thin filled rule (`re … f`) spanning `[frac_a, frac_b]` of `bounds`'
 /// width at vertical position `y_frac` of its height, in the run's fill colour
 /// (or black). Used for underline (`y_frac≈0.08`) and strike (`≈0.42`).
 trait PushRule {
-    fn push_rule(&mut self, bounds: Bounds, frac_a: f64, frac_b: f64, y_frac: f64, color: Option<[f64; 3]>);
+    fn push_rule(
+        &mut self,
+        bounds: Bounds,
+        frac_a: f64,
+        frac_b: f64,
+        y_frac: f64,
+        color: Option<[f64; 3]>,
+    );
 }
 impl PushRule for Vec<Operation> {
-    fn push_rule(&mut self, bounds: Bounds, frac_a: f64, frac_b: f64, y_frac: f64, color: Option<[f64; 3]>) {
+    fn push_rule(
+        &mut self,
+        bounds: Bounds,
+        frac_a: f64,
+        frac_b: f64,
+        y_frac: f64,
+        color: Option<[f64; 3]>,
+    ) {
         let x0 = bounds.x + bounds.width * frac_a;
         let w = bounds.width * (frac_b - frac_a);
         if w <= 0.0 {
@@ -1378,13 +1417,17 @@ pub fn set_text_run_style(
         .filter(|e| e.kind == ElementKind::Text && !e.nested)
         .nth(index);
     let run_bounds = run_element.as_ref().and_then(|e| e.bounds);
-    let effective_pt = run_element.as_ref().and_then(|e| e.font_size).filter(|s| *s > 0.0);
+    let effective_pt = run_element
+        .as_ref()
+        .and_then(|e| e.font_size)
+        .filter(|s| *s > 0.0);
 
     // Walk the atoms, grouping maximal runs that share the same style. Each group
     // is re-emitted as one (optionally styled) show op.
     let mut groups: Vec<(usize, usize, Option<TextStylePatch>)> = Vec::new();
     let mut g_start = 0usize;
-    let mut g_style: Option<TextStylePatch> = span_at(starts.first().copied().unwrap_or(0)).cloned();
+    let mut g_style: Option<TextStylePatch> =
+        span_at(starts.first().copied().unwrap_or(0)).cloned();
     for (i, &offset) in starts.iter().enumerate().skip(1) {
         let here = span_at(offset).cloned();
         if here != g_style {
@@ -3845,8 +3888,22 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         // styled span wrapped in q/Q, original glyphs preserved across the split.
         let content = b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (ABCDE) Tj ET";
         let spans = vec![
-            (0usize, 2usize, TextStylePatch { color: Some([1.0, 0.0, 0.0]), ..Default::default() }),
-            (2usize, 4usize, TextStylePatch { size_pt: Some(24.0), ..Default::default() }),
+            (
+                0usize,
+                2usize,
+                TextStylePatch {
+                    color: Some([1.0, 0.0, 0.0]),
+                    ..Default::default()
+                },
+            ),
+            (
+                2usize,
+                4usize,
+                TextStylePatch {
+                    size_pt: Some(24.0),
+                    ..Default::default()
+                },
+            ),
         ];
         let edited = set_text_run_style(content, 0, &spans, &FontDecoders::new()).unwrap();
         let s = String::from_utf8_lossy(&edited);
@@ -3857,9 +3914,15 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         assert!(ab < cd && cd < e, "slices keep their reading order");
         // A fill colour op was injected for the first span, a Tf for the second.
         assert!(s.contains("rg"), "colour op for span 1");
-        assert!(count(&edited, b"Tf") >= 2, "a Tf is emitted for the resized span");
+        assert!(
+            count(&edited, b"Tf") >= 2,
+            "a Tf is emitted for the resized span"
+        );
         // Styled spans are wrapped; the original single Tj is gone.
-        assert!(count(&edited, b"q") >= 2 && count(&edited, b"Q") >= 2, "styled spans wrapped");
+        assert!(
+            count(&edited, b"q") >= 2 && count(&edited, b"Q") >= 2,
+            "styled spans wrapped"
+        );
         // No text was lost: concatenated shown text still reads ABCDE.
         let runs = extract_text_runs(&edited).unwrap();
         let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
@@ -3871,10 +3934,20 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         // A span ending past the run length is clamped; styling still applies to
         // the in-range portion and no panic occurs.
         let content = b"BT /F1 12 Tf (HI) Tj ET";
-        let spans = vec![(0usize, 999usize, TextStylePatch { color: Some([0.0, 0.0, 1.0]), ..Default::default() })];
+        let spans = vec![(
+            0usize,
+            999usize,
+            TextStylePatch {
+                color: Some([0.0, 0.0, 1.0]),
+                ..Default::default()
+            },
+        )];
         let edited = set_text_run_style(content, 0, &spans, &FontDecoders::new()).unwrap();
         let s = String::from_utf8_lossy(&edited);
-        assert!(s.contains("(HI)"), "whole run styled, clamped to its length");
+        assert!(
+            s.contains("(HI)"),
+            "whole run styled, clamped to its length"
+        );
         assert!(s.contains("rg"), "colour applied to the clamped span");
     }
 
@@ -3883,7 +3956,12 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         // No text run at index 1 (only one run) → Err, mirroring the
         // text-run-not-found contract for a non-matching index.
         let content = b"BT /F1 12 Tf (only) Tj ET";
-        let result = set_text_run_style(content, 1, &[(0, 1, TextStylePatch::default())], &FontDecoders::new());
+        let result = set_text_run_style(
+            content,
+            1,
+            &[(0, 1, TextStylePatch::default())],
+            &FontDecoders::new(),
+        );
         assert!(result.is_err(), "an index with no run must fail");
     }
 
@@ -3892,18 +3970,35 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         // An underline span draws a filled rule (re … f) appended after the text,
         // in addition to showing the (unwrapped, style-free) slice.
         let content = b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (WORD) Tj ET";
-        let spans = vec![(0usize, 4usize, TextStylePatch { underline: Some(true), ..Default::default() })];
+        let spans = vec![(
+            0usize,
+            4usize,
+            TextStylePatch {
+                underline: Some(true),
+                ..Default::default()
+            },
+        )];
         let edited = set_text_run_style(content, 0, &spans, &FontDecoders::new()).unwrap();
         let s = String::from_utf8_lossy(&edited);
         assert!(s.contains("(WORD)"), "text still shown");
-        assert!(count(&edited, b"re") >= 1 && count(&edited, b"f") >= 1, "an underline rule is drawn");
+        assert!(
+            count(&edited, b"re") >= 1 && count(&edited, b"f") >= 1,
+            "an underline rule is drawn"
+        );
     }
 
     #[test]
     fn set_text_run_style_faux_bold_uses_render_mode_two() {
         // Bold with no variant font → faux-bold via `2 Tr` (fill+stroke).
         let content = b"BT /F1 12 Tf (B) Tj ET";
-        let spans = vec![(0usize, 1usize, TextStylePatch { bold: Some(true), ..Default::default() })];
+        let spans = vec![(
+            0usize,
+            1usize,
+            TextStylePatch {
+                bold: Some(true),
+                ..Default::default()
+            },
+        )];
         let edited = set_text_run_style(content, 0, &spans, &FontDecoders::new()).unwrap();
         let s = String::from_utf8_lossy(&edited);
         assert!(s.contains("2 Tr"), "faux-bold sets text render mode 2");
@@ -3914,7 +4009,11 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
     fn set_text_run_style_empty_spans_is_noop() {
         let content = b"BT /F1 12 Tf (X) Tj ET";
         let edited = set_text_run_style(content, 0, &[], &FontDecoders::new()).unwrap();
-        assert_eq!(edited, content.to_vec(), "no spans leaves content byte-for-byte");
+        assert_eq!(
+            edited,
+            content.to_vec(),
+            "no spans leaves content byte-for-byte"
+        );
     }
 
     #[test]

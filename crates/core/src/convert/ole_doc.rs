@@ -103,7 +103,13 @@ pub fn doc_to_model(bytes: &[u8]) -> Option<Document> {
     // degrade to a single UTF-16 piece over `ccpText` (handled in `build_text`).
     let table = cfb
         .read_stream(table_name)
-        .or_else(|| cfb.read_stream(if fib.which_table_stream { "0Table" } else { "1Table" }))
+        .or_else(|| {
+            cfb.read_stream(if fib.which_table_stream {
+                "0Table"
+            } else {
+                "1Table"
+            })
+        })
         .unwrap_or_default();
 
     // Reassemble the logical text from the piece table (CP-ordered), recording for
@@ -1298,14 +1304,7 @@ mod tests {
         /// Build a two-piece `CLX`: piece 0 UTF-16 (`cp` `0..split`, bytes at
         /// `fc0`), piece 1 CP1252 (`cp` `split..end`, bytes at `fc1`). Returns the
         /// CLX byte length.
-        fn clx_two_pieces(
-            &mut self,
-            off: usize,
-            split: u32,
-            end: u32,
-            fc0: u32,
-            fc1: u32,
-        ) -> u32 {
+        fn clx_two_pieces(&mut self, off: usize, split: u32, end: u32, fc0: u32, fc1: u32) -> u32 {
             // Plcfpcd: 3 CPs (0, split, end) + 2 Pcds (8 bytes each).
             let plcfpcd_len = 4 * 3 + 8 * 2; // 28
             let mut clx = vec![0u8; 1 + 4 + plcfpcd_len];
@@ -1367,7 +1366,7 @@ mod tests {
             const SIG: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
             let word_sectors = self.word.len().div_ceil(512); // 8
             let table_sectors = self.table.len().div_ceil(512); // 8
-            // sector 0 FAT, 1 directory, then WordDocument, then 1Table.
+                                                                // sector 0 FAT, 1 directory, then WordDocument, then 1Table.
             let word_first = 2u32;
             let table_first = word_first + word_sectors as u32;
             let total = 2 + word_sectors + table_sectors;
@@ -1407,7 +1406,17 @@ mod tests {
             // ---- directory (sector 1) ----
             {
                 let dir = &mut sectors[1];
-                dir_entry(dir, 0, "Root Entry", 5, NOSTREAM, NOSTREAM, 1, 0xFFFF_FFFE, 0);
+                dir_entry(
+                    dir,
+                    0,
+                    "Root Entry",
+                    5,
+                    NOSTREAM,
+                    NOSTREAM,
+                    1,
+                    0xFFFF_FFFE,
+                    0,
+                );
                 // WordDocument: slot 1, right→slot 2 (sibling).
                 dir_entry(
                     dir,
@@ -1568,7 +1577,11 @@ mod tests {
 
         let doc = doc_to_model(&bytes).expect("valid .doc must parse");
         let paras = page_paragraphs(&doc);
-        assert_eq!(paras, vec!["Hello world".to_string()], "one paragraph, text intact");
+        assert_eq!(
+            paras,
+            vec!["Hello world".to_string()],
+            "one paragraph, text intact"
+        );
 
         // The paragraph must contain a bold "world" run.
         let block = &doc.sections[0].pages[0].blocks[0];
@@ -1585,9 +1598,11 @@ mod tests {
             .collect();
         assert_eq!(bold_text, "world", "the 'world' run must be bold");
         // And "Hello " must be a non-bold run.
-        let plain_bold = p.runs.iter().any(|r| matches!(
-            r, model::Inline::Run(run) if !run.style.bold && run.text.contains("Hello")
-        ));
+        let plain_bold = p.runs.iter().any(|r| {
+            matches!(
+                r, model::Inline::Run(run) if !run.style.bold && run.text.contains("Hello")
+            )
+        });
         assert!(plain_bold, "'Hello ' must be a non-bold run");
     }
 
@@ -1613,7 +1628,11 @@ mod tests {
 
         let doc = doc_to_model(&bytes).expect("valid .doc must parse");
         let paras = page_paragraphs(&doc);
-        assert_eq!(paras, vec!["FooBär".to_string()], "pieces reassemble in CP order");
+        assert_eq!(
+            paras,
+            vec!["FooBär".to_string()],
+            "pieces reassemble in CP order"
+        );
     }
 
     #[test]
@@ -1638,13 +1657,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(tables.len(), 1, "the cell marks must build exactly one table");
+        assert_eq!(
+            tables.len(),
+            1,
+            "the cell marks must build exactly one table"
+        );
         let table = tables[0];
         assert_eq!(table.rows.len(), 1, "one row");
         assert_eq!(table.rows[0].cells.len(), 2, "two cells in the row");
-        let cell_text = |c: &Cell| -> String {
-            c.blocks.first().map(para_text).unwrap_or_default()
-        };
+        let cell_text =
+            |c: &Cell| -> String { c.blocks.first().map(para_text).unwrap_or_default() };
         assert_eq!(cell_text(&table.rows[0].cells[0]), "A", "first cell = A");
         assert_eq!(cell_text(&table.rows[0].cells[1]), "B", "second cell = B");
     }
@@ -1670,7 +1692,11 @@ mod tests {
         let BlockKind::Paragraph(p) = &block.kind else {
             panic!("expected a paragraph block");
         };
-        assert_eq!(p.style.align, model::Align::Center, "alignment must be centered");
+        assert_eq!(
+            p.style.align,
+            model::Align::Center,
+            "alignment must be centered"
+        );
     }
 
     /// Build a one-page PAPX bin table (`PlcfBtePapx`) in `1Table` at `off` naming
@@ -1715,7 +1741,10 @@ mod tests {
 
     #[test]
     fn garbage_is_none_no_panic() {
-        assert!(doc_to_model(b"not a compound file").is_none(), "garbage ⇒ None");
+        assert!(
+            doc_to_model(b"not a compound file").is_none(),
+            "garbage ⇒ None"
+        );
         assert!(doc_to_model(&[]).is_none(), "empty ⇒ None");
         // A valid CFB but with no WordDocument stream ⇒ None.
         // (Reuse the CFB module's expectation: our builder always adds one, so we

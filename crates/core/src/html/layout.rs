@@ -723,10 +723,7 @@ fn flow_units<'a>(
                 if st.display == Display::ListItem {
                     list_index += 1;
                 }
-                units.push(FlowUnit::Block {
-                    el: e,
-                    list_index,
-                });
+                units.push(FlowUnit::Block { el: e, list_index });
             }
         } else {
             inline_run.push(child);
@@ -885,7 +882,15 @@ impl Flow<'_> {
                     let y_before = y;
                     let child_bfc = establishes_bfc(&st);
                     y = self.block_in_flow(
-                        e, &st, parent_style, x, avail_w, y, ancestors, list_index, child_bfc,
+                        e,
+                        &st,
+                        parent_style,
+                        x,
+                        avail_w,
+                        y,
+                        ancestors,
+                        list_index,
+                        child_bfc,
                     );
                     // `page-break-inside: avoid` — if the block straddled a page
                     // boundary yet fits within one page, discard it and re-lay
@@ -908,8 +913,15 @@ impl Flow<'_> {
                             if moved > y_before {
                                 start = self.out.len();
                                 y = self.block_in_flow(
-                                    e, &st, parent_style, x, avail_w, moved, ancestors,
-                                    list_index, child_bfc,
+                                    e,
+                                    &st,
+                                    parent_style,
+                                    x,
+                                    avail_w,
+                                    moved,
+                                    ancestors,
+                                    list_index,
+                                    child_bfc,
                                 );
                             }
                         }
@@ -1370,8 +1382,7 @@ impl Flow<'_> {
         avail_w: f64,
         y: f64,
     ) -> Option<f64> {
-        let diagram =
-            super::diagram::try_build(el, style, avail_w.max(1.0), self.m)?;
+        let diagram = super::diagram::try_build(el, style, avail_w.max(1.0), self.m)?;
 
         // Honour the block's own vertical margins; centre the diagram in the
         // available width when it's narrower (mermaid renders centred).
@@ -1490,7 +1501,8 @@ impl Flow<'_> {
         // centres it in the available width: the auto side(s) split the free
         // space. With only one auto side, that side pushes the box to the
         // opposite edge. Falls back to the normal `x + margin-left` otherwise.
-        let box_x = if style.width.is_some() && (style.margin_left_auto || style.margin_right_auto) {
+        let box_x = if style.width.is_some() && (style.margin_left_auto || style.margin_right_auto)
+        {
             let free = (avail_w - box_w).max(0.0);
             match (style.margin_left_auto, style.margin_right_auto) {
                 (true, true) => x + free / 2.0,
@@ -1647,7 +1659,15 @@ impl Flow<'_> {
         for n in nodes {
             self.collect_inline(n, style, ancestors, &mut items);
         }
-        self.flow_lines(&items, x, avail_w, y, style.align, style.text_indent, style.direction)
+        self.flow_lines(
+            &items,
+            x,
+            avail_w,
+            y,
+            style.align,
+            style.text_indent,
+            style.direction,
+        )
     }
 
     fn collect_inline(
@@ -2562,7 +2582,10 @@ impl Flow<'_> {
         // A rounded box can collapse the background + a uniform SOLID border into
         // a single rounded fill+stroke rect (so both follow the contour). Only
         // when there's no gradient overlay (which paints its own box).
-        let all_solid = style.border_style_edges.iter().all(|s| *s == BorderStyle::Solid);
+        let all_solid = style
+            .border_style_edges
+            .iter()
+            .all(|s| *s == BorderStyle::Solid);
         let uniform_border = any_border
             && all_solid
             && (b.top - b.right).abs() < 1e-6
@@ -3381,7 +3404,8 @@ impl Flow<'_> {
         // Resolve per-column widths from the track list (or equal columns when no
         // track list is present), then the cumulative x of each column's left
         // edge (including the column gaps that precede it).
-        let col_widths = resolve_track_sizes(&style.grid_template_columns, cols, content_w, gap_col);
+        let col_widths =
+            resolve_track_sizes(&style.grid_template_columns, cols, content_w, gap_col);
         let col_x: Vec<f64> = cumulative_offsets(content_x, &col_widths, gap_col);
 
         // Assign each item a (row, col) cell + span. Items with an explicit
@@ -3753,8 +3777,7 @@ impl Flow<'_> {
         let mut heights: Vec<f64> = Vec::with_capacity(units.len());
         for unit in &units {
             let probe_start = self.out.len();
-            let bottom =
-                self.lay_unit(unit, style, content_x, col_w, content_top, &new_ancestors);
+            let bottom = self.lay_unit(unit, style, content_x, col_w, content_top, &new_ancestors);
             self.out.truncate(probe_start);
             heights.push((bottom - content_top).max(0.0));
         }
@@ -3779,8 +3802,7 @@ impl Flow<'_> {
                 col += 1;
                 col_y = content_top;
             }
-            let bottom =
-                self.lay_unit(unit, style, col_x(col), col_w, col_y, &new_ancestors);
+            let bottom = self.lay_unit(unit, style, col_x(col), col_w, col_y, &new_ancestors);
             col_y = bottom;
             max_bottom = max_bottom.max(col_y);
         }
@@ -5596,11 +5618,9 @@ mod tests {
         // 2 columns. The FIRST item carries `grid-column: 2`, so it lands in the
         // right column; the auto-flowing second item fills the (free) left cell of
         // the same row. Hence "A" ends up to the RIGHT of "B" despite source order.
-        let layout = run(
-            r#"<div style="display:grid;grid-template-columns:1fr 1fr">
+        let layout = run(r#"<div style="display:grid;grid-template-columns:1fr 1fr">
                  <div style="grid-column:2">A</div><div>B</div>
-               </div>"#,
-        );
+               </div>"#);
         let t = text_xy(&layout);
         let a = t.iter().find(|(_, _, s)| s == "A").unwrap();
         let b = t.iter().find(|(_, _, s)| s == "B").unwrap();
@@ -5615,11 +5635,9 @@ mod tests {
     fn grid_row_start_places_item_on_a_later_row() {
         // An item with `grid-row: 2` drops to the second row; a plain item stays
         // on the first. So "Late" sits below "Early".
-        let layout = run(
-            r#"<div style="display:grid;grid-template-columns:1fr 1fr">
+        let layout = run(r#"<div style="display:grid;grid-template-columns:1fr 1fr">
                  <div>Early</div><div style="grid-row:2;grid-column:1">Late</div>
-               </div>"#,
-        );
+               </div>"#);
         let t = text_xy(&layout);
         let early = t.iter().find(|(_, _, s)| s == "Early").unwrap();
         let late = t.iter().find(|(_, _, s)| s == "Late").unwrap();
@@ -5670,10 +5688,14 @@ mod tests {
         let cleared = run(&format!(
             "<div>{floated}<div style=\"clear:left\">After</div></div>"
         ));
-        let not_cleared = run(&format!(
-            "<div>{floated}<div>After</div></div>"
-        ));
-        let y_of = |l: &Layout| text_xy(l).into_iter().find(|(_, _, s)| s == "After").unwrap().1;
+        let not_cleared = run(&format!("<div>{floated}<div>After</div></div>"));
+        let y_of = |l: &Layout| {
+            text_xy(l)
+                .into_iter()
+                .find(|(_, _, s)| s == "After")
+                .unwrap()
+                .1
+        };
         let yc = y_of(&cleared);
         let yn = y_of(&not_cleared);
         assert!(
@@ -5691,10 +5713,14 @@ mod tests {
         let clear_right = run(&format!(
             "<div>{floated}<div style=\"clear:right\">After</div></div>"
         ));
-        let not_cleared = run(&format!(
-            "<div>{floated}<div>After</div></div>"
-        ));
-        let y_of = |l: &Layout| text_xy(l).into_iter().find(|(_, _, s)| s == "After").unwrap().1;
+        let not_cleared = run(&format!("<div>{floated}<div>After</div></div>"));
+        let y_of = |l: &Layout| {
+            text_xy(l)
+                .into_iter()
+                .find(|(_, _, s)| s == "After")
+                .unwrap()
+                .1
+        };
         assert!(
             (y_of(&clear_right) - y_of(&not_cleared)).abs() < 1.0,
             "clear:right does not clear a left float (right={}, baseline={})",
@@ -5711,10 +5737,14 @@ mod tests {
         let cleared = run(&format!(
             "<div>{floated}<div style=\"clear:both\">After</div></div>"
         ));
-        let not_cleared = run(&format!(
-            "<div>{floated}<div>After</div></div>"
-        ));
-        let y_of = |l: &Layout| text_xy(l).into_iter().find(|(_, _, s)| s == "After").unwrap().1;
+        let not_cleared = run(&format!("<div>{floated}<div>After</div></div>"));
+        let y_of = |l: &Layout| {
+            text_xy(l)
+                .into_iter()
+                .find(|(_, _, s)| s == "After")
+                .unwrap()
+                .1
+        };
         assert!(
             y_of(&cleared) > y_of(&not_cleared) + 20.0,
             "clear:both drops below a right float (cleared={}, baseline={})",
@@ -5729,9 +5759,7 @@ mod tests {
         let tol = 0.05;
         rects(layout)
             .into_iter()
-            .filter(|(.., fill)| {
-                fill.is_some_and(|c| (0..3).all(|i| (c[i] - want[i]).abs() < tol))
-            })
+            .filter(|(.., fill)| fill.is_some_and(|c| (0..3).all(|i| (c[i] - want[i]).abs() < tol)))
             .map(|(x, y, w, h, _)| (x, y, w, h))
             .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
             .expect("a background rect with the wanted fill")
@@ -5743,9 +5771,8 @@ mod tests {
         // max-content width, NOT the legacy `avail_w / 3` (= 540/3 = 180pt).
         // "Hi" is 2 chars ≈ 2 × 8pt = 16pt under AverageMeasure (16pt / 0.5em).
         // A grey background makes the float's own box rect findable.
-        let layout = run(
-            r#"<div style="float:left;background:#cccccc">Hi</div><p>beside the float</p>"#,
-        );
+        let layout =
+            run(r#"<div style="float:left;background:#cccccc">Hi</div><p>beside the float</p>"#);
         let (_, _, fw, _) = smallest_filled_rect(&layout, [0.8, 0.8, 0.8]);
         assert!(
             fw > 8.0 && fw < 80.0,
@@ -5770,12 +5797,10 @@ mod tests {
         // content is not shrink-to-fit measured). With explicit `width=120` it
         // reserves a wider band. We read the band width through where the wrapping
         // text starts (content origin 36 + the float width).
-        let narrow = run(
-            r#"<img src="a.png" width="40" height="20" style="float:left"><p>beside</p>"#,
-        );
-        let wide = run(
-            r#"<img src="a.png" width="120" height="20" style="float:left"><p>beside</p>"#,
-        );
+        let narrow =
+            run(r#"<img src="a.png" width="40" height="20" style="float:left"><p>beside</p>"#);
+        let wide =
+            run(r#"<img src="a.png" width="120" height="20" style="float:left"><p>beside</p>"#);
         let beside_x = |l: &Layout| {
             text_xy(l)
                 .into_iter()
@@ -5800,13 +5825,11 @@ mod tests {
         // A left float (80pt) followed by a normal block, then a `clear:left`
         // block. The middle block's *box* must sit beside the float (x shifted
         // right by ~80, width reduced); the cleared block drops below the float.
-        let layout = run(
-            r#"<div>
+        let layout = run(r#"<div>
                  <div style="float:left;width:80pt">F</div>
                  <div style="background:#eeeeee">B</div>
                  <div style="clear:left;background:#cccccc">C</div>
-               </div>"#,
-        );
+               </div>"#);
         // Content origin is the 36pt page margin.
         let (bx, by, bw, _) = smallest_filled_rect(&layout, [0.9333, 0.9333, 0.9333]);
         assert!(
@@ -5830,10 +5853,8 @@ mod tests {
         // sibling container's* content (same formatting context). But when the
         // float's container is a NEW block formatting context (`overflow:hidden`),
         // the float is contained and the sibling is full width.
-        let shared = run(
-            r#"<div><div style="float:left;width:80pt">F</div></div>
-               <p style="background:#eeeeee">After</p>"#,
-        );
+        let shared = run(r#"<div><div style="float:left;width:80pt">F</div></div>
+               <p style="background:#eeeeee">After</p>"#);
         let bfc = run(
             r#"<div style="overflow:hidden"><div style="float:left;width:80pt">F</div></div>
                <p style="background:#eeeeee">After</p>"#,
@@ -5858,12 +5879,10 @@ mod tests {
         // column (x near the content origin), the later ones spill into the right
         // column (a distinctly larger x). The right column starts at roughly the
         // column width + gutter further right than the left.
-        let layout = run(
-            r#"<div style="column-count:2">
+        let layout = run(r#"<div style="column-count:2">
                  <p>Alpha</p><p>Bravo</p><p>Charlie</p>
                  <p>Delta</p><p>Echo</p><p>Foxtrot</p>
-               </div>"#,
-        );
+               </div>"#);
         let t = text_xy(&layout);
         let x_of = |s: &str| t.iter().find(|(_, _, label)| label == s).unwrap().0;
 
@@ -5925,16 +5944,12 @@ mod tests {
     fn column_gap_widens_the_gutter_and_pushes_the_right_column() {
         // A larger `column-gap` narrows each column and shifts the right column's
         // start further right than the default gutter would.
-        let wide = run(
-            r#"<div style="column-count:2;column-gap:60pt">
+        let wide = run(r#"<div style="column-count:2;column-gap:60pt">
                  <p>One</p><p>Two</p><p>Three</p><p>Four</p>
-               </div>"#,
-        );
-        let narrow = run(
-            r#"<div style="column-count:2;column-gap:4pt">
+               </div>"#);
+        let narrow = run(r#"<div style="column-count:2;column-gap:4pt">
                  <p>One</p><p>Two</p><p>Three</p><p>Four</p>
-               </div>"#,
-        );
+               </div>"#);
         let right_x = |l: &Layout| {
             // The right-column start = the largest distinct x among fragments.
             text_xy(l)
@@ -5961,13 +5976,11 @@ mod tests {
         // `columns: 3` (the count form of the shorthand) yields three columns;
         // with nine short blocks the last one lands in the third column, well
         // right of the first.
-        let layout = run(
-            r#"<div style="columns:3">
+        let layout = run(r#"<div style="columns:3">
                  <p>A1</p><p>A2</p><p>A3</p>
                  <p>B1</p><p>B2</p><p>B3</p>
                  <p>C1</p><p>C2</p><p>C3</p>
-               </div>"#,
-        );
+               </div>"#);
         let t = text_xy(&layout);
         let xs: Vec<f64> = t.iter().map(|(x, _, _)| *x).collect();
         let min_x = xs.iter().copied().fold(f64::INFINITY, f64::min);
@@ -5993,7 +6006,10 @@ mod tests {
         assert_eq!(t.len(), 3, "three paragraphs, one each");
         // All at the same (content-origin) x and strictly increasing y.
         for (x, _, _) in &t {
-            assert!((*x - 36.0).abs() < 1.0, "stacked at the content origin ({x})");
+            assert!(
+                (*x - 36.0).abs() < 1.0,
+                "stacked at the content origin ({x})"
+            );
         }
         assert!(
             t[0].1 < t[1].1 && t[1].1 < t[2].1,
@@ -6004,7 +6020,10 @@ mod tests {
         let one = run(r#"<div style="column-count:1"><p>One</p><p>Two</p></div>"#);
         let to = text_xy(&one);
         for (x, _, _) in &to {
-            assert!((*x - 36.0).abs() < 1.0, "column-count:1 stays single-column ({x})");
+            assert!(
+                (*x - 36.0).abs() < 1.0,
+                "column-count:1 stays single-column ({x})"
+            );
         }
     }
 
@@ -6013,12 +6032,10 @@ mod tests {
         // The unit that fills the left column comes before, in document order,
         // the unit that opens the right column — i.e. the flow goes top-of-left
         // then top-of-right (newspaper columns), not interleaved.
-        let layout = run(
-            r#"<div style="column-count:2">
+        let layout = run(r#"<div style="column-count:2">
                  <p>First</p><p>Second</p><p>Third</p>
                  <p>Fourth</p><p>Fifth</p><p>Sixth</p>
-               </div>"#,
-        );
+               </div>"#);
         let t = text_xy(&layout);
         let pos = |s: &str| {
             let (x, y, _) = t.iter().find(|(_, _, l)| l == s).unwrap();
@@ -6041,9 +6058,7 @@ mod tests {
     fn margin_auto_centres_fixed_width_block() {
         // A 200pt block centred in the 540pt content area (page 612 − 2×36
         // margin) should start at x ≈ 36 + (540 − 200)/2 = 206.
-        let layout = run(
-            "<div style=\"width:200pt;margin:0 auto;background:#eee\">centered</div>",
-        );
+        let layout = run("<div style=\"width:200pt;margin:0 auto;background:#eee\">centered</div>");
         let x = layout
             .pages
             .iter()
@@ -6078,15 +6093,13 @@ mod tests {
     fn adjacent_block_margins_collapse() {
         // Two stacked blocks, each with 20pt vertical margins. The gap between
         // them must be ~20pt (the larger margin), not 40pt (their sum).
-        let layout = run(
-            "<div style=\"margin:20pt 0;height:10pt\">A</div>\
-             <div style=\"margin:20pt 0;height:10pt\">B</div>",
-        );
+        let layout = run("<div style=\"margin:20pt 0;height:10pt\">A</div>\
+             <div style=\"margin:20pt 0;height:10pt\">B</div>");
         let ay = cell_y(&layout, "A");
         let by = cell_y(&layout, "B");
         let gap = by - ay; // baseline-to-baseline ≈ A height + collapsed margin
-        // A's content (~10pt height) + 20pt collapsed margin ≈ 30pt. Without
-        // collapsing it would be ~50pt. Assert it is clearly under 45.
+                           // A's content (~10pt height) + 20pt collapsed margin ≈ 30pt. Without
+                           // collapsing it would be ~50pt. Assert it is clearly under 45.
         assert!(
             (25.0..45.0).contains(&gap),
             "collapsed gap ~30pt, not the 50pt sum (got {gap})"
@@ -6100,10 +6113,8 @@ mod tests {
         // Fill most of page 1 with a tall spacer, then an `avoid` block that is
         // short enough to fit on one page but, placed in flow, would straddle
         // the page-1/page-2 boundary. It must move whole onto page 2.
-        let layout = run(
-            "<div style=\"height:700pt\">spacer</div>\
-             <div style=\"page-break-inside:avoid;height:120pt\">keep</div>",
-        );
+        let layout = run("<div style=\"height:700pt\">spacer</div>\
+             <div style=\"page-break-inside:avoid;height:120pt\">keep</div>");
         assert!(layout.pages.len() >= 2, "content spans pages");
         // The whole `keep` block (its text) lands on page 2, not page 1.
         let on_p1 = layout.pages[0]
@@ -6112,7 +6123,10 @@ mod tests {
         let on_p2 = layout
             .pages
             .get(1)
-            .map(|p| p.iter().any(|f| matches!(f, Fragment::Text { text, .. } if text == "keep")))
+            .map(|p| {
+                p.iter()
+                    .any(|f| matches!(f, Fragment::Text { text, .. } if text == "keep"))
+            })
             .unwrap_or(false);
         assert!(!on_p1, "avoid block does not start on page 1");
         assert!(on_p2, "avoid block moved whole to page 2");
@@ -6121,10 +6135,8 @@ mod tests {
     #[test]
     fn page_break_inside_avoid_keeps_block_that_already_fits() {
         // A short `avoid` block that fits entirely on page 1 is NOT moved.
-        let layout = run(
-            "<div style=\"height:50pt\">top</div>\
-             <div style=\"page-break-inside:avoid;height:50pt\">keep</div>",
-        );
+        let layout = run("<div style=\"height:50pt\">top</div>\
+             <div style=\"page-break-inside:avoid;height:50pt\">keep</div>");
         let on_p1 = layout.pages[0]
             .iter()
             .any(|f| matches!(f, Fragment::Text { text, .. } if text == "keep"));
@@ -6225,7 +6237,10 @@ mod tests {
         );
         let wide = cell_x(&layout, "Wide");
         let next = cell_x(&layout, "Next");
-        assert!((wide - 36.0).abs() < 2.0, "spanning cell starts at the left ({wide})");
+        assert!(
+            (wide - 36.0).abs() < 2.0,
+            "spanning cell starts at the left ({wide})"
+        );
         assert!(
             (next - (36.0 + 360.0)).abs() < 4.0,
             "Next lands in column 3 after the 2-col span (~396), got {next}"
@@ -6236,16 +6251,26 @@ mod tests {
     fn grid_row_span_keeps_following_item_on_first_row() {
         // A row-spanning item in column 1 leaves column 2 of the first row free,
         // so the next item stays on row 1 (same y), to its right.
-        let layout = run(
-            r#"<div style="display:grid;grid-template-columns:1fr 1fr">
+        let layout = run(r#"<div style="display:grid;grid-template-columns:1fr 1fr">
                  <div style="grid-row:span 2">Tall</div><div>Side</div><div>Below</div>
-               </div>"#,
-        );
-        let tall = text_xy(&layout).into_iter().find(|(_, _, s)| s == "Tall").unwrap();
-        let side = text_xy(&layout).into_iter().find(|(_, _, s)| s == "Side").unwrap();
-        let below = text_xy(&layout).into_iter().find(|(_, _, s)| s == "Below").unwrap();
+               </div>"#);
+        let tall = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "Tall")
+            .unwrap();
+        let side = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "Side")
+            .unwrap();
+        let below = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "Below")
+            .unwrap();
         assert!(side.0 > tall.0, "Side is right of the spanning Tall");
-        assert!((side.1 - tall.1).abs() < 2.0, "Side shares the first row with Tall");
+        assert!(
+            (side.1 - tall.1).abs() < 2.0,
+            "Side shares the first row with Tall"
+        );
         // `Below` auto-flows into row 2 column 2 (Tall still occupies r2c1).
         assert!(below.1 > tall.1, "Below drops to a later row ({:?})", below);
         assert!(below.0 > tall.0, "Below sits in column 2 under Side");
@@ -6338,7 +6363,10 @@ mod tests {
             b < 36.0 + 400.0 - 50.0,
             "flex-shrink pulls B left of its 400pt basis position ({b})"
         );
-        assert!(b > 36.0 + 200.0, "but B is still past the midpoint area ({b})");
+        assert!(
+            b > 36.0 + 200.0,
+            "but B is still past the midpoint area ({b})"
+        );
     }
 
     #[test]
@@ -6360,15 +6388,19 @@ mod tests {
     fn flex_wrap_breaks_onto_a_second_line() {
         // Three items each basis 250pt (sum 750 > 540) with flex-wrap: the third
         // wraps below the first. Item 3 sits lower than item 1, at the same x.
-        let layout = run(
-            r#"<div style="display:flex;flex-wrap:wrap">
+        let layout = run(r#"<div style="display:flex;flex-wrap:wrap">
                  <div style="flex:0 0 250pt">One</div>
                  <div style="flex:0 0 250pt">Two</div>
                  <div style="flex:0 0 250pt">Three</div>
-               </div>"#,
-        );
-        let one = text_xy(&layout).into_iter().find(|(_, _, s)| s == "One").unwrap();
-        let three = text_xy(&layout).into_iter().find(|(_, _, s)| s == "Three").unwrap();
+               </div>"#);
+        let one = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "One")
+            .unwrap();
+        let three = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "Three")
+            .unwrap();
         assert!(
             three.1 > one.1 && (three.0 - one.0).abs() < 3.0,
             "Three wraps below One at the same x (one={one:?}, three={three:?})"
@@ -6451,8 +6483,14 @@ mod tests {
         let layout = run(&format!(
             "<div style=\"display:flex;align-items:center\">{tall}<div style=\"flex:0 0 200pt\">short</div></div>"
         ));
-        let t1 = text_xy(&layout).into_iter().find(|(_, _, s)| s == "t1").unwrap();
-        let short = text_xy(&layout).into_iter().find(|(_, _, s)| s == "short").unwrap();
+        let t1 = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "t1")
+            .unwrap();
+        let short = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "short")
+            .unwrap();
         assert!(
             short.1 > t1.1 + 10.0,
             "align-items:center lowers the short item below the tall item's first line (t1={t1:?}, short={short:?})"
@@ -6590,7 +6628,10 @@ mod tests {
         // An explicit physical `text-align:left` inside an RTL block still lands
         // the run's left corner at the left content edge (36) — the box block is
         // pushed left, only the within-line box order is reversed.
-        let x = run_x(&run(r#"<p dir="rtl" style="text-align:left">word</p>"#), "word");
+        let x = run_x(
+            &run(r#"<p dir="rtl" style="text-align:left">word</p>"#),
+            "word",
+        );
         assert!(
             (x - 36.0).abs() < 0.01,
             "RTL + text-align:left puts the single run at the left edge (x={x})"
@@ -6702,7 +6743,10 @@ mod tests {
         let layout = run(r#"<p dir="rtl">AAA BBB</p>"#);
         let a = run_x(&layout, "AAA");
         let b = run_x(&layout, "BBB");
-        assert!(a < b, "Latin-only RTL keeps source order (AAA={a}, BBB={b})");
+        assert!(
+            a < b,
+            "Latin-only RTL keeps source order (AAA={a}, BBB={b})"
+        );
         // Right-aligned: BBB's right edge ≈ 576. BBB = 3 glyphs × 8pt = 24pt wide
         // ⇒ its left corner ≈ 552, far past the left content edge (36).
         assert!(
@@ -6770,7 +6814,8 @@ mod tests {
         // `<mark>` (UA `background:#ffff00`) and a span with `background-color`
         // each paint a filled rect behind their glyphs; the text itself is still
         // emitted. The rect sits at z=0 (before the z=1 text in paint order).
-        let layout = run(r#"<p><mark>hi</mark> <span style="background-color:#00ff00">x</span></p>"#);
+        let layout =
+            run(r#"<p><mark>hi</mark> <span style="background-color:#00ff00">x</span></p>"#);
         let fills: Vec<[f64; 3]> = rect_decorations(&layout)
             .into_iter()
             .filter_map(|(fill, ..)| fill)
@@ -6805,7 +6850,10 @@ mod tests {
             .into_iter()
             .filter(|(fill, ..)| *fill == Some([0.2, 0.4, 0.8]))
             .count();
-        assert_eq!(blue, 1, "exactly one blue rect (the box), no text duplicate");
+        assert_eq!(
+            blue, 1,
+            "exactly one blue rect (the box), no text duplicate"
+        );
     }
 
     #[test]
@@ -6940,8 +6988,7 @@ mod tests {
     fn solid_border_stays_plain_rects_no_border_fragment() {
         // Guard: an all-solid border emits NO styled `Border` fragments — it stays
         // the legacy filled-rect path, byte-identical to before.
-        let layout =
-            run(r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#);
+        let layout = run(r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#);
         assert!(
             border_sides(&layout).is_empty(),
             "a solid border emits no styled Border fragments"
@@ -6967,9 +7014,8 @@ mod tests {
 
     #[test]
     fn one_dotted_side_emits_one_border_band() {
-        let layout = run(
-            r#"<div style="border-bottom:3pt dotted #000000;width:90pt;height:30pt"></div>"#,
-        );
+        let layout =
+            run(r#"<div style="border-bottom:3pt dotted #000000;width:90pt;height:30pt"></div>"#);
         let sides = border_sides(&layout);
         assert_eq!(sides.len(), 1, "exactly one styled side");
         assert_eq!(sides[0], (true, BorderStyle::Dotted), "horizontal dotted");
@@ -7052,15 +7098,22 @@ mod tests {
     fn elliptical_radius_reaches_the_background_rect() {
         // `border-radius: 12pt / 4pt` ⇒ the decoration rect carries distinct
         // horizontal (12) and vertical (4) radii.
-        let layout = run(
-            r#"<div style="background:#3366cc;border-radius:12pt / 4pt;padding:6pt">x</div>"#,
-        );
+        let layout =
+            run(r#"<div style="background:#3366cc;border-radius:12pt / 4pt;padding:6pt">x</div>"#);
         let bg = rect_radii(&layout)
             .into_iter()
             .find(|(fill, ..)| *fill == Some([0.2, 0.4, 0.8]))
             .expect("the blue rounded rect");
-        assert!(bg.1.iter().all(|r| (*r - 12.0).abs() < 0.01), "h=12: {:?}", bg.1);
-        assert!(bg.2.iter().all(|r| (*r - 4.0).abs() < 0.01), "v=4: {:?}", bg.2);
+        assert!(
+            bg.1.iter().all(|r| (*r - 12.0).abs() < 0.01),
+            "h=12: {:?}",
+            bg.1
+        );
+        assert!(
+            bg.2.iter().all(|r| (*r - 4.0).abs() < 0.01),
+            "v=4: {:?}",
+            bg.2
+        );
     }
 
     #[test]
@@ -7087,7 +7140,9 @@ mod tests {
         let rects = rect_radii(&layout);
         // Background rect with the topmost shadow.
         assert!(
-            rects.iter().any(|(fill, _, _, shadow)| fill.is_some() && *shadow),
+            rects
+                .iter()
+                .any(|(fill, _, _, shadow)| fill.is_some() && *shadow),
             "background rect carries the topmost shadow"
         );
         // Exactly one extra shadow-only rect (no fill, shadow present).
@@ -7135,21 +7190,30 @@ mod tests {
             sticky_y < 100.0,
             "sticky shift clamped within the container (y={sticky_y}, not ~9999)"
         );
-        assert!(sticky_y >= 36.0, "still within/after the container top (y={sticky_y})");
+        assert!(
+            sticky_y >= 36.0,
+            "still within/after the container top (y={sticky_y})"
+        );
     }
 
     #[test]
     fn sticky_with_room_applies_the_offset() {
         // With slack inside the container, a modest sticky offset DOES move the
         // box (it behaves like relative until it hits the container edge).
-        let base = run(
-            r#"<div style="height:200pt"><p style="margin:0">x</p></div>"#,
-        );
+        let base = run(r#"<div style="height:200pt"><p style="margin:0">x</p></div>"#);
         let shifted = run(
             r#"<div style="height:200pt"><p style="position:sticky;top:20pt;margin:0">x</p></div>"#,
         );
-        let y0 = text_xy(&base).into_iter().find(|(_, _, s)| s == "x").unwrap().1;
-        let y1 = text_xy(&shifted).into_iter().find(|(_, _, s)| s == "x").unwrap().1;
+        let y0 = text_xy(&base)
+            .into_iter()
+            .find(|(_, _, s)| s == "x")
+            .unwrap()
+            .1;
+        let y1 = text_xy(&shifted)
+            .into_iter()
+            .find(|(_, _, s)| s == "x")
+            .unwrap()
+            .1;
         assert!(
             (y1 - y0 - 20.0).abs() < 0.5,
             "sticky with room shifts by ~20pt (y0={y0}, y1={y1})"

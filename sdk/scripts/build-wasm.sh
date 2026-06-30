@@ -35,5 +35,5 @@ if compgen -G "$MODELS_SRC/*.gpocr" > /dev/null; then
   cp "$MODELS_SRC"/*.gpocr "$PKG_DIR/models/"
   echo "✓ copied $(ls "$PKG_DIR/models"/*.gpocr | wc -l) OCR model(s) → $PKG_DIR/models/"
 else
-  echo "⚠ no .gpocr models in $MODELS_SRC — OCR limited to the mono-glyph classifier" >&2
+  echo "ℹ no .gpocr models in $MODELS_SRC — OCR limited to the mono-glyph classifier"
 fi

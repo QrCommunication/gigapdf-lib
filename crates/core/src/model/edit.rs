@@ -274,10 +274,7 @@ pub enum ModelOp {
     SetListLevel { addr: BlockAddr, level: u8 },
     /// Set the bullet/number [`marker`](crate::model::ListMarker) of the
     /// addressed list. No-op on non-list blocks.
-    SetListMarker {
-        addr: BlockAddr,
-        marker: ListMarker,
-    },
+    SetListMarker { addr: BlockAddr, marker: ListMarker },
     /// Set whether the addressed list is `ordered` (numbered) or not. No-op on
     /// non-list blocks.
     SetListOrdered { addr: BlockAddr, ordered: bool },
@@ -700,12 +697,8 @@ fn apply_one(doc: &mut Document, op: &ModelOp) -> bool {
             t.border = *border;
             true
         }),
-        ModelOp::InsertTableRow { addr, at } => {
-            with_table(doc, addr, |t| insert_table_row(t, *at))
-        }
-        ModelOp::DeleteTableRow { addr, at } => {
-            with_table(doc, addr, |t| delete_table_row(t, *at))
-        }
+        ModelOp::InsertTableRow { addr, at } => with_table(doc, addr, |t| insert_table_row(t, *at)),
+        ModelOp::DeleteTableRow { addr, at } => with_table(doc, addr, |t| delete_table_row(t, *at)),
         ModelOp::InsertTableColumn { addr, at } => {
             with_table(doc, addr, |t| insert_table_column(t, *at))
         }
@@ -879,12 +872,7 @@ fn paragraph_block(text: &str) -> Block {
 /// The table's logical grid-column count: the widest row's summed `col_span`,
 /// never below `col_widths.len()`.
 fn table_columns(table: &Table) -> usize {
-    let from_rows = table
-        .rows
-        .iter()
-        .map(row_columns)
-        .max()
-        .unwrap_or(0);
+    let from_rows = table.rows.iter().map(row_columns).max().unwrap_or(0);
     from_rows.max(table.col_widths.len())
 }
 
@@ -956,7 +944,9 @@ fn insert_table_column(table: &mut Table, at: usize) -> bool {
     if table.col_widths.len() < cols {
         table.col_widths.resize(cols, width);
     }
-    table.col_widths.insert(at.min(table.col_widths.len()), width);
+    table
+        .col_widths
+        .insert(at.min(table.col_widths.len()), width);
 
     for row in &mut table.rows {
         insert_row_column(row, at);
@@ -2331,10 +2321,7 @@ mod tests {
         assert_eq!(n, 1);
         let t = get_table(&doc);
         assert_eq!(t.col_widths.len(), 2, "3→2 column widths");
-        assert_eq!(
-            t.rows[0].cells[0].col_span, 1,
-            "spanning cell shrinks 2→1"
-        );
+        assert_eq!(t.rows[0].cells[0].col_span, 1, "spanning cell shrinks 2→1");
         assert_eq!(t.rows[0].cells.len(), 2, "row 0 keeps both cells");
         assert_eq!(t.rows[1].cells.len(), 2, "row 1 drops a single cell");
         assert_eq!(table_columns(t), 2);
@@ -2781,7 +2768,11 @@ mod tests {
         assert_eq!(s.first_line_pt, -9.0, "first_line patched");
         assert_eq!(s.space_before_pt, 6.0, "space_before patched");
         assert_eq!(s.space_after_pt, 3.0, "space_after patched");
-        assert_eq!(s.line_height, LineHeight::Multiple(1.5), "line_height patched");
+        assert_eq!(
+            s.line_height,
+            LineHeight::Multiple(1.5),
+            "line_height patched"
+        );
         assert_eq!(s.indent_left_pt, 5.0, "indent_left untouched");
     }
 
@@ -2859,9 +2850,9 @@ mod tests {
                         level,
                     })
                     .collect(),
-            
-            ..Default::default()
-}),
+
+                ..Default::default()
+            }),
             ..Block::default()
         }
     }
@@ -2946,7 +2937,10 @@ mod tests {
             },
         );
         assert_eq!(n, 1);
-        assert_eq!(first_block(&doc).frame, Some(Rect::new(10.0, 20.0, 100.0, 50.0)));
+        assert_eq!(
+            first_block(&doc).frame,
+            Some(Rect::new(10.0, 20.0, 100.0, 50.0))
+        );
     }
 
     #[test]
@@ -3001,7 +2995,10 @@ mod tests {
                 color: Some([0.9, 0.9, 0.9]),
             },
         );
-        assert_eq!(get_table(&doc).rows[0].cells[1].shading, Some([0.9, 0.9, 0.9]));
+        assert_eq!(
+            get_table(&doc).rows[0].cells[1].shading,
+            Some([0.9, 0.9, 0.9])
+        );
         // Clear it again.
         run_one(
             &mut doc,

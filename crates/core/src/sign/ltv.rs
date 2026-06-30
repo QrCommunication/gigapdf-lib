@@ -484,7 +484,7 @@ mod tests {
     fn parse_ocsp_accepts_successful_and_rejects_failure() {
         // OCSPResponse { responseStatus ENUMERATED 0, responseBytes [0] {...} }.
         let ok = der::sequence(&[
-            der::tlv(0x0A, &[0x00]),                          // successful
+            der::tlv(0x0A, &[0x00]), // successful
             der::context(0, &der::octet_string(b"basic-ocsp-response")),
         ]);
         let parsed = parse_ocsp_response(&ok).expect("successful");
@@ -516,7 +516,8 @@ mod tests {
         let key = vri_key(b"signature contents");
         assert_eq!(key.len(), 40, "40 hex chars for a 20-byte SHA-1");
         assert!(
-            key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
+            key.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
             "upper-case hex"
         );
         let expected = {

@@ -306,7 +306,12 @@ impl PolyMask {
 /// Build the interior coverage mask of `polys` (device pixels) under the GDI
 /// fill rule, bounded to `width`×`height`. Returns `None` when the polygons
 /// don't cover any pixel.
-fn build_poly_mask(polys: &[Vec<Pt>], width: u32, height: u32, alternate: bool) -> Option<PolyMask> {
+fn build_poly_mask(
+    polys: &[Vec<Pt>],
+    width: u32,
+    height: u32,
+    alternate: bool,
+) -> Option<PolyMask> {
     let mut edges: Vec<Edge> = Vec::new();
     let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
     let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -1996,7 +2001,14 @@ mod tests {
             Pt { x: 16.0, y: 0.0 },
             Pt { x: 0.0, y: 16.0 },
         ];
-        fill_hatch(&mut c, &[tri], Rgba::rgb(0, 0, 0), HatchStyle::Horizontal, true, None);
+        fill_hatch(
+            &mut c,
+            &[tri],
+            Rgba::rgb(0, 0, 0),
+            HatchStyle::Horizontal,
+            true,
+            None,
+        );
         // Far corner outside the triangle: never painted.
         assert_eq!(px(&c, 39, 39).a, 0, "outside the triangle stays clear");
     }
@@ -2047,14 +2059,32 @@ mod tests {
         };
         // Nearest: a hard step (only 0 or 255 appear).
         let mut near = Canvas::new(8, 1);
-        blit_dib(&mut near, &src, 0.0, 0.0, 8.0, 1.0, None, StretchMode::Nearest);
+        blit_dib(
+            &mut near,
+            &src,
+            0.0,
+            0.0,
+            8.0,
+            1.0,
+            None,
+            StretchMode::Nearest,
+        );
         for x in 0..8 {
             let v = px(&near, x, 0).r;
             assert!(v == 0 || v == 255, "nearest must be hard-edged, got {v}");
         }
         // Bilinear: intermediate greys appear somewhere across the gradient.
         let mut bil = Canvas::new(8, 1);
-        blit_dib(&mut bil, &src, 0.0, 0.0, 8.0, 1.0, None, StretchMode::Bilinear);
+        blit_dib(
+            &mut bil,
+            &src,
+            0.0,
+            0.0,
+            8.0,
+            1.0,
+            None,
+            StretchMode::Bilinear,
+        );
         let mid_grey = (0..8).any(|x| {
             let v = px(&bil, x, 0).r;
             v > 0 && v < 255
@@ -2081,8 +2111,18 @@ mod tests {
 
     #[test]
     fn logrect_union_and_region_bbox() {
-        let a = LogRect { left: 0.0, top: 0.0, right: 10.0, bottom: 10.0 };
-        let b = LogRect { left: 20.0, top: 5.0, right: 30.0, bottom: 25.0 };
+        let a = LogRect {
+            left: 0.0,
+            top: 0.0,
+            right: 10.0,
+            bottom: 10.0,
+        };
+        let b = LogRect {
+            left: 20.0,
+            top: 5.0,
+            right: 30.0,
+            bottom: 25.0,
+        };
         let u = a.union(&b);
         assert_eq!((u.left, u.top, u.right, u.bottom), (0.0, 0.0, 30.0, 25.0));
         let bbox = region_bbox(&[a, b]).unwrap();
@@ -2108,7 +2148,12 @@ mod tests {
     fn set_clip_logrect_bounds_paint() {
         let mut g = Gdi::new(20, 20, Affine::identity());
         // Clip to the logical rect (4,4)-(12,12); paint a full-canvas rect.
-        g.set_clip_logrect(Some(LogRect { left: 4.0, top: 4.0, right: 12.0, bottom: 12.0 }));
+        g.set_clip_logrect(Some(LogRect {
+            left: 4.0,
+            top: 4.0,
+            right: 12.0,
+            bottom: 12.0,
+        }));
         let poly = rect(0.0, 0.0, 20.0, 20.0);
         let color = Rgba::rgb(0, 0, 0);
         let clip = g.clip;

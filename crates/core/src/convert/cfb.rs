@@ -823,7 +823,10 @@ mod tests {
         let cfb = Cfb::open(&bytes).expect("open");
         let mut names = cfb.stream_names();
         names.sort();
-        assert_eq!(names, vec!["BigStream".to_string(), "MiniStream".to_string()]);
+        assert_eq!(
+            names,
+            vec!["BigStream".to_string(), "MiniStream".to_string()]
+        );
     }
 
     #[test]
@@ -831,7 +834,11 @@ mod tests {
         let (bytes, big, _) = minimal_cfb();
         let cfb = Cfb::open(&bytes).expect("open");
         let got = cfb.read_stream_at_path(&["BigStream"]);
-        assert_eq!(got.as_deref(), Some(big.as_slice()), "path lookup must match");
+        assert_eq!(
+            got.as_deref(),
+            Some(big.as_slice()),
+            "path lookup must match"
+        );
     }
 
     #[test]
@@ -839,7 +846,10 @@ mod tests {
         let (bytes, _, _) = minimal_cfb();
         let cfb = Cfb::open(&bytes).expect("open");
         assert!(cfb.read_stream("Nope").is_none(), "missing stream ⇒ None");
-        assert!(cfb.read_stream_at_path(&["A", "B"]).is_none(), "missing path ⇒ None");
+        assert!(
+            cfb.read_stream_at_path(&["A", "B"]).is_none(),
+            "missing path ⇒ None"
+        );
     }
 
     #[test]

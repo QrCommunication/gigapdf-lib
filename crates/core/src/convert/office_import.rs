@@ -2125,9 +2125,9 @@ fn docx_paragraph_model(
                     }],
                     level: level.min(u8::MAX as u32) as u8,
                 }],
-            
-            ..Default::default()
-}),
+
+                ..Default::default()
+            }),
             ..Block::default()
         }
     } else {
@@ -2181,7 +2181,10 @@ struct DocxLink {
 /// The inline buffer currently receiving runs: the open hyperlink's children
 /// when one is being built, else the paragraph's top-level run list. Lets text /
 /// images / breaks land inside a link without duplicating the push logic.
-fn active_inlines<'a>(runs: &'a mut Vec<Inline>, link: &'a mut Option<DocxLink>) -> &'a mut Vec<Inline> {
+fn active_inlines<'a>(
+    runs: &'a mut Vec<Inline>,
+    link: &'a mut Option<DocxLink>,
+) -> &'a mut Vec<Inline> {
     match link {
         Some(l) => &mut l.children,
         None => runs,
@@ -4730,9 +4733,9 @@ fn pptx_group_paras_to_blocks(paras: Vec<PptxPara>) -> Vec<Block> {
                         ordered,
                         marker,
                         items,
-                    
-                    ..Default::default()
-}),
+
+                        ..Default::default()
+                    }),
                     ..Block::default()
                 });
             }
@@ -5895,9 +5898,9 @@ fn odf_walk_model(
                                             }],
                                             level: level.min(u8::MAX as u32) as u8,
                                         }],
-                                    
-                                    ..Default::default()
-}),
+
+                                        ..Default::default()
+                                    }),
                                     ..Block::default()
                                 });
                             }
@@ -6102,14 +6105,15 @@ fn odf_inline_model(
                     "annotation" if !sc => {
                         let ordinal = outline.comments.len() + 1;
                         let comment = odf_annotation_inline(x, attr(&attrs, "name"), ordinal);
-                        active_inlines(&mut runs, &mut link)
-                            .push(Inline::CommentRef { id: comment.id.clone() });
+                        active_inlines(&mut runs, &mut link).push(Inline::CommentRef {
+                            id: comment.id.clone(),
+                        });
                         outline.comments.push(comment);
                     }
                     // The paired range terminator carries no body and no anchor of
                     // its own; ignore it (it must not break the paragraph walk).
                     "annotation-end" => {}
-                    "tab" => odf_push(active_inlines(&mut runs, &mut link), &span_stack, " "),
+                    "tab" => odf_push(active_inlines(&mut runs, &mut link), &span_stack, "\t"),
                     "line-break" => active_inlines(&mut runs, &mut link).push(Inline::LineBreak),
                     "s" => {
                         let n = attr(&attrs, "c")
@@ -8792,7 +8796,12 @@ impl ParaStyle {
         for (i, side) in self.borders.iter().enumerate() {
             if let Some(b) = side {
                 has_border = true;
-                css.push_str(&format!("{}:{}pt {}", SIDE_PROP[i], fmt_pt(b.width_pt), b.style));
+                css.push_str(&format!(
+                    "{}:{}pt {}",
+                    SIDE_PROP[i],
+                    fmt_pt(b.width_pt),
+                    b.style
+                ));
                 if let Some(c) = &b.color {
                     css.push_str(&format!(" #{c}"));
                 }
@@ -16117,7 +16126,10 @@ mod tests {
                     .any(|r| matches!(r, Inline::CommentRef { id } if id == "1")),
                 _ => false,
             });
-        assert!(has_anchor, "an Inline::CommentRef{{id:\"1\"}} anchor is present");
+        assert!(
+            has_anchor,
+            "an Inline::CommentRef{{id:\"1\"}} anchor is present"
+        );
 
         // Semantic HTML render: in-flow marker + comment body in the aside.
         let html = crate::convert::web::html_from_model(&document);
@@ -16133,10 +16145,7 @@ mod tests {
             html.contains("Please clarify"),
             "HTML renders the comment body text"
         );
-        assert!(
-            html.contains("Reviewer"),
-            "HTML renders the comment author"
-        );
+        assert!(html.contains("Reviewer"), "HTML renders the comment author");
     }
 
     /// A formatting-change record (`w:rPrChange`, embedding the *old* `w:rPr`) is
@@ -19269,7 +19278,10 @@ mod tests {
                 _ => None,
             })
             .expect("an Inline::Link in the model");
-        assert_eq!(href, model::LinkTarget::Url("https://example.com/".to_string()));
+        assert_eq!(
+            href,
+            model::LinkTarget::Url("https://example.com/".to_string())
+        );
         let link_text: String = children
             .iter()
             .filter_map(|c| match c {
@@ -20898,7 +20910,10 @@ mod tests {
         let has_anchor = model_first_section_inlines(&model)
             .iter()
             .any(|i| matches!(i, Inline::CommentRef { id } if id == "cmt1"));
-        assert!(has_anchor, "an Inline::CommentRef{{id:\"cmt1\"}} anchor is present");
+        assert!(
+            has_anchor,
+            "an Inline::CommentRef{{id:\"cmt1\"}} anchor is present"
+        );
 
         // The surrounding text is intact (the annotation body did not leak in).
         let text: String = model_first_section_inlines(&model)
@@ -22887,7 +22902,11 @@ mod tests {
         </worksheet>"#;
         let s = xlsx_model_sheet("", sheet, None);
         // Columns 0..=4: [140, 140, 140, default(0), 84].
-        assert_eq!(s.col_widths.len(), 5, "five columns sized (incl. default gap)");
+        assert_eq!(
+            s.col_widths.len(),
+            5,
+            "five columns sized (incl. default gap)"
+        );
         for (i, w) in [140.0, 140.0, 140.0].iter().enumerate() {
             assert!(
                 (s.col_widths[i] - w).abs() < 1e-9,
@@ -23189,7 +23208,10 @@ mod tests {
           </office:spreadsheet></office:body>
         </office:document-content>"#;
         let mut z = ZipWriter::new();
-        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.spreadsheet");
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.spreadsheet",
+        );
         z.add_stored("content.xml", content.as_bytes());
         let model = office_to_model(&z.finish()).expect("ods → model");
         let sheet = match &model.sections[0].pages[0].blocks[0].kind {
@@ -24881,9 +24903,9 @@ mod tests {
                 width: 960.0,
                 height: 540.0,
                 margins: Margins::uniform(0.0),
-            
-        column_count: 1,
-    },
+
+                column_count: 1,
+            },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -25162,5 +25184,186 @@ mod tests {
         let _ = office_to_model(truncated.as_bytes());
         // The font-scan entry point is equally graceful on the same inputs.
         assert!(office_needed_fonts(b"<html></html>").is_none());
+    }
+
+    // ──────────────────── direct per-converter coverage ─────────────────────
+    //
+    // The dispatchers (`office_to_pdf` / `office_to_model`) are heavily tested
+    // above, but each concrete `<fmt>_to_pdf` / `<fmt>_to_model` entry point is
+    // also a public API surface. These tests call them DIRECTLY (bypassing the
+    // mimetype dispatch) so a regression confined to one converter can never
+    // hide behind the dispatcher.
+
+    /// Wrap a `content.xml` string into the zip-parts map the `*_to_*` builders
+    /// consume, tagging it with the matching ODF mimetype.
+    fn odf_parts(mimetype: &[u8], content: &str) -> BTreeMap<String, Vec<u8>> {
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", mimetype);
+        z.add_stored("content.xml", content.as_bytes());
+        read_zip(&z.finish())
+    }
+
+    #[test]
+    fn odt_to_pdf_direct_renders_text() {
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:h text:outline-level="1">ODT Direct Heading</text:h>
+    <text:p>odt direct body</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let parts = odf_parts(b"application/vnd.oasis.opendocument.text", content);
+        let pdf = odt_to_pdf(&parts);
+        let text = norm(&opens(&pdf).to_text());
+        assert!(text.contains("ODT Direct Heading"), "heading in: {text}");
+        assert!(text.contains("odt direct body"), "body in: {text}");
+    }
+
+    #[test]
+    fn odt_to_model_direct_lowers_heading_and_paragraph() {
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:table="tb" xmlns:style="s" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:style style:name="T1"><style:text-properties fo:font-weight="bold"/></style:style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:h text:outline-level="2">Model Heading</text:h>
+    <text:p>plain <text:span text:style-name="T1">bold</text:span> tail</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let parts = odf_parts(b"application/vnd.oasis.opendocument.text", content);
+        let document = odt_to_model(&parts);
+        let blocks: Vec<&BlockKind> = document
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .map(|b| &b.kind)
+            .collect();
+        let heading = blocks.iter().find_map(|k| match k {
+            BlockKind::Heading(h) => Some(h),
+            _ => None,
+        });
+        assert!(heading.is_some(), "a heading block is lowered");
+        assert_eq!(
+            heading.unwrap().level,
+            2,
+            "outline-level 2 → heading level 2"
+        );
+        let para = blocks.iter().find_map(|k| match k {
+            BlockKind::Paragraph(p) => Some(p),
+            _ => None,
+        });
+        let para = para.expect("a paragraph block is lowered");
+        assert!(
+            para.runs.iter().any(
+                |i| matches!(i, model::Inline::Run(r) if r.text.contains("bold") && r.style.bold)
+            ),
+            "the styled span keeps its bold CharStyle: {:?}",
+            para.runs
+        );
+    }
+
+    #[test]
+    fn ods_to_pdf_direct_renders_cells() {
+        let content = r#"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t">
+  <office:body><office:spreadsheet>
+    <table:table table:name="DirectSheet">
+      <table:table-row>
+        <table:table-cell><text:p>Alpha</text:p></table:table-cell>
+        <table:table-cell><text:p>42</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"#;
+        let parts = odf_parts(b"application/vnd.oasis.opendocument.spreadsheet", content);
+        let pdf = ods_to_pdf(&parts);
+        let text = norm(&opens(&pdf).to_text());
+        for needle in ["DirectSheet", "Alpha", "42"] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    #[test]
+    fn odp_to_pdf_direct_renders_slides() {
+        let content = r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:text="t">
+  <office:body><office:presentation>
+    <draw:page draw:name="p1"><draw:frame><draw:text-box>
+      <text:p>Direct Slide One</text:p>
+    </draw:text-box></draw:frame></draw:page>
+    <draw:page draw:name="p2"><draw:frame><draw:text-box>
+      <text:p>Direct Slide Two</text:p>
+    </draw:text-box></draw:frame></draw:page>
+  </office:presentation></office:body>
+</office:document-content>"#;
+        let parts = odf_parts(b"application/vnd.oasis.opendocument.presentation", content);
+        let pdf = odp_to_pdf(&parts);
+        let document = opens(&pdf);
+        assert!(document.page_count() >= 2, "one page per slide");
+        let text = norm(&document.to_text());
+        assert!(text.contains("Direct Slide One"), "slide 1 in: {text}");
+        assert!(text.contains("Direct Slide Two"), "slide 2 in: {text}");
+    }
+
+    #[test]
+    fn xlsx_to_pdf_direct_renders_cells() {
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "xl/workbook.xml",
+            br#"<workbook xmlns="x" xmlns:r="r"><sheets><sheet name="Direct" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        );
+        z.add_stored(
+            "xl/_rels/workbook.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+        );
+        z.add_stored(
+            "xl/worksheets/sheet1.xml",
+            br#"<worksheet xmlns="x"><sheetData>
+              <row r="1"><c r="A1" t="inlineStr"><is><t>CellOne</t></is></c><c r="B1"><v>99</v></c></row>
+            </sheetData></worksheet>"#,
+        );
+        let zip = read_zip(&z.finish());
+        let pdf = xlsx_to_pdf(&zip);
+        let text = norm(&opens(&pdf).to_text());
+        for needle in ["CellOne", "99"] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    #[test]
+    fn pptx_to_pdf_direct_renders_slides() {
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "ppt/presentation.xml",
+            br#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rId2"/></p:sldIdLst></p:presentation>"#,
+        );
+        z.add_stored(
+            "ppt/_rels/presentation.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide2.xml"/></Relationships>"#,
+        );
+        z.add_stored(
+            "ppt/slides/slide1.xml",
+            br#"<p:sld xmlns:a="a"><a:p><a:r><a:t>Direct PPTX One</a:t></a:r></a:p></p:sld>"#,
+        );
+        z.add_stored(
+            "ppt/slides/slide2.xml",
+            br#"<p:sld xmlns:a="a"><a:p><a:r><a:t>Direct PPTX Two</a:t></a:r></a:p></p:sld>"#,
+        );
+        let zip = read_zip(&z.finish());
+        let pdf = pptx_to_pdf(&zip);
+        let document = opens(&pdf);
+        assert!(document.page_count() >= 2, "one page per slide");
+        let text = norm(&document.to_text());
+        assert!(text.contains("Direct PPTX One"), "slide 1 in: {text}");
+        assert!(text.contains("Direct PPTX Two"), "slide 2 in: {text}");
+    }
+
+    #[test]
+    fn docx_to_pdf_direct_renders_text() {
+        let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>Direct DOCX body</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let zip = read_zip(&build_docx(doc, None, &[]));
+        let pdf = docx_to_pdf(&zip);
+        let text = norm(&opens(&pdf).to_text());
+        assert!(text.contains("Direct DOCX body"), "body in: {text}");
     }
 }

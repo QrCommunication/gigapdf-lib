@@ -21,19 +21,34 @@ const DET_BIN_THRESH: f32 = 0.3; // DBNet probability-map binarization threshold
 /// our own Latin/Cyrillic/Greek handwriting recognizer (grayscale H32 CRNN). One DBNet detector
 /// covers every script; only the recognizer + dict (+ input profile) vary.
 pub const REC_MODELS: &[(&str, &str, bool, Profile)] = &[
-    ("ar", "arabic_PP-OCRv3_rec", true, Profile::PaddleStd),   // Arabic — RTL
-    ("he", "hebrew", true, Profile::PaddleStd),                // Hebrew — our model, RTL
-    ("zh", "ch_PP-OCRv4_rec", false, Profile::PaddleStd),      // Simplified Chinese (+ Latin + digits)
-    ("zh_tw", "chinese_cht_PP-OCRv3_rec", false, Profile::PaddleStd), // Traditional Chinese
-    ("cyrillic", "cyrillic_PP-OCRv3_rec", false, Profile::PaddleStd), // Russian/Ukrainian/…
-    ("devanagari", "devanagari_PP-OCRv3_rec", false, Profile::PaddleStd), // Hindi/Marathi/…
-    ("en", "en_PP-OCRv4_rec", false, Profile::PaddleStd),      // English
-    ("ja", "japan_PP-OCRv3_rec", false, Profile::PaddleStd),   // Japanese
-    ("kn", "ka_PP-OCRv3_rec", false, Profile::PaddleStd),      // Kannada
-    ("ko", "korean_PP-OCRv3_rec", false, Profile::PaddleStd),  // Korean
+    ("ar", "arabic_PP-OCRv3_rec", true, Profile::PaddleStd), // Arabic — RTL
+    ("he", "hebrew", true, Profile::PaddleStd),              // Hebrew — our model, RTL
+    ("zh", "ch_PP-OCRv4_rec", false, Profile::PaddleStd), // Simplified Chinese (+ Latin + digits)
+    (
+        "zh_tw",
+        "chinese_cht_PP-OCRv3_rec",
+        false,
+        Profile::PaddleStd,
+    ), // Traditional Chinese
+    (
+        "cyrillic",
+        "cyrillic_PP-OCRv3_rec",
+        false,
+        Profile::PaddleStd,
+    ), // Russian/Ukrainian/…
+    (
+        "devanagari",
+        "devanagari_PP-OCRv3_rec",
+        false,
+        Profile::PaddleStd,
+    ), // Hindi/Marathi/…
+    ("en", "en_PP-OCRv4_rec", false, Profile::PaddleStd), // English
+    ("ja", "japan_PP-OCRv3_rec", false, Profile::PaddleStd), // Japanese
+    ("kn", "ka_PP-OCRv3_rec", false, Profile::PaddleStd), // Kannada
+    ("ko", "korean_PP-OCRv3_rec", false, Profile::PaddleStd), // Korean
     ("latin", "latin_PP-OCRv3_rec", false, Profile::PaddleStd), // French/German/Spanish/… (printed Latin)
-    ("ta", "ta_PP-OCRv3_rec", false, Profile::PaddleStd),      // Tamil
-    ("te", "te_PP-OCRv3_rec", false, Profile::PaddleStd),      // Telugu
+    ("ta", "ta_PP-OCRv3_rec", false, Profile::PaddleStd),       // Tamil
+    ("te", "te_PP-OCRv3_rec", false, Profile::PaddleStd),       // Telugu
     // Our Latin/Cyrillic/Greek handwriting CRNN (tools/train_handwriting.py) — grayscale H32.
     ("latin_hw", "latin_hw", false, Profile::Gray32),
 ];
@@ -132,7 +147,10 @@ fn load_charlist(
 impl OcrEngine {
     /// Build an engine with only the (shared) detection model; add rec models with `add_rec`.
     pub fn new(det: impl AsRef<Path>) -> Result<OcrEngine, Box<dyn std::error::Error>> {
-        Ok(OcrEngine { det: Model::load_file(det.as_ref())?, recs: Vec::new() })
+        Ok(OcrEngine {
+            det: Model::load_file(det.as_ref())?,
+            recs: Vec::new(),
+        })
     }
 
     /// Register a PaddleOCR-convention recognition model (RGB H48) under `name`.
@@ -207,10 +225,16 @@ impl OcrEngine {
         boxes.sort_by_key(|b| (b.y0 / 10, b.x0)); // top-to-bottom, then left-to-right
         let mut out = Vec::with_capacity(boxes.len());
         for b in boxes {
-            let crop = image::imageops::crop_imm(img, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0).to_image();
+            let crop =
+                image::imageops::crop_imm(img, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0).to_image();
             let (text, confidence, model) = self.recognize_line_auto(&crop)?;
             if !text.trim().is_empty() {
-                out.push(Line { bbox: b, text, confidence, model });
+                out.push(Line {
+                    bbox: b,
+                    text,
+                    confidence,
+                    model,
+                });
             }
         }
         Ok(out)
@@ -225,9 +249,13 @@ impl OcrEngine {
         page: u32,
         scale: f64,
     ) -> Result<Vec<OcrWord>, Box<dyn std::error::Error>> {
-        let png = doc.render_page(page, scale).map_err(|e| format!("render_page: {e:?}"))?;
+        let png = doc
+            .render_page(page, scale)
+            .map_err(|e| format!("render_page: {e:?}"))?;
         let img = image::load_from_memory(&png)?.to_rgb8();
-        let (_pw, ph, _rot) = doc.page_info(page).map_err(|e| format!("page_info: {e:?}"))?;
+        let (_pw, ph, _rot) = doc
+            .page_info(page)
+            .map_err(|e| format!("page_info: {e:?}"))?;
         let s = scale.max(0.01);
         Ok(self
             .recognize_page(&img)?
@@ -306,10 +334,16 @@ impl OcrEngine {
         boxes.sort_by_key(|b| (b.y0 / 10, b.x0));
         let mut out = Vec::with_capacity(boxes.len());
         for b in boxes {
-            let crop = image::imageops::crop_imm(img, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0).to_image();
+            let crop =
+                image::imageops::crop_imm(img, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0).to_image();
             if let Some((text, confidence)) = self.recognize_line_with(&crop, model)? {
                 if !text.trim().is_empty() {
-                    out.push(Line { bbox: b, text, confidence, model: model.to_string() });
+                    out.push(Line {
+                        bbox: b,
+                        text,
+                        confidence,
+                        model: model.to_string(),
+                    });
                 }
             }
         }
@@ -331,14 +365,19 @@ impl OcrEngine {
     }
 
     /// Run one rec model on a cropped line → (text, mean confidence). Reverses RTL output to logical.
-    fn decode(&self, m: &RecModel, line: &RgbImage) -> Result<(String, f32), Box<dyn std::error::Error>> {
+    fn decode(
+        &self,
+        m: &RecModel,
+        line: &RgbImage,
+    ) -> Result<(String, f32), Box<dyn std::error::Error>> {
         let (w0, h0) = (line.width().max(1) as f32, line.height().max(1) as f32);
         // Preprocess per input profile.
         let input: NdTensor<f32, 4> = match m.profile {
             Profile::PaddleStd => {
                 // RGB, height 48, normalize (px/255 − 0.5)/0.5, [1,3,48,W] (dynamic width).
                 let new_w = ((REC_H as f32) * w0 / h0).round().max(1.0) as u32;
-                let resized = image::imageops::resize(line, new_w, REC_H as u32, FilterType::Triangle);
+                let resized =
+                    image::imageops::resize(line, new_w, REC_H as u32, FilterType::Triangle);
                 let w = new_w as usize;
                 let mut data = vec![0f32; 3 * REC_H * w];
                 for y in 0..REC_H {
@@ -356,7 +395,9 @@ impl OcrEngine {
                 // box, resize to height 32 at its NATURAL width (the standard-LSTM ONNX is dynamic
                 // — no padding, so the backward pass sees the real line end). bg = 0.
                 let (lw, lh) = (line.width() as usize, line.height() as usize);
-                let ink = |px: &image::Rgb<u8>| 1.0 - (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0 / 255.0;
+                let ink = |px: &image::Rgb<u8>| {
+                    1.0 - (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0 / 255.0
+                };
                 let (mut x0, mut y0, mut x1, mut y1) = (lw, lh, 0usize, 0usize);
                 for y in 0..lh {
                     for x in 0..lw {
@@ -370,13 +411,24 @@ impl OcrEngine {
                 }
                 // Fallback to the full crop if no ink found.
                 let (cx, cy, cw, ch) = if x1 >= x0 && y1 >= y0 {
-                    (x0 as u32, y0 as u32, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32)
+                    (
+                        x0 as u32,
+                        y0 as u32,
+                        (x1 - x0 + 1) as u32,
+                        (y1 - y0 + 1) as u32,
+                    )
                 } else {
                     (0, 0, lw as u32, lh as u32)
                 };
                 let cropped = image::imageops::crop_imm(line, cx, cy, cw, ch).to_image();
-                let w = (((GRAY_H as f32) * cw as f32 / ch as f32).round().max(1.0) as usize).max(8);
-                let resized = image::imageops::resize(&cropped, w as u32, GRAY_H as u32, FilterType::Triangle);
+                let w =
+                    (((GRAY_H as f32) * cw as f32 / ch as f32).round().max(1.0) as usize).max(8);
+                let resized = image::imageops::resize(
+                    &cropped,
+                    w as u32,
+                    GRAY_H as u32,
+                    FilterType::Triangle,
+                );
                 let mut data = vec![0f32; GRAY_H * w];
                 for y in 0..GRAY_H {
                     for x in 0..w {

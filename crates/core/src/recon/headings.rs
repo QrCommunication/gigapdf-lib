@@ -347,7 +347,11 @@ mod tests {
         // three lines (2 breaks) — still a heading (gap #75 #5), not collapsed back
         // to a paragraph by the old 2-line cap.
         let lv = levels(&[20.0]);
-        let block = promote(para_block("A rather long chapter title", 20.0, false, 2), 12.0, &lv);
+        let block = promote(
+            para_block("A rather long chapter title", 20.0, false, 2),
+            12.0,
+            &lv,
+        );
         match block.kind {
             BlockKind::Heading(h) => assert_eq!(h.level, 1),
             _ => panic!("a 3-line large title should be a heading"),
@@ -368,7 +372,10 @@ mod tests {
         // The single-line bold subhead still promotes (the run-in subheading case).
         let lv1 = levels(&[12.0]);
         let one = promote(para_block("Bold subhead", 12.0, true, 0), 12.0, &lv1);
-        assert!(matches!(one.kind, BlockKind::Heading(_)), "one-line bold subhead promotes");
+        assert!(
+            matches!(one.kind, BlockKind::Heading(_)),
+            "one-line bold subhead promotes"
+        );
     }
 
     // ── clustering of the distinct heading sizes present ─────────────────────

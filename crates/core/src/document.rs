@@ -2843,7 +2843,9 @@ impl Document {
             contact_info,
             crate::sign::SubFilter::AdbePkcs7Detached,
             CONTENTS_BYTES_LEGACY,
-            move |signed| crate::sign::detached_cms_external(&key, &cert, signed).unwrap_or_default(),
+            move |signed| {
+                crate::sign::detached_cms_external(&key, &cert, signed).unwrap_or_default()
+            },
         )
     }
 
@@ -6490,7 +6492,9 @@ impl Document {
             def.default.header.extend(h.to_running(true).default.header);
         }
         if let Some(f) = legacy.footer {
-            def.default.footer.extend(f.to_running(false).default.footer);
+            def.default
+                .footer
+                .extend(f.to_running(false).default.footer);
         }
         Some(def)
     }
@@ -6748,7 +6752,14 @@ impl Document {
         marker: &str,
     ) -> Result<Vec<u8>> {
         Ok(self
-            .render_page_canvas_ex(page_no, scale, skip_text, &[], false, Some(marker.as_bytes()))?
+            .render_page_canvas_ex(
+                page_no,
+                scale,
+                skip_text,
+                &[],
+                false,
+                Some(marker.as_bytes()),
+            )?
             .to_png())
     }
 
@@ -7092,7 +7103,10 @@ impl Document {
                 let outline = rgb3([1.0, 0.0, 0.0]); // redaction red
                 let ic = self.read_num_array(dict, b"IC");
                 let fill = (ic.len() == 3).then(|| [ic[0], ic[1], ic[2]]);
-                (annot::redaction_default(rect, outline, fill), Dictionary::new())
+                (
+                    annot::redaction_default(rect, outline, fill),
+                    Dictionary::new(),
+                )
             }
             b"3D" => (
                 annot::annot_3d_default(rect, rgb3([0.2, 0.2, 0.2])),
@@ -7873,8 +7887,7 @@ impl Document {
         };
         // Reuse the shape extractor: the first painted path's fill (else stroke)
         // is the tile's dominant ink.
-        let paths =
-            content::vector::vector_paths_from_ops(&ops, &BTreeMap::new(), &resolver);
+        let paths = content::vector::vector_paths_from_ops(&ops, &BTreeMap::new(), &resolver);
         paths.iter().find_map(|p| p.fill.or(p.stroke))
     }
 
@@ -8386,15 +8399,18 @@ impl Document {
                             .font_style
                             .as_ref()
                             .map(|fs| {
-                                let mut ts =
-                                    crate::convert::style::parse_base_font(&fs.base_font);
+                                let mut ts = crate::convert::style::parse_base_font(&fs.base_font);
                                 ts.family = fs.family.clone();
                                 ts.bold = fs.bold;
                                 ts.italic = fs.italic;
                                 ts
                             })
                             .or_else(|| {
-                                element.font.as_deref().and_then(|f| font_styles.get(f)).cloned()
+                                element
+                                    .font
+                                    .as_deref()
+                                    .and_then(|f| font_styles.get(f))
+                                    .cloned()
                             })
                             .unwrap_or_default();
                         style.color = element.color;
@@ -9219,12 +9235,14 @@ impl Document {
             // target (to avoid cascading merges onto a moved block).
             for i in 0..section.pages.len() - 1 {
                 // Find the last Paragraph on page i (skipping empty blocks).
-                let tail_idx = section.pages[i].blocks.iter().rposition(|b| {
-                    matches!(&b.kind, BlockKind::Paragraph(_))
-                });
-                let head_idx = section.pages[i + 1].blocks.iter().position(|b| {
-                    matches!(&b.kind, BlockKind::Paragraph(_))
-                });
+                let tail_idx = section.pages[i]
+                    .blocks
+                    .iter()
+                    .rposition(|b| matches!(&b.kind, BlockKind::Paragraph(_)));
+                let head_idx = section.pages[i + 1]
+                    .blocks
+                    .iter()
+                    .position(|b| matches!(&b.kind, BlockKind::Paragraph(_)));
                 let (Some(tail_idx), Some(head_idx)) = (tail_idx, head_idx) else {
                     continue;
                 };
@@ -9254,7 +9272,8 @@ impl Document {
                     // Font size compatibility (within 15%).
                     let tail_size = Self::dominant_font_size(tail_p);
                     let head_size = Self::dominant_font_size(head_p);
-                    let ratio = (tail_size / head_size.max(1.0)).min(head_size / tail_size.max(1.0));
+                    let ratio =
+                        (tail_size / head_size.max(1.0)).min(head_size / tail_size.max(1.0));
                     if ratio < 0.85 {
                         continue;
                     }
@@ -9282,13 +9301,9 @@ impl Document {
                 }
                 // Perform the merge: move head's runs into tail, remove head.
                 let head_block = section.pages[i + 1].blocks.remove(head_idx);
-                if let (
-                    BlockKind::Paragraph(ref mut tail_p),
-                    BlockKind::Paragraph(head_p),
-                ) = (
-                    &mut section.pages[i].blocks[tail_idx].kind,
-                    head_block.kind,
-                ) {
+                if let (BlockKind::Paragraph(ref mut tail_p), BlockKind::Paragraph(head_p)) =
+                    (&mut section.pages[i].blocks[tail_idx].kind, head_block.kind)
+                {
                     // Join with a space if neither side already has trailing/
                     // leading whitespace (mirrors the paragraph builder's
                     // gap-aware run join).
@@ -9612,10 +9627,7 @@ impl Document {
                         .document_language()
                         .lang
                         .unwrap_or_else(|| "en".to_string());
-                    catalog.set(
-                        b"Lang",
-                        Object::String(lang.into_bytes(), Literal),
-                    );
+                    catalog.set(b"Lang", Object::String(lang.into_bytes(), Literal));
                 }
                 let _ = built.next_free;
             }
@@ -10479,8 +10491,9 @@ impl Document {
     pub fn to_linearized_with_version(&self, version: crate::serialize::PdfVersion) -> Vec<u8> {
         let objects = self.flate_streams();
         let header = version.header();
-        crate::serialize::to_linearized_with_header(&objects, &self.trailer, header)
-            .unwrap_or_else(|| crate::serialize::to_pdf_with_header(&objects, &self.trailer, header))
+        crate::serialize::to_linearized_with_header(&objects, &self.trailer, header).unwrap_or_else(
+            || crate::serialize::to_pdf_with_header(&objects, &self.trailer, header),
+        )
     }
 
     /// Reading-order text lines of a page (structured text): each line's text
@@ -14436,7 +14449,14 @@ impl Document {
                 Self::tile_image_ops(&img_name, x0, y0, page_w, page_h, draw_w, draw_h, opts)
             } else {
                 let (cx, cy) = Self::anchor_center(
-                    opts.anchor, x0, y0, page_w, page_h, draw_w, draw_h, opts.offset_x,
+                    opts.anchor,
+                    x0,
+                    y0,
+                    page_w,
+                    page_h,
+                    draw_w,
+                    draw_h,
+                    opts.offset_x,
                     opts.offset_y,
                 );
                 content::image_ops_centered_rotated(
@@ -22116,7 +22136,10 @@ fn build_doc_timestamp_layout(pdf: &[u8]) -> Result<(Vec<u8>, usize, usize, Vec<
     let mut sig = Dictionary::new();
     sig.set(b"Type".to_vec(), Object::Name(b"DocTimeStamp".to_vec()));
     sig.set(b"Filter".to_vec(), Object::Name(b"Adobe.PPKLite".to_vec()));
-    sig.set(b"SubFilter".to_vec(), Object::Name(b"ETSI.RFC3161".to_vec()));
+    sig.set(
+        b"SubFilter".to_vec(),
+        Object::Name(b"ETSI.RFC3161".to_vec()),
+    );
     sig.set(
         b"ByteRange".to_vec(),
         Object::Array(vec![Object::Integer(9_999_999_999); 4]),
@@ -22225,7 +22248,10 @@ fn build_doc_timestamp_layout(pdf: &[u8]) -> Result<(Vec<u8>, usize, usize, Vec<
 
 /// Resolve an optional indirect reference against a parsed object map (one hop;
 /// LTV helpers work on freshly scanned bytes, not the live `Document::resolve`).
-fn resolve_in<'a>(objects: &'a BTreeMap<ObjectId, Object>, obj: Option<&'a Object>) -> Option<&'a Object> {
+fn resolve_in<'a>(
+    objects: &'a BTreeMap<ObjectId, Object>,
+    obj: Option<&'a Object>,
+) -> Option<&'a Object> {
     match obj {
         Some(Object::Reference(id)) => objects.get(id),
         other => other,
@@ -22831,7 +22857,9 @@ fn json_obj_upsert(obj: &mut Vec<(String, EditorJson)>, key: &str, val: EditorJs
 
 /// Remove and return the value of `key` from an order-preserving object.
 fn json_obj_take(obj: &mut Vec<(String, EditorJson)>, key: &str) -> Option<EditorJson> {
-    obj.iter().position(|(k, _)| k == key).map(|p| obj.remove(p).1)
+    obj.iter()
+        .position(|(k, _)| k == key)
+        .map(|p| obj.remove(p).1)
 }
 
 fn json_skip_ws(b: &[u8], i: &mut usize) {
@@ -22890,7 +22918,10 @@ fn json_parse_number(b: &[u8], i: &mut usize) -> Option<EditorJson> {
             *i += 1;
         }
     }
-    let n = std::str::from_utf8(&b[start..*i]).ok()?.parse::<f64>().ok()?;
+    let n = std::str::from_utf8(&b[start..*i])
+        .ok()?
+        .parse::<f64>()
+        .ok()?;
     n.is_finite().then_some(EditorJson::Num(n))
 }
 
@@ -23105,7 +23136,10 @@ mod tests {
         let doc = Document::open(&pdf).unwrap();
         let pdfa = doc.to_pdfa();
         // The serialized trailer must contain a non-empty /ID array.
-        assert!(has_op(&pdfa, b"/ID"), "PDF/A output must carry a trailer /ID");
+        assert!(
+            has_op(&pdfa, b"/ID"),
+            "PDF/A output must carry a trailer /ID"
+        );
         // And it must still be a readable, single-page PDF.
         let reopened = Document::open(&pdfa).unwrap();
         assert!(reopened.page_count() >= 1);
@@ -23137,7 +23171,10 @@ mod tests {
             let out = doc.to_pdfa_level(level);
             assert!(out.starts_with(header), "{level:?} file header");
             assert!(
-                has_op(&out, format!("<pdfaid:part>{part}</pdfaid:part>").as_bytes()),
+                has_op(
+                    &out,
+                    format!("<pdfaid:part>{part}</pdfaid:part>").as_bytes()
+                ),
                 "{level:?} XMP part"
             );
             assert!(
@@ -24384,8 +24421,11 @@ mod tests {
         // the page re-parseable. Uses the text-run index (same as replace_text_run).
         let pdf = crate::convert::reverse::txt_to_pdf("seed");
         let mut doc = Document::open(&pdf).unwrap();
-        doc.set_page_content(1, b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (HELLO) Tj ET\n".to_vec())
-            .unwrap();
+        doc.set_page_content(
+            1,
+            b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (HELLO) Tj ET\n".to_vec(),
+        )
+        .unwrap();
 
         let els = doc.page_text_elements(1);
         let idx = els
@@ -24397,7 +24437,14 @@ mod tests {
         doc.set_text_run_style(
             1,
             idx,
-            &[(0, 2, content::TextStylePatch { color: Some([1.0, 0.0, 0.0]), ..Default::default() })],
+            &[(
+                0,
+                2,
+                content::TextStylePatch {
+                    color: Some([1.0, 0.0, 0.0]),
+                    ..Default::default()
+                },
+            )],
         )
         .unwrap();
 
@@ -24406,11 +24453,15 @@ mod tests {
         let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(joined, "HELLO", "no glyphs lost by the split");
         let s = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
-        assert!(s.contains("rg"), "a fill colour op was injected for the span");
+        assert!(
+            s.contains("rg"),
+            "a fill colour op was injected for the span"
+        );
 
         // An index that does not resolve (only one run) is an error.
         assert!(
-            doc.set_text_run_style(1, 99, &[(0, 1, content::TextStylePatch::default())]).is_err(),
+            doc.set_text_run_style(1, 99, &[(0, 1, content::TextStylePatch::default())])
+                .is_err(),
             "an out-of-range run index fails"
         );
     }
@@ -26692,12 +26743,30 @@ mod tests {
             .embed_truetype_font("Liberation Sans", crate::font::bundled::FALLBACK_TTF)
             .unwrap();
         let shaped = [
-            ShapedGlyph { gid: 1, x_advance: 600, x_offset: 0, y_offset: 0, cluster: 0 },
-            ShapedGlyph { gid: 2, x_advance: 600, x_offset: 0, y_offset: 0, cluster: 1 },
+            ShapedGlyph {
+                gid: 1,
+                x_advance: 600,
+                x_offset: 0,
+                y_offset: 0,
+                cluster: 0,
+            },
+            ShapedGlyph {
+                gid: 2,
+                x_advance: 600,
+                x_offset: 0,
+                y_offset: 0,
+                cluster: 1,
+            },
         ];
         let ops = doc.shaped_glyph_ops(font, &shaped, 1000.0, 20.0);
-        assert!(ops.contains("0 0 Td <0001> Tj"), "first glyph at origin: {ops}");
-        assert!(ops.contains("12 0 Td <0002> Tj"), "pen advanced 12pt: {ops}");
+        assert!(
+            ops.contains("0 0 Td <0001> Tj"),
+            "first glyph at origin: {ops}"
+        );
+        assert!(
+            ops.contains("12 0 Td <0002> Tj"),
+            "pen advanced 12pt: {ops}"
+        );
     }
 
     #[test]
@@ -27166,7 +27235,14 @@ mod tests {
 
         // AES-128 public-key encryption.
         let enc = original
-            .encrypt_for_recipients(std::slice::from_ref(&cert), -44, false, true, &seed, &rng_seed)
+            .encrypt_for_recipients(
+                std::slice::from_ref(&cert),
+                -44,
+                false,
+                true,
+                &seed,
+                &rng_seed,
+            )
             .unwrap();
         assert!(
             String::from_utf8_lossy(&enc).contains("/Adobe.PubSec"),
@@ -27205,7 +27281,14 @@ mod tests {
 
         // AES-256 public-key encryption round-trips too.
         let enc3 = original
-            .encrypt_for_recipients(std::slice::from_ref(&cert), -44, true, true, &seed, &rng_seed)
+            .encrypt_for_recipients(
+                std::slice::from_ref(&cert),
+                -44,
+                true,
+                true,
+                &seed,
+                &rng_seed,
+            )
             .unwrap();
         let opened3 = Document::open_with_private_key(&enc3, &cert, &key).unwrap();
         let got3: String = opened3
@@ -31224,7 +31307,10 @@ mod tests {
                 .and_then(|ap| ap.get(b"N"))
                 .is_some()
         };
-        assert!(has_ap, "FreeText annotation gains an /AP after regeneration");
+        assert!(
+            has_ap,
+            "FreeText annotation gains an /AP after regeneration"
+        );
         // A bad index is an InvalidArgument.
         assert!(matches!(
             doc.regenerate_appearance(1, 99),
@@ -31764,7 +31850,10 @@ mod tests {
         let page = els.iter().find(|e| e.text == "PAGE").expect("PAGE run");
         assert_eq!(page.font_family, "Helvetica", "page run keeps page /F1");
         assert!(!page.bold && !page.italic, "page run is regular");
-        assert_eq!(page.base_font, "Helvetica", "page run base_font is its /BaseFont");
+        assert_eq!(
+            page.base_font, "Helvetica",
+            "page run base_font is its /BaseFont"
+        );
 
         // The fix: the form run resolves against the FORM's /F1 (Times Bold-Italic),
         // NOT the page's Helvetica — and exposes the raw subset /BaseFont.
@@ -32811,11 +32900,17 @@ mod tests {
         let bottom_right = px(&canvas, 90, 90);
         // R grows with user-x (left→right): top_left low R, bottom_right high R.
         assert!(top_left[0] < 80, "top-left R ≈ 25, got {top_left:?}");
-        assert!(bottom_right[0] > 180, "bottom-right R ≈ 229, got {bottom_right:?}");
+        assert!(
+            bottom_right[0] > 180,
+            "bottom-right R ≈ 229, got {bottom_right:?}"
+        );
         // G grows with user-y (bottom→top in user space = top→bottom in device):
         // top_left (user y=90) high G, bottom_right (user y=10) low G.
         assert!(top_left[1] > 180, "top-left G ≈ 229, got {top_left:?}");
-        assert!(bottom_right[1] < 80, "bottom-right G ≈ 25, got {bottom_right:?}");
+        assert!(
+            bottom_right[1] < 80,
+            "bottom-right G ≈ 25, got {bottom_right:?}"
+        );
         // Blue is identically zero across the domain.
         assert!(top_left[2] < 20 && bottom_right[2] < 20, "B ≈ 0 everywhere");
     }
@@ -32870,8 +32965,7 @@ mod tests {
     /// is the dictionary *contents* (without the surrounding `<< >>` length entry,
     /// which is appended here). Test-only helper for the mesh fixtures.
     fn stream_obj_body(dict_inner: &str, data: &[u8]) -> Vec<u8> {
-        let mut body =
-            format!("<< {dict_inner} /Length {} >>\nstream\n", data.len()).into_bytes();
+        let mut body = format!("<< {dict_inner} /Length {} >>\nstream\n", data.len()).into_bytes();
         body.extend_from_slice(data);
         body.extend_from_slice(b"\nendstream");
         body
@@ -33502,11 +33596,8 @@ mod tests {
                 "page {page} should have no baked header after remove_headers"
             );
             assert!(
-                content::extract_marked_content_text(
-                    &reopened.page_content(page).unwrap(),
-                    b"h"
-                )
-                .is_none(),
+                content::extract_marked_content_text(&reopened.page_content(page).unwrap(), b"h")
+                    .is_none(),
                 "page {page} /GPHF header span must be stripped"
             );
         }
@@ -33679,7 +33770,10 @@ mod tests {
         let no_header = doc
             .render_page_excluding_marked_content(1, 1.0, false, "GPHF")
             .unwrap();
-        assert_ne!(full, no_header, "excluding the /GPHF band changes the raster");
+        assert_ne!(
+            full, no_header,
+            "excluding the /GPHF band changes the raster"
+        );
 
         // The header-excluded render equals a body-only render of the same page →
         // the band is fully gone AND the body is unchanged.
@@ -33769,7 +33863,9 @@ mod tests {
         );
 
         let reopened = Document::open(&doc.save()).unwrap();
-        let m2 = reopened.editor_margins(1).expect("margins survive save/open");
+        let m2 = reopened
+            .editor_margins(1)
+            .expect("margins survive save/open");
         assert!((m2.left - 40.0).abs() < 1e-9, "left margin round-trips");
     }
 
@@ -34003,11 +34099,9 @@ mod tests {
             .unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
         for (page, expect) in [(1u32, "MyDoc 1/3 2026-06-26"), (2, "MyDoc 2/3 2026-06-26")] {
-            let text = content::extract_marked_content_text(
-                &reopened.page_content(page).unwrap(),
-                b"h",
-            )
-            .unwrap_or_default();
+            let text =
+                content::extract_marked_content_text(&reopened.page_content(page).unwrap(), b"h")
+                    .unwrap_or_default();
             assert!(
                 text.contains(expect),
                 "page {page} header should read '{expect}', got '{text}'"
@@ -34057,7 +34151,10 @@ mod tests {
         };
         assert!(header_at(1).contains("COVER"), "page 1 → first_page zone");
         assert!(header_at(2).contains("EVEN"), "page 2 → even_page zone");
-        assert!(header_at(3).contains("DEFAULT"), "page 3 (odd) → default zone");
+        assert!(
+            header_at(3).contains("DEFAULT"),
+            "page 3 (odd) → default zone"
+        );
         assert!(header_at(4).contains("EVEN"), "page 4 → even_page zone");
     }
 
@@ -34247,10 +34344,8 @@ mod tests {
              << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
                 /Function << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [0 0 1] /N 1 >> \
                 /Extend [true true] >> >> >>";
-        let paths = vector_paths_with_resources(
-            "1 0 0 rg /Pattern cs /P1 scn 20 20 60 60 re f",
-            resources,
-        );
+        let paths =
+            vector_paths_with_resources("1 0 0 rg /Pattern cs /P1 scn 20 20 60 60 re f", resources);
         assert_eq!(paths.len(), 1, "the pattern-filled path must be emitted");
         let fill = paths[0].fill.expect("a representative fill colour");
         assert!(
@@ -34767,7 +34862,10 @@ mod tests {
         )
         .unwrap();
         let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
-        assert!(content.contains("(CONFIDENTIAL) Tj"), "text watermark drawn");
+        assert!(
+            content.contains("(CONFIDENTIAL) Tj"),
+            "text watermark drawn"
+        );
         assert!(content.contains(" gs"), "opacity via ExtGState");
         assert!(Document::open(&doc.save()).is_ok());
     }
@@ -34828,7 +34926,11 @@ mod tests {
 
         // The original signed bytes are an untouched prefix (incremental update).
         assert!(lt.len() > original_len, "DSS appended");
-        assert_eq!(&lt[..original_len], &pdf[..], "signed bytes byte-for-byte intact");
+        assert_eq!(
+            &lt[..original_len],
+            &pdf[..],
+            "signed bytes byte-for-byte intact"
+        );
 
         // The DSS dictionary with its three material arrays is present.
         let text = String::from_utf8_lossy(&lt);
@@ -34841,7 +34943,10 @@ mod tests {
         // The upgraded PDF still parses, and the catalog now has a /DSS ref.
         let reopened = Document::open(&lt).expect("reopen B-LT PDF");
         let catalog = reopened.catalog().expect("catalog");
-        assert!(catalog.get(b"DSS").is_some(), "catalog /DSS survives reparse");
+        assert!(
+            catalog.get(b"DSS").is_some(),
+            "catalog /DSS survives reparse"
+        );
     }
 
     #[test]
@@ -34881,11 +34986,17 @@ mod tests {
         ]);
 
         // Phase 2: embed the token, finalize B-LTA.
-        let blta = doc.finish_doc_timestamp(&token).expect("finish doc timestamp");
+        let blta = doc
+            .finish_doc_timestamp(&token)
+            .expect("finish doc timestamp");
 
         // The B-LT bytes are an untouched prefix; the timestamp is appended.
         assert!(blta.len() > blt_len, "doc timestamp appended");
-        assert_eq!(&blta[..blt_len], &blt[..], "B-LT bytes intact under the timestamp");
+        assert_eq!(
+            &blta[..blt_len],
+            &blt[..],
+            "B-LT bytes intact under the timestamp"
+        );
 
         let text = String::from_utf8_lossy(&blta);
         assert!(text.contains("/DocTimeStamp"), "document-timestamp /Type");
@@ -34894,7 +35005,10 @@ mod tests {
         // The token is embedded (hex-encoded) in the final /Contents window, and
         // recovers byte-for-byte through the hex/DER-trim reader.
         let token_hex: String = token.iter().map(|b| format!("{b:02X}")).collect();
-        assert!(text.contains(&token_hex), "TSA token hex present in /Contents");
+        assert!(
+            text.contains(&token_hex),
+            "TSA token hex present in /Contents"
+        );
         assert_eq!(
             signature_contents_bytes(&blta).as_deref(),
             Some(token.as_slice()),
@@ -36284,9 +36398,9 @@ mod tests {
                     level: 1,
                 },
             ],
-        
-        ..Default::default()
-};
+
+            ..Default::default()
+        };
         let ordered_text = text_from_model(&model_with_blocks(vec![Block {
             kind: BlockKind::List(list),
             ..Block::default()
@@ -36316,9 +36430,9 @@ mod tests {
                     level: 1,
                 },
             ],
-        
-        ..Default::default()
-};
+
+            ..Default::default()
+        };
         let bl_text = text_from_model(&model_with_blocks(vec![Block {
             kind: BlockKind::List(bullets),
             ..Block::default()

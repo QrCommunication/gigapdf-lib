@@ -9,6 +9,56 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.109.0] - 2026-06-30
+
+This release closes the remaining **1:1 import/export fidelity gaps** across the
+conversion matrix, makes **image conversion complete and uniform** across every
+entry point, and adds **dedicated tests for every converter** (52 format
+converters + the full image pipeline, end-to-end through the production WASM).
+
+### Added — conversion fidelity (both directions)
+
+- **HTML ⇄ model**: `letter-spacing` → `CharStyle.letter_spacing_pt`;
+  `visibility:hidden` / `display:none` → `CharStyle.hidden`; `<sup>`/`<sub>` →
+  run-level `VAlign::Super`/`Sub`; `<colgroup><col width>` → `Table.col_widths`.
+- **Markdown ⇄ model**: inline HTML `<sup>`/`<sub>` imported as run-level
+  super/subscript.
+- **ODT ⇄ model**: `text:tab` imported as a real tab character; model tabs
+  exported as `<text:tab/>` (was a literal space / raw tab).
+- **DOCX export**: model tabs emitted as `<w:tab/>` (was a raw tab inside
+  `<w:t>`).
+- **RTF ⇄ model / HTML**: `\page` recovered as a real page boundary in the
+  `Document` model and as a CSS `break-before:page` marker in the HTML/PDF path.
+
+### Added — image conversion (PNG · JPEG · GIF · WebP · AVIF · TIFF)
+
+The two image entry points were asymmetric; they are now in lockstep, so every
+supported format works on **all** of import-to-model, image-to-PDF and direct
+embedding:
+
+- **AVIF** is now accepted by the PDF image embedder (`prepare_image`) and the
+  soft-mask source path — `add_image` / `addImage` / image watermark accept AVIF
+  directly (previously image→PDF only).
+- **TIFF** is now accepted by `image_to_pdf` / the image-watermark transcode
+  path and by `image_to_model` (header-only `ImageWidth`/`ImageLength` probe,
+  little- and big-endian, SHORT/LONG tags) — the embedder already decoded TIFF,
+  so the three entry points now agree.
+
+### Tests
+
+- **Every converter has a dedicated test.** Audited all 52 public format
+  converters; added direct tests for the 7 that were previously only exercised
+  through the format dispatcher (`odt_to_pdf`, `ods_to_pdf`, `odp_to_pdf`,
+  `xlsx_to_pdf`, `pptx_to_pdf`, `docx_to_pdf`, `odt_to_model`, `flow_to_pdf`).
+- **Image pipeline coverage**, including the production WASM binary: PNG, JPEG,
+  GIF, WebP, AVIF and TIFF → PDF, plus AVIF/TIFF detection and the embed paths.
+- Rust engine: **2276** unit tests. SDK: **59** tests (6 new image-conversion
+  tests). `cargo clippy --workspace --all-targets -D warnings` is clean.
+
+### Note
+
+- EPUB remains **export-only** by design (no EPUB import).
+
 ## [0.107.1] - 2026-06-27
 
 ### Fixed

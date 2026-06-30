@@ -60,8 +60,8 @@ pub use annot::Annotation;
 pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, TextRun};
 pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 pub use document::{
-    AfRelationship, Attachment, Bookmark, Color, CollectionConfig, CollectionField,
-    CollectionFieldSubtype, CollectionItem, CollectionView, Document, EmbeddedFontInfo,
+    AfRelationship, Attachment, Bookmark, CollectionConfig, CollectionField,
+    CollectionFieldSubtype, CollectionItem, CollectionView, Color, Document, EmbeddedFontInfo,
     GradientKind, GradientSpec, GradientStop, ImageElementInfo, ImageWatermarkOptions, InfoFields,
     NupOptions, PageBox, PageBoxes, PageBoxesDeclared, PageLabelRange, PageLabelStyle,
     PageTransition, SearchMatch, SignatureInfo, SignatureReport, TextElementInfo, TextLayerRun,

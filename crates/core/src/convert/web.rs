@@ -641,7 +641,6 @@ fn html_slide(slide: &Slide, doc: &Document, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::convert::{Generic, PlacedImage, PlacedText, TextStyle};
 
     #[test]
     fn html_table_renders_header_row_as_thead_th() {

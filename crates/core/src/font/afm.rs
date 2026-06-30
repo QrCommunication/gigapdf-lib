@@ -132,7 +132,10 @@ fn ascii_width(afm: Afm, c: char) -> u16 {
     };
     let idx = (c as usize).saturating_sub(0x20);
     // Fall back to lowercase-'n' width for anything out of the ASCII range.
-    table.get(idx).copied().unwrap_or(table['n' as usize - 0x20])
+    table
+        .get(idx)
+        .copied()
+        .unwrap_or(table['n' as usize - 0x20])
 }
 
 /// Map an accented Latin letter to its base ASCII letter. In every Core-14 face

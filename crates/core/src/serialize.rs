@@ -2003,9 +2003,7 @@ fn build_hint_payload(input: HintInput) -> (Vec<u8>, HintOffsets) {
 /// the end for the last `startxref` keyword. `None` if absent or unparsable.
 pub fn last_startxref(pdf: &[u8]) -> Option<usize> {
     let keyword = b"startxref";
-    let pos = pdf
-        .windows(keyword.len())
-        .rposition(|w| w == keyword)?;
+    let pos = pdf.windows(keyword.len()).rposition(|w| w == keyword)?;
     let rest = &pdf[pos + keyword.len()..];
     let digits: Vec<u8> = rest
         .iter()
@@ -2340,7 +2338,10 @@ mod tests {
     /// `/Outlines` (a 2-item outline) and `/Threads` (one article: thread + info +
     /// bead). Object numbers: 1 catalog, 2 pages, 3/5 page objects, 4/6 contents,
     /// 7 outlines + 8/9 items, 10 thread + 11 info + 12 bead.
-    fn lin_objects(with_outline: bool, with_threads: bool) -> (BTreeMap<ObjectId, Object>, Dictionary) {
+    fn lin_objects(
+        with_outline: bool,
+        with_threads: bool,
+    ) -> (BTreeMap<ObjectId, Object>, Dictionary) {
         let mut objects: BTreeMap<ObjectId, Object> = BTreeMap::new();
         let mut catalog = vec![("Type", tname(b"Catalog")), ("Pages", tref(2))];
         if with_outline {
@@ -2435,7 +2436,10 @@ mod tests {
                     ("N", tref(12)),
                     ("V", tref(12)),
                     ("P", tref(3)),
-                    ("R", Object::Array(vec![tint(0), tint(0), tint(100), tint(100)])),
+                    (
+                        "R",
+                        Object::Array(vec![tint(0), tint(0), tint(100), tint(100)]),
+                    ),
                 ])),
             );
         }
@@ -2559,7 +2563,11 @@ mod tests {
         let lin = to_linearized(&objects, &trailer).expect("linearize");
         let doc = Document::open(&lin).expect("reopen");
         assert_eq!(doc.page_count(), 2);
-        assert_eq!(doc.outline_items().len(), 2, "outline survives linearization");
+        assert_eq!(
+            doc.outline_items().len(),
+            2,
+            "outline survives linearization"
+        );
 
         let (decoded, dict) = extract_hint(&lin);
         let o = int_after(&dict, b"/O ").expect("hint dict has /O") as usize;
@@ -2622,7 +2630,10 @@ mod tests {
         ]));
         let pages = Object::Dictionary(mkdict(vec![
             ("Type", tname(b"Pages")),
-            ("Kids", Object::Array(vec![tref(3), tref(5), tref(new_page)])),
+            (
+                "Kids",
+                Object::Array(vec![tref(3), tref(5), tref(new_page)]),
+            ),
             ("Count", tint(3)),
         ]));
         let new = vec![(new_page, 0u16, page), (2u32, 0u16, pages)];
@@ -2635,7 +2646,10 @@ mod tests {
     fn incremental_xref_stream_update_round_trips() {
         let (objects, trailer) = lin_objects(false, false);
         let base = to_pdf_compressed(&objects, &trailer, false); // xref-stream base
-        assert!(find_sub(&base, b"/Type /XRef").is_some(), "base uses an xref stream");
+        assert!(
+            find_sub(&base, b"/Type /XRef").is_some(),
+            "base uses an xref stream"
+        );
 
         let (updated, prev_size) = add_page_update(&base);
         let appended = &updated[base.len()..];
@@ -2667,7 +2681,10 @@ mod tests {
         let base = to_pdf(&objects, &trailer); // classic xref base
         let (updated, prev_size) = add_page_update(&base);
         let appended = &updated[base.len()..];
-        assert!(find_sub(appended, b"xref\n").is_some(), "classic xref table");
+        assert!(
+            find_sub(appended, b"xref\n").is_some(),
+            "classic xref table"
+        );
         assert!(find_sub(appended, b"trailer").is_some(), "classic trailer");
         assert!(
             find_sub(appended, b"/Type /XRef").is_none(),
@@ -2689,9 +2706,11 @@ mod tests {
         assert_eq!(PdfVersion::default(), PdfVersion::V1_7);
         let (objects, trailer) = lin_objects(false, false);
 
-        let v17 = to_pdf_compressed_with_header(&objects, &trailer, true, PdfVersion::V1_7.header());
+        let v17 =
+            to_pdf_compressed_with_header(&objects, &trailer, true, PdfVersion::V1_7.header());
         assert!(v17.starts_with(b"%PDF-1.7"));
-        let v20 = to_pdf_compressed_with_header(&objects, &trailer, true, PdfVersion::V2_0.header());
+        let v20 =
+            to_pdf_compressed_with_header(&objects, &trailer, true, PdfVersion::V2_0.header());
         assert!(v20.starts_with(b"%PDF-2.0"));
         // The bare wrapper keeps the historical 1.5 banner.
         assert!(to_pdf_compressed(&objects, &trailer, true).starts_with(b"%PDF-1.5"));

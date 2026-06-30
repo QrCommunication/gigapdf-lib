@@ -169,9 +169,9 @@ fn emit_block(
                     ordered,
                     marker: synthetic_marker,
                     items: vec![list_item(el, sheet, style, &chain, 0)],
-                
-                ..Default::default()
-})));
+
+                    ..Default::default()
+                })));
                 return;
             }
             let mut child_blocks = Vec::new();
@@ -269,8 +269,70 @@ fn emit_table(el: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Ele
     collect_rows(el, sheet, style, ancestors, false, &mut rows);
     Table {
         rows,
-        col_widths: Vec::new(),
+        col_widths: table_col_widths(el, sheet, style, ancestors),
         border: crate::model::BorderStyle::default(),
+    }
+}
+
+/// HTML `<colgroup><col width=…>` / CSS `width` → model column widths (points).
+/// A zero/missing width is left out, so exporters keep their auto-layout default.
+fn table_col_widths(
+    el: &Element,
+    sheet: &Stylesheet,
+    style: &Style,
+    ancestors: &[&Element],
+) -> Vec<f64> {
+    let mut widths = Vec::new();
+    let mut chain = ancestors.to_vec();
+    chain.push(el);
+    for child in &el.children {
+        let Node::Element(cg) = child else { continue };
+        if cg.tag != "colgroup" {
+            continue;
+        }
+        let cg_style = sheet.computed(cg, style, &chain);
+        let mut cg_chain = chain.clone();
+        cg_chain.push(cg);
+        for node in &cg.children {
+            let Node::Element(col) = node else { continue };
+            if col.tag != "col" {
+                continue;
+            }
+            let repeat = col
+                .attr("span")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let cs = sheet.computed(col, &cg_style, &cg_chain);
+            let width = cs
+                .width
+                .and_then(|w| match w {
+                    crate::html::css::Len::Pt(pt) if pt > 0.0 => Some(pt),
+                    _ => None,
+                })
+                .or_else(|| col.attr("width").and_then(parse_col_width_pt));
+            if let Some(pt) = width {
+                widths.extend(std::iter::repeat_n(pt, repeat));
+            }
+        }
+    }
+    widths
+}
+
+fn parse_col_width_pt(raw: &str) -> Option<f64> {
+    let v = raw.trim();
+    if v.is_empty() || v.ends_with('%') {
+        return None;
+    }
+    let num = v
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    if num > 0.0 {
+        Some(num)
+    } else {
+        None
     }
 }
 
@@ -528,12 +590,13 @@ fn char_style(style: &Style) -> CharStyle {
         strike: style.strike,
         color: Some(style.color),
         background: style.background,
-        vertical_align: match style.vertical_align {
-            crate::html::css::VAlign::Top => crate::model::VAlign::Baseline,
-            crate::html::css::VAlign::Middle => crate::model::VAlign::Baseline,
-            crate::html::css::VAlign::Bottom => crate::model::VAlign::Baseline,
+        vertical_align: match style.valign {
+            crate::html::css::VShift::Super => crate::model::VAlign::Super,
+            crate::html::css::VShift::Sub => crate::model::VAlign::Sub,
+            _ => crate::model::VAlign::Baseline,
         },
-        ..Default::default()
+        letter_spacing_pt: style.letter_spacing,
+        hidden: style.hidden || style.display == Display::None,
     }
 }
 
@@ -745,6 +808,42 @@ mod tests {
         };
         assert!(t.rows[0].is_header, "all-<th> row → header");
         assert!(!t.rows[1].is_header, "mixed/<td> row → body");
+    }
+
+    #[test]
+    fn inline_fidelity_styles_and_col_widths_lower_to_model() {
+        let doc = model_of(
+            "<table><colgroup><col style=\"width:42pt\"><col span=\"2\" width=\"24\"></colgroup>\
+             <tr><td><p><span style=\"letter-spacing:2pt\">wide</span><sup>2</sup>\
+             <sub>x</sub><span style=\"visibility:hidden\">hide</span></p></td></tr></table>",
+        );
+        let t = match &blocks(&doc)[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected table, got {other:?}"),
+        };
+        assert_eq!(t.col_widths, vec![42.0, 24.0, 24.0]);
+        let para = match &t.rows[0].cells[0].blocks[0].kind {
+            BlockKind::Paragraph(p) => p,
+            other => panic!("expected paragraph in cell, got {other:?}"),
+        };
+        assert!(
+            para.runs.iter().any(|i| matches!(i, Inline::Run(r) if r.text == "wide" && (r.style.letter_spacing_pt - 2.0).abs() < 1e-9)),
+            "letter-spacing survives in CharStyle"
+        );
+        assert!(
+            para.runs.iter().any(|i| matches!(i, Inline::Run(r) if r.text == "2" && r.style.vertical_align == crate::model::VAlign::Super)),
+            "sup survives in CharStyle"
+        );
+        assert!(
+            para.runs.iter().any(|i| matches!(i, Inline::Run(r) if r.text == "x" && r.style.vertical_align == crate::model::VAlign::Sub)),
+            "sub survives in CharStyle"
+        );
+        assert!(
+            para.runs
+                .iter()
+                .any(|i| matches!(i, Inline::Run(r) if r.text == "hide" && r.style.hidden)),
+            "visibility:hidden survives in CharStyle"
+        );
     }
 
     /// Concatenate a paragraph's plain run text (for assertions).
