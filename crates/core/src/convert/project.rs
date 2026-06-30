@@ -1419,4 +1419,543 @@ mod tests {
         assert!(pdf.starts_with(b"%PDF-"), "starts with PDF magic");
         assert!(pdf.windows(5).any(|w| w == b"%%EOF"), "has EOF marker");
     }
+
+    // ── absolute placement (frame = Some) drives the place_* functions ─────────
+
+    fn shape(fill: Option<[f64; 3]>) -> Shape {
+        Shape {
+            segments: vec![
+                PathSeg::Move(0.0, 0.0),
+                PathSeg::Line(10.0, 0.0),
+                PathSeg::Cubic(10.0, 0.0, 20.0, 5.0, 20.0, 10.0),
+                PathSeg::Close,
+            ],
+            fill,
+            stroke: Some([0.0, 0.0, 1.0]),
+            stroke_width: 2.0,
+            dash: vec![3.0, 2.0],
+        }
+    }
+
+    #[test]
+    fn absolute_shape_translates_segments_to_frame_origin() {
+        let frame = Rect::new(100.0, 200.0, 30.0, 30.0);
+        let pages: Vec<ConvPage> =
+            (&doc_with(BlockKind::Shape(shape(Some([1.0, 0.0, 0.0]))), Some(frame))).into();
+        assert_eq!(pages[0].shapes.len(), 1, "one placed shape");
+        let s = &pages[0].shapes[0];
+        assert_eq!((s.x, s.y), (100.0, 200.0));
+        assert_eq!(s.fill, Some([1.0, 0.0, 0.0]));
+        assert_eq!(s.stroke, Some([0.0, 0.0, 1.0]));
+        assert_eq!(s.dash, vec![3.0, 2.0]);
+        // The first Move is offset by the frame origin (segments are stored
+        // frame-relative, translated on placement).
+        match s.segments[0] {
+            PathSeg::Move(x, y) => assert_eq!((x, y), (100.0, 200.0)),
+            other => panic!("expected Move, got {other:?}"),
+        }
+        // The Cubic's three control points are all offset.
+        match s.segments[2] {
+            PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                assert_eq!((x1, y1), (110.0, 200.0));
+                assert_eq!((x2, y2), (120.0, 205.0));
+                assert_eq!((x3, y3), (120.0, 210.0));
+            }
+            other => panic!("expected Cubic, got {other:?}"),
+        }
+        // Close passes through unchanged.
+        assert!(matches!(s.segments[3], PathSeg::Close));
+    }
+
+    #[test]
+    fn absolute_image_records_box_and_skips_zero_size() {
+        let img = ImageRef {
+            resource: 7,
+            alt: None,
+        };
+        let frame = Rect::new(50.0, 60.0, 120.0, 90.0);
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::Image(img.clone()), Some(frame))).into();
+        assert_eq!(pages[0].images.len(), 1);
+        let pi = &pages[0].images[0];
+        assert_eq!((pi.x, pi.y, pi.width, pi.height), (50.0, 60.0, 120.0, 90.0));
+        assert!(pi.png.is_empty(), "compat fallback carries no bytes");
+
+        // A zero-sized frame is skipped entirely (the early return).
+        let pages: Vec<ConvPage> =
+            (&doc_with(BlockKind::Image(img), Some(Rect::new(0.0, 0.0, 0.0, 40.0)))).into();
+        assert!(pages[0].images.is_empty(), "zero-width image not placed");
+    }
+
+    #[test]
+    fn absolute_list_box_places_each_item_with_prefix_and_indent() {
+        let list = List {
+            ordered: false,
+            marker: ListMarker::Bullet('*'),
+            items: vec![
+                ListItem {
+                    blocks: vec![block(BlockKind::Paragraph(paragraph("alpha")), None)],
+                    level: 0,
+                },
+                ListItem {
+                    blocks: vec![block(BlockKind::Paragraph(paragraph("beta")), None)],
+                    level: 1, // deeper → larger indent
+                },
+            ],
+            start: 1,
+        };
+        let frame = Rect::new(40.0, 40.0, 300.0, 200.0);
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::List(list), Some(frame))).into();
+        let texts = &pages[0].texts;
+        let a = texts.iter().find(|t| t.text == "* alpha").expect("item 0");
+        let b = texts.iter().find(|t| t.text == "* beta").expect("item 1");
+        assert_eq!(a.x, 40.0, "level-0 item at frame x");
+        assert_eq!(b.x, 40.0 + 18.0, "level-1 item indented by 18pt");
+        assert!(b.y > a.y, "second item below the first");
+    }
+
+    #[test]
+    fn absolute_table_box_places_cells_on_a_column_grid() {
+        let cell = |s: &str| crate::model::Cell {
+            blocks: vec![block(BlockKind::Paragraph(paragraph(s)), None)],
+            ..crate::model::Cell::default()
+        };
+        let table = Table {
+            rows: vec![
+                crate::model::Row {
+                    cells: vec![cell("R0C0"), cell("R0C1")],
+                    height: Some(20.0),
+                    is_header: true,
+                },
+                crate::model::Row {
+                    cells: vec![cell("R1C0"), cell("")], // empty cell skipped
+                    height: None,
+                    is_header: false,
+                },
+            ],
+            col_widths: vec![100.0, 60.0],
+            border: Default::default(),
+        };
+        let frame = Rect::new(30.0, 30.0, 200.0, 100.0);
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::Table(table), Some(frame))).into();
+        let texts = &pages[0].texts;
+        let c00 = texts.iter().find(|t| t.text == "R0C0").unwrap();
+        let c01 = texts.iter().find(|t| t.text == "R0C1").unwrap();
+        let c10 = texts.iter().find(|t| t.text == "R1C0").unwrap();
+        assert_eq!(c00.x, 30.0, "first column at frame x");
+        assert!(c01.x > c00.x, "second column to the right");
+        assert!(c10.y > c00.y, "second row below header");
+        // The empty cell produced no text.
+        assert_eq!(texts.iter().filter(|t| t.text.is_empty()).count(), 0);
+    }
+
+    #[test]
+    fn absolute_code_box_places_each_nonblank_line() {
+        let code = crate::model::CodeBlock {
+            lang: None,
+            code: "line1\n\nline3".into(), // blank middle line skipped
+        };
+        let frame = Rect::new(20.0, 20.0, 400.0, 200.0);
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::CodeBlock(code), Some(frame))).into();
+        let texts = &pages[0].texts;
+        assert!(texts.iter().any(|t| t.text == "line1"));
+        assert!(texts.iter().any(|t| t.text == "line3"));
+        assert!(!texts.iter().any(|t| t.text.is_empty()));
+        // Monospace generic carried through.
+        let l1 = texts.iter().find(|t| t.text == "line1").unwrap();
+        assert_eq!(l1.style.generic, Generic::Mono);
+    }
+
+    #[test]
+    fn absolute_quote_box_indents_inner_blocks() {
+        let quote = crate::model::Blockquote {
+            blocks: vec![block(BlockKind::Paragraph(paragraph("quoted")), None)],
+        };
+        let frame = Rect::new(10.0, 10.0, 300.0, 100.0);
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::Blockquote(quote), Some(frame))).into();
+        let q = pages[0].texts.iter().find(|t| t.text == "quoted").unwrap();
+        // place_quote_box nudges content right by 18pt from the frame x.
+        assert_eq!(q.x, 10.0 + 18.0);
+    }
+
+    #[test]
+    fn absolute_rule_emits_a_thin_horizontal_stroke() {
+        let frame = Rect::new(72.0, 100.0, 200.0, 0.0);
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::HorizontalRule, Some(frame))).into();
+        assert_eq!(pages[0].shapes.len(), 1, "rule emits a stroke shape");
+        let s = &pages[0].shapes[0];
+        assert_eq!(s.height, 0.0, "rule is a zero-height line");
+        assert_eq!(s.stroke, Some([0.6, 0.6, 0.6]));
+        assert!(s.fill.is_none());
+        assert_eq!(s.segments.len(), 2, "a Move + a Line");
+    }
+
+    #[test]
+    fn absolute_textbox_stacks_inner_blocks_from_frame() {
+        let tb = TextBox {
+            blocks: vec![
+                block(BlockKind::Paragraph(paragraph("one")), None),
+                block(BlockKind::Paragraph(paragraph("two")), None),
+            ],
+        };
+        let frame = Rect::new(15.0, 25.0, 200.0, 100.0);
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::TextBox(tb), Some(frame))).into();
+        let one = pages[0].texts.iter().find(|t| t.text == "one").unwrap();
+        let two = pages[0].texts.iter().find(|t| t.text == "two").unwrap();
+        assert_eq!(one.x, 15.0);
+        assert!(two.y > one.y, "second paragraph below the first");
+    }
+
+    // ── slide lowering ────────────────────────────────────────────────────────
+
+    #[test]
+    fn slide_block_lowers_to_one_conv_page_per_slide() {
+        use crate::model::slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
+        let title = Placeholder {
+            role: PlaceholderRole::Title,
+            block: block(
+                BlockKind::Paragraph(paragraph("Slide Title")),
+                Some(Rect::new(40.0, 30.0, 600.0, 60.0)),
+            ),
+        };
+        let body_shape = block(
+            BlockKind::Paragraph(paragraph("Body bullet")),
+            Some(Rect::new(40.0, 120.0, 600.0, 300.0)),
+        );
+        let slide = Slide {
+            geometry: PageGeometry {
+                width: 720.0,
+                height: 540.0,
+                ..PageGeometry::default()
+            },
+            shapes: vec![body_shape],
+            placeholders: vec![title],
+            notes: None,
+            background: None,
+        };
+        let doc = Document {
+            sections: vec![Section {
+                geometry: PageGeometry::a4(),
+                pages: vec![Page {
+                    blocks: vec![block(
+                        BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        None,
+                    )],
+                    absolute: true,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let pages: Vec<ConvPage> = (&doc).into();
+        assert_eq!(pages.len(), 1, "one slide ⇒ one ConvPage");
+        assert_eq!((pages[0].width, pages[0].height), (720.0, 540.0));
+        let texts = &pages[0].texts;
+        assert!(texts.iter().any(|t| t.text == "Slide Title"));
+        assert!(texts.iter().any(|t| t.text == "Body bullet"));
+    }
+
+    #[test]
+    fn sheet_block_with_trailing_flow_blocks_emits_extra_flow_page() {
+        // A page carrying BOTH a Sheet and a plain paragraph: the sheet expands to
+        // its own page, and the leftover paragraph is not dropped — it lands on an
+        // appended flow page (the `handled_special` + `rest` branch).
+        use crate::model::{SheetBlock, SheetRow};
+        let sheet = Sheet {
+            name: "S".into(),
+            rows: vec![SheetRow {
+                cells: vec![crate::model::SheetCell {
+                    value: CellValue::Text("cell".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: vec![80.0],
+        };
+        let doc = Document {
+            sections: vec![Section {
+                geometry: PageGeometry::a4(),
+                pages: vec![Page {
+                    blocks: vec![
+                        block(
+                            BlockKind::Sheet(SheetBlock {
+                                sheets: vec![sheet],
+                            }),
+                            None,
+                        ),
+                        block(BlockKind::Paragraph(paragraph("leftover")), None),
+                    ],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let pages: Vec<ConvPage> = (&doc).into();
+        assert_eq!(pages.len(), 2, "sheet page + appended flow page");
+        let all: String = pages
+            .iter()
+            .flat_map(|p| p.texts.iter())
+            .map(|t| t.text.as_str())
+            .collect();
+        assert!(all.contains("cell"), "sheet content present");
+        assert!(all.contains("leftover"), "trailing flow block not dropped");
+    }
+
+    // ── flow layout: lists, tables, code, rules, pagination, styles ────────────
+
+    fn styled_para(text: &str, cs: CharStyle, ph: crate::model::ParagraphStyle) -> Paragraph {
+        Paragraph {
+            runs: vec![Inline::Run(InlineRun {
+                text: text.to_string(),
+                style: cs,
+                source_index: None,
+            })],
+            style: ph,
+            style_ref: None,
+        }
+    }
+
+    #[test]
+    fn flow_list_handles_multi_block_items_and_empty_items() {
+        // Item 0: a paragraph (prefixed) PLUS a trailing paragraph flowed under it.
+        // Item 1: leads with a non-paragraph (a nested list) → the `_ =>` arm.
+        // Item 2: empty → still emits the bare marker (the else branch).
+        let nested = List {
+            ordered: false,
+            marker: ListMarker::Bullet('-'),
+            items: vec![ListItem {
+                blocks: vec![block(BlockKind::Paragraph(paragraph("nested")), None)],
+                level: 0,
+            }],
+            start: 1,
+        };
+        let list = List {
+            ordered: true,
+            marker: ListMarker::Decimal,
+            items: vec![
+                ListItem {
+                    blocks: vec![
+                        block(BlockKind::Paragraph(paragraph("primary")), None),
+                        block(BlockKind::Paragraph(paragraph("continued")), None),
+                    ],
+                    level: 0,
+                },
+                ListItem {
+                    blocks: vec![block(BlockKind::List(nested), None)],
+                    level: 0,
+                },
+                ListItem {
+                    blocks: vec![], // empty item
+                    level: 0,
+                },
+            ],
+            start: 1,
+        };
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::List(list), None)).into();
+        let texts: Vec<&str> = pages[0].texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(texts.iter().any(|t| t.contains("primary")));
+        assert!(texts.contains(&"continued"));
+        assert!(texts.iter().any(|t| t.contains("nested")));
+        // The empty third item still emits its "3." marker (trimmed).
+        assert!(texts.iter().any(|t| t.starts_with("3.")));
+    }
+
+    #[test]
+    fn flow_table_lays_rows_with_advance_and_skips_empty_cells() {
+        let cell = |s: &str| crate::model::Cell {
+            blocks: if s.is_empty() {
+                vec![]
+            } else {
+                vec![block(BlockKind::Paragraph(paragraph(s)), None)]
+            },
+            ..crate::model::Cell::default()
+        };
+        let table = Table {
+            rows: vec![
+                crate::model::Row {
+                    cells: vec![cell("A"), cell("")], // one empty cell
+                    height: None,
+                    is_header: false,
+                },
+                crate::model::Row {
+                    cells: vec![cell("B"), cell("C")],
+                    height: Some(40.0), // explicit row height path
+                    is_header: false,
+                },
+            ],
+            col_widths: vec![60.0, 60.0],
+            border: Default::default(),
+        };
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::Table(table), None)).into();
+        let texts = &pages[0].texts;
+        for want in ["A", "B", "C"] {
+            assert!(texts.iter().any(|t| t.text == want), "cell {want} present");
+        }
+        // No empty-string text leaked from the empty cell.
+        assert!(!texts.iter().any(|t| t.text.is_empty()));
+        let a = texts.iter().find(|t| t.text == "A").unwrap();
+        let b = texts.iter().find(|t| t.text == "B").unwrap();
+        assert!(b.y > a.y, "row 2 below row 1");
+    }
+
+    #[test]
+    fn flow_code_and_rule_emit_lines_and_a_stroke() {
+        let code = crate::model::CodeBlock {
+            lang: None,
+            code: "fn x() {}\n  body".into(),
+        };
+        let doc = Document {
+            sections: vec![Section {
+                geometry: PageGeometry::a4(),
+                pages: vec![Page {
+                    blocks: vec![
+                        block(BlockKind::CodeBlock(code), None),
+                        block(BlockKind::HorizontalRule, None),
+                    ],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let pages: Vec<ConvPage> = (&doc).into();
+        let texts: Vec<&str> = pages[0].texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(texts.iter().any(|t| t.contains("fn x")));
+        assert!(texts.iter().any(|t| t.contains("body")));
+        // The rule emits a stroke shape in the flow.
+        assert!(!pages[0].shapes.is_empty(), "flow rule produced a stroke");
+    }
+
+    #[test]
+    fn flow_paginates_when_the_column_overflows() {
+        // Many tall lines must spill onto a second page (the ensure_room path).
+        let blocks: Vec<Block> = (0..120)
+            .map(|i| block(BlockKind::Paragraph(paragraph(&format!("line {i}"))), None))
+            .collect();
+        let doc = Document {
+            sections: vec![Section {
+                geometry: PageGeometry::a4(),
+                pages: vec![Page {
+                    blocks,
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let pages: Vec<ConvPage> = (&doc).into();
+        assert!(pages.len() >= 2, "120 lines overflow onto extra pages");
+    }
+
+    #[test]
+    fn flow_paragraph_honours_spacing_indent_and_line_heights() {
+        use crate::model::{LineHeight as LH, ParagraphStyle};
+        let mk = |lh: LH| {
+            let ps = ParagraphStyle {
+                line_height: lh,
+                space_before_pt: 6.0,
+                space_after_pt: 4.0,
+                indent_left_pt: 24.0,
+                ..ParagraphStyle::default()
+            };
+            let cs = CharStyle {
+                size_pt: 12.0,
+                generic: Generic::Serif,
+                bold: true,
+                italic: true,
+                color: Some([0.1, 0.2, 0.3]),
+                background: Some([0.9, 0.9, 0.0]),
+                ..CharStyle::default()
+            };
+            styled_para("styled", cs, ps)
+        };
+        for lh in [LH::Normal, LH::Multiple(1.5), LH::Points(20.0)] {
+            let doc = Document {
+                sections: vec![Section {
+                    geometry: PageGeometry::a4(),
+                    pages: vec![Page {
+                        blocks: vec![block(BlockKind::Paragraph(mk(lh)), None)],
+                        absolute: false,
+                    }],
+                    ..Section::default()
+                }],
+                ..Document::default()
+            };
+            let pages: Vec<ConvPage> = (&doc).into();
+            let t = pages[0]
+                .texts
+                .iter()
+                .find(|t| t.text == "styled")
+                .expect("styled run present");
+            // The left indent (24pt) is applied on top of the section's margin.
+            assert!(t.x > PageGeometry::a4().margins.left, "indent applied");
+            assert!(t.style.bold && t.style.italic, "bold+italic carried");
+            assert_eq!(t.style.color, Some([0.1, 0.2, 0.3]));
+            assert_eq!(t.style.background, Some([0.9, 0.9, 0.0]));
+        }
+    }
+
+    #[test]
+    fn text_style_falls_back_to_generic_family_names() {
+        // Empty family + each generic class resolves to the standard font name.
+        let mk = |g: Generic| {
+            text_style(&CharStyle {
+                family: String::new(),
+                generic: g,
+                ..CharStyle::default()
+            })
+            .family
+        };
+        assert_eq!(mk(Generic::Serif), "Times New Roman");
+        assert_eq!(mk(Generic::Mono), "Courier New");
+        assert_eq!(mk(Generic::Sans), "Helvetica");
+        // A non-empty family is preserved verbatim.
+        assert_eq!(
+            text_style(&CharStyle {
+                family: "Garamond".into(),
+                ..CharStyle::default()
+            })
+            .family,
+            "Garamond"
+        );
+    }
+
+    #[test]
+    fn paragraph_text_collects_links_breaks_and_skips_images() {
+        // A paragraph mixing a run, a line break, an image (ignored), and a link
+        // whose children carry text → all text concatenated, image contributes
+        // nothing, the break becomes a space.
+        let para = Paragraph {
+            runs: vec![
+                run("Hello"),
+                Inline::LineBreak,
+                Inline::Image(ImageRef {
+                    resource: 1,
+                    alt: None,
+                }),
+                Inline::Link {
+                    href: crate::model::LinkTarget::Url("http://x".into()),
+                    children: vec![run("World")],
+                },
+            ],
+            ..Paragraph::default()
+        };
+        assert_eq!(paragraph_text(&para), "Hello World");
+        // paragraph_char_style recurses into the link to find the first style.
+        let only_link = Paragraph {
+            runs: vec![Inline::Link {
+                href: crate::model::LinkTarget::Url("http://y".into()),
+                children: vec![run("inner")],
+            }],
+            ..Paragraph::default()
+        };
+        // The first styled run inside the link is found (size 12 from `run`).
+        assert_eq!(paragraph_char_style(&only_link).size_pt, 12.0);
+        // A paragraph with no styled run falls back to default.
+        let empty = Paragraph::default();
+        assert_eq!(paragraph_char_style(&empty), CharStyle::default());
+    }
 }
