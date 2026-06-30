@@ -862,4 +862,184 @@ mod tests {
             }
         }
     }
+
+    // ── more block kinds ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ordered_list_is_marked_ordered() {
+        let doc = model_of("<ol><li>one</li><li>two</li></ol>");
+        match &blocks(&doc)[0].kind {
+            BlockKind::List(l) => {
+                assert!(l.ordered, "<ol> is ordered");
+                assert_eq!(l.items.len(), 2);
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_list_lowers_recursively() {
+        let doc = model_of("<ul><li>a<ul><li>a1</li></ul></li></ul>");
+        match &blocks(&doc)[0].kind {
+            BlockKind::List(l) => {
+                assert_eq!(l.items.len(), 1, "one top-level item");
+                // The item contains a nested list block.
+                let has_nested = l.items[0]
+                    .blocks
+                    .iter()
+                    .any(|b| matches!(b.kind, BlockKind::List(_)));
+                assert!(has_nested, "nested <ul> lowered inside the item");
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blockquote_wraps_child_blocks() {
+        let doc = model_of("<blockquote><p>quoted</p></blockquote>");
+        match &blocks(&doc)[0].kind {
+            BlockKind::Blockquote(bq) => {
+                assert!(!bq.blocks.is_empty(), "blockquote has child blocks");
+                let text: String = bq
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match &b.kind {
+                        BlockKind::Paragraph(p) => Some(run_text(p)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(text, "quoted");
+            }
+            other => panic!("expected blockquote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_code_block_keeps_text_and_language() {
+        let doc = model_of("<pre><code class=\"language-rust\">fn main() {}</code></pre>");
+        match &blocks(&doc)[0].kind {
+            BlockKind::CodeBlock(cb) => {
+                assert_eq!(cb.lang.as_deref(), Some("rust"), "language hint");
+                assert!(cb.code.contains("fn main"), "verbatim code: {:?}", cb.code);
+            }
+            other => panic!("expected code block, got {other:?}"),
+        }
+        // A <pre> with no language-classed <code> has no lang.
+        let doc2 = model_of("<pre>plain text</pre>");
+        match &blocks(&doc2)[0].kind {
+            BlockKind::CodeBlock(cb) => assert!(cb.lang.is_none(), "no lang"),
+            other => panic!("expected code block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn horizontal_rule_lowers() {
+        let doc = model_of("<p>a</p><hr><p>b</p>");
+        assert!(
+            blocks(&doc)
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::HorizontalRule)),
+            "hr lowered to HorizontalRule"
+        );
+    }
+
+    #[test]
+    fn image_lowers_with_src_hash_and_alt() {
+        // A top-level <img> is inline by default, so it lands as an Inline::Image
+        // inside a paragraph; its src is hashed to a resource key.
+        let doc = model_of("<img src=\"pic.png\" alt=\"a cat\">");
+        let img = blocks(&doc)
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => p.runs.iter().find_map(|i| match i {
+                    Inline::Image(img) => Some(img),
+                    _ => None,
+                }),
+                BlockKind::Image(img) => Some(img),
+                _ => None,
+            })
+            .next()
+            .expect("an image (inline or block) is present");
+        assert_ne!(img.resource, 0, "src hashed to a resource key");
+        assert_eq!(img.alt.as_deref(), Some("a cat"));
+
+        // An <img> with no src is dropped entirely — no image anywhere.
+        let doc2 = model_of("<img alt=\"x\">");
+        let has_image = doc2
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .any(|b| match &b.kind {
+                BlockKind::Image(_) => true,
+                BlockKind::Paragraph(p) => p.runs.iter().any(|i| matches!(i, Inline::Image(_))),
+                _ => false,
+            });
+        assert!(!has_image, "src-less img is not emitted");
+    }
+
+    #[test]
+    fn all_heading_levels_lower_to_their_level() {
+        for (tag, want) in [
+            ("h1", 1),
+            ("h2", 2),
+            ("h3", 3),
+            ("h4", 4),
+            ("h5", 5),
+            ("h6", 6),
+        ] {
+            let doc = model_of(&format!("<{tag}>H</{tag}>"));
+            match &blocks(&doc)[0].kind {
+                BlockKind::Heading(h) => assert_eq!(h.level, want, "{tag} → level {want}"),
+                other => panic!("expected heading for {tag}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn paragraph_text_align_lowers_to_model() {
+        let doc = model_of("<p style=\"text-align:center\">centered</p>");
+        match &blocks(&doc)[0].kind {
+            BlockKind::Paragraph(p) => {
+                assert_eq!(p.style.align, crate::model::Align::Center);
+            }
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    // ── pure helper units ─────────────────────────────────────────────────────
+
+    #[test]
+    fn heading_level_maps_h1_to_h6_and_rejects_others() {
+        assert_eq!(heading_level("h1"), Some(1));
+        assert_eq!(heading_level("h6"), Some(6));
+        assert_eq!(heading_level("h7"), None);
+        assert_eq!(heading_level("p"), None);
+    }
+
+    #[test]
+    fn marker_char_for_each_unordered_style() {
+        assert_eq!(marker_char(ListStyle::Circle), '\u{25E6}');
+        assert_eq!(marker_char(ListStyle::Square), '\u{25AA}');
+        assert_eq!(marker_char(ListStyle::Disc), '\u{2022}');
+        // A non-bullet style falls back to the disc glyph.
+        assert_eq!(marker_char(ListStyle::Decimal), '\u{2022}');
+    }
+
+    #[test]
+    fn fnv1a_is_deterministic_and_distinguishes_inputs() {
+        assert_eq!(fnv1a(b"abc"), fnv1a(b"abc"), "stable for equal input");
+        assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"), "differs for different input");
+        // The canonical FNV-1a empty-string offset basis.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
+    fn collapse_ws_normalizes_internal_and_edge_whitespace() {
+        assert_eq!(collapse_ws("a   b\tc"), "a b c");
+        assert_eq!(collapse_ws("  lead"), " lead");
+        assert_eq!(collapse_ws("trail  "), "trail ");
+        assert_eq!(collapse_ws("   "), " ", "all-whitespace → single space");
+        assert_eq!(collapse_ws(""), "", "empty stays empty");
+    }
 }
