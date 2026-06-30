@@ -99,6 +99,7 @@ mod tests {
     use super::*;
     use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::signature::Verifier;
+    use rsa::traits::PrivateKeyParts;
 
     #[test]
     fn small_key_signs_and_verifies() {
@@ -118,5 +119,39 @@ mod tests {
     #[test]
     fn rejects_short_randomness() {
         assert!(RsaPrivateKey::generate(512, &[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn pkcs1_der_round_trips() {
+        let rand: Vec<u8> = (0..64).map(|i| (i * 13 + 7) as u8).collect();
+        let key = RsaPrivateKey::generate(512, &rand).expect("key");
+        let der = key.to_pkcs1_der().expect("encode");
+        let back = RsaPrivateKey::from_pkcs1_der(&der).expect("decode");
+        // Same modulus length and same public components.
+        assert_eq!(back.modulus_len, key.modulus_len);
+        assert_eq!(back.n_bytes_be(), key.n_bytes_be());
+        assert_eq!(back.e_bytes_be(), key.e_bytes_be());
+        // Garbage DER is rejected.
+        assert!(RsaPrivateKey::from_pkcs1_der(&[0, 1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn from_components_rebuilds_a_working_key() {
+        let rand: Vec<u8> = (0..64).map(|i| (i * 29 + 3) as u8).collect();
+        let key = RsaPrivateKey::generate(512, &rand).expect("key");
+        let n = key.n_bytes_be();
+        let e = key.e_bytes_be();
+        let d = key.inner().d().to_bytes_be();
+        let rebuilt = RsaPrivateKey::from_components(&n, &e, &d).expect("rebuild");
+        assert_eq!(rebuilt.n_bytes_be(), n);
+        assert_eq!(rebuilt.e_bytes_be(), e);
+        // The rebuilt key still produces verifiable signatures.
+        let msg = b"rebuilt key signs";
+        let sig = rebuilt.sign_sha256(msg);
+        let vk = VerifyingKey::<Sha256>::new(rebuilt.inner.to_public_key());
+        let signature = Signature::try_from(sig.as_slice()).expect("sig parses");
+        vk.verify(msg, &signature).expect("verifies");
+        // Inconsistent components fail gracefully.
+        assert!(RsaPrivateKey::from_components(&[0], &[0], &[0]).is_none());
     }
 }
