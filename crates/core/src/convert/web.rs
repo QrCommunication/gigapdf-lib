@@ -1012,4 +1012,378 @@ mod tests {
             "textbox text preserved: {html}"
         );
     }
+
+    // ── doc-level: meta, comments, header/footer ──────────────────────────────
+
+    use crate::model::{InlineRun, Page, Section};
+
+    fn doc_with_blocks(blocks: Vec<Block>) -> Document {
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks,
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        }
+    }
+
+    fn para(text: &str) -> Block {
+        Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: text.to_string(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn meta_title_and_lang_appear_in_head() {
+        let mut doc = doc_with_blocks(vec![para("body")]);
+        doc.meta.title = Some("My <Doc>".to_string());
+        doc.meta.lang = Some("fr-FR".to_string());
+        let html = html_from_model(&doc);
+        assert!(
+            html.contains(r#"<html lang="fr-FR">"#),
+            "lang injected: {html}"
+        );
+        // The title is HTML-escaped.
+        assert!(
+            html.contains("<title>My &lt;Doc&gt;</title>"),
+            "escaped title: {html}"
+        );
+    }
+
+    #[test]
+    fn comments_section_and_inline_ref_link_up() {
+        use crate::model::Comment;
+        let mut doc = doc_with_blocks(vec![Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![
+                    Inline::Run(InlineRun {
+                        text: "see".to_string(),
+                        ..Default::default()
+                    }),
+                    Inline::CommentRef { id: "c1".into() },
+                    // A ref to an unknown id emits nothing.
+                    Inline::CommentRef {
+                        id: "missing".into(),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        doc.comments = vec![Comment {
+            id: "c1".into(),
+            author: "Alice".into(),
+            date: "2024-01-02".into(),
+            text: "Nice & tidy".into(),
+        }];
+        let html = html_from_model(&doc);
+        // Inline marker for the known comment (1-based number).
+        assert!(
+            html.contains(r##"[1]</a></sup>"##),
+            "inline ref marker: {html}"
+        );
+        // Comments aside with escaped author/date/body.
+        assert!(
+            html.contains(r#"<aside class="comments">"#),
+            "aside: {html}"
+        );
+        assert!(html.contains("Alice"), "author rendered: {html}");
+        assert!(html.contains("2024-01-02"), "date rendered: {html}");
+        assert!(html.contains("Nice &amp; tidy"), "body escaped: {html}");
+        // The unknown ref produced no extra marker (count the inline marker
+        // pattern, not the CSS rule in <style> which also mentions cmt-ref).
+        assert_eq!(
+            html.matches(r#"class="cmt-ref" id="#).count(),
+            1,
+            "only one valid ref: {html}"
+        );
+    }
+
+    #[test]
+    fn header_and_footer_blocks_are_wrapped() {
+        let mut doc = doc_with_blocks(vec![para("middle")]);
+        doc.sections[0].header = Some(vec![para("top")]);
+        doc.sections[0].footer = Some(vec![para("bottom")]);
+        let html = html_from_model(&doc);
+        assert!(
+            html.contains("<header>") && html.contains("top"),
+            "header: {html}"
+        );
+        assert!(
+            html.contains("<footer>") && html.contains("bottom"),
+            "footer: {html}"
+        );
+    }
+
+    // ── lists, code, images, sheets, slides, inline links ─────────────────────
+
+    #[test]
+    fn ordered_list_emits_type_and_start() {
+        use crate::model::{List, ListItem, ListMarker};
+        let li = |t: &str| ListItem {
+            blocks: vec![para(t)],
+            level: 0,
+        };
+        let list = List {
+            ordered: true,
+            marker: ListMarker::LowerRoman,
+            items: vec![li("one"), li("two")],
+            start: 3,
+        };
+        let mut out = String::new();
+        html_list(&list, &Document::default(), &mut out);
+        assert!(
+            out.contains(r#"<ol type="i" start="3">"#),
+            "ol type+start: {out}"
+        );
+        assert!(out.contains("<li>") && out.contains("one"), "items: {out}");
+
+        // An unordered list is a plain <ul> with no type/start.
+        let ul = List {
+            ordered: false,
+            marker: ListMarker::Bullet('•'),
+            items: vec![li("x")],
+            start: 1,
+        };
+        let mut out2 = String::new();
+        html_list(&ul, &Document::default(), &mut out2);
+        assert!(
+            out2.contains("<ul>") && !out2.contains("type="),
+            "plain ul: {out2}"
+        );
+    }
+
+    #[test]
+    fn code_block_emits_language_class_and_escapes() {
+        let cb = CodeBlock {
+            lang: Some("rust".into()),
+            code: "let x = a < b && c > d;".into(),
+        };
+        let mut out = String::new();
+        html_code(&cb, &mut out);
+        assert!(
+            out.contains(r#"<pre><code class="language-rust">"#),
+            "language class: {out}"
+        );
+        assert!(
+            out.contains("a &lt; b &amp;&amp; c &gt; d"),
+            "escaped code: {out}"
+        );
+        // No-language code block omits the class.
+        let mut out2 = String::new();
+        html_code(
+            &CodeBlock {
+                lang: None,
+                code: "plain".into(),
+            },
+            &mut out2,
+        );
+        assert!(out2.contains("<pre><code>plain"), "no class: {out2}");
+    }
+
+    #[test]
+    fn image_block_emits_data_uri_with_mime() {
+        use crate::model::{ImageResource, ResourceTable};
+        let mut images = std::collections::BTreeMap::new();
+        images.insert(
+            42u64,
+            ImageResource {
+                bytes: vec![1, 2, 3, 4],
+                format: "jpeg".into(),
+            },
+        );
+        let doc = Document {
+            resources: ResourceTable { images },
+            ..doc_with_blocks(vec![Block {
+                kind: BlockKind::Image(ImageRef {
+                    resource: 42,
+                    alt: Some("a \"photo\"".into()),
+                }),
+                ..Default::default()
+            }])
+        };
+        let html = html_from_model(&doc);
+        assert!(
+            html.contains("data:image/jpeg;base64,"),
+            "jpeg data uri: {html}"
+        );
+        assert!(
+            html.contains("alt=\"a &quot;photo&quot;\""),
+            "escaped alt: {html}"
+        );
+        // An image referencing a missing resource emits nothing (early return).
+        let doc2 = doc_with_blocks(vec![Block {
+            kind: BlockKind::Image(ImageRef {
+                resource: 999,
+                alt: None,
+            }),
+            ..Default::default()
+        }]);
+        assert!(
+            !html_from_model(&doc2).contains("<img"),
+            "missing resource → no <img>"
+        );
+    }
+
+    #[test]
+    fn sheet_table_renders_typed_cell_values() {
+        use crate::model::{SheetBlock, SheetCell, SheetRow};
+        let cell = |v: CellValue| SheetCell {
+            value: v,
+            ..SheetCell::default()
+        };
+        let sheet = Sheet {
+            name: "S".into(),
+            rows: vec![SheetRow {
+                cells: vec![
+                    cell(CellValue::Text("hi".into())),
+                    cell(CellValue::Number(3.5)),
+                    cell(CellValue::Bool(true)),
+                    cell(CellValue::Bool(false)),
+                    cell(CellValue::Empty),
+                ],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+        };
+        let mut out = String::new();
+        html_sheet(
+            &SheetBlock {
+                sheets: vec![sheet],
+            },
+            &mut out,
+        );
+        assert!(
+            out.contains("<table>") && out.contains("hi"),
+            "text cell: {out}"
+        );
+        assert!(out.contains("3.5"), "number cell: {out}");
+        assert!(
+            out.contains("TRUE") && out.contains("FALSE"),
+            "bool cells: {out}"
+        );
+    }
+
+    #[test]
+    fn slide_renders_placeholders_and_shapes() {
+        use crate::model::slide::{Placeholder, PlaceholderRole};
+        use crate::model::{PageGeometry, Slide};
+        let slide = Slide {
+            geometry: PageGeometry::default(),
+            placeholders: vec![Placeholder {
+                role: PlaceholderRole::Title,
+                block: para("Title text"),
+            }],
+            shapes: vec![para("Shape text")],
+            notes: None,
+            background: None,
+        };
+        let mut out = String::new();
+        html_slide(&slide, &Document::default(), &mut out);
+        assert!(out.contains("<section>"), "slide section: {out}");
+        assert!(out.contains("Title text"), "placeholder rendered: {out}");
+        assert!(out.contains("Shape text"), "shape block rendered: {out}");
+    }
+
+    #[test]
+    fn inline_link_url_and_page_targets() {
+        let mut out = String::new();
+        html_inlines(
+            &[
+                Inline::Link {
+                    href: LinkTarget::Url("https://x.example/a?b=c&d".into()),
+                    children: vec![Inline::Run(InlineRun {
+                        text: "link".into(),
+                        ..Default::default()
+                    })],
+                },
+                Inline::LineBreak,
+                Inline::Link {
+                    href: LinkTarget::Page(4),
+                    children: vec![Inline::Run(InlineRun {
+                        text: "p".into(),
+                        ..Default::default()
+                    })],
+                },
+            ],
+            &Document::default(),
+            &mut out,
+        );
+        assert!(
+            out.contains(r#"href="https://x.example/a?b=c&amp;d""#),
+            "url escaped: {out}"
+        );
+        assert!(out.contains(r##"href="#page4""##), "page target: {out}");
+        assert!(out.contains("<br/>"), "line break: {out}");
+    }
+
+    #[test]
+    fn char_style_css_emits_full_declaration() {
+        let css = char_style_css(&CharStyle {
+            family: "Georgia".into(),
+            size_pt: 14.0,
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+            color: Some([0.5, 0.25, 0.75]),
+            ..CharStyle::default()
+        });
+        assert!(css.contains("font-family:'Georgia'"), "family: {css}");
+        assert!(css.contains("font-size:14pt"), "size: {css}");
+        assert!(css.contains("font-weight:bold"), "bold: {css}");
+        assert!(css.contains("font-style:italic"), "italic: {css}");
+        assert!(
+            css.contains("text-decoration:underline line-through"),
+            "decorations: {css}"
+        );
+        assert!(css.contains("color:#"), "colour: {css}");
+    }
+
+    #[test]
+    fn para_style_attr_emits_alignment_and_spacing() {
+        use crate::model::{LineHeight, ParagraphStyle};
+        let p = Paragraph {
+            style: ParagraphStyle {
+                align: Align::Center,
+                indent_left_pt: 12.0,
+                indent_right_pt: 6.0,
+                space_before_pt: 8.0,
+                space_after_pt: 4.0,
+                line_height: LineHeight::Multiple(1.5),
+                ..ParagraphStyle::default()
+            },
+            ..Default::default()
+        };
+        let attr = para_style_attr(&p);
+        assert!(attr.contains("text-align:center"), "align: {attr}");
+        assert!(attr.contains("margin-left:12.0pt"), "indent-left: {attr}");
+        assert!(attr.contains("margin-right:6.0pt"), "indent-right: {attr}");
+        assert!(attr.contains("margin-top:8.0pt"), "space-before: {attr}");
+        assert!(attr.contains("margin-bottom:4.0pt"), "space-after: {attr}");
+        assert!(attr.contains("line-height:1.50"), "line-height: {attr}");
+        // A default-styled paragraph emits no style attribute.
+        assert!(
+            para_style_attr(&Paragraph::default()).is_empty(),
+            "default → empty"
+        );
+    }
+
+    #[test]
+    fn esc_escapes_all_special_chars() {
+        let mut out = String::new();
+        esc("a&b<c>d\"e'f", &mut out);
+        assert_eq!(out, "a&amp;b&lt;c&gt;d&quot;e&#39;f");
+    }
 }
