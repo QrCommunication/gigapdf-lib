@@ -1391,4 +1391,298 @@ mod tests {
         bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(parse_emf_rgndata(&bad, 0).len(), 2);
     }
+
+    // ── opcode coverage ──────────────────────────────────────────────────────
+
+    /// rclBounds(16) + count(4) + N 16-bit point pairs.
+    fn poly16_body(bounds: (i32, i32, i32, i32), pts: &[(i16, i16)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        pi32(&mut b, bounds.0);
+        pi32(&mut b, bounds.1);
+        pi32(&mut b, bounds.2);
+        pi32(&mut b, bounds.3);
+        pu32(&mut b, pts.len() as u32);
+        for &(x, y) in pts {
+            pu16(&mut b, x as u16);
+            pu16(&mut b, y as u16);
+        }
+        b
+    }
+
+    /// rclBounds(16) + count(4) + N 32-bit point pairs.
+    fn poly32_body(bounds: (i32, i32, i32, i32), pts: &[(i32, i32)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        pi32(&mut b, bounds.0);
+        pi32(&mut b, bounds.1);
+        pi32(&mut b, bounds.2);
+        pi32(&mut b, bounds.3);
+        pu32(&mut b, pts.len() as u32);
+        for &(x, y) in pts {
+            pi32(&mut b, x);
+            pi32(&mut b, y);
+        }
+        b
+    }
+
+    fn rectl(l: i32, t: i32, r: i32, bo: i32) -> Vec<u8> {
+        let mut b = Vec::new();
+        pi32(&mut b, l);
+        pi32(&mut b, t);
+        pi32(&mut b, r);
+        pi32(&mut b, bo);
+        b
+    }
+
+    fn render(records: &[u8]) -> MetafileRaster {
+        decode(&emf_with(100, 100, records)).expect("valid EMF decodes")
+    }
+
+    #[test]
+    fn rejects_malformed_headers() {
+        assert!(decode(&[0u8; 10]).is_none()); // too short
+        let mut not_emf = emf_with(10, 10, &[]);
+        not_emf[0] = 99; // iType ≠ EMR_HEADER
+        assert!(decode(&not_emf).is_none());
+        let mut bad_sig = emf_with(10, 10, &[]);
+        bad_sig[40] = 0; // break " EMF" signature
+        assert!(decode(&bad_sig).is_none());
+    }
+
+    #[test]
+    fn transform_and_state_records() {
+        let mut recs = Vec::new();
+        record(&mut recs, EMR_SETWINDOWEXTEX, &rectl(100, 100, 0, 0)[..8]);
+        record(&mut recs, EMR_SETWINDOWORGEX, &rectl(0, 0, 0, 0)[..8]);
+        record(&mut recs, EMR_SETVIEWPORTEXTEX, &rectl(100, 100, 0, 0)[..8]);
+        record(&mut recs, EMR_SETVIEWPORTORGEX, &rectl(0, 0, 0, 0)[..8]);
+        record(&mut recs, EMR_SETMAPMODE, &8i32.to_le_bytes());
+        record(&mut recs, EMR_SETTEXTCOLOR, &0x00FF_0000u32.to_le_bytes());
+        record(&mut recs, EMR_SETBKCOLOR, &0x0000_00FFu32.to_le_bytes());
+        record(&mut recs, EMR_SETBKMODE, &2u32.to_le_bytes());
+        record(&mut recs, EMR_SETPOLYFILLMODE, &2u32.to_le_bytes());
+        record(&mut recs, EMR_SETROP2, &7u32.to_le_bytes());
+        record(&mut recs, EMR_SETSTRETCHBLTMODE, &4u32.to_le_bytes());
+        let m = render(&recs);
+        assert!(m.width >= 1 && m.height >= 1);
+    }
+
+    #[test]
+    fn world_transform_records_set_and_modify() {
+        let mut recs = Vec::new();
+        // XFORM: m11,m12,m21,m22,dx,dy as f32.
+        let mut xf = Vec::new();
+        for f in [1.0f32, 0.0, 0.0, 1.0, 5.0, 5.0] {
+            xf.extend_from_slice(&f.to_le_bytes());
+        }
+        record(&mut recs, EMR_SETWORLDTRANSFORM, &xf);
+        // ModifyWorldTransform with each mode.
+        for mode in [1u32, 2, 3, 4] {
+            let mut body = xf.clone();
+            body.extend_from_slice(&mode.to_le_bytes());
+            record(&mut recs, EMR_MODIFYWORLDTRANSFORM, &body);
+        }
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn moveto_lineto_and_setpixelv() {
+        let mut recs = Vec::new();
+        record(&mut recs, EMR_MOVETOEX, &rectl(10, 50, 0, 0)[..8]);
+        record(&mut recs, EMR_LINETO, &rectl(90, 50, 0, 0)[..8]);
+        // SETPIXELV: x(4), y(4), colorref(4)
+        let mut sp = Vec::new();
+        pi32(&mut sp, 50);
+        pi32(&mut sp, 50);
+        pu32(&mut sp, 0x0000_00FF);
+        record(&mut recs, EMR_SETPIXELV, &sp);
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn poly32_family_records() {
+        let bounds = (0, 0, 100, 100);
+        let mut recs = Vec::new();
+        recs.extend(solid_brush(1, 0x0000_0000));
+        recs.extend(select(1));
+        record(
+            &mut recs,
+            EMR_POLYGON,
+            &poly32_body(bounds, &[(10, 10), (90, 10), (90, 90)]),
+        );
+        record(
+            &mut recs,
+            EMR_POLYLINE,
+            &poly32_body(bounds, &[(10, 50), (50, 10), (90, 50)]),
+        );
+        record(&mut recs, EMR_MOVETOEX, &rectl(10, 10, 0, 0)[..8]);
+        record(
+            &mut recs,
+            EMR_POLYLINETO,
+            &poly32_body(bounds, &[(80, 80), (20, 80)]),
+        );
+        record(
+            &mut recs,
+            EMR_POLYBEZIER,
+            &poly32_body(bounds, &[(10, 90), (30, 10), (70, 10), (90, 90)]),
+        );
+        record(&mut recs, EMR_MOVETOEX, &rectl(10, 90, 0, 0)[..8]);
+        record(
+            &mut recs,
+            EMR_POLYBEZIERTO,
+            &poly32_body(bounds, &[(30, 10), (70, 10), (90, 90)]),
+        );
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn poly16_family_records() {
+        let bounds = (0, 0, 100, 100);
+        let mut recs = Vec::new();
+        recs.extend(solid_brush(1, 0x0000_0000));
+        recs.extend(select(1));
+        record(
+            &mut recs,
+            EMR_POLYGON16,
+            &poly16_body(bounds, &[(10, 10), (90, 10), (90, 90)]),
+        );
+        record(
+            &mut recs,
+            EMR_POLYLINE16,
+            &poly16_body(bounds, &[(10, 50), (50, 10), (90, 50)]),
+        );
+        record(&mut recs, EMR_MOVETOEX, &rectl(10, 10, 0, 0)[..8]);
+        record(
+            &mut recs,
+            EMR_POLYLINETO16,
+            &poly16_body(bounds, &[(80, 80), (20, 80)]),
+        );
+        record(
+            &mut recs,
+            EMR_POLYBEZIERTO16,
+            &poly16_body(bounds, &[(30, 10), (70, 10), (90, 90)]),
+        );
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn poly_poly_records_16_and_32() {
+        let mut recs = Vec::new();
+        recs.extend(solid_brush(1, 0x0000_0000));
+        recs.extend(select(1));
+        // PolyPolygon: rclBounds(16), nPolys(4), nPoints(4), aPolyCounts[nPolys],
+        // then all points. One triangle.
+        let mut body32 = Vec::new();
+        body32.extend(rectl(0, 0, 100, 100));
+        pu32(&mut body32, 1); // nPolys
+        pu32(&mut body32, 3); // total points
+        pu32(&mut body32, 3); // poly[0] count
+        for (x, y) in [(10i32, 10), (90, 10), (50, 90)] {
+            pi32(&mut body32, x);
+            pi32(&mut body32, y);
+        }
+        record(&mut recs, EMR_POLYPOLYGON, &body32);
+        let mut body16 = Vec::new();
+        body16.extend(rectl(0, 0, 100, 100));
+        pu32(&mut body16, 1);
+        pu32(&mut body16, 3);
+        pu32(&mut body16, 3);
+        for (x, y) in [(20i16, 20), (80, 20), (50, 80)] {
+            pu16(&mut body16, x as u16);
+            pu16(&mut body16, y as u16);
+        }
+        record(&mut recs, EMR_POLYPOLYGON16, &body16);
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn shape_records_rect_ellipse_roundrect_arc_pie_chord() {
+        let mut recs = Vec::new();
+        recs.extend(solid_brush(1, 0x0000_0000));
+        recs.extend(select(1));
+        record(&mut recs, EMR_RECTANGLE, &rectl(10, 10, 90, 90));
+        record(&mut recs, EMR_ELLIPSE, &rectl(10, 10, 90, 90));
+        // ROUNDRECT: rect(16) + szlCorner cx,cy
+        let mut rr = rectl(10, 10, 90, 90);
+        pi32(&mut rr, 20);
+        pi32(&mut rr, 20);
+        record(&mut recs, EMR_ROUNDRECT, &rr);
+        // ARC/PIE/CHORD: rect(16) + xStart,yStart,xEnd,yEnd
+        let mut arc = rectl(10, 10, 90, 90);
+        pi32(&mut arc, 90);
+        pi32(&mut arc, 50);
+        pi32(&mut arc, 50);
+        pi32(&mut arc, 10);
+        record(&mut recs, EMR_ARC, &arc);
+        record(&mut recs, EMR_PIE, &arc);
+        record(&mut recs, EMR_CHORD, &arc);
+        record(&mut recs, EMR_ARCTO, &arc);
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn object_table_create_pen_select_delete() {
+        let mut recs = Vec::new();
+        // CREATEPEN: ihPen(4), penStyle(4), widthX(4), widthY(4), colorref(4)
+        let mut pen = Vec::new();
+        pu32(&mut pen, 1); // handle
+        pu32(&mut pen, 0); // PS_SOLID
+        pi32(&mut pen, 2);
+        pi32(&mut pen, 0);
+        pu32(&mut pen, 0x0000_0000);
+        record(&mut recs, EMR_CREATEPEN, &pen);
+        recs.extend(solid_brush(2, 0x0000_00FF));
+        record(&mut recs, EMR_SELECTOBJECT, &select(1));
+        record(&mut recs, EMR_SELECTOBJECT, &select(2));
+        record(&mut recs, EMR_RECTANGLE, &rectl(10, 10, 90, 90));
+        record(&mut recs, EMR_DELETEOBJECT, &1u32.to_le_bytes());
+        // DeleteObject with handle 0 is a no-op (covered branch).
+        record(&mut recs, EMR_DELETEOBJECT, &0u32.to_le_bytes());
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn paint_rgn_record() {
+        let mut recs = Vec::new();
+        recs.extend(solid_brush(1, 0x0000_0000));
+        recs.extend(select(1));
+        // PAINTRGN: rclBounds(16), cbRgnData(4), RGNDATA
+        let rd = rgndata(&[(10, 10, 90, 90)]);
+        let mut body = rectl(10, 10, 90, 90);
+        pu32(&mut body, rd.len() as u32);
+        body.extend_from_slice(&rd);
+        record(&mut recs, EMR_PAINTRGN, &body);
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn ext_text_out_a_and_w_records() {
+        let mut recs = Vec::new();
+        // EXTTEXTOUTA/W: rclBounds(16), iGraphicsMode(4), exScale(4), eyScale(4),
+        // then EMRTEXT { ptlReference(8), nChars(4), offString(4), options(4),
+        // rcl(16), offDx(4) }, then string. Build a minimal valid-ish record;
+        // the decoder is defensive and won't panic on partial bodies.
+        let mut body = rectl(0, 0, 100, 100);
+        pu32(&mut body, 0); // graphics mode
+        body.extend_from_slice(&1.0f32.to_le_bytes()); // exScale
+        body.extend_from_slice(&1.0f32.to_le_bytes()); // eyScale
+        pi32(&mut body, 10); // ref x
+        pi32(&mut body, 20); // ref y
+        pu32(&mut body, 0); // nChars
+        pu32(&mut body, 0); // offString
+        pu32(&mut body, 0); // options
+        body.extend(rectl(0, 0, 0, 0)); // rcl
+        pu32(&mut body, 0); // offDx
+        record(&mut recs, EMR_EXTTEXTOUTA, &body);
+        record(&mut recs, EMR_EXTTEXTOUTW, &body);
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn eof_and_unknown_records_skip_safely() {
+        let mut recs = Vec::new();
+        record(&mut recs, 9999, &[1, 2, 3, 4]); // unmodelled → no-op
+        record(&mut recs, EMR_EOF, &[0u8; 12]);
+        let m = render(&recs);
+        assert!(m.width >= 1);
+    }
 }
