@@ -381,6 +381,46 @@ mod tests {
         assert_eq!(decode_stream(&stream).unwrap(), [0, 1, 2, 3]);
     }
 
+    #[test]
+    fn lzw_early_change_zero_via_decode_parms() {
+        // A LZWDecode stream with explicit `/EarlyChange 0` exercises the
+        // early_change() parm-parsing path (the v != 0 → false branch).
+        let raw = vec![0x80u8, 0x12, 0x0c, 0xa6, 0xc3, 0x61, 0xbe, 0x02];
+        let mut dict = Dictionary::new();
+        dict.set(b"Filter".to_vec(), Object::Name(b"LZWDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.set(b"EarlyChange".to_vec(), Object::Integer(0));
+        dict.set(b"DecodeParms".to_vec(), Object::Dictionary(parms));
+        let stream = Stream::new(dict, raw);
+        // With early_change=0 the Adobe-encoded bytes won't reproduce "Hello",
+        // but the decode must still run through the parm path without error.
+        assert!(decode_stream(&stream).is_ok());
+    }
+
+    #[test]
+    fn lzw_early_change_one_explicit_via_decode_parms() {
+        // `/EarlyChange 1` (explicit Adobe default) round-trips "Hello".
+        let raw = vec![0x80u8, 0x12, 0x0c, 0xa6, 0xc3, 0x61, 0xbe, 0x02];
+        let mut dict = Dictionary::new();
+        dict.set(b"Filter".to_vec(), Object::Name(b"LZWDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.set(b"EarlyChange".to_vec(), Object::Integer(1));
+        dict.set(b"DecodeParms".to_vec(), Object::Dictionary(parms));
+        let stream = Stream::new(dict, raw);
+        assert_eq!(decode_stream(&stream).unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn jbig2_globals_non_stream_yields_none() {
+        // A `/JBIG2Globals` that is NOT a stream object (here an integer) makes
+        // jbig2_globals_bytes return None — the page-stream-only decode path.
+        let mut parms = Dictionary::new();
+        parms.set(b"JBIG2Globals".to_vec(), Object::Integer(7));
+        assert!(jbig2_globals_bytes(&parms).is_none());
+        // Absent entirely → also None.
+        assert!(jbig2_globals_bytes(&Dictionary::new()).is_none());
+    }
+
     // Minimal ASCII85 encoder, used only to build test fixtures.
     fn ascii85_encode(data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();

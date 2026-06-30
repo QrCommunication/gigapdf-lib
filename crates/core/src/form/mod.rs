@@ -459,3 +459,178 @@ pub(crate) fn radio_appearance(style: &FieldStyle, w: f64, h: f64) -> Vec<u8> {
 pub(crate) fn empty_appearance(style: &FieldStyle, w: f64, h: f64) -> Vec<u8> {
     box_decoration(style, w, h).into_bytes()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(field_type: &str, flags: u32) -> FormField {
+        FormField {
+            name: "f".into(),
+            field_type: field_type.into(),
+            value: String::new(),
+            flags,
+            options: Vec::new(),
+            max_len: None,
+            comb: false,
+            quadding: 0,
+            da_font: None,
+            da_size: 0.0,
+            page: None,
+            bounds: None,
+        }
+    }
+
+    #[test]
+    fn field_trigger_pdf_key_and_from_name() {
+        assert_eq!(FieldTrigger::Keystroke.pdf_key(), b"K");
+        assert_eq!(FieldTrigger::Format.pdf_key(), b"F");
+        assert_eq!(FieldTrigger::Validate.pdf_key(), b"V");
+        assert_eq!(FieldTrigger::Calculate.pdf_key(), b"C");
+
+        assert_eq!(
+            FieldTrigger::from_name("keystroke"),
+            Some(FieldTrigger::Keystroke)
+        );
+        assert_eq!(FieldTrigger::from_name("k"), Some(FieldTrigger::Keystroke));
+        assert_eq!(
+            FieldTrigger::from_name("format"),
+            Some(FieldTrigger::Format)
+        );
+        assert_eq!(
+            FieldTrigger::from_name("validate"),
+            Some(FieldTrigger::Validate)
+        );
+        assert_eq!(FieldTrigger::from_name("C"), Some(FieldTrigger::Calculate));
+        assert_eq!(FieldTrigger::from_name("nope"), None);
+    }
+
+    #[test]
+    fn form_field_kind_covers_every_branch() {
+        assert_eq!(field("Tx", 0).kind(), FieldKind::Text);
+        assert_eq!(field("Sig", 0).kind(), FieldKind::Signature);
+        assert_eq!(
+            field("Btn", flags::PUSHBUTTON).kind(),
+            FieldKind::PushButton
+        );
+        assert_eq!(field("Btn", flags::RADIO).kind(), FieldKind::Radio);
+        assert_eq!(field("Btn", 0).kind(), FieldKind::Checkbox);
+        assert_eq!(field("Ch", flags::COMBO).kind(), FieldKind::ComboBox);
+        assert_eq!(field("Ch", 0).kind(), FieldKind::ListBox);
+        assert_eq!(field("???", 0).kind(), FieldKind::Unknown);
+    }
+
+    #[test]
+    fn form_field_flag_predicates() {
+        assert!(field("Tx", flags::MULTILINE).is_multiline());
+        assert!(!field("Btn", flags::MULTILINE).is_multiline());
+        assert!(field("Tx", flags::PASSWORD).is_password());
+        assert!(field("Tx", flags::COMB).is_comb());
+        assert!(field("Ch", flags::COMBO | flags::EDIT).is_editable_combo());
+        assert!(!field("Ch", flags::COMBO).is_editable_combo());
+        assert!(field("Ch", flags::MULTI_SELECT).is_multi_select());
+        assert!(field("Tx", flags::READ_ONLY).is_read_only());
+        assert!(field("Tx", flags::REQUIRED).is_required());
+
+        // Fillable: text yes; push-button no; signature no; read-only no.
+        assert!(field("Tx", 0).is_fillable());
+        assert!(!field("Btn", flags::PUSHBUTTON).is_fillable());
+        assert!(!field("Sig", 0).is_fillable());
+        assert!(!field("Tx", flags::READ_ONLY).is_fillable());
+    }
+
+    #[test]
+    fn field_style_default_and_number_formatting() {
+        let s = FieldStyle::default();
+        assert_eq!(s.font_size, 0.0);
+        assert_eq!(s.border, Some([0.0, 0.0, 0.0]));
+        assert!(s.background.is_none());
+        assert_eq!(s.border_width, 1.0);
+
+        assert_eq!(n(1.0), "1");
+        assert_eq!(n(1.5), "1.5");
+        assert_eq!(n(1.250), "1.25");
+        assert_eq!(n(0.0), "0");
+    }
+
+    #[test]
+    fn escape_stream_literal_handles_specials() {
+        assert_eq!(escape_stream_literal("a(b)c"), "a\\(b\\)c");
+        assert_eq!(escape_stream_literal("x\\y"), "x\\\\y");
+        assert_eq!(escape_stream_literal("a\tb"), "a\\tb");
+        // A non-printable byte → octal escape.
+        let esc = escape_stream_literal("\u{1}");
+        assert!(esc.starts_with("\\0"));
+    }
+
+    #[test]
+    fn da_string_and_mk_dict() {
+        let style = FieldStyle {
+            font_size: 12.0,
+            color: [1.0, 0.0, 0.0],
+            border: Some([0.0, 0.0, 1.0]),
+            background: Some([1.0, 1.0, 1.0]),
+            border_width: 1.0,
+        };
+        match da_string(&style) {
+            Object::String(bytes, StringKind::Literal) => {
+                let s = String::from_utf8(bytes).unwrap();
+                assert!(s.contains("/Helv 12 Tf"));
+                assert!(s.contains("1 0 0 rg"));
+            }
+            other => panic!("expected DA literal string, got {other:?}"),
+        }
+
+        let mk = mk_dict(&style).expect("border+bg → Some");
+        assert!(mk.get(b"BC").is_some());
+        assert!(mk.get(b"BG").is_some());
+
+        // No border, no background → None.
+        let plain = FieldStyle {
+            border: None,
+            background: None,
+            ..FieldStyle::default()
+        };
+        assert!(mk_dict(&plain).is_none());
+    }
+
+    #[test]
+    fn resolved_size_auto_vs_explicit() {
+        let auto = FieldStyle {
+            font_size: 0.0,
+            ..FieldStyle::default()
+        };
+        // Auto-size clamps into 4..=12 from (h - 4).
+        assert_eq!(resolved_size(&auto, 20.0), 12.0);
+        assert_eq!(resolved_size(&auto, 6.0), 4.0); // (6-4)=2 clamped up to 4
+        let explicit = FieldStyle {
+            font_size: 9.0,
+            ..FieldStyle::default()
+        };
+        assert_eq!(resolved_size(&explicit, 20.0), 9.0);
+    }
+
+    #[test]
+    fn appearance_streams_emit_expected_operators() {
+        let style = FieldStyle {
+            background: Some([0.9, 0.9, 0.9]),
+            ..FieldStyle::default()
+        };
+        let text = String::from_utf8(text_appearance("Hi(x)", &style, 100.0, 20.0)).unwrap();
+        assert!(text.contains("/Tx BMC"));
+        assert!(text.contains("(Hi\\(x\\)) Tj")); // value escaped
+        assert!(text.contains("re\nf\n")); // background fill from box_decoration
+
+        let check = String::from_utf8(check_appearance(&style, 20.0, 20.0)).unwrap();
+        assert!(check.contains("\nS\n")); // tick stroke
+        assert!(check.contains(" m\n")); // moveto
+
+        let radio = String::from_utf8(radio_appearance(&style, 20.0, 20.0)).unwrap();
+        assert!(radio.contains(" c\n")); // bezier
+        assert!(radio.trim_end().ends_with("f")); // filled dot
+
+        let empty = String::from_utf8(empty_appearance(&style, 20.0, 20.0)).unwrap();
+        assert!(empty.contains("rg")); // just the box decoration
+        assert!(!empty.contains("Tj")); // no glyph
+    }
+}

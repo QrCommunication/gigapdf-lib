@@ -382,4 +382,192 @@ mod tests {
         assert!(Action::from_json("not json").is_none());
         assert!(Action::from_json(r#"{"type":"goto"}"#).is_none()); // missing dest
     }
+
+    #[test]
+    fn destination_page_accessor_covers_every_variant() {
+        assert_eq!(
+            Destination::Xyz {
+                page: 1,
+                left: None,
+                top: None,
+                zoom: None
+            }
+            .page(),
+            Some(1)
+        );
+        assert_eq!(Destination::Fit { page: 2 }.page(), Some(2));
+        assert_eq!(Destination::FitH { page: 3, top: None }.page(), Some(3));
+        assert_eq!(
+            Destination::FitV {
+                page: 4,
+                left: None
+            }
+            .page(),
+            Some(4)
+        );
+        assert_eq!(
+            Destination::FitR {
+                page: 5,
+                rect: [0.0; 4]
+            }
+            .page(),
+            Some(5)
+        );
+        assert_eq!(Destination::FitB { page: 6 }.page(), Some(6));
+        assert_eq!(Destination::FitBH { page: 7, top: None }.page(), Some(7));
+        assert_eq!(
+            Destination::FitBV {
+                page: 8,
+                left: None
+            }
+            .page(),
+            Some(8)
+        );
+        assert_eq!(Destination::Named("x".into()).page(), None);
+    }
+
+    #[test]
+    fn parses_and_builds_every_fit_destination() {
+        // fitH / fitV
+        let fith = Action::from_json(r#"{"type":"goto","dest":{"fit":"fitH","page":1,"top":50}}"#)
+            .unwrap();
+        assert_eq!(
+            fith,
+            Action::GoTo(Destination::FitH {
+                page: 1,
+                top: Some(50.0)
+            })
+        );
+        let fitv = Action::from_json(r#"{"type":"goto","dest":{"fit":"fitV","page":1,"left":20}}"#)
+            .unwrap();
+        assert_eq!(
+            fitv,
+            Action::GoTo(Destination::FitV {
+                page: 1,
+                left: Some(20.0)
+            })
+        );
+        // fitR with a 4-element rect
+        let fitr =
+            Action::from_json(r#"{"type":"goto","dest":{"fit":"fitR","page":2,"rect":[1,2,3,4]}}"#)
+                .unwrap();
+        assert_eq!(
+            fitr,
+            Action::GoTo(Destination::FitR {
+                page: 2,
+                rect: [1.0, 2.0, 3.0, 4.0]
+            })
+        );
+        // fitB / fitBH / fitBV
+        assert_eq!(
+            Action::from_json(r#"{"type":"goto","dest":{"fit":"fitB","page":3}}"#).unwrap(),
+            Action::GoTo(Destination::FitB { page: 3 })
+        );
+        assert_eq!(
+            Action::from_json(r#"{"type":"goto","dest":{"fit":"fitBH","page":4,"top":9}}"#)
+                .unwrap(),
+            Action::GoTo(Destination::FitBH {
+                page: 4,
+                top: Some(9.0)
+            })
+        );
+        assert_eq!(
+            Action::from_json(r#"{"type":"goto","dest":{"fit":"fitBV","page":5,"left":7}}"#)
+                .unwrap(),
+            Action::GoTo(Destination::FitBV {
+                page: 5,
+                left: Some(7.0)
+            })
+        );
+        // Unknown fit falls back to Fit.
+        assert_eq!(
+            Action::from_json(r#"{"type":"goto","dest":{"fit":"mystery","page":6}}"#).unwrap(),
+            Action::GoTo(Destination::Fit { page: 6 })
+        );
+
+        // Every fit destination round-trips into a /D array via build_d_value.
+        for dest in [
+            Destination::FitH {
+                page: 1,
+                top: Some(1.0),
+            },
+            Destination::FitV {
+                page: 1,
+                left: Some(1.0),
+            },
+            Destination::FitR {
+                page: 1,
+                rect: [1.0, 2.0, 3.0, 4.0],
+            },
+            Destination::FitB { page: 1 },
+            Destination::FitBH { page: 1, top: None },
+            Destination::FitBV {
+                page: 1,
+                left: None,
+            },
+        ] {
+            let v = dest.build_d_value(&ref_resolver);
+            assert!(matches!(v, Object::Array(_)));
+        }
+    }
+
+    #[test]
+    fn parses_launch_and_submitform_and_named_variants() {
+        assert_eq!(
+            Action::from_json(r#"{"type":"launch","file":"app.exe"}"#).unwrap(),
+            Action::Launch("app.exe".into())
+        );
+        assert_eq!(
+            Action::from_json(r#"{"type":"submitForm","url":"https://post.test"}"#).unwrap(),
+            Action::SubmitForm {
+                url: "https://post.test".into()
+            }
+        );
+        assert_eq!(
+            Action::from_json(r#"{"type":"named","action":"prevPage"}"#).unwrap(),
+            Action::Named(NamedAction::PrevPage)
+        );
+        assert_eq!(
+            Action::from_json(r#"{"type":"named","action":"firstPage"}"#).unwrap(),
+            Action::Named(NamedAction::FirstPage)
+        );
+        // Unknown named action defaults to NextPage.
+        assert_eq!(
+            Action::from_json(r#"{"type":"named","action":"whatever"}"#).unwrap(),
+            Action::Named(NamedAction::NextPage)
+        );
+    }
+
+    #[test]
+    fn build_dict_covers_launch_submitform_named_pdf_names() {
+        // pdf_name() for every NamedAction variant via build_dict.
+        for (na, want) in [
+            (NamedAction::NextPage, b"NextPage".as_slice()),
+            (NamedAction::PrevPage, b"PrevPage".as_slice()),
+            (NamedAction::FirstPage, b"FirstPage".as_slice()),
+            (NamedAction::LastPage, b"LastPage".as_slice()),
+        ] {
+            let d = Action::Named(na).build_dict(&ref_resolver);
+            assert_eq!(d.get(b"N").and_then(Object::as_name), Some(want));
+        }
+        // Launch writes /S /Launch + /F.
+        let launch = Action::Launch("doc.pdf".into()).build_dict(&ref_resolver);
+        assert_eq!(
+            launch.get(b"S").and_then(Object::as_name),
+            Some(b"Launch".as_slice())
+        );
+        // SubmitForm writes /S /SubmitForm + /F.
+        let submit = Action::SubmitForm { url: "u".into() }.build_dict(&ref_resolver);
+        assert_eq!(
+            submit.get(b"S").and_then(Object::as_name),
+            Some(b"SubmitForm".as_slice())
+        );
+    }
+
+    #[test]
+    fn parses_named_destination_via_fit_named() {
+        let a =
+            Action::from_json(r#"{"type":"goto","dest":{"fit":"named","name":"intro"}}"#).unwrap();
+        assert_eq!(a, Action::GoTo(Destination::Named("intro".into())));
+    }
 }
