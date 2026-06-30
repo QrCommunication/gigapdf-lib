@@ -125,3 +125,63 @@ impl Default for BoundsBuilder {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounds_contains_area_and_intersects() {
+        let b = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 4.0,
+        };
+        assert!(b.contains(5.0, 2.0));
+        assert!(b.contains(0.0, 0.0)); // edge counts as inside
+        assert!(!b.contains(11.0, 2.0));
+        assert_eq!(b.area(), 40.0);
+
+        let touching = Bounds {
+            x: 10.0,
+            y: 0.0,
+            width: 2.0,
+            height: 2.0,
+        };
+        assert!(b.intersects(&touching)); // touching edges overlap
+        let apart = Bounds {
+            x: 100.0,
+            y: 100.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        assert!(!b.intersects(&apart));
+    }
+
+    #[test]
+    fn builder_build_none_when_empty() {
+        let bb = BoundsBuilder::new();
+        assert!(bb.build().is_none());
+        // Default is the same as new().
+        let def = BoundsBuilder::default();
+        assert!(def.build().is_none());
+    }
+
+    #[test]
+    fn builder_accumulates_points_and_transforms() {
+        let mut bb = BoundsBuilder::default();
+        bb.add(1.0, 1.0);
+        bb.add(4.0, 5.0);
+        let b = bb.build().expect("non-empty");
+        assert_eq!((b.x, b.y, b.width, b.height), (1.0, 1.0, 3.0, 4.0));
+
+        // add_through applies the matrix before accumulating.
+        let mut bb2 = BoundsBuilder::new();
+        let m = Matrix::new(1.0, 0.0, 0.0, 1.0, 10.0, 20.0); // translate
+        bb2.add_through(&m, 0.0, 0.0);
+        bb2.add_through(&m, 2.0, 3.0);
+        let b2 = bb2.build().unwrap();
+        assert_eq!((b2.x, b2.y, b2.width, b2.height), (10.0, 20.0, 2.0, 3.0));
+    }
+}

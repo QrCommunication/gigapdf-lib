@@ -58,3 +58,63 @@ impl fmt::Display for EngineError {
 }
 
 impl std::error::Error for EngineError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_constructor_builds_parse_variant() {
+        let e = EngineError::parse(42, "bad token");
+        assert_eq!(
+            e,
+            EngineError::Parse {
+                offset: 42,
+                message: "bad token".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn display_covers_every_variant() {
+        assert_eq!(
+            EngineError::parse(7, "oops").to_string(),
+            "parse error at byte 7: oops"
+        );
+        assert_eq!(
+            EngineError::Missing("Root".into()).to_string(),
+            "missing: Root"
+        );
+        assert_eq!(
+            EngineError::Unsupported("JBIG2".into()).to_string(),
+            "unsupported: JBIG2"
+        );
+        assert_eq!(
+            EngineError::Filter("flate".into()).to_string(),
+            "filter error: flate"
+        );
+        assert_eq!(
+            EngineError::Content("ops".into()).to_string(),
+            "content stream error: ops"
+        );
+        assert_eq!(EngineError::PageNotFound(3).to_string(), "page 3 not found");
+        assert_eq!(
+            EngineError::RunNotFound { index: 5, page: 2 }.to_string(),
+            "content object #5 not found on page 2"
+        );
+        assert_eq!(
+            EngineError::InvalidArgument("rect".into()).to_string(),
+            "invalid argument: rect"
+        );
+    }
+
+    #[test]
+    fn implements_std_error_and_is_usable_as_trait_object() {
+        let e = EngineError::Missing("x".into());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert_eq!(dyn_err.to_string(), "missing: x");
+        // Result alias round-trips an Err of this type.
+        let r: Result<()> = Err(EngineError::PageNotFound(1));
+        assert!(r.is_err());
+    }
+}

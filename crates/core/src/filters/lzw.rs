@@ -175,4 +175,35 @@ mod tests {
     fn empty_input_yields_empty_output() {
         assert_eq!(lzw_decode(&[], true).unwrap(), Vec::<u8>::new());
     }
+
+    #[test]
+    fn invalid_code_errors() {
+        // CLEAR (256) then a 9-bit code 300, which is neither in the fresh
+        // 258-entry table nor the special next-code case → "invalid LZW code".
+        // Bits: 100000000 (256) 100101100 (300) packed MSB-first.
+        let mut bits = String::new();
+        for code in [256u16, 300] {
+            bits.push_str(&format!("{code:09b}"));
+        }
+        while !bits.len().is_multiple_of(8) {
+            bits.push('0');
+        }
+        let bytes: Vec<u8> = bits
+            .as_bytes()
+            .chunks(8)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap())
+            .collect();
+        assert!(lzw_decode(&bytes, true).is_err());
+    }
+
+    #[test]
+    fn strict_tiff_early_change_zero_decodes() {
+        // early_change = false (strict TIFF) exercises the no-bump width path.
+        // "AB": CLEAR 'A' 'B' EOD encoded with early_change=0 still round-trips
+        // a couple of literals; we only assert it decodes without error and is
+        // non-trivial, since the bit layout differs from the Adobe stream.
+        let encoded = [0x80u8, 0x10, 0x48, 0x50, 0x10];
+        let decoded = lzw_decode(&encoded, false).unwrap();
+        assert!(decoded.starts_with(b"A"));
+    }
 }

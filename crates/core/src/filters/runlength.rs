@@ -81,4 +81,11 @@ mod tests {
         let encoded = [3u8, b'a', b'b'];
         assert!(run_length_decode(&encoded).is_err());
     }
+
+    #[test]
+    fn truncated_repeat_run_errors() {
+        // A repeat length byte (129..=255) with no byte following to repeat.
+        let encoded = [200u8];
+        assert!(run_length_decode(&encoded).is_err());
+    }
 }
