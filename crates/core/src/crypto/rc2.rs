@@ -22,3 +22,29 @@ pub fn rc2_cbc_decrypt(
     dec.decrypt_padded_mut::<NoPadding>(&mut buf).ok()?;
     Some(buf)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_iv_or_data_length() {
+        let key = [0u8; 5];
+        // IV not 8 bytes.
+        assert!(rc2_cbc_decrypt(&key, 40, &[0u8; 7], &[0u8; 8]).is_none());
+        // Empty data.
+        assert!(rc2_cbc_decrypt(&key, 40, &[0u8; 8], &[]).is_none());
+        // Data not a multiple of the 8-byte block.
+        assert!(rc2_cbc_decrypt(&key, 40, &[0u8; 8], &[0u8; 9]).is_none());
+    }
+
+    #[test]
+    fn decrypts_a_valid_block_to_some() {
+        // A well-formed call (8-byte IV, 1 full block) decodes to Some bytes.
+        let key = [0x12u8; 5];
+        let iv = [0u8; 8];
+        let ct = [0xABu8; 8];
+        let out = rc2_cbc_decrypt(&key, 40, &iv, &ct).expect("valid lengths → Some");
+        assert_eq!(out.len(), 8);
+    }
+}

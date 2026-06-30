@@ -218,4 +218,15 @@ mod tests {
         // Spanning more than one hash block produces > u bytes correctly.
         assert_eq!(pkcs12_kdf_sha1(1, &pass, &salt, 1, 40).len(), 40);
     }
+
+    #[test]
+    fn expand_pads_and_handles_empty() {
+        // Empty input → empty output (the early-return branch).
+        assert!(expand(&[], 8).is_empty());
+        // Non-empty input is repeated byte-wise to fill ceil(len/block)*block.
+        assert_eq!(expand(&[1, 2, 3], 4), vec![1, 2, 3, 1]);
+        assert_eq!(expand(&[9], 3), vec![9, 9, 9]);
+        // Exact multiple stays the same length.
+        assert_eq!(expand(&[1, 2, 3, 4], 4), vec![1, 2, 3, 4]);
+    }
 }

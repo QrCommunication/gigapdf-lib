@@ -118,4 +118,11 @@ mod tests {
         // partial group of one, which is malformed per the spec.
         assert!(ascii_85_decode(b"87cUR!~>").is_err());
     }
+
+    #[test]
+    fn z_inside_a_group_is_error() {
+        // 'z' is only valid at a group boundary; one mid-group (after a digit
+        // has started a group) is rejected.
+        assert!(ascii_85_decode(b"8z~>").is_err());
+    }
 }

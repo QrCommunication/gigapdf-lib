@@ -50,4 +50,11 @@ mod tests {
         let cipher = rc4(key, data);
         assert_eq!(rc4(key, &cipher), data);
     }
+
+    #[test]
+    fn empty_key_returns_data_unchanged() {
+        // With no key there is no keystream — the data passes through verbatim.
+        assert_eq!(rc4(b"", b"unchanged"), b"unchanged");
+        assert_eq!(rc4(&[], &[]), Vec::<u8>::new());
+    }
 }

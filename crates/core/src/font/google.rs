@@ -87,4 +87,15 @@ mod tests {
             Some("https://fonts.gstatic.com/s/x/y.ttf")
         );
     }
+
+    #[test]
+    fn unterminated_url_open_paren_breaks_cleanly() {
+        // A `url(` with no closing `)` hits the break arm → None, no panic.
+        assert_eq!(
+            parse_css_font_url("src:url(https://fonts.gstatic.com/x"),
+            None
+        );
+        // No url( at all → None.
+        assert_eq!(parse_css_font_url("body{color:red}"), None);
+    }
 }
