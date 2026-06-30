@@ -4255,6 +4255,28 @@ export class GigaPdfDoc {
     return { format, bytes: buf.subarray(1) };
   }
   /**
+   * Extract an embedded font as a **browser-loadable** sfnt by (fuzzy)
+   * `/BaseFont` name — for a host editor's `@font-face` overlay-text layer.
+   * Unlike {@link extractFont} (raw program, for re-embedding), this always
+   * returns bytes a browser's `FontFace`/OTS will accept, **keeping the
+   * document's own glyphs** (no substitution): a bare CFF (Type1C) is wrapped to
+   * OpenType with a `cmap` from its charset, and a `cmap`-less TrueType subset is
+   * repaired with a `cmap` synthesised from the PDF's `code → Unicode` (original
+   * `glyf` kept). `truetype`/`otf` are directly loadable; `cff`/`type1` are raw
+   * last-resort fallbacks. `null` when nothing embedded matches.
+   */
+  extractWebFont(
+    name: string
+  ): { format: "truetype" | "otf" | "cff" | "type1"; bytes: Uint8Array } | null {
+    const buf = this.g._withStr(name, (p, l) =>
+      this.g._buffer((o) => this.ex().gp_extract_web_font(this.h, p, l, o))
+    );
+    if (buf.length === 0) return null;
+    const format =
+      buf[0] === 1 ? "truetype" : buf[0] === 2 ? "otf" : buf[0] === 3 ? "cff" : "type1";
+    return { format, bytes: buf.subarray(1) };
+  }
+  /**
    * The fonts **embedded** in the document — each `{ baseFont, format }`. Pair
    * with {@link extractFont} to pull a font's bytes out and re-embed them via
    * {@link embedFont}, e.g. to draw new text (with {@link addText}) in a face

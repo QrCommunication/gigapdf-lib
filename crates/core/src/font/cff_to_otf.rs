@@ -59,6 +59,75 @@ pub fn wrap(cff_bytes: &[u8]) -> Option<Vec<u8>> {
     Some(assemble_sfnt(0x4F54_544F, &mut tables))
 }
 
+/// Make a TrueType (`glyf`) program **browser-loadable** by injecting a Unicode
+/// `cmap` (from `pairs`, `code point → gid`) and the OTS-mandatory `OS/2`/`name`/
+/// `post` tables when they are absent — keeping every original table (`glyf`,
+/// `loca`, `head`, `hhea`, `hmtx`, `maxp`, hinting…) byte-for-byte, so the
+/// **original glyphs** are served, not a substitute.
+///
+/// Subset fonts embedded in a PDF routinely ship **no** `cmap` (the PDF maps
+/// codes to glyphs via `/Encoding`/`CIDToGIDMap`), which `@font-face`/OTS reject.
+/// This rebuilds a minimal valid sfnt around the existing glyph data. Returns
+/// `None` on a malformed directory. A stale `DSIG` is dropped (the edit voids it).
+pub(crate) fn repair_sfnt_with_cmap(program: &[u8], pairs: &[(u32, u16)]) -> Option<Vec<u8>> {
+    if program.len() < 12 {
+        return None;
+    }
+    let flavor = u32::from_be_bytes([program[0], program[1], program[2], program[3]]);
+    let num_tables = u16::from_be_bytes([program[4], program[5]]) as usize;
+
+    let mut tables: Vec<([u8; 4], Vec<u8>)> = Vec::with_capacity(num_tables + 4);
+    let mut hhea_max_adv: u16 = 1000;
+    for i in 0..num_tables {
+        let rec = 12 + i * 16;
+        if rec + 16 > program.len() {
+            return None;
+        }
+        let tag = [program[rec], program[rec + 1], program[rec + 2], program[rec + 3]];
+        let off = u32::from_be_bytes([
+            program[rec + 8],
+            program[rec + 9],
+            program[rec + 10],
+            program[rec + 11],
+        ]) as usize;
+        let len = u32::from_be_bytes([
+            program[rec + 12],
+            program[rec + 13],
+            program[rec + 14],
+            program[rec + 15],
+        ]) as usize;
+        if off + len > program.len() {
+            continue; // skip a malformed record rather than abort the repair
+        }
+        let data = program[off..off + len].to_vec();
+        if &tag == b"hhea" && data.len() >= 12 {
+            hhea_max_adv = u16::from_be_bytes([data[10], data[11]]);
+        }
+        // Replace any existing cmap (we inject our own) and drop a now-stale DSIG.
+        if &tag == b"cmap" || &tag == b"DSIG" {
+            continue;
+        }
+        tables.push((tag, data));
+    }
+
+    tables.push((*b"cmap", build_cmap(pairs)));
+    if !tables.iter().any(|(t, _)| t == b"OS/2") {
+        tables.push((*b"OS/2", build_os2(hhea_max_adv, 0)));
+    }
+    if !tables.iter().any(|(t, _)| t == b"name") {
+        tables.push((*b"name", build_name()));
+    }
+    if !tables.iter().any(|(t, _)| t == b"post") {
+        tables.push((*b"post", build_post()));
+    }
+    tables.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // `assemble_sfnt` wants `&[u8; 4]` tags — borrow them from the owned vec.
+    let mut dir: Vec<(&[u8; 4], Vec<u8>)> =
+        tables.iter().map(|(tag, data)| (tag, data.clone())).collect();
+    Some(assemble_sfnt(flavor, &mut dir))
+}
+
 /// Build a glyph-id → Unicode **string** map from a CFF font's charset glyph
 /// names, resolving **ligature** glyphs (`ffi`, `fi`, …) to their multi-character
 /// expansions. Drives the `/ToUnicode` CMap for a CFF-embedded font so a ligated
@@ -397,7 +466,7 @@ fn build_maxp(num_glyphs: u16) -> Vec<u8> {
     t
 }
 
-fn build_post() -> Vec<u8> {
+pub(crate) fn build_post() -> Vec<u8> {
     let mut t = Vec::new();
     t.extend_from_slice(&0x0003_0000u32.to_be_bytes()); // version 3.0 (no names)
     t.extend_from_slice(&0i32.to_be_bytes()); // italicAngle
@@ -411,7 +480,7 @@ fn build_post() -> Vec<u8> {
     t
 }
 
-fn build_os2(max_adv: u16, _num_glyphs: u16) -> Vec<u8> {
+pub(crate) fn build_os2(max_adv: u16, _num_glyphs: u16) -> Vec<u8> {
     let mut t = Vec::with_capacity(96);
     t.extend_from_slice(&4u16.to_be_bytes()); // version 4
     t.extend_from_slice(&((max_adv / 2) as i16).to_be_bytes()); // xAvgCharWidth
@@ -440,7 +509,7 @@ fn build_os2(max_adv: u16, _num_glyphs: u16) -> Vec<u8> {
     t
 }
 
-fn build_name() -> Vec<u8> {
+pub(crate) fn build_name() -> Vec<u8> {
     // One record (nameID 6, PostScript name) in platform 3 / encoding 1 / 0x409.
     let value: Vec<u16> = "GigaPDFCFF".encode_utf16().collect();
     let mut string_data = Vec::new();
@@ -462,12 +531,20 @@ fn build_name() -> Vec<u8> {
     t
 }
 
-fn build_cmap(pairs: &[(u32, u16)]) -> Vec<u8> {
+pub(crate) fn build_cmap(pairs: &[(u32, u16)]) -> Vec<u8> {
     // Format 4 with one segment per code point + the mandatory 0xFFFF terminator.
+    // The spec REQUIRES segments ordered by ascending `endCode` with no
+    // duplicates: strict shapers (FreeType/HarfBuzz) reject an unsorted table and
+    // fall every code to `.notdef`. Enforce it here so every caller is safe
+    // regardless of the order it passes pairs in.
+    let mut sorted: Vec<(u32, u16)> = pairs.iter().filter(|&&(cp, _)| cp <= 0xFFFF).copied().collect();
+    sorted.sort_by_key(|&(cp, _)| cp);
+    sorted.dedup_by_key(|&mut (cp, _)| cp);
+
     let mut ends: Vec<u16> = Vec::new();
     let mut starts: Vec<u16> = Vec::new();
     let mut deltas: Vec<i16> = Vec::new();
-    for &(cp, gid) in pairs {
+    for &(cp, gid) in &sorted {
         let c = cp as u16;
         ends.push(c);
         starts.push(c);
@@ -762,6 +839,46 @@ mod tests {
         assert_eq!(parsed.gid_for_unicode(0x41), Some(3));
         assert_eq!(parsed.gid_for_unicode(0xE9), Some(7));
         assert_eq!(parsed.gid_for_unicode(0x2603), None); // unmapped
+    }
+
+    #[test]
+    fn repair_injects_cmap_and_required_tables_keeping_originals() {
+        // A stripped sfnt: glyph/metric tables but NO cmap / OS-2 / name / post
+        // — exactly what a PDF TrueType/CFF subset ships.
+        let advances = vec![500u16; 4];
+        let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
+            (b"CFF ", vec![1, 0, 4, 1]), // stub program table (kept verbatim)
+            (b"head", build_head(1000)),
+            (b"hhea", build_hhea(500, 4)),
+            (b"hmtx", build_hmtx(&advances)),
+            (b"maxp", build_maxp(4)),
+        ];
+        tables.sort_by(|a, b| a.0.cmp(b.0));
+        let program = assemble_sfnt(0x4F54_544F, &mut tables);
+
+        // No cmap before the repair.
+        assert!(crate::font::truetype::TrueTypeFont::parse_metrics(&program)
+            .and_then(|f| f.gid_for_unicode(0x41))
+            .is_none());
+
+        // Pairs intentionally unsorted to exercise build_cmap's ordering guard.
+        let pairs = [(0x42u32, 2u16), (0x41u32, 1u16)];
+        let repaired = repair_sfnt_with_cmap(&program, &pairs).expect("repair must succeed");
+
+        let f = crate::font::truetype::TrueTypeFont::parse_metrics(&repaired)
+            .expect("repaired sfnt must parse");
+        assert_eq!(f.num_glyphs(), 4); // original maxp preserved
+        assert_eq!(f.gid_for_unicode(0x41), Some(1));
+        assert_eq!(f.gid_for_unicode(0x42), Some(2));
+
+        // OTS-mandatory tables are now present, and the original program is kept.
+        let has = |tag: &[u8; 4]| {
+            let n = u16::from_be_bytes([repaired[4], repaired[5]]) as usize;
+            (0..n).any(|i| &repaired[12 + i * 16..12 + i * 16 + 4] == tag)
+        };
+        for tag in [b"cmap", b"OS/2", b"name", b"post", b"CFF "] {
+            assert!(has(tag), "repaired sfnt is missing {:?}", tag);
+        }
     }
 
     #[test]

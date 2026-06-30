@@ -5190,6 +5190,40 @@ pub extern "C" fn gp_extract_font(
     }
 }
 
+/// Extract an embedded font as a **browser-loadable** sfnt by (fuzzy) `/BaseFont`
+/// name (for a `@font-face` overlay-text layer). The first byte tags the format
+/// (1 = truetype, 2 = otf, 3 = cff, 4 = type1) followed by the sfnt bytes. Unlike
+/// [`gp_extract_font`], a bare CFF is wrapped to OpenType and a cmap-less
+/// TrueType subset is repaired with a synthesised cmap — original glyphs kept.
+#[no_mangle]
+pub extern "C" fn gp_extract_web_font(
+    handle: *const Document,
+    name_ptr: *const u8,
+    name_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_ref() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    match doc.extract_font_for_web(name) {
+        Some((bytes, format)) => {
+            let tag: u8 = match format {
+                "truetype" => 1,
+                "otf" => 2,
+                "cff" => 3,
+                _ => 4,
+            };
+            let mut out = Vec::with_capacity(bytes.len() + 1);
+            out.push(tag);
+            out.extend_from_slice(&bytes);
+            unsafe { bytes_into_host(out, out_len) }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Add a text-markup annotation (Highlight / Underline / StrikeOut / Squiggly)
 /// over `quads` (flat `[x0,y0,x1,y1, …]` in PDF coords). `meta` packs five
 /// `\x1f`-separated strings: subtype, contents, author, id, date. `rgb` packed

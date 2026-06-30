@@ -11193,54 +11193,10 @@ impl Document {
     /// composites (via `/DescendantFonts`). `None` when nothing matches or the
     /// match carries no embedded program (only a `/FontDescriptor` reference).
     pub fn extract_font_program(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
-        let target = normalize_font_name(name);
-        if target.is_empty() {
-            return None;
-        }
-        // Collect matching font dicts first (cloned) so we don't keep
-        // `self.objects` borrowed while resolving descriptors via `self.resolve`.
-        let mut candidates: Vec<Dictionary> = Vec::new();
-        for object in self.objects.values() {
-            let Some(dict) = object.as_dict() else {
+        for dict in self.matched_font_dicts(name) {
+            let Some(carrier) = self.font_carrier(&dict) else {
                 continue;
             };
-            if dict.get(b"Type").and_then(Object::as_name) != Some(b"Font".as_slice()) {
-                continue;
-            }
-            let base = dict
-                .get(b"BaseFont")
-                .and_then(Object::as_name)
-                .map(|n| String::from_utf8_lossy(n).into_owned())
-                .unwrap_or_default();
-            let candidate = normalize_font_name(&base);
-            if candidate.is_empty() {
-                continue;
-            }
-            // Two-direction substring match absorbs subset prefixes and the
-            // "-Regular"/"MT"/"PS" suffix variants without explicit stripping.
-            if candidate == target || candidate.contains(&target) || target.contains(&candidate) {
-                candidates.push(dict.clone());
-            }
-        }
-
-        for dict in candidates {
-            // Type0 composites carry the descriptor on the descendant CIDFont.
-            let carrier =
-                if dict.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice()) {
-                    match dict
-                        .get(b"DescendantFonts")
-                        .map(|o| self.resolve(o))
-                        .and_then(Object::as_array)
-                        .and_then(|a| a.first())
-                        .map(|o| self.resolve(o))
-                        .and_then(Object::as_dict)
-                    {
-                        Some(descendant) => descendant.clone(),
-                        None => continue,
-                    }
-                } else {
-                    dict.clone()
-                };
             let Some(descriptor) = carrier
                 .get(b"FontDescriptor")
                 .map(|o| self.resolve(o))
@@ -11267,6 +11223,362 @@ impl Document {
             }
         }
         None
+    }
+
+    /// Top-level `/Font` dicts whose normalized `/BaseFont` fuzzy-matches `name`
+    /// (two-direction substring, so subset prefixes and `-Regular`/`MT`/`PS`
+    /// suffix variants match without explicit stripping). Cloned up-front so the
+    /// caller can resolve descriptors without holding `self.objects` borrowed.
+    fn matched_font_dicts(&self, name: &str) -> Vec<Dictionary> {
+        let target = normalize_font_name(name);
+        if target.is_empty() {
+            return Vec::new();
+        }
+        let mut candidates: Vec<Dictionary> = Vec::new();
+        for object in self.objects.values() {
+            let Some(dict) = object.as_dict() else {
+                continue;
+            };
+            if dict.get(b"Type").and_then(Object::as_name) != Some(b"Font".as_slice()) {
+                continue;
+            }
+            let base = dict
+                .get(b"BaseFont")
+                .and_then(Object::as_name)
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .unwrap_or_default();
+            let candidate = normalize_font_name(&base);
+            if candidate.is_empty() {
+                continue;
+            }
+            if candidate == target || candidate.contains(&target) || target.contains(&candidate) {
+                candidates.push(dict.clone());
+            }
+        }
+        candidates
+    }
+
+    /// The dict carrying the `/FontDescriptor`: the descendant CIDFont for a
+    /// Type0 composite, else the font dict itself.
+    fn font_carrier(&self, dict: &Dictionary) -> Option<Dictionary> {
+        if dict.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice()) {
+            dict.get(b"DescendantFonts")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .and_then(|a| a.first())
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+                .cloned()
+        } else {
+            Some(dict.clone())
+        }
+    }
+
+    /// Extract an embedded font as a **browser-loadable** sfnt by (fuzzy)
+    /// `/BaseFont` name — the editor's overlay-text font source. Unlike
+    /// [`extract_font_program`](Self::extract_font_program) (which returns the
+    /// raw program for re-embedding), this always yields a font `@font-face`/OTS
+    /// will accept, **keeping the document's own glyphs** (no substitution):
+    ///
+    /// * **CFF** (`/FontFile3`): bare Type1C is wrapped into an OpenType (`OTTO`)
+    ///   with a `cmap` built from the CFF charset ([`cff_to_otf::wrap`]); an
+    ///   already-OpenType `/FontFile3` with a Unicode `cmap` passes through.
+    /// * **TrueType** (`/FontFile2`): passes through when it already maps Unicode;
+    ///   otherwise a `cmap` is synthesised from the PDF's `code → Unicode`
+    ///   (`/ToUnicode`, `/Differences`, WinAnsi) with the subset `code == gid`
+    ///   convention, and the OTS-mandatory `OS/2`/`name`/`post` are stubbed in —
+    ///   original `glyf` kept ([`cff_to_otf::repair_sfnt_with_cmap`]).
+    /// * **Type1** (`/FontFile`): returned as-is (best effort).
+    ///
+    /// Format tag mirrors [`extract_font_program`]: `truetype`, `otf` (wrapped
+    /// CFF) or `type1`. `None` when nothing embedded matches.
+    pub fn extract_font_for_web(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
+        // Target the right face with increasing looseness:
+        //  1. EXACT raw `/BaseFont` (subset prefix included) — a host editor
+        //     passes the run's own `…+TimesNewRoman,Bold`, so this serves *that*
+        //     subset's own glyphs (the only correct choice when a document embeds
+        //     many disjoint subsets of one family).
+        //  2. else exact *normalized* name (prefix dropped) — keeps the variant
+        //     (`…,Bold` never falls to a plain/italic face).
+        //  3. else the loose two-direction match (`matched_font_dicts`).
+        let all = self.matched_font_dicts(name);
+        let raw_target = name.trim();
+        let base_of = |d: &Dictionary| {
+            d.get(b"BaseFont")
+                .and_then(Object::as_name)
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+        };
+        let exact_raw: Vec<Dictionary> = all
+            .iter()
+            .filter(|d| base_of(d).is_some_and(|b| b.eq_ignore_ascii_case(raw_target)))
+            .cloned()
+            .collect();
+        let dicts = if !exact_raw.is_empty() {
+            exact_raw
+        } else {
+            let target = normalize_font_name(name);
+            let exact_norm: Vec<Dictionary> = all
+                .iter()
+                .filter(|d| base_of(d).is_some_and(|b| normalize_font_name(&b) == target))
+                .cloned()
+                .collect();
+            if exact_norm.is_empty() {
+                all
+            } else {
+                exact_norm
+            }
+        };
+
+        // Pass 1 — a program that is browser-loadable directly: a CFF (always
+        // wrappable to OpenType with a `cmap` from its own charset) or a
+        // TrueType that already maps Unicode. Preferred over a cmap-less subset
+        // so a fuzzy name match returns a *usable* face, not an orphan stub.
+        for dict in &dicts {
+            let Some(descriptor) = self.web_font_descriptor(dict) else {
+                continue;
+            };
+            if let Some(bytes) = self.font_file_bytes(&descriptor, b"FontFile3") {
+                if !bytes.is_empty() {
+                    if Self::is_sfnt(&bytes) {
+                        if Self::sfnt_has_unicode_cmap(&bytes) {
+                            return Some((bytes, "otf"));
+                        }
+                    } else if let Some(otf) = crate::font::cff_to_otf::wrap(&bytes) {
+                        // `wrap`'s `cmap` is charset-only and misses synthetic
+                        // (`gNN`) glyph names; rebuild it from the PDF's
+                        // code→Unicode + the spec code→gid so every painted glyph
+                        // maps. Falls back to the charset `cmap` if that yields
+                        // nothing (e.g. CID-keyed CFF).
+                        if let Some(source) = self.font_program(dict) {
+                            let pairs = self.simple_cmap_pairs(dict, &source, None);
+                            if !pairs.is_empty() {
+                                if let Some(fixed) =
+                                    crate::font::cff_to_otf::repair_sfnt_with_cmap(&otf, &pairs)
+                                {
+                                    return Some((fixed, "otf"));
+                                }
+                            }
+                        }
+                        return Some((otf, "otf"));
+                    }
+                }
+            }
+            if let Some(bytes) = self.font_file_bytes(&descriptor, b"FontFile2") {
+                if !bytes.is_empty() && Self::sfnt_has_unicode_cmap(&bytes) {
+                    return Some((bytes, "truetype"));
+                }
+            }
+        }
+
+        // Pass 2 — only cmap-less / bare programs remain. Repair a cmap-less
+        // TrueType subset (original `glyf` kept), borrowing a sibling's
+        // `Unicode → gid` so full-glyph-order subsets resolve correctly; bare
+        // CFF/Type1 is handed back as a last resort.
+        let donor = self.web_font_donor_cmap(&dicts);
+        for dict in &dicts {
+            let Some(descriptor) = self.web_font_descriptor(dict) else {
+                continue;
+            };
+            if let Some(bytes) = self.font_file_bytes(&descriptor, b"FontFile2") {
+                if !bytes.is_empty() {
+                    let pairs = self
+                        .font_program(dict)
+                        .map(|source| self.simple_cmap_pairs(dict, &source, donor.as_ref()))
+                        .unwrap_or_default();
+                    if !pairs.is_empty() {
+                        if let Some(repaired) =
+                            crate::font::cff_to_otf::repair_sfnt_with_cmap(&bytes, &pairs)
+                        {
+                            return Some((repaired, "truetype"));
+                        }
+                    }
+                    return Some((bytes, "truetype"));
+                }
+            }
+            if let Some(bytes) = self.font_file_bytes(&descriptor, b"FontFile3") {
+                if !bytes.is_empty() {
+                    return Some((bytes, "cff"));
+                }
+            }
+            if let Some(bytes) = self.font_file_bytes(&descriptor, b"FontFile") {
+                if !bytes.is_empty() {
+                    return Some((bytes, "type1"));
+                }
+            }
+        }
+        None
+    }
+
+    /// The `/FontDescriptor` dict of a matched font (via its Type0-aware
+    /// carrier), or `None` when absent.
+    fn web_font_descriptor(&self, dict: &Dictionary) -> Option<Dictionary> {
+        self.font_carrier(dict)?
+            .get(b"FontDescriptor")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+    }
+
+    /// A `Unicode → gid` map borrowed from the first matched program that ships a
+    /// usable `cmap` (TrueType `cmap` reversed, or a CFF charset). A cmap-less
+    /// **full-glyph-order** subset (the common `code != gid` case — it kept the
+    /// donor's glyph ids, only blanking unused outlines) resolves its glyphs
+    /// through this instead of guessing `code == gid`.
+    fn web_font_donor_cmap(&self, dicts: &[Dictionary]) -> Option<BTreeMap<u32, u16>> {
+        for dict in dicts {
+            let Some(descriptor) = self.web_font_descriptor(dict) else {
+                continue;
+            };
+            if let Some(bytes) = self.font_file_bytes(&descriptor, b"FontFile2") {
+                if let Some(ttf) = crate::font::truetype::TrueTypeFont::parse_metrics(&bytes) {
+                    let mut map: BTreeMap<u32, u16> = BTreeMap::new();
+                    for (gid, uni) in ttf.gid_to_unicode_map() {
+                        map.entry(uni).or_insert(gid);
+                    }
+                    if !map.is_empty() {
+                        return Some(map);
+                    }
+                }
+            }
+            if let Some(bytes) = self.font_file_bytes(&descriptor, b"FontFile3") {
+                if let Some(cff) = crate::font::cff::CffFont::parse(&bytes) {
+                    let map = crate::font::cff_to_otf::cff_unicode_to_gid(&cff);
+                    if !map.is_empty() {
+                        return Some(map);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// First four bytes are a known sfnt magic (TrueType / `OTTO` / `true` /
+    /// `ttcf`).
+    fn is_sfnt(bytes: &[u8]) -> bool {
+        matches!(
+            bytes.get(0..4),
+            Some([0x00, 0x01, 0x00, 0x00])
+                | Some(b"OTTO")
+                | Some(b"true")
+                | Some(b"ttcf")
+        )
+    }
+
+    /// True when an sfnt's `cmap` maps at least one common Latin code point —
+    /// the cheap, robust test for "FontFace can render text with this as-is".
+    /// `parse_metrics` reads the `cmap` without requiring `glyf`, so it also
+    /// answers for CFF OpenType.
+    fn sfnt_has_unicode_cmap(bytes: &[u8]) -> bool {
+        crate::font::truetype::TrueTypeFont::parse_metrics(bytes)
+            .map(|f| {
+                [0x41u32, 0x61, 0x20, 0x30]
+                    .iter()
+                    .any(|&cp| f.gid_for_unicode(cp).is_some())
+            })
+            .unwrap_or(false)
+    }
+
+    /// Build `code point → gid` pairs for a cmap-less simple TrueType subset.
+    /// `code → Unicode` comes from the PDF (`/ToUnicode`, then a `/Differences`
+    /// glyph name via the AGL, then the WinAnsi scalar); `code → gid` uses the
+    /// subset `code == gid` convention (the only mapping a stripped TrueType
+    /// subset preserves). BMP only — the synthesised `cmap` is format 4.
+    fn simple_cmap_pairs(
+        &self,
+        font: &Dictionary,
+        program: &crate::font::GlyphSource,
+        donor: Option<&BTreeMap<u32, u16>>,
+    ) -> Vec<(u32, u16)> {
+        use crate::font::GlyphSource;
+        // `code → gid` is authoritative for CFF/Type1 (the spec `/Encoding` vs
+        // charset resolution — handles synthetic `gNN` glyph names by name, the
+        // exact thing the charset-only `cmap` misses). TrueType has no name
+        // charset, so `simple_code_to_gid` returns `None` and we fall to a donor's
+        // `Unicode → gid` (full-glyph-order subset) or the `code == gid` subset
+        // convention.
+        let code_to_gid = self.simple_code_to_gid(font, Some(program));
+        let num_glyphs = match program {
+            GlyphSource::TrueType(f) => f.num_glyphs(),
+            GlyphSource::Cff(f) => f.num_glyphs(),
+            GlyphSource::Type1(f) => f.name_to_gid_map().len().min(0xFFFF) as u16,
+        };
+        if num_glyphs == 0 {
+            return Vec::new();
+        }
+        // `code → Unicode` built EXACTLY like the text decoder
+        // ([`font_decoders_for`]): the `/Encoding`+`/Differences` map (with the
+        // CFF charset fallback), then a `/ToUnicode` whose gaps are recovered via
+        // the document-wide ASCII offset. This is what makes a subset whose
+        // `/ToUnicode` omits codes — and whose `/Differences` carries opaque
+        // `gNN` names — still map `N`→its glyph: the synthesised cmap's keys are
+        // the SAME code points the run's extracted text uses, so the browser
+        // renders the run, not tofu.
+        let simple_encoding = self.simple_font_encoding(font, Some(program));
+        let reserved: BTreeSet<u32> = simple_encoding
+            .as_ref()
+            .map(|m| m.keys().map(|&c| c as u32).collect())
+            .unwrap_or_default();
+        let doc_delta = self.document_ascii_offset();
+        let to_unicode = font
+            .get(b"ToUnicode")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)
+            .and_then(|s| decode_stream(s).ok())
+            .map(|bytes| crate::font::cmap::ToUnicode::parse(&bytes))
+            .filter(|c| !c.is_empty())
+            .map(|mut c| {
+                c.infer_ascii_gaps(doc_delta, &reserved);
+                c
+            });
+        let in_range = |g: u16| g != 0 && (g as u32) < num_glyphs as u32;
+
+        let mut pairs: Vec<(u32, u16)> = Vec::new();
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        for code in 0u32..=255 {
+            let scalar = simple_encoding
+                .as_ref()
+                .and_then(|m| m.get(&(code as u8)))
+                .and_then(|s| s.chars().next())
+                .map(|c| c as u32)
+                .or_else(|| {
+                    to_unicode
+                        .as_ref()
+                        .and_then(|t| t.decode(code))
+                        .and_then(|s| s.chars().next())
+                        .map(|c| c as u32)
+                })
+                .or_else(|| {
+                    let c = crate::font::winansi_to_char(code as u8) as u32;
+                    (c != 0).then_some(c)
+                });
+            let Some(cp) = scalar else { continue };
+            // Skip control code points (a code with no real Unicode would
+            // otherwise land a glyph on an unreachable slot).
+            if !(0x20..=0xFFFF).contains(&cp) {
+                continue;
+            }
+            let gid = if let Some(map) = &code_to_gid {
+                // CFF/Type1: authoritative; skip codes the font doesn't map.
+                match map.get(&code).copied() {
+                    Some(g) => g,
+                    None => continue,
+                }
+            } else {
+                // TrueType: borrow the donor's gid for this Unicode (correct for
+                // full-glyph-order subsets), else `code == gid`.
+                donor
+                    .and_then(|d| d.get(&cp).copied())
+                    .filter(|&g| in_range(g))
+                    .unwrap_or(code as u16)
+            };
+            if !in_range(gid) {
+                continue;
+            }
+            if seen.insert(cp) {
+                pairs.push((cp, gid));
+            }
+        }
+        pairs
     }
 
     /// Index of the element at page point `(x, y)` (user space), preferring the

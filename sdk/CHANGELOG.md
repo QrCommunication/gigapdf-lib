@@ -6,6 +6,37 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.110.0] - 2026-06-30
+
+### Added — `extractWebFont`: serve a document's own embedded fonts to a browser
+
+- New engine method **`extractWebFont(name)`** (FFI `gp_extract_web_font`) returns
+  a PDF's **own embedded font** as a **browser-loadable sfnt** for a `@font-face`
+  overlay-text layer — keeping the document's **original glyphs**, never a
+  substitute. It complements `extractFont` (which returns the raw program for
+  re-embedding): where `extractFont` hands back bytes a browser's `FontFace`/OTS
+  routinely rejects (a bare CFF, or a `cmap`-less TrueType subset),
+  `extractWebFont` repairs them:
+  - **CFF (Type1C)** → wrapped to OpenType (`OTTO`) with a `cmap` built from the
+    PDF's `code → Unicode` decode mapping (the same one text extraction uses, so
+    it resolves subset glyphs whose `/Differences` carries opaque `gNN` names and
+    whose `/ToUnicode` is partial — the exact case that otherwise renders the
+    wrong letters).
+  - **TrueType** → passed through when it already maps Unicode; otherwise a `cmap`
+    is synthesised (`code → Unicode` from the decode path, `code → gid` borrowed
+    from a sibling's `cmap` for full-glyph-order subsets, else the `code == gid`
+    convention) and the OTS-mandatory `OS/2`/`name`/`post` are stubbed in — the
+    original `glyf` is kept verbatim.
+  - Face selection prefers an **exact raw `/BaseFont`** match (subset prefix
+    included), so a host that serves many disjoint subsets of one family gets
+    *that* subset's own glyphs per run.
+- New internal helper `cff_to_otf::repair_sfnt_with_cmap` (injects a Unicode
+  `cmap` + the OTS-required tables around existing glyph data) and a hardened
+  `build_cmap` (now sorts/dedupes segments, so a synthesised format-4 table is
+  accepted by strict shapers — FreeType/HarfBuzz).
+- Tests: `repair_injects_cmap_and_required_tables_keeping_originals` (the repair
+  keeps the original tables and adds a working `cmap`).
+
 ### Added — bidirectional conversion symmetry: model importers for RTF, TXT and images
 
 - New engine methods `rtfToModel(rtf)`, `txtToModel(text)` and
