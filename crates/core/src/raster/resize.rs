@@ -158,4 +158,26 @@ mod tests {
         assert!(out[0] > 200 && out[1] < 60, "stays red: {:?}", &out[..4]);
         assert_eq!(out[3], 128, "alpha averaged (255+0)/2");
     }
+
+    #[test]
+    fn fully_transparent_output_has_zero_inverse_alpha() {
+        // Every source pixel transparent → the resampled alpha is 0, exercising
+        // the `a > 0 { … } else { 0.0 }` unpremultiply guard. RGB clamps to 0.
+        let src = [12, 34, 56, 0, 78, 90, 120, 0]; // 2×1, both alpha 0
+        let out = resize_rgba(&src, 2, 1, 1, 1);
+        assert_eq!(out, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn large_downscale_collapses_many_pixels() {
+        // A wide gradient downscaled hard exercises the multi-pixel footprint
+        // accumulation and normalisation across the support window.
+        let mut src = Vec::new();
+        for x in 0..16u8 {
+            src.extend_from_slice(&[x * 16, 0, 0, 255]);
+        }
+        let out = resize_rgba(&src, 16, 1, 1, 1);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[3], 255);
+    }
 }

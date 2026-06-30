@@ -217,4 +217,40 @@ mod tests {
         assert_eq!(parsed.token_der, token);
         assert_eq!(parsed.status, 0);
     }
+
+    #[test]
+    fn parse_rejects_first_member_neither_oid_nor_sequence() {
+        // First member is an INTEGER → neither a status-info SEQUENCE nor a token
+        // OID, so parse_response returns None.
+        let resp = der::sequence(&[der::integer_u32(7), der::integer_u32(0)]);
+        assert!(parse_response(&resp).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_token_member_not_a_sequence() {
+        // Valid granted status, but the token member is an INTEGER not a SEQUENCE.
+        let status_info = der::sequence(&[der::integer_u32(0)]);
+        let resp = der::sequence(&[status_info, der::integer_u32(42)]);
+        assert!(parse_response(&resp).is_none());
+    }
+
+    #[test]
+    fn parse_accepts_granted_with_mods_status_one() {
+        let status_info = der::sequence(&[der::integer_u32(1)]); // grantedWithMods
+        let token = der::sequence(&[der::oid(&[1, 2, 840, 113549, 1, 7, 2])]);
+        let resp = der::sequence(&[status_info, token]);
+        let parsed = parse_response(&resp).expect("grantedWithMods");
+        assert_eq!(parsed.status, 1);
+    }
+
+    #[test]
+    fn be_u32_rejects_oversized_and_handles_sign_byte() {
+        // > 4 content octets → None.
+        assert!(be_u32(&[1, 2, 3, 4, 5]).is_none());
+        // Leading sign byte stripped; empty → 0.
+        assert_eq!(be_u32(&[0x00]), Some(0));
+        assert_eq!(be_u32(&[0x00, 0x01, 0x00]), Some(256));
+        assert_eq!(be_u32(&[]), Some(0));
+        assert_eq!(be_u32(&[0xFF, 0xFF]), Some(0xFFFF));
+    }
 }

@@ -51,4 +51,21 @@ mod eval_tests {
         assert_eq!(super::eval("[1,2,3].map(x => x * 2).join(',')"), "2,4,6");
         assert_eq!(super::eval("'abc'.toUpperCase()"), "ABC");
     }
+
+    #[test]
+    fn boa_eval_syntax_error_is_passed_through() {
+        // A parse failure surfaces the SyntaxError verbatim (not "Uncaught …").
+        let out = super::eval("function (");
+        assert!(out.starts_with("SyntaxError"), "got: {out}");
+    }
+
+    #[test]
+    fn boa_eval_runtime_error_is_uncaught() {
+        // A thrown value / runtime error is prefixed with "Uncaught".
+        let out = super::eval("throw new Error('boom')");
+        assert!(out.starts_with("Uncaught"), "got: {out}");
+        // Referencing an undefined symbol is also a runtime (not syntax) error.
+        let ref_err = super::eval("nope.someMethod()");
+        assert!(ref_err.starts_with("Uncaught"), "got: {ref_err}");
+    }
 }

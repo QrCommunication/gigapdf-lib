@@ -201,4 +201,63 @@ mod tests {
         let s = Margins::symmetric(20.0, 30.0);
         assert_eq!((s.top, s.right, s.bottom, s.left), (20.0, 30.0, 20.0, 30.0));
     }
+
+    #[test]
+    fn every_named_size_resolves() {
+        for name in [
+            "a0",
+            "a1",
+            "a2",
+            "a3",
+            "a4",
+            "a5",
+            "a6",
+            "b4",
+            "b5",
+            "letter",
+            "us-letter",
+            "legal",
+            "us-legal",
+            "tabloid",
+            "ledger",
+            "executive",
+        ] {
+            let (w, h) = page_size(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert!(w > 0.0 && h > 0.0 && h >= w, "{name} portrait {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn landscape_prefix_and_short_suffix() {
+        let (pw, ph) = page_size("a4").unwrap();
+        // `landscape ` prefix.
+        let (lw, lh) = page_size("landscape a4").unwrap();
+        assert_eq!((lw, lh), (ph, pw));
+        // `landscape-` prefix.
+        let (lw2, lh2) = page_size("landscape-a4").unwrap();
+        assert_eq!((lw2, lh2), (ph, pw));
+        // `-l` short suffix.
+        let (lw3, lh3) = page_size("a4-l").unwrap();
+        assert_eq!((lw3, lh3), (ph, pw));
+        // Case-insensitive.
+        assert_eq!(page_size("LETTER"), page_size("letter"));
+    }
+
+    #[test]
+    fn render_options_for_size_and_fallback() {
+        let letter = RenderOptions::for_size("letter");
+        assert_eq!((letter.page_w, letter.page_h), (612.0, 792.0));
+        assert_eq!(letter.start_page_number, 1);
+        assert!(letter.header.is_none() && letter.footer.is_none());
+        // Unknown name → A4 portrait fallback.
+        let unknown = RenderOptions::for_size("not-a-size");
+        assert!((unknown.page_w - 595.2756).abs() < 0.01);
+        assert!((unknown.page_h - 841.8898).abs() < 0.01);
+    }
+
+    #[test]
+    fn substitute_total_token_alias() {
+        // `{{total}}` is an alias for the page count.
+        assert_eq!(substitute_tokens("p {{total}}", 1, 5), "p 5");
+    }
 }
