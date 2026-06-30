@@ -2165,4 +2165,231 @@ mod tests {
         g.set_clip_logrect(None);
         assert!(g.clip.is_none());
     }
+
+    // ── enum converters: exhaustive arms ─────────────────────────────────────
+
+    #[test]
+    fn rop2_from_u32_covers_every_arm() {
+        let expect = [
+            (1, Rop2::Black),
+            (2, Rop2::NotMergePen),
+            (3, Rop2::MaskNotPen),
+            (4, Rop2::NotCopyPen),
+            (5, Rop2::MaskPenNot),
+            (6, Rop2::Not),
+            (7, Rop2::XorPen),
+            (8, Rop2::NotMaskPen),
+            (9, Rop2::MaskPen),
+            (10, Rop2::NotXorPen),
+            (11, Rop2::Nop),
+            (12, Rop2::MergeNotPen),
+            (13, Rop2::CopyPen),
+            (14, Rop2::MergePenNot),
+            (15, Rop2::MergePen),
+            (16, Rop2::White),
+            (0, Rop2::CopyPen),
+            (17, Rop2::CopyPen),
+        ];
+        for (v, want) in expect {
+            assert_eq!(Rop2::from_u32(v), want, "from_u32({v})");
+        }
+        assert!(Rop2::Nop.is_nop());
+        assert!(!Rop2::CopyPen.is_nop());
+    }
+
+    #[test]
+    fn rop2_mix_channel_every_variant() {
+        let s = 0b1100_1010u8;
+        let d = 0b1010_0110u8;
+        let cases = [
+            (Rop2::Black, 0u8),
+            (Rop2::NotMergePen, !(s | d)),
+            (Rop2::MaskNotPen, d & !s),
+            (Rop2::NotCopyPen, !s),
+            (Rop2::MaskPenNot, s & !d),
+            (Rop2::Not, !d),
+            (Rop2::XorPen, s ^ d),
+            (Rop2::NotMaskPen, !(s & d)),
+            (Rop2::MaskPen, s & d),
+            (Rop2::NotXorPen, !(s ^ d)),
+            (Rop2::Nop, d),
+            (Rop2::MergeNotPen, d | !s),
+            (Rop2::CopyPen, s),
+            (Rop2::MergePenNot, s | !d),
+            (Rop2::MergePen, s | d),
+            (Rop2::White, 0xFF),
+        ];
+        for (op, want) in cases {
+            assert_eq!(op.mix_channel(s, d), want, "{op:?}");
+        }
+    }
+
+    #[test]
+    fn stretch_mode_from_u32_all_arms() {
+        assert_eq!(StretchMode::from_u32(4), StretchMode::Bilinear);
+        assert_eq!(StretchMode::from_u32(1), StretchMode::Nearest);
+        assert_eq!(StretchMode::from_u32(3), StretchMode::Nearest);
+        assert_eq!(StretchMode::from_u32(99), StretchMode::Nearest);
+    }
+
+    #[test]
+    fn pen_style_from_u32_all_arms() {
+        assert_eq!(PenStyle::from_u32(0), PenStyle::Solid);
+        assert_eq!(PenStyle::from_u32(1), PenStyle::Dash);
+        assert_eq!(PenStyle::from_u32(2), PenStyle::Dot);
+        assert_eq!(PenStyle::from_u32(3), PenStyle::DashDot);
+        assert_eq!(PenStyle::from_u32(4), PenStyle::DashDotDot);
+        assert_eq!(PenStyle::from_u32(5), PenStyle::Null);
+        assert_eq!(PenStyle::from_u32(6), PenStyle::InsideFrame);
+        assert_eq!(PenStyle::from_u32(7), PenStyle::Solid); // unknown
+        assert_eq!(PenStyle::from_u32(0x1_0001), PenStyle::Dash); // masked to low nibble
+    }
+
+    #[test]
+    fn hatch_style_from_u32_all_arms() {
+        assert_eq!(HatchStyle::from_u32(0), HatchStyle::Horizontal);
+        assert_eq!(HatchStyle::from_u32(1), HatchStyle::Vertical);
+        assert_eq!(HatchStyle::from_u32(2), HatchStyle::FDiagonal);
+        assert_eq!(HatchStyle::from_u32(3), HatchStyle::BDiagonal);
+        assert_eq!(HatchStyle::from_u32(4), HatchStyle::Cross);
+        assert_eq!(HatchStyle::from_u32(5), HatchStyle::DiagCross);
+        assert_eq!(HatchStyle::from_u32(42), HatchStyle::Horizontal); // unknown
+    }
+
+    // ── Affine transform ─────────────────────────────────────────────────────
+
+    #[test]
+    fn affine_identity_apply_and_concat() {
+        let id = Affine::identity();
+        let p = id.apply(3.0, 7.0);
+        assert_eq!((p.x, p.y), (3.0, 7.0));
+        // Translate then scale, via concat (self ∘ other = apply other first).
+        let scale = Affine {
+            m11: 2.0,
+            m12: 0.0,
+            m21: 0.0,
+            m22: 2.0,
+            dx: 0.0,
+            dy: 0.0,
+        };
+        let translate = Affine {
+            m11: 1.0,
+            m12: 0.0,
+            m21: 0.0,
+            m22: 1.0,
+            dx: 5.0,
+            dy: 1.0,
+        };
+        let composed = scale.concat(&translate); // translate first, then scale
+        let q = composed.apply(1.0, 1.0); // (1+5, 1+1)*2 = (12, 4)
+        assert_eq!((q.x, q.y), (12.0, 4.0));
+    }
+
+    // ── region bbox ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn region_bbox_unions_rects_and_handles_empty() {
+        assert!(region_bbox(&[]).is_none());
+        let rects = [
+            LogRect {
+                left: 5.0,
+                top: 5.0,
+                right: 10.0,
+                bottom: 8.0,
+            },
+            LogRect {
+                left: 1.0,
+                top: 2.0,
+                right: 7.0,
+                bottom: 20.0,
+            },
+        ];
+        let bb = region_bbox(&rects).expect("union");
+        assert_eq!(
+            (bb.left, bb.top, bb.right, bb.bottom),
+            (1.0, 2.0, 10.0, 20.0)
+        );
+    }
+
+    // ── DIB decoding: each bpp path ──────────────────────────────────────────
+
+    /// Build a BITMAPINFOHEADER (40 bytes) + appended `body`.
+    fn bih(w: i32, h: i32, bpp: u16, compression: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // planes
+        v.extend_from_slice(&bpp.to_le_bytes());
+        v.extend_from_slice(&compression.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // image size
+        v.extend_from_slice(&[0u8; 16]); // ppm x/y, clrUsed, clrImportant
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn decode_packed_dib_rejects_malformed() {
+        assert!(decode_packed_dib(&[]).is_none());
+        assert!(decode_packed_dib(&[0u8; 3]).is_none());
+        // header_size < 40
+        assert!(decode_packed_dib(&12u32.to_le_bytes()).is_none());
+        // zero width
+        assert!(decode_packed_dib(&bih(0, 1, 24, 0, &[])).is_none());
+        // zero height
+        assert!(decode_packed_dib(&bih(1, 0, 24, 0, &[])).is_none());
+    }
+
+    #[test]
+    fn decode_packed_dib_24bpp_bottom_up() {
+        // 2×1, 24bpp BI_RGB. Row padded to 4 bytes. BGR order. Bottom-up.
+        // Pixel0 = blue(255,0,0 BGR=0,0,255), Pixel1 = green.
+        let row = [0u8, 0, 255, /*p0 BGR*/ 0, 255, 0 /*p1 BGR*/, 0, 0]; // +2 pad → 8 bytes
+        let dib = decode_packed_dib(&bih(2, 1, 24, 0, &row)).expect("24bpp");
+        assert_eq!((dib.width, dib.height), (2, 1));
+        assert_eq!(dib.at(0, 0), Rgba::rgb(255, 0, 0));
+        assert_eq!(dib.at(1, 0), Rgba::rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn decode_packed_dib_32bpp() {
+        // 1×1 32bpp BGRA.
+        let body = [10u8, 20, 30, 255]; // B,G,R,A
+        let dib = decode_packed_dib(&bih(1, 1, 32, 0, &body)).expect("32bpp");
+        assert_eq!(dib.at(0, 0), Rgba::rgb(30, 20, 10));
+    }
+
+    #[test]
+    fn decode_packed_dib_8bpp_palette() {
+        // 1×1 8bpp: palette of 256 BGRA quads precedes 4-byte-padded pixel row.
+        let mut body = Vec::new();
+        // palette[0] = red (BGRA), rest zero.
+        body.extend_from_slice(&[0u8, 0, 255, 0]);
+        body.extend_from_slice(&vec![0u8; 255 * 4]);
+        body.extend_from_slice(&[0u8, 0, 0, 0]); // pixel index 0, padded row
+        let dib = decode_packed_dib(&bih(1, 1, 8, 0, &body)).expect("8bpp");
+        assert_eq!(dib.at(0, 0), Rgba::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn dib_sample_bilinear_clamps_and_empty() {
+        let dib = Dib {
+            width: 0,
+            height: 0,
+            rgba: vec![],
+        };
+        assert_eq!(dib.sample_bilinear(0.5, 0.5), Rgba::TRANSPARENT);
+        let dib = Dib {
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
+        };
+        // Sampling well outside clamps to edge texels.
+        let left = dib.sample_bilinear(-5.0, 0.5);
+        let right = dib.sample_bilinear(10.0, 0.5);
+        assert_eq!(left, Rgba::rgb(0, 0, 0));
+        assert_eq!(right, Rgba::rgb(255, 255, 255));
+        // Out-of-range at() returns transparent.
+        assert_eq!(dib.at(9, 9), Rgba::TRANSPARENT);
+    }
 }

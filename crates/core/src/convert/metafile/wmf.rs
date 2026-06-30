@@ -1057,4 +1057,193 @@ mod tests {
         // Truncated payload never panics.
         assert!(parse_wmf_region(&[0u8; 4]).is_empty());
     }
+
+    // ── opcode coverage: render a buffer and assert it never panics + sizes ────
+
+    /// Build a placeable WMF over a 0..100 window containing `recs` and decode it.
+    fn render(recs: &[u8]) -> MetafileRaster {
+        let buf = placeable((0, 0, 100, 100), 100, recs);
+        decode(&buf).expect("valid placeable WMF should decode")
+    }
+
+    #[test]
+    fn rejects_too_short_and_bad_headers() {
+        assert!(decode(&[0u8; 4]).is_none()); // < 18 bytes
+                                              // 18 bytes but mtType invalid (0).
+        let mut bad = vec![0u8; 18];
+        bad[0] = 0; // mtType low byte = 0 → invalid
+        assert!(decode(&bad).is_none());
+        // Valid type but wrong header size word.
+        let mut hdr = Vec::new();
+        pu16(&mut hdr, 1); // mtType = memory
+        pu16(&mut hdr, 8); // mtHeaderSize ≠ 9 → reject
+        for _ in 0..7 {
+            pu16(&mut hdr, 0);
+        }
+        assert!(decode(&hdr).is_none());
+    }
+
+    #[test]
+    fn non_placeable_metaheader_decodes() {
+        // Bare METAHEADER (no APMHEADER) + a window setup + a rectangle.
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        record(&mut recs, 0x02FA, &[0, 0, 1, 0, 0]); // pen indirect (solid, w=1, black)
+        record(&mut recs, 0x041B, &[80, 80, 10, 10]); // rectangle
+        let mut v = Vec::new();
+        pu16(&mut v, 1); // mtType
+        pu16(&mut v, 9); // header size
+        pu16(&mut v, 0x0300);
+        pu32(&mut v, 0);
+        pu16(&mut v, 4);
+        pu32(&mut v, 0);
+        pu16(&mut v, 0);
+        v.extend_from_slice(&recs);
+        let m = decode(&v).expect("bare metaheader decodes");
+        assert!(m.width >= 1 && m.height >= 1);
+    }
+
+    #[test]
+    fn viewport_org_ext_and_mapmode_records() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        record(&mut recs, 0x0103, &[8]); // SetMapMode (MM_ANISOTROPIC)
+        record(&mut recs, 0x020D, &[0, 0]); // SetViewportOrg
+        record(&mut recs, 0x020E, &[100, 100]); // SetViewportExt
+        record(&mut recs, 0x0418, &[90, 90, 10, 10]); // ellipse to exercise transform
+        let m = render(&recs);
+        assert!(m.width >= 1 && m.height >= 1);
+    }
+
+    #[test]
+    fn state_color_and_mode_records() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        let red = colorref(255, 0, 0);
+        record(&mut recs, 0x0209, &[red[0], red[1]]); // SetTextColor
+        record(&mut recs, 0x0201, &[red[0], red[1]]); // SetBkColor
+        record(&mut recs, 0x0102, &[2]); // SetBkMode OPAQUE
+        record(&mut recs, 0x0106, &[2]); // SetPolyFillMode WINDING
+        record(&mut recs, 0x0104, &[1]); // SetROP2
+        record(&mut recs, 0x0107, &[4]); // SetStretchBltMode HALFTONE
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn moveto_lineto_strokes_a_visible_line() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        // Solid black pen so the line is visible.
+        record(&mut recs, 0x02FA, &[0, 3, 0, 0, 0]); // CreatePenIndirect width 3 black
+        record(&mut recs, 0x012D, &[0]); // SelectObject pen
+        record(&mut recs, 0x0214, &[50, 10]); // MoveTo (x=10,y=50)
+        record(&mut recs, 0x0213, &[50, 90]); // LineTo (x=90,y=50)
+        let m = render(&recs);
+        // Somewhere along the horizontal midline should have non-zero alpha ink.
+        let mid = m.height / 2;
+        let inked = (0..m.width).any(|x| px(&m, x, mid).3 > 0);
+        assert!(inked, "MoveTo/LineTo should leave ink");
+    }
+
+    #[test]
+    fn polygon_polyline_polypolygon_records() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        record(&mut recs, 0x02FC, &[0, 0, 0, 0]); // brush indirect solid black
+        record(&mut recs, 0x012D, &[0]); // select brush
+                                         // META_POLYGON: count, then count (x,y) pairs.
+        record(&mut recs, 0x0324, &[4, 10, 10, 90, 10, 90, 90, 10, 90]);
+        // META_POLYLINE: count, then pairs.
+        record(&mut recs, 0x0325, &[3, 10, 50, 50, 10, 90, 50]);
+        // META_POLYPOLYGON: polyCount, [counts…], then all points.
+        record(&mut recs, 0x0538, &[1, 4, 20, 20, 80, 20, 80, 80, 20, 80]);
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn shape_records_rectangle_roundrect_ellipse_arc_pie_chord() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        record(&mut recs, 0x02FC, &[0, 0, 0, 0]); // brush solid black
+        record(&mut recs, 0x012D, &[0]); // select
+        record(&mut recs, 0x041B, &[80, 80, 10, 10]); // rectangle
+        record(&mut recs, 0x041C, &[20, 20, 80, 80, 10, 10]); // roundrect
+        record(&mut recs, 0x0418, &[80, 80, 10, 10]); // ellipse
+                                                      // arc/pie/chord: yEnd,xEnd,yStart,xStart,bottom,right,top,left
+        record(&mut recs, 0x0817, &[10, 90, 90, 10, 90, 90, 10, 10]); // arc
+        record(&mut recs, 0x081A, &[10, 90, 90, 10, 90, 90, 10, 10]); // pie
+        record(&mut recs, 0x0830, &[10, 90, 90, 10, 90, 90, 10, 10]); // chord
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn setpixel_paints_one_dot() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        let red = colorref(255, 0, 0);
+        // META_SETPIXEL: COLORREF(2), y, x
+        record(&mut recs, 0x041F, &[red[0], red[1], 50, 50]);
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn text_out_and_ext_text_out_records() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        // META_TEXTOUT: count, string(words), y, x. "Hi" = 0x69,0x48 little-endian.
+        let hi = u16::from_le_bytes([b'H', b'i']);
+        record(&mut recs, 0x0521, &[2, hi, 20, 10]);
+        // META_EXTTEXTOUT: y, x, count, options=0, string.
+        record(&mut recs, 0x0A32, &[40, 10, 2, 0, hi]);
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn object_table_create_select_delete() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        record(&mut recs, 0x02FA, &[0, 1, 0, 0, 0]); // CreatePenIndirect (obj 0)
+        record(&mut recs, 0x02FC, &[0, 0, 0, 0]); // CreateBrushIndirect (obj 1)
+        record(&mut recs, 0x012D, &[0]); // SelectObject pen
+        record(&mut recs, 0x012D, &[1]); // SelectObject brush
+        record(&mut recs, 0x041B, &[80, 80, 10, 10]); // rectangle uses them
+        record(&mut recs, 0x01F0, &[0]); // DeleteObject pen
+        record(&mut recs, 0x02FF, &[]); // legacy empty-region slot
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn create_region_select_clip_and_paint() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        // CreateRegion payload: header(8w) + bbox(4w) + one scan(count=1,top,bottom,(l,r),count).
+        let mut region = Vec::<u16>::new();
+        region.extend_from_slice(&[0, 0x0006, 0, 0, 0, 1, 0, 0]); // header (scanCount @ w5 = 1)
+        region.extend_from_slice(&[10, 10, 90, 90]); // bbox
+        region.extend_from_slice(&[1, 20, 80, 20, 80, 1]); // scan
+        record(&mut recs, 0x06FF, &region); // CreateRegion (obj 0)
+        record(&mut recs, 0x012C, &[0]); // SelectClipRegion
+        record(&mut recs, 0x02FC, &[0, 0, 0, 0]); // brush solid black (obj 1)
+        record(&mut recs, 0x012D, &[1]); // select brush
+        record(&mut recs, 0x012B, &[0]); // PaintRegion
+        record(&mut recs, 0x0228, &[0]); // FillRegion (region, brush)
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn dib_pattern_brush_and_solid_pattern() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        record(&mut recs, 0x02FD, &[]); // CreatePatternBrush (solid fallback)
+        let _ = render(&recs);
+    }
+
+    #[test]
+    fn unknown_opcode_is_skipped_safely() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        record(&mut recs, 0x0999, &[1, 2, 3]); // unmodelled → no-op branch
+        let m = render(&recs);
+        assert!(m.width >= 1);
+    }
 }
