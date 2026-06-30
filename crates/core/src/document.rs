@@ -12547,12 +12547,11 @@ impl Document {
         height: f64,
         opacity: f64,
     ) -> Result<()> {
-        let prep = content::image::prepare_image(data)
-            .ok_or_else(|| {
-                EngineError::Missing(
-                    "unsupported image (need PNG, JPEG, WebP, GIF, TIFF or AVIF)".into(),
-                )
-            })?;
+        let prep = content::image::prepare_image(data).ok_or_else(|| {
+            EngineError::Missing(
+                "unsupported image (need PNG, JPEG, WebP, GIF, TIFF or AVIF)".into(),
+            )
+        })?;
         let img_id = self.embed_image_xobject(&prep);
 
         // Register the image in the page's /Resources /XObject and get its name.
@@ -12601,12 +12600,11 @@ impl Document {
         let id = self.xobject_id(page_no, &name).ok_or_else(|| {
             EngineError::Missing("image XObject is not an indirect object".into())
         })?;
-        let prep = content::image::prepare_image(data)
-            .ok_or_else(|| {
-                EngineError::Missing(
-                    "unsupported image (need PNG, JPEG, WebP, GIF, TIFF or AVIF)".into(),
-                )
-            })?;
+        let prep = content::image::prepare_image(data).ok_or_else(|| {
+            EngineError::Missing(
+                "unsupported image (need PNG, JPEG, WebP, GIF, TIFF or AVIF)".into(),
+            )
+        })?;
         // Re-encode and overwrite the stream at the existing id: same object number,
         // new image dict + bytes. The old `/SMask`/palette is dropped — the
         // re-encoded stream is self-describing (a fresh `/SMask` is wired when the
@@ -24416,7 +24414,10 @@ mod tests {
 
         // Object id preserved → every `/Do` reference + placement matrix intact.
         let id_after = doc.xobject_id(1, &im1).expect("indirect XObject");
-        assert_eq!(id_before, id_after, "object number (and /Do refs) preserved");
+        assert_eq!(
+            id_before, id_after,
+            "object number (and /Do refs) preserved"
+        );
         let content_after = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
         assert_eq!(
             content_before, content_after,
