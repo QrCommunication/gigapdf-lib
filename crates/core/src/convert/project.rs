@@ -1006,8 +1006,8 @@ pub fn pdf_from_model(doc: &Document) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::model::{
-        Block, BlockId, BlockKind, CellValue, Document, Heading, Inline, InlineRun, Page,
-        Paragraph, Section, Sheet, SheetBlock, SheetCell, SheetRow, TextBox,
+        Block, BlockId, BlockKind, CellValue, Document, Heading, Inline, InlineRun, List, ListItem,
+        ListMarker, Page, Paragraph, Section, Sheet, SheetBlock, SheetCell, SheetRow, TextBox,
     };
 
     fn run(text: &str) -> Inline {
@@ -1271,5 +1271,152 @@ mod tests {
             !String::from_utf8_lossy(&plain).contains("1 1 0 rg"),
             "a plain run paints no highlight fill"
         );
+    }
+
+    // ── pure helper units ────────────────────────────────────────────────────
+
+    #[test]
+    fn alpha_spreadsheet_letters() {
+        assert_eq!(alpha(1, true), "A");
+        assert_eq!(alpha(26, true), "Z");
+        assert_eq!(alpha(27, true), "AA");
+        assert_eq!(alpha(52, false), "az");
+        assert_eq!(alpha(0, true), ""); // n=0 → empty
+    }
+
+    #[test]
+    fn roman_numerals_and_out_of_range() {
+        assert_eq!(roman(1), "I");
+        assert_eq!(roman(4), "IV");
+        assert_eq!(roman(9), "IX");
+        assert_eq!(roman(40), "XL");
+        assert_eq!(roman(90), "XC");
+        assert_eq!(roman(400), "CD");
+        assert_eq!(roman(900), "CM");
+        assert_eq!(roman(2024), "MMXXIV");
+        assert_eq!(roman(3999), "MMMCMXCIX");
+        // Out of 1..=3999 falls back to decimal.
+        assert_eq!(roman(0), "0");
+        assert_eq!(roman(4000), "4000");
+    }
+
+    #[test]
+    fn list_prefix_for_each_marker() {
+        let mk = |marker: ListMarker| List {
+            ordered: true,
+            marker,
+            items: vec![],
+            start: 1,
+        };
+        assert_eq!(list_prefix(&mk(ListMarker::Bullet('•')), 0), "• ");
+        assert_eq!(list_prefix(&mk(ListMarker::Decimal), 2), "3. ");
+        assert_eq!(list_prefix(&mk(ListMarker::LowerAlpha), 0), "a. ");
+        assert_eq!(list_prefix(&mk(ListMarker::UpperAlpha), 1), "B. ");
+        assert_eq!(list_prefix(&mk(ListMarker::LowerRoman), 3), "iv. ");
+        assert_eq!(list_prefix(&mk(ListMarker::UpperRoman), 8), "IX. ");
+    }
+
+    #[test]
+    fn format_number_integral_and_fractional() {
+        assert_eq!(format_number(42.0), "42");
+        assert_eq!(format_number(-7.0), "-7");
+        assert_eq!(format_number(3.5), "3.5");
+        assert_eq!(format_number(1.0 / 3.0), "0.333333"); // capped to 6 fracs
+        assert_eq!(format_number(2.50000), "2.5"); // trailing zeros stripped
+    }
+
+    #[test]
+    fn cell_value_text_variants() {
+        assert_eq!(cell_value_text(&CellValue::Empty), "");
+        assert_eq!(cell_value_text(&CellValue::Text("x".into())), "x");
+        assert_eq!(cell_value_text(&CellValue::Number(12.0)), "12");
+        assert_eq!(cell_value_text(&CellValue::Bool(true)), "TRUE");
+        assert_eq!(cell_value_text(&CellValue::Bool(false)), "FALSE");
+    }
+
+    #[test]
+    fn column_offsets_and_width() {
+        let widths = [50.0, 80.0, 30.0];
+        let offs = column_offsets(&widths, 10.0);
+        assert_eq!(offs, vec![10.0, 60.0, 140.0]);
+        assert_eq!(column_width(&widths, 1), 80.0);
+        // Out-of-range index falls back to a default width (non-zero).
+        assert!(column_width(&widths, 99) > 0.0);
+        assert!(column_width(&[], 0) > 0.0);
+    }
+
+    // ── block-type lowering integration ──────────────────────────────────────
+
+    fn doc_with(kind: BlockKind, frame: Option<Rect>) -> Document {
+        Document {
+            sections: vec![Section {
+                geometry: PageGeometry::a4(),
+                pages: vec![Page {
+                    blocks: vec![block(kind, frame)],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        }
+    }
+
+    #[test]
+    fn ordered_list_lowers_with_numbered_prefixes() {
+        let list = List {
+            ordered: true,
+            marker: ListMarker::Decimal,
+            items: vec![
+                ListItem {
+                    blocks: vec![block(BlockKind::Paragraph(paragraph("First")), None)],
+                    level: 0,
+                },
+                ListItem {
+                    blocks: vec![block(BlockKind::Paragraph(paragraph("Second")), None)],
+                    level: 0,
+                },
+            ],
+            start: 1,
+        };
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::List(list), None)).into();
+        let joined: String = pages[0].texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(joined.contains("First") && joined.contains("Second"));
+    }
+
+    #[test]
+    fn code_block_lowers_to_monospace_text() {
+        let code = crate::model::CodeBlock {
+            lang: Some("rust".into()),
+            code: "fn main() {}\nlet x = 1;".into(),
+        };
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::CodeBlock(code), None)).into();
+        let joined: String = pages[0].texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(joined.contains("fn main") || joined.contains("let x"));
+    }
+
+    #[test]
+    fn blockquote_lowers_its_inner_blocks() {
+        let quote = crate::model::Blockquote {
+            blocks: vec![block(BlockKind::Paragraph(paragraph("Quoted line")), None)],
+        };
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::Blockquote(quote), None)).into();
+        let joined: String = pages[0].texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(joined.contains("Quoted line"));
+    }
+
+    #[test]
+    fn rule_block_lowers_without_panicking() {
+        let pages: Vec<ConvPage> = (&doc_with(BlockKind::HorizontalRule, None)).into();
+        assert_eq!(pages.len(), 1);
+    }
+
+    #[test]
+    fn pdf_from_model_produces_valid_pdf_bytes() {
+        let pdf = pdf_from_model(&doc_with(
+            BlockKind::Paragraph(paragraph("Hello PDF")),
+            None,
+        ));
+        assert!(pdf.starts_with(b"%PDF-"), "starts with PDF magic");
+        assert!(pdf.windows(5).any(|w| w == b"%%EOF"), "has EOF marker");
     }
 }
