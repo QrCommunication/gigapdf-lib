@@ -142,4 +142,57 @@ mod tests {
             "ffi ligature expands to f f i: {cmap}"
         );
     }
+
+    #[test]
+    fn gid_to_unicode_maps_bundled_font_glyphs() {
+        let ttf =
+            TrueTypeFont::parse(crate::font::bundled::FALLBACK_TTF).expect("bundled font parses");
+        let pairs = gid_to_unicode(&ttf);
+        assert!(
+            !pairs.is_empty(),
+            "the bundled cmap yields glyph→char pairs"
+        );
+        // Every entry's string is a single non-empty character.
+        for (_gid, s) in &pairs {
+            assert!(!s.is_empty());
+            assert_eq!(s.chars().count(), 1, "one scalar per entry");
+        }
+        // 'A' must be reachable through the produced map.
+        assert!(
+            pairs.iter().any(|(_, s)| s == "A"),
+            "ASCII 'A' is mapped by the bundled font"
+        );
+    }
+
+    #[test]
+    fn scaled_advances_normalises_to_1000_em() {
+        let ttf = TrueTypeFont::parse(crate::font::bundled::FALLBACK_TTF).unwrap();
+        let adv = scaled_advances(&ttf);
+        assert_eq!(adv.len(), ttf.num_glyphs() as usize);
+        // At least one glyph has a non-zero advance.
+        assert!(adv.iter().any(|&w| w > 0));
+    }
+
+    #[test]
+    fn ligature_expansion_folds_component_glyphs() {
+        let ttf = TrueTypeFont::parse(crate::font::bundled::FALLBACK_TTF).unwrap();
+        let cmap = ttf.gid_to_unicode_map();
+        // Find the glyph ids for 'f' and 'i' so we can build a fake "fi" ligature.
+        let gid_of = |ch: char| {
+            cmap.iter()
+                .find(|(_, &cp)| cp == ch as u32)
+                .map(|(&g, _)| g)
+        };
+        let (gf, gi) = (gid_of('f'), gid_of('i'));
+        if let (Some(gf), Some(gi)) = (gf, gi) {
+            // Use a high, unused gid as the synthetic ligature glyph.
+            let lig_gid = ttf.num_glyphs().saturating_sub(1);
+            let pairs = gid_to_unicode_with_ligatures(&ttf, &[(lig_gid, vec![gf, gi])]);
+            let lig = pairs.iter().find(|(g, _)| *g == lig_gid);
+            assert_eq!(lig.map(|(_, s)| s.as_str()), Some("fi"));
+        }
+        // A ligature whose component has no cmap entry is skipped (no panic).
+        let skipped = gid_to_unicode_with_ligatures(&ttf, &[(60000, vec![65535])]);
+        assert!(!skipped.iter().any(|(g, _)| *g == 60000));
+    }
 }

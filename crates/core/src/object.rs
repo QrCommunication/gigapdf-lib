@@ -198,3 +198,90 @@ impl Stream {
         Self { dict, raw }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_accessors_match_variant_and_reject_others() {
+        assert_eq!(Object::Name(b"Foo".to_vec()).as_name(), Some(&b"Foo"[..]));
+        assert_eq!(Object::Null.as_name(), None);
+
+        let s = Object::String(b"hi".to_vec(), StringKind::Literal);
+        assert_eq!(s.as_string(), Some(&b"hi"[..]));
+        assert_eq!(Object::Null.as_string(), None);
+
+        let arr = Object::Array(vec![Object::Integer(1)]);
+        assert_eq!(arr.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(Object::Null.as_array(), None);
+
+        assert_eq!(Object::Reference((5, 0)).as_reference(), Some((5, 0)));
+        assert_eq!(Object::Null.as_reference(), None);
+
+        assert_eq!(Object::Boolean(true).as_bool(), Some(true));
+        assert_eq!(Object::Null.as_bool(), None);
+    }
+
+    #[test]
+    fn numeric_coercions() {
+        // as_i64: integer direct, real truncates, other → None.
+        assert_eq!(Object::Integer(7).as_i64(), Some(7));
+        assert_eq!(Object::Real(3.9).as_i64(), Some(3));
+        assert_eq!(Object::Null.as_i64(), None);
+        // as_f64: real direct, integer widens, other → None.
+        assert_eq!(Object::Real(2.5).as_f64(), Some(2.5));
+        assert_eq!(Object::Integer(4).as_f64(), Some(4.0));
+        assert_eq!(Object::Null.as_f64(), None);
+    }
+
+    #[test]
+    fn as_dict_covers_dictionary_and_stream() {
+        let mut d = Dictionary::new();
+        d.set("Type", Object::Name(b"Page".to_vec()));
+        let dict_obj = Object::Dictionary(d.clone());
+        assert!(dict_obj.as_dict().is_some());
+        // A stream's dict is reachable through as_dict.
+        let stream = Object::Stream(Stream::new(d, b"raw".to_vec()));
+        assert_eq!(
+            stream
+                .as_dict()
+                .and_then(|x| x.get(b"Type"))
+                .and_then(|o| o.as_name()),
+            Some(&b"Page"[..])
+        );
+        assert!(stream.as_stream().is_some());
+        assert_eq!(
+            stream.as_stream().map(|s| s.raw.as_slice()),
+            Some(&b"raw"[..])
+        );
+        assert!(Object::Null.as_dict().is_none());
+        assert!(Object::Null.as_stream().is_none());
+    }
+
+    #[test]
+    fn dictionary_crud_and_len() {
+        let mut d = Dictionary::new();
+        assert!(d.is_empty());
+        assert_eq!(d.len(), 0);
+        d.set("A", Object::Integer(1));
+        d.set("B", Object::Boolean(false));
+        assert_eq!(d.len(), 2);
+        assert!(!d.is_empty());
+        assert!(d.contains(b"A"));
+        assert!(!d.contains(b"Z"));
+        assert_eq!(d.get(b"A").and_then(|o| o.as_i64()), Some(1));
+        // remove returns the value, then the key is gone.
+        assert_eq!(d.remove(b"A"), Some(Object::Integer(1)));
+        assert!(!d.contains(b"A"));
+        assert_eq!(d.remove(b"A"), None);
+    }
+
+    #[test]
+    fn dictionary_debug_renders_keys_as_strings() {
+        let mut d = Dictionary::new();
+        d.set("Type", Object::Name(b"Catalog".to_vec()));
+        let dbg = format!("{d:?}");
+        assert!(dbg.contains("Type"), "key rendered as UTF-8 string: {dbg}");
+    }
+}
