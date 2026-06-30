@@ -378,4 +378,104 @@ mod tests {
         assert_eq!(base_font_name("Courier"), "Courier");
         assert_eq!(base_font_name("Unknown"), "Helvetica");
     }
+
+    #[test]
+    fn classifies_all_acroform_short_names() {
+        assert_eq!(classify("heob"), Afm::Helv);
+        assert_eq!(classify("hebo"), Afm::HelvBold);
+        assert_eq!(classify("tiro"), Afm::Times);
+        assert_eq!(classify("tibo"), Afm::TimesBold);
+        assert_eq!(classify("tiit"), Afm::TimesItalic);
+        assert_eq!(classify("tibi"), Afm::TimesBoldItalic);
+        assert_eq!(classify("cour"), Afm::Courier);
+        assert_eq!(classify("cobo"), Afm::Courier);
+        assert_eq!(classify("coob"), Afm::Courier);
+    }
+
+    #[test]
+    fn classifies_full_names_with_subset_prefix() {
+        // Subset tag "ABCDEF+Name" → the part after '+' classifies.
+        assert_eq!(classify("ABCDEF+Times-Bold"), Afm::TimesBold);
+        assert_eq!(classify("XYZ+Courier-Oblique"), Afm::Courier);
+        // Serif family via descriptive names.
+        assert_eq!(classify("Times New Roman Italic"), Afm::TimesItalic);
+        // Mono family.
+        assert_eq!(classify("Courier New Bold"), Afm::Courier);
+    }
+
+    #[test]
+    fn fold_accent_covers_all_groups() {
+        let h = Afm::Helv;
+        // Uppercase groups.
+        for c in ['À', 'Á', 'Â', 'Ã', 'Ä', 'Å'] {
+            assert_eq!(width_of(h, c), width_of(h, 'A'));
+        }
+        assert_eq!(width_of(h, 'Ç'), width_of(h, 'C'));
+        for c in ['È', 'Ê', 'Ë'] {
+            assert_eq!(width_of(h, c), width_of(h, 'E'));
+        }
+        for c in ['Ì', 'Í', 'Î', 'Ï'] {
+            assert_eq!(width_of(h, c), width_of(h, 'I'));
+        }
+        assert_eq!(width_of(h, 'Ñ'), width_of(h, 'N'));
+        for c in ['Ò', 'Ó', 'Ô', 'Õ', 'Ö'] {
+            assert_eq!(width_of(h, c), width_of(h, 'O'));
+        }
+        for c in ['Ù', 'Ú', 'Û', 'Ü'] {
+            assert_eq!(width_of(h, c), width_of(h, 'U'));
+        }
+        assert_eq!(width_of(h, 'Ý'), width_of(h, 'Y'));
+        assert_eq!(width_of(h, 'Š'), width_of(h, 'S'));
+        assert_eq!(width_of(h, 'Ž'), width_of(h, 'Z'));
+        // Lowercase groups.
+        for c in ['à', 'â', 'ä', 'å'] {
+            assert_eq!(width_of(h, c), width_of(h, 'a'));
+        }
+        assert_eq!(width_of(h, 'ç'), width_of(h, 'c'));
+        assert_eq!(width_of(h, 'î'), width_of(h, 'i'));
+        assert_eq!(width_of(h, 'ñ'), width_of(h, 'n'));
+        assert_eq!(width_of(h, 'õ'), width_of(h, 'o'));
+        assert_eq!(width_of(h, 'û'), width_of(h, 'u'));
+        assert_eq!(width_of(h, 'ÿ'), width_of(h, 'y'));
+        assert_eq!(width_of(h, 'š'), width_of(h, 's'));
+        assert_eq!(width_of(h, 'ž'), width_of(h, 'z'));
+    }
+
+    #[test]
+    fn special_width_serif_vs_sans() {
+        // Euro: serif 500, sans 556.
+        assert_eq!(width_of(Afm::Times, '€'), 500);
+        assert_eq!(width_of(Afm::Helv, '€'), 556);
+        // Ellipsis and per-mille are 1000 in both.
+        assert_eq!(width_of(Afm::Times, '…'), 1000);
+        assert_eq!(width_of(Afm::Helv, '‰'), 1000);
+        // Ligatures.
+        assert_eq!(width_of(Afm::Times, 'Œ'), 889);
+        assert_eq!(width_of(Afm::Helv, 'Œ'), 1000);
+        assert_eq!(width_of(Afm::Times, 'œ'), 722);
+        // Currency & symbols.
+        assert_eq!(width_of(Afm::Times, '£'), 500);
+        assert_eq!(width_of(Afm::Helv, '£'), 556);
+        assert_eq!(width_of(Afm::Times, '©'), 760);
+        assert_eq!(width_of(Afm::Helv, '©'), 737);
+        // Fractions.
+        assert_eq!(width_of(Afm::Times, '½'), 750);
+        assert_eq!(width_of(Afm::Helv, '½'), 834);
+        // Special letters with own advance.
+        assert_eq!(width_of(Afm::Times, 'Æ'), 889);
+        assert_eq!(width_of(Afm::Times, 'ß'), 500);
+        assert_eq!(width_of(Afm::Helv, 'ß'), 611);
+        assert_eq!(width_of(Afm::Times, 'Ð'), 722);
+        // Unknown codepoint → falls back to 'n' width.
+        assert_eq!(width_of(Afm::Helv, '\u{2603}'), width_of(Afm::Helv, 'n'));
+    }
+
+    #[test]
+    fn courier_is_monospaced_for_specials_too() {
+        // Every glyph advances 600 in Courier, including accented/special.
+        assert_eq!(width_of(Afm::Courier, '€'), 600);
+        assert_eq!(width_of(Afm::Courier, 'É'), 600);
+        assert_eq!(width_of(Afm::Courier, 'Œ'), 600);
+        assert_eq!(width_of(Afm::Courier, ' '), 600);
+    }
 }
