@@ -321,6 +321,12 @@ pub fn glyph_index_name(name: &str) -> Option<&'static str> {
     MAC_GLYPH_ORDER.get(idx).copied()
 }
 
+/// Standard Macintosh Glyph Ordering name at index `idx` (the 258 names a `post`
+/// table format-2.0 references for non-custom glyphs). `None` when out of range.
+pub fn standard_mac_glyph_name(idx: usize) -> Option<&'static str> {
+    MAC_GLYPH_ORDER.get(idx).copied()
+}
+
 /// Unicode string for glyph id `gid` under the Standard Macintosh Glyph Ordering
 /// (`post` format-1). Used as a **last-resort** recovery for Identity-encoded
 /// subset fonts whose glyph ids follow that standard order but which ship no

@@ -11014,6 +11014,159 @@ impl Document {
         )
     }
 
+    /// `Unicode → gid` pairs to rebuild a browser-loadable `cmap` for a `FontFile2`
+    /// served by [`extract_font_for_web`]. Only a **composite** (Type0 / CIDFont)
+    /// subset is rebuilt here: that is where a *stale* embedded `cmap` (a repacked
+    /// CIDFont pointing Unicode at the original, now-blanked gids) garbles the
+    /// served face, and where `code → CID → gid` gives an authoritative map. A
+    /// **simple** TrueType keeps its embedded `cmap` (it already drives both the
+    /// rasterizer and the browser) and is only rebuilt when cmap-less (Pass 2).
+    /// Empty ⇒ no rebuild (caller keeps the embedded `cmap`).
+    fn web_cmap_pairs(
+        &self,
+        dict: &Dictionary,
+        program: &crate::font::GlyphSource,
+    ) -> Vec<(u32, u16)> {
+        match self.type0_for(dict) {
+            Some(type0) => self.composite_cmap_pairs(&type0, program),
+            None => Vec::new(),
+        }
+    }
+
+    /// The Type0 font dict governing `dict`: `dict` itself when it is the Type0,
+    /// or the parent Type0 whose `/DescendantFonts` references this CIDFont (the
+    /// `/ToUnicode` + `/Encoding` live on the Type0, the `/FontFile2` on the
+    /// CIDFont — either may be the dict matched by name). `None` for a simple font.
+    fn type0_for(&self, dict: &Dictionary) -> Option<Dictionary> {
+        let sub = dict.get(b"Subtype").and_then(Object::as_name);
+        if sub == Some(b"Type0".as_slice()) {
+            return Some(dict.clone());
+        }
+        if sub != Some(b"CIDFontType2".as_slice()) && sub != Some(b"CIDFontType0".as_slice()) {
+            return None;
+        }
+        let base = dict.get(b"BaseFont").and_then(Object::as_name);
+        self.objects.values().find_map(|o| {
+            let d = o.as_dict()?;
+            if d.get(b"Subtype").and_then(Object::as_name) != Some(b"Type0".as_slice()) {
+                return None;
+            }
+            // The Type0's first descendant must be THIS CIDFont (matched by its
+            // `/BaseFont`, which a Type0 shares with its descendant).
+            let desc_obj = d
+                .get(b"DescendantFonts")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .and_then(|a| a.first())
+                .map(|o| self.resolve(o))?;
+            let desc_base = desc_obj
+                .as_dict()
+                .and_then(|cd| cd.get(b"BaseFont"))
+                .and_then(Object::as_name);
+            (desc_base.is_some() && desc_base == base).then(|| d.clone())
+        })
+    }
+
+    /// Build `unicode → gid` pairs for a **composite** (Type0 / CIDFont) TrueType
+    /// subset, to rebuild a browser `cmap` whose mapping matches the rasterizer.
+    ///
+    /// A subset's embedded `cmap` is routinely **stale** — a repacked CIDFont
+    /// keeps the original (3,1) `cmap` pointing each Unicode at the *original*
+    /// (now-blanked) glyph id while the real outlines live at other gids selected
+    /// by `code → CID → gid` (`/CIDToGIDMap`). The browser, which can only reach
+    /// glyphs via the `cmap`, then draws hollow/wrong glyphs for the run's
+    /// extracted text. This reuses the **exact** rasterizer path
+    /// (`/ToUnicode` for `code → Unicode`, [`composite_code_to_cid`] +
+    /// [`composite_cid_to_gid`] for `code → gid`) so the served `cmap` maps each
+    /// painted Unicode to the same gid the rasterizer fills. Empty when no
+    /// `/ToUnicode` (nothing to key the map on).
+    fn composite_cmap_pairs(
+        &self,
+        font: &Dictionary,
+        program: &crate::font::GlyphSource,
+    ) -> Vec<(u32, u16)> {
+        let Some(mut to_unicode) = font
+            .get(b"ToUnicode")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)
+            .and_then(|s| decode_stream(s).ok())
+            .map(|b| crate::font::cmap::ToUnicode::parse(&b))
+            .filter(|t| !t.is_empty())
+        else {
+            return Vec::new();
+        };
+        // A subset Type0 `/ToUnicode` is routinely INCOMPLETE (it omits codes the
+        // subset paints), leaving glyphs the run's extracted text DOES carry — e.g.
+        // `g`/`q`/`è`/`:` in "organisme"/"qui"/"règle :". The text decoder recovers
+        // them from the document-wide affine `code = unicode - delta` layout
+        // (`infer_ascii_gaps`); the served cmap must use the SAME recovery so every
+        // codepoint the run renders maps to its glyph (no tofu). Reserved is empty:
+        // the CMap's explicit entries already win inside `infer_ascii_gaps`.
+        to_unicode.infer_ascii_gaps(self.document_ascii_offset(), &BTreeSet::new());
+        let code_to_cid = self.composite_code_to_cid(font);
+        let cid_to_gid = self.composite_cid_to_gid(font, Some(program));
+        let num_glyphs = match program {
+            crate::font::GlyphSource::TrueType(f) => f.num_glyphs(),
+            crate::font::GlyphSource::Cff(f) => f.num_glyphs(),
+            crate::font::GlyphSource::Type1(_) => return Vec::new(),
+        };
+        if num_glyphs == 0 {
+            return Vec::new();
+        }
+        // Per-glyph `gid → Unicode` from the embedded program's OWN cmap — the
+        // SAME source the text decoder uses to fill the gaps a partial subset
+        // `/ToUnicode` leaves ([`cid_font_cmap_unicode`]). It recovers NON-ASCII
+        // Latin accents (`è`/`à`/`ç`) the affine `infer_ascii_gaps` (ASCII-only)
+        // can't, so every codepoint the run renders maps to its glyph.
+        let gid_unicode = self.cid_font_cmap_unicode(font);
+        let mut pairs: Vec<(u32, u16)> = Vec::new();
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        for code in 0u32..=0xFFFF {
+            // code → CID (Identity ⇒ CID == code), then CID → gid (Identity ⇒
+            // gid == CID) — the SAME resolution the rasterizer uses.
+            let cid = match &code_to_cid {
+                Some(cmap) => match cmap.cid(code as u16) {
+                    Some(c) => c as u32,
+                    None => continue,
+                },
+                None => code,
+            };
+            let gid = match &cid_to_gid {
+                Some(map) => map.get(cid as usize).copied().unwrap_or(0),
+                None => cid as u16,
+            };
+            // Unicode for this code: the font's `/ToUnicode` (ASCII gaps already
+            // affine-filled above), else the embedded cmap's `gid → Unicode`.
+            let Some(scalar) = to_unicode
+                .decode(code)
+                .and_then(|s| s.chars().next())
+                .map(|c| c as u32)
+                .or_else(|| {
+                    gid_unicode
+                        .as_ref()
+                        .and_then(|m| m.get(&gid))
+                        .and_then(|s| s.chars().next())
+                        .map(|c| c as u32)
+                })
+            else {
+                continue;
+            };
+            // Skip control points: a code with no real Unicode would otherwise
+            // pin a glyph on an unreachable slot. Space (`0x20`) is kept — its
+            // empty glyf is legitimate (advance-only).
+            if !(0x20..=0xFFFF).contains(&scalar) {
+                continue;
+            }
+            if gid == 0 || gid as u32 >= num_glyphs as u32 {
+                continue;
+            }
+            if seen.insert(scalar) {
+                pairs.push((scalar, gid));
+            }
+        }
+        pairs
+    }
+
     /// A composite (Type0) font's `/Encoding` CMap mapping character codes → CIDs
     /// (ISO 32000-1 §9.7.5), or `None` for the Identity case (`Identity-H`/
     /// `Identity-V`, where code == CID and no remapping is needed — the common
@@ -11364,8 +11517,32 @@ impl Document {
                 }
             }
             if let Some(bytes) = self.font_file_bytes(&descriptor, b"FontFile2") {
-                if !bytes.is_empty() && Self::sfnt_has_unicode_cmap(&bytes) {
-                    return Some((bytes, "truetype"));
+                if !bytes.is_empty() {
+                    // A subset's embedded `cmap` is often **stale**: a repacked
+                    // CIDFont keeps the original (3,1) `cmap` mapping each Unicode
+                    // to the *original* (now-blanked) glyph id, while the real
+                    // outlines sit at the gids reached by `code → CID → gid`. The
+                    // browser, which can only reach glyphs through the `cmap`,
+                    // then draws hollow/wrong glyphs. Rebuild the `cmap` from the
+                    // SAME `Unicode → gid` the rasterizer fills
+                    // ([`composite_cmap_pairs`]) so the served face renders the
+                    // run correctly — even when `sfnt_has_unicode_cmap` is already
+                    // true. Fall back to the embedded `cmap` only when the rebuild
+                    // yields nothing (no `/ToUnicode` to key on).
+                    if let Some(pairs) = self
+                        .font_program(dict)
+                        .map(|program| self.web_cmap_pairs(dict, &program))
+                        .filter(|p| !p.is_empty())
+                    {
+                        if let Some(fixed) =
+                            crate::font::cff_to_otf::repair_sfnt_with_cmap(&bytes, &pairs)
+                        {
+                            return Some((fixed, "truetype"));
+                        }
+                    }
+                    if Self::sfnt_has_unicode_cmap(&bytes) {
+                        return Some((bytes, "truetype"));
+                    }
                 }
             }
         }
@@ -11532,6 +11709,23 @@ impl Document {
             });
         let in_range = |g: u16| g != 0 && (g as u32) < num_glyphs as u32;
 
+        // TrueType rescue inputs: the embedded program (for `gid_for_unicode` and
+        // the `glyph_is_empty` test) and its `post` glyph-name → gid table. A
+        // *repacked* simple subset keeps a `cmap` that points each Unicode at the
+        // original, now-blanked gid; its real outline is reached by the PDF
+        // `/Encoding` `/Differences` glyph name resolved through `post`. This
+        // mirrors what the spec viewer draws, so the served `cmap` matches it.
+        let tt = match program {
+            GlyphSource::TrueType(f) => Some(f),
+            _ => None,
+        };
+        let post_names = tt.map(|f| f.post_name_to_gid()).unwrap_or_default();
+        let differences = if tt.is_some() && !post_names.is_empty() {
+            self.encoding_differences(font)
+        } else {
+            BTreeMap::new()
+        };
+
         let mut pairs: Vec<(u32, u16)> = Vec::new();
         let mut seen: BTreeSet<u32> = BTreeSet::new();
         for code in 0u32..=255 {
@@ -11563,9 +11757,30 @@ impl Document {
                     Some(g) => g,
                     None => continue,
                 }
+            } else if let Some(ttf) = tt {
+                // TrueType. Prefer a mapping that lands on a REAL outline:
+                //  1. the embedded `cmap` (the rasterizer's own path) when it is
+                //     not a blanked gid — keeps a good subset's mapping intact;
+                //  2. the `/Differences` glyph name via the `post` table — rescues
+                //     a repacked subset whose `cmap` points at the blanked gid;
+                //  3. a donor sibling's `Unicode → gid` (full-glyph-order subset).
+                // Last resort keeps the prior behaviour (embedded `cmap`, else the
+                // donor, else `code == gid`), so nothing regresses.
+                let solid = |g: u16| in_range(g) && !ttf.glyph_is_empty(g);
+                ttf.gid_for_unicode(cp)
+                    .filter(|&g| solid(g))
+                    .or_else(|| {
+                        differences
+                            .get(&(code as u8))
+                            .and_then(|name| post_names.get(name).copied())
+                            .filter(|&g| solid(g))
+                    })
+                    .or_else(|| donor.and_then(|d| d.get(&cp).copied()).filter(|&g| solid(g)))
+                    .or_else(|| ttf.gid_for_unicode(cp).filter(|&g| in_range(g)))
+                    .or_else(|| donor.and_then(|d| d.get(&cp).copied()).filter(|&g| in_range(g)))
+                    .unwrap_or(code as u16)
             } else {
-                // TrueType: borrow the donor's gid for this Unicode (correct for
-                // full-glyph-order subsets), else `code == gid`.
+                // Non-TrueType with no `code_to_gid` (rare): donor or `code == gid`.
                 donor
                     .and_then(|d| d.get(&cp).copied())
                     .filter(|&g| in_range(g))

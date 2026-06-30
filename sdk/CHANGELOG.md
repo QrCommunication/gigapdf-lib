@@ -6,6 +6,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.110.4] - 2026-06-30
+
+### Fixed — repacked CIDFont subset web-font cmap (`extractWebFont` no longer garbles labels)
+
+- `extract_font_for_web` now **rebuilds** the served `cmap` for a Type0/CIDFontType2
+  subset (e.g. `ECYBWA+TimesNewRoman`) from the **authoritative** `code → CID → gid`
+  mapping (the same one the rasterizer uses) + the font's `/ToUnicode` (ASCII gaps
+  affine-filled via `infer_ascii_gaps`) + the embedded program's `gid → Unicode` —
+  instead of trusting the subset's **stale** embedded `(3,1)` cmap, which maps each
+  Unicode to the original, now-blanked glyph id (the real outlines sit at the gids
+  reached only by `code → CID → gid`). A repacked subset previously rendered its
+  text as garbage in a host browser (e.g. "Nom et adresse de l'organisme" →
+  "Nç ê Dçê D ê"); the cmap is now rebuilt **even when** the subset already has a
+  Unicode cmap, and only the embedded cmap is kept when the rebuild is empty. PDF
+  rasterisation (`code → CID → gid`) was always correct. Non-repacked subsets keep
+  their correct cmap — no regression.
+- New `TrueTypeFont::post_name_to_gid()` / `glyph_is_empty()` and
+  `encoding::standard_mac_glyph_name()` back an authoritative TrueType `post`
+  name→gid resolver for simple-font subsets. Test:
+  `repacked_cid_subset_serves_real_glyphs` (skips unless `GIGAPDF_REPACKED_CID_FIXTURE`
+  points at a repacked-CID PDF — the reproducing CERFA carries PII and is not committed).
+- Known limitation: a few non-ASCII Latin accents (`è`/`à`/`ç`) absent from a
+  subset's `/ToUnicode` and off the affine ASCII layout may stay unmapped; `é` and
+  all ASCII render correctly.
+
 ## [0.110.3] - 2026-06-30
 
 ### Fixed — CFF advance widths (`extractWebFont` no longer jams text in the browser)

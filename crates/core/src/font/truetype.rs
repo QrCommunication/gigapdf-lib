@@ -55,6 +55,10 @@ pub struct TrueTypeFont {
     /// `(offset, len)` of the `GDEF` table, if present (glyph classes + mark
     /// attachment classes used by the shaper for mark positioning).
     gdef: Option<(usize, usize)>,
+    /// `(offset, len)` of the `post` table, if present (glyph names — the
+    /// authoritative `glyph name → gid` map for a simple TrueType font whose PDF
+    /// `/Encoding` `/Differences` names its glyphs, e.g. a repacked subset).
+    post: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +167,7 @@ impl TrueTypeFont {
         let gpos = tables.get(b"GPOS").copied();
         let gsub = tables.get(b"GSUB").copied();
         let gdef = tables.get(b"GDEF").copied();
+        let post = tables.get(b"post").copied();
 
         Some(TrueTypeFont {
             data,
@@ -181,6 +186,7 @@ impl TrueTypeFont {
             gpos,
             gsub,
             gdef,
+            post,
         })
     }
 
@@ -259,6 +265,71 @@ impl TrueTypeFont {
     /// Number of glyphs in the font.
     pub fn num_glyphs(&self) -> u16 {
         self.num_glyphs
+    }
+
+
+    /// Whether glyph `gid` has no outline (a zero-length `glyf` entry — `space`,
+    /// or a *blanked* glyph in a repacked subset whose real outline moved to
+    /// another gid). Used to reject a stale `cmap`/`post` mapping that lands on a
+    /// hollow slot. `true` when out of range or `glyf`/`loca` is absent.
+    pub fn glyph_is_empty(&self, gid: u16) -> bool {
+        let i = gid as usize;
+        if i + 1 >= self.loca.len() {
+            return true;
+        }
+        self.loca[i + 1] <= self.loca[i]
+    }
+
+    /// The `post` table's `glyph name → gid` map (format 2.0; the 258 standard
+    /// Macintosh names plus the font's own custom Pascal-string names). This is
+    /// the authoritative resolver for a simple TrueType font whose PDF
+    /// `/Encoding` `/Differences` names its glyphs — notably a *repacked* subset
+    /// whose embedded `cmap` still points Unicode at the original (now blanked)
+    /// glyph ids while the real outlines sit at `glyphNNN`-named gids. Empty for a
+    /// format-1/3 `post` (no per-glyph names) or when the table is absent.
+    pub fn post_name_to_gid(&self) -> std::collections::BTreeMap<String, u16> {
+        let mut map = std::collections::BTreeMap::new();
+        let Some((off, len)) = self.post else {
+            return map;
+        };
+        let end = off + len;
+        if end > self.data.len() || len < 34 {
+            return map;
+        }
+        // Only format 2.0 carries a per-glyph name index; 1.0/3.0/4.0 do not.
+        if be32(&self.data, off) != 0x0002_0000 {
+            return map;
+        }
+        let num = be16(&self.data, off + 32) as usize;
+        let idx_start = off + 34;
+        if idx_start + num * 2 > end {
+            return map;
+        }
+        // Collect the custom Pascal-string names that follow the index array.
+        let mut custom: Vec<String> = Vec::new();
+        let mut p = idx_start + num * 2;
+        while p < end {
+            let n = self.data[p] as usize;
+            p += 1;
+            if p + n > end {
+                break;
+            }
+            custom.push(String::from_utf8_lossy(&self.data[p..p + n]).into_owned());
+            p += n;
+        }
+        for gid in 0..num {
+            let index = be16(&self.data, idx_start + gid * 2) as usize;
+            let name = if index < 258 {
+                super::encoding::standard_mac_glyph_name(index).map(str::to_owned)
+            } else {
+                custom.get(index - 258).cloned()
+            };
+            if let Some(name) = name {
+                // First gid wins: a duplicate name keeps the lowest id.
+                map.entry(name).or_insert(gid as u16);
+            }
+        }
+        map
     }
 
     /// Glyph advance width in font units.
