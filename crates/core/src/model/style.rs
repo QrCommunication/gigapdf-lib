@@ -192,3 +192,56 @@ pub struct StyleId(pub String);
 pub struct StyleTable {
     pub named: BTreeMap<StyleId, NamedStyle>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn char_style_compatibility_size_threshold() {
+        let base = CharStyle {
+            size_pt: 12.0,
+            ..CharStyle::default()
+        };
+        // Within 0.5pt ⇒ compatible.
+        let near = CharStyle {
+            size_pt: 12.3,
+            ..CharStyle::default()
+        };
+        assert!(base.is_compatible_with(&near));
+        // Beyond 0.5pt ⇒ not compatible.
+        let far = CharStyle {
+            size_pt: 13.0,
+            ..CharStyle::default()
+        };
+        assert!(!base.is_compatible_with(&far));
+        // A zero (unset/inherited) size matches any size.
+        let unset = CharStyle {
+            size_pt: 0.0,
+            ..CharStyle::default()
+        };
+        assert!(unset.is_compatible_with(&far));
+        assert!(far.is_compatible_with(&unset));
+    }
+
+    #[test]
+    fn char_style_text_attributes_must_match() {
+        let base = CharStyle {
+            size_pt: 12.0,
+            ..CharStyle::default()
+        };
+        // Differing bold/italic/etc. ⇒ never compatible regardless of size.
+        let bold = CharStyle {
+            size_pt: 12.0,
+            bold: true,
+            ..CharStyle::default()
+        };
+        assert!(!base.is_compatible_with(&bold));
+        let colored = CharStyle {
+            size_pt: 12.0,
+            color: Some([1.0, 0.0, 0.0]),
+            ..CharStyle::default()
+        };
+        assert!(!base.is_compatible_with(&colored));
+    }
+}

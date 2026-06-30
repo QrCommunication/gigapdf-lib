@@ -11816,6 +11816,15 @@ mod tests {
     }
 
     #[test]
+    fn category_as_str_all_variants() {
+        assert_eq!(Category::Sans.as_str(), "sans-serif");
+        assert_eq!(Category::Serif.as_str(), "serif");
+        assert_eq!(Category::Mono.as_str(), "monospace");
+        assert_eq!(Category::Display.as_str(), "display");
+        assert_eq!(Category::Handwriting.as_str(), "handwriting");
+    }
+
+    #[test]
     fn lookup_is_case_insensitive_and_aliased() {
         assert_eq!(lookup("roboto").unwrap().family, "Roboto");
         assert_eq!(lookup("ROBOTO").unwrap().family, "Roboto");

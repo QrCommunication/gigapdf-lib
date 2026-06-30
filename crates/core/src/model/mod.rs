@@ -407,3 +407,21 @@ pub struct BorderStyle {
     pub width: f64,
     pub color: [f64; 3],
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_kind_default_is_empty_paragraph() {
+        match BlockKind::default() {
+            BlockKind::Paragraph(p) => assert!(p.runs.is_empty()),
+            other => panic!("expected default Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_target_default_is_empty_url() {
+        assert_eq!(LinkTarget::default(), LinkTarget::Url(String::new()));
+    }
+}

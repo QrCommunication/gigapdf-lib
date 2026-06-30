@@ -114,3 +114,45 @@ impl Rotation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_degrees_all_variants() {
+        assert_eq!(Rotation::D0.degrees(), 0.0);
+        assert_eq!(Rotation::D90.degrees(), 90.0);
+        assert_eq!(Rotation::D180.degrees(), 180.0);
+        assert_eq!(Rotation::D270.degrees(), 270.0);
+        assert_eq!(Rotation::Deg(33.5).degrees(), 33.5);
+        assert_eq!(Rotation::default(), Rotation::D0);
+    }
+
+    #[test]
+    fn margins_constructors() {
+        let u = Margins::uniform(10.0);
+        assert_eq!((u.top, u.right, u.bottom, u.left), (10.0, 10.0, 10.0, 10.0));
+        let s = Margins::symmetric(5.0, 8.0);
+        assert_eq!((s.top, s.bottom), (5.0, 5.0));
+        assert_eq!((s.left, s.right), (8.0, 8.0));
+        // Default is 36pt (0.5") on every side.
+        assert_eq!(Margins::default(), Margins::uniform(36.0));
+    }
+
+    #[test]
+    fn page_geometry_a4_and_default() {
+        let a4 = PageGeometry::a4();
+        assert!((a4.width - 595.27).abs() < 0.1, "A4 width ≈ 595.27pt");
+        assert!((a4.height - 841.89).abs() < 0.1, "A4 height ≈ 841.89pt");
+        assert_eq!(a4.column_count, 1);
+        assert_eq!(PageGeometry::default(), a4);
+    }
+
+    #[test]
+    fn rect_new_and_default() {
+        let r = Rect::new(1.0, 2.0, 3.0, 4.0);
+        assert_eq!((r.x, r.y, r.w, r.h), (1.0, 2.0, 3.0, 4.0));
+        assert_eq!(Rect::default(), Rect::new(0.0, 0.0, 0.0, 0.0));
+    }
+}
