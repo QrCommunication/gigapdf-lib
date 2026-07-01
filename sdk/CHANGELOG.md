@@ -6,6 +6,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.112.0] - 2026-07-01
+
+### Fixed — per-word tiling for space-justified & `Td`-positioned runs (footers now overlay-faithful)
+
+`run_layout` previously split a run into positioned `segments` only at large `TJ`
+kern jumps. A run justified by **word spacing** (`Tw`) or **wide space glyphs** —
+or one whose words are placed by separate `Td` moves with wide leading gaps (a
+CERFA-style legal footer) — stayed a single long box, so a host painting one
+editable box per run rendered its glyphs at the browser's natural (non-justified)
+advance: the text drifted and collided with the neighbouring runs.
+
+Now **any positioned run** — one carrying a real `TJ` jump **or** a space wider
+than half an em — is split at **word boundaries**, each word tiling at its exact
+rasterizer pen `x`. Every space (a normal one or a wide justification gap) tiles
+as an inter-segment **gap**, never inside a word box, and a **leading** gap is
+folded so a lone word after it (e.g. a footer's `" financière"`) lands at its true
+pen `x` instead of drifting left. Single-word positioned runs now emit their one
+fragment too (the run box alone would sit at the pre-gap pen). Whitespace is
+detected by the decoded glyph, so a font whose space isn't byte `0x20` still tiles
+per word. Plain natural-flow runs (no jump, only normal spaces) stay a single
+inline-editable box — byte-identical.
+
+Result: a justified small-print legal footer reproduces the rasterizer
+word-for-word in an editable overlay.
+
 ## [0.111.0] - 2026-07-01
 
 ### Added — per-run text `segments` for pixel-faithful editable overlays (`TextElementInfo.segments`)

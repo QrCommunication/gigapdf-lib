@@ -1661,6 +1661,28 @@ fn run_layout(
     // every visible justification kern becomes a segment boundary, so each segment
     // is a contiguous glyph run positioned at its exact rasterizer pen x.
     let split = font_size * 0.02;
+    // A *positioned* run needs per-word tiling: either a real `TJ` position jump, OR a
+    // WIDE space glyph (a justification gap — `Tw` or a wide `/Widths` space). One
+    // overlay box would render such gaps at the browser's natural (narrow) advance, so
+    // the visible text drifts left and collides with the neighbouring runs. A plain
+    // natural-flow run (no jump, only normal spaces) stays whole → it remains a single
+    // inline-editable element. A space wider than half an em is the gap threshold
+    // (a normal space is ≈ a quarter em).
+    let positioned = atoms.iter().any(|a| match a {
+        ShowAtom::Kern(n) => (-n / 1000.0 * font_size * h_scale).abs() > split,
+        ShowAtom::Glyph { bytes, .. } => {
+            let d = decoder.decode(bytes);
+            let is_space = !d.is_empty() && d.chars().all(char::is_whitespace);
+            is_space && {
+                let mut adv =
+                    decoder.string_advance(bytes, font_size).unwrap_or(0.0) + char_spacing;
+                if bytes.as_slice() == [0x20] {
+                    adv += word_spacing;
+                }
+                adv * h_scale > font_size * 0.5
+            }
+        }
+    });
     // (text, start_x, end_x) in text space, relative to the run's matrix. Pen steps
     // mirror the rasterizer exactly (ISO 32000-1 §9.4.4): each glyph advances by
     // `(width + Tc [+ Tw for a single-byte space]) · Tz`, each `TJ` kern by
@@ -1672,15 +1694,34 @@ fn run_layout(
     for atom in &atoms {
         match atom {
             ShowAtom::Glyph { bytes, .. } => {
-                seg_text.push_str(&decoder.decode(bytes));
+                let decoded = decoder.decode(bytes);
+                let is_space =
+                    !decoded.is_empty() && decoded.chars().all(char::is_whitespace);
                 let width = decoder
                     .string_advance(bytes, font_size)
                     .unwrap_or(0.5 * font_size);
                 let mut step = width + char_spacing;
+                // `Tw` (word spacing) applies ONLY to the single-byte code 32
+                // (ISO 32000-1 §9.3.3); a word BOUNDARY, though, is any glyph that
+                // renders as whitespace (incl. a font-specific space code decoding to
+                // U+0020), so a run whose spaces aren't byte 0x20 still tiles per word.
                 if bytes.as_slice() == [0x20] {
                     step += word_spacing;
                 }
-                cur_x += step * h_scale;
+                if positioned && is_space {
+                    // Word boundary: close the word (glyphs only — the space is NEVER
+                    // kept in a word box) and let the space advance tile as a GAP, so
+                    // the next word starts at its exact rasterizer pen x. Holds for both
+                    // a normal space and a wide justification space.
+                    if !seg_text.is_empty() {
+                        segs.push((std::mem::take(&mut seg_text), seg_start, cur_x));
+                    }
+                    cur_x += step * h_scale;
+                    seg_start = cur_x;
+                } else {
+                    seg_text.push_str(&decoded);
+                    cur_x += step * h_scale;
+                }
             }
             ShowAtom::Kern(n) => {
                 let disp = -n / 1000.0 * font_size * h_scale;
@@ -1690,6 +1731,11 @@ fn run_layout(
                     seg_start = cur_x;
                 } else {
                     cur_x += disp;
+                    // A kern between words (nothing accumulated) folds into the gap so
+                    // the next word's box starts after it, not before.
+                    if seg_text.is_empty() {
+                        seg_start = cur_x;
+                    }
                 }
             }
         }
@@ -1698,10 +1744,16 @@ fn run_layout(
         segs.push((seg_text, seg_start, cur_x));
     }
     // `cur_x` is the run's total advance in text space — what the pen (and the
-    // next run) must move by. Segments are only worth emitting when the run
-    // actually split; otherwise the single element already positions it.
+    // next run) must move by.
     let advance = cur_x;
-    if segs.len() < 2 {
+    // A PLAIN run keeps its single box (no segments): its own element bounds already
+    // position it, and the common case stays byte-identical. A POSITIONED run emits
+    // its fragments even when there is only ONE: the run's own bounds.x is the pen
+    // BEFORE a wide leading gap (a `Tw`/wide-space justification space), but the
+    // fragment carries the gap-folded start — so a single word after such a gap
+    // (e.g. a footer's " financière") still tiles at its exact rasterizer pen x
+    // instead of drifting left when the overlay renders the gap at browser width.
+    if segs.is_empty() || (segs.len() < 2 && !positioned) {
         return (advance, Vec::new());
     }
     let segments = segs
@@ -4564,6 +4616,98 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
             .find(|e| e.kind == ElementKind::Text)
             .unwrap();
         assert!(run.segments.is_empty(), "no split for a plain run");
+    }
+
+    /// A *positioned* run (a `TJ` with a real position jump) that also spaces WORDS
+    /// via literal spaces inside a fragment splits at EVERY word boundary — not only
+    /// at the jump. A single long fragment renders its glyphs at the browser's
+    /// natural advance in the overlay, so a space-justified line drifts and collides
+    /// with interleaved runs; per-word fragments tile at their exact rasterizer pen x.
+    #[test]
+    fn positioned_run_splits_at_word_boundaries() {
+        // "one two", a +50pt jump (TJ -5000 at 10pt), then "three four".
+        let content = b"BT /F1 10 Tf 100 700 Td [(one two) -5000 (three four)] TJ ET";
+        let run = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        let texts: Vec<&str> = run.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["one", "two", "three", "four"],
+            "positioned run splits at word boundaries, spaces tile as gaps (got {texts:?})",
+        );
+        // Words tile left→right; the jump is a big gap between "two" and "three".
+        let xs: Vec<f64> = run.segments.iter().map(|s| s.bounds.x).collect();
+        assert!(
+            xs.windows(2).all(|w| w[1] > w[0]),
+            "segment x strictly increasing: {xs:?}",
+        );
+        let two_end = run.segments[1].bounds.x + run.segments[1].bounds.width;
+        assert!(
+            run.segments[2].bounds.x - two_end > 40.0,
+            "big jump gap before 'three' (start {} vs 'two' end {})",
+            run.segments[2].bounds.x,
+            two_end,
+        );
+    }
+
+    /// A justification GAP written as a run of spaces is folded into the
+    /// inter-segment space, not kept inside the next word's box: the following word
+    /// must start at its exact rasterizer pen x (leading spaces rendered at the
+    /// browser's natural width would drift the word). Only the FIRST space closes the
+    /// preceding word; the extra ones tile as a gap.
+    #[test]
+    fn positioned_run_folds_wide_gap_into_intersegment_space() {
+        // "foo" + a 3-space justification gap + "bar", plus a real jump so the run
+        // qualifies as positioned.
+        let content = b"BT /F1 10 Tf 100 700 Td [(foo   bar) -5000 (baz)] TJ ET";
+        let run = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        let texts: Vec<&str> = run.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["foo", "bar", "baz"],
+            "wide gap folded, no leading-space word (got {texts:?})",
+        );
+        // "bar" begins one space past "foo "'s end PLUS the two folded gap spaces —
+        // i.e. clearly right of where "foo " ends (the gap is real, not zero).
+        let foo_end = run.segments[0].bounds.x + run.segments[0].bounds.width;
+        assert!(
+            run.segments[1].bounds.x - foo_end > 0.0,
+            "bar starts right of foo's box (gap folded): bar.x {} vs foo end {}",
+            run.segments[1].bounds.x,
+            foo_end,
+        );
+    }
+
+    /// A positioned run with a wide LEADING justification gap and a SINGLE word still
+    /// emits its one fragment: the run's own bounds.x is the pen BEFORE the gap, so a
+    /// lone word (a footer's " financière") would drift left if rendered from the run
+    /// box. The fragment carries the gap-folded start, tiling at the word's true pen x.
+    #[test]
+    fn positioned_single_word_after_wide_gap_emits_one_fragment() {
+        // `6 Tw` widens the leading space into a justification gap, then one word.
+        let content = b"BT /F1 10 Tf 100 700 Td 6 Tw ( word) Tj ET";
+        let run = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        assert_eq!(run.segments.len(), 1, "one word ⇒ one positioned fragment");
+        assert_eq!(run.segments[0].text, "word");
+        // The word starts well right of the run's own left edge (wide gap folded in).
+        let run_x = run.bounds.unwrap().x;
+        assert!(
+            run.segments[0].bounds.x - run_x > 5.0,
+            "word x {} folded past run start {}",
+            run.segments[0].bounds.x,
+            run_x,
+        );
     }
 
     /// An unresolvable named space falls back to `scn` arity inference (here a
