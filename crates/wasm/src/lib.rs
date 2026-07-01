@@ -6599,6 +6599,38 @@ fn fields_json(fields: &[FormField]) -> String {
             }
             json_escape(option, &mut out);
         }
+        // Every widget placement (page + bounds + button export) so a host renders
+        // the field on ALL its pages / for all its radio buttons, not just the first.
+        out.push_str("],\"widgets\":[");
+        for (k, w) in field.widgets.iter().enumerate() {
+            if k > 0 {
+                out.push(',');
+            }
+            out.push('{');
+            let mut first = true;
+            if let Some(p) = w.page {
+                out.push_str(&format!("\"page\":{p}"));
+                first = false;
+            }
+            if let Some(b) = w.bounds {
+                if !first {
+                    out.push(',');
+                }
+                out.push_str(&format!(
+                    "\"bounds\":[{},{},{},{}]",
+                    b[0], b[1], b[2], b[3]
+                ));
+                first = false;
+            }
+            if let Some(e) = &w.export {
+                if !first {
+                    out.push(',');
+                }
+                out.push_str("\"export\":");
+                json_escape(e, &mut out);
+            }
+            out.push('}');
+        }
         out.push_str("]}");
     }
     out.push(']');

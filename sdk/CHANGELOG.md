@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.113.0] - 2026-07-01
+
+### Added — every form-field widget placement (`FieldInfo.widgets`)
+
+`fields()` now returns, for each AcroForm field, a **`widgets`** array listing
+EVERY on-page widget of that field — not just the first. A field can have several:
+the same field repeated on a duplicate page (an official form's carbon copy — fill
+it once and it shows on both pages), or one widget per button of a radio group.
+Each `WidgetPlacement` carries its `page`, its top-left `bounds`, and — for a button
+— its on-state `export` (which radio button it is / the value stored when selected).
+The flat `page`/`bounds` stay the first widget for backward compatibility.
+
+Redundant or near-coincident widgets (a merged field also listed under `/Kids`, a
+duplicate `/Kids` ref) are de-duplicated by (page, ~2pt bounds). A host renders one
+field overlay per widget, so nothing is missing on page 2 and every radio button is
+placed with the correct checked state.
+
 ## [0.112.0] - 2026-07-01
 
 ### Fixed — per-word tiling for space-justified & `Td`-positioned runs (footers now overlay-faithful)

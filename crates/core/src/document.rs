@@ -15,7 +15,7 @@ use crate::annot::{self, Annotation};
 use crate::content::{self, ContentElement, TextRun};
 use crate::error::{EngineError, Result};
 use crate::filters::decode_stream;
-use crate::form::{self, FormField};
+use crate::form::{self, FormField, WidgetPlacement};
 use crate::headerfooter::{
     Align, HFItem, HeaderFooter, HeaderFooterSpec, Margins, RunningHeaderFooter,
 };
@@ -20730,22 +20730,67 @@ impl Document {
             "Btn" => self.button_export_states(dict),
             _ => Vec::new(),
         };
-        // Widget geometry: the field dict itself (merged field+widget) carries
-        // /Rect, or its first widget kid does; /P points at the widget's page.
-        let widget = if dict.contains(b"Rect") {
-            Some(dict)
-        } else {
-            dict.get(b"Kids")
-                .map(|o| self.resolve(o))
-                .and_then(Object::as_array)
-                .and_then(|kids| kids.first())
-                .map(|k| self.resolve(k))
-                .and_then(Object::as_dict)
-        };
-        let (page, bounds) = match widget {
-            Some(w) => self.widget_geometry(w),
-            None => (None, None),
-        };
+        // Widget geometry: collect EVERY widget placement, not just the first.
+        // A merged field+widget carries /Rect directly; otherwise each pure-widget
+        // kid (they have /Rect but no /T — named kids were recursed above) is one
+        // placement. A field can thus land on several pages (a duplicate copy that
+        // shares the value) or as several radio buttons; a host renders them all.
+        // Gather the candidate widget dicts: the merged field+widget (has /Rect)
+        // and/or each pure-widget kid (has /Rect, no /T — named kids were recursed
+        // above). Only a button field's widget carries a meaningful on-state export.
+        let is_button = field_type == "Btn";
+        let mut widget_dicts: Vec<&Dictionary> = Vec::new();
+        if dict.contains(b"Rect") {
+            widget_dicts.push(dict);
+        }
+        if let Some(kids) = dict
+            .get(b"Kids")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            for kid in kids {
+                if let Some(kd) = self.resolve(kid).as_dict() {
+                    if kd.contains(b"Rect") {
+                        widget_dicts.push(kd);
+                    }
+                }
+            }
+        }
+        let mut widgets: Vec<WidgetPlacement> = Vec::new();
+        for w in widget_dicts {
+            let (page, bounds) = self.widget_geometry(w);
+            let Some(rect) = bounds else { continue };
+            // Dedupe redundant placements (a merged field also listed under /Kids, or
+            // a duplicate /Kids ref) by (page, rounded bounds) — never render twice.
+            // Same page + boxes coincident within ~2pt on every edge ⇒ the same
+            // placement (float noise or a near-overlapping redundant widget). Radio
+            // buttons (tens of points apart) and distinct fields stay separate.
+            let dup = widgets.iter().any(|x| {
+                x.page == page
+                    && x.bounds.is_some_and(|a| {
+                        a.iter().zip(rect.iter()).all(|(p, q)| (p - q).abs() < 2.0)
+                    })
+            });
+            if dup {
+                continue;
+            }
+            let export = if is_button {
+                self.widget_on_state(w)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+            } else {
+                None
+            };
+            widgets.push(WidgetPlacement {
+                page,
+                bounds,
+                export,
+            });
+        }
+        // Backward-compatible first-widget shortcut.
+        let (page, bounds) = widgets
+            .first()
+            .map(|w| (w.page, w.bounds))
+            .unwrap_or((None, None));
 
         out.push(FormField {
             name,
@@ -20760,6 +20805,7 @@ impl Document {
             da_size,
             page,
             bounds,
+            widgets,
         });
     }
 
@@ -26294,6 +26340,45 @@ mod tests {
         assert!(fields
             .iter()
             .any(|f| f.name == "country" && f.field_type == "Ch" && f.value == "France"));
+    }
+
+    /// Every field exposes ALL its widget placements (a field on a duplicate page,
+    /// or each radio button), the legacy `page`/`bounds` mirror the first widget,
+    /// and only button widgets carry an on-state export.
+    #[test]
+    fn field_widgets_expose_every_placement_and_only_buttons_export() {
+        let doc = Document::open(&fixture("with-forms.pdf")).unwrap();
+        let fields = doc.form_fields().unwrap();
+        for f in &fields {
+            // Backward-compat: the flat page/bounds equal the FIRST widget's.
+            assert_eq!(f.page, f.widgets.first().and_then(|w| w.page), "{} page", f.name);
+            assert_eq!(
+                f.bounds,
+                f.widgets.first().and_then(|w| w.bounds),
+                "{} bounds",
+                f.name
+            );
+            // A text/choice widget never carries a button on-state export.
+            if f.field_type == "Tx" || f.field_type == "Ch" {
+                assert!(
+                    f.widgets.iter().all(|w| w.export.is_none()),
+                    "{} (text/choice) leaked a button export",
+                    f.name
+                );
+            }
+            // Every listed widget has a real rectangle.
+            assert!(f.widgets.iter().all(|w| w.bounds.is_some()), "{} widget no rect", f.name);
+        }
+        // The button field's widget(s) carry their on-state export (which button).
+        let btn = fields
+            .iter()
+            .find(|f| f.field_type == "Btn" && !f.widgets.is_empty())
+            .expect("a button field with a widget");
+        assert!(
+            btn.widgets.iter().any(|w| w.export.is_some()),
+            "button {} has no widget on-state export",
+            btn.name
+        );
     }
 
     #[test]

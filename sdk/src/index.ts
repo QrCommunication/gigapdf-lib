@@ -2076,6 +2076,33 @@ export interface FieldInfo {
   bounds?: [number, number, number, number];
   value: string;
   options: string[];
+  /**
+   * EVERY widget placement of this field — one per on-page widget. A field
+   * repeated on a duplicate page has one entry per page (fill it once, it shows
+   * on both); a radio group has one entry per button. `page`/`bounds` above are
+   * this list's first entry (kept for backward compatibility). A host renders a
+   * field overlay per widget so nothing is missing on a duplicate/second page.
+   */
+  widgets: WidgetPlacement[];
+}
+/**
+ * One on-page placement of a form field — a single widget annotation. See
+ * {@link FieldInfo.widgets}.
+ */
+export interface WidgetPlacement {
+  /** 1-based page the widget sits on (from its `/P`). */
+  page?: number;
+  /**
+   * Widget rectangle `[x, y, width, height]` in points, **top-left origin**
+   * (already Y-flipped from the PDF's bottom-left `/Rect`).
+   */
+  bounds?: [number, number, number, number];
+  /**
+   * For a button widget, its on-state export name (the non-`Off` `/AP /N` key)
+   * — which radio button this widget is / the value stored when selected. Absent
+   * for text and choice widgets.
+   */
+  export?: string;
 }
 /**
  * A view destination (ISO 32000-1 §12.3.2). `page` is 1-based; optional

@@ -117,6 +117,23 @@ impl FieldTrigger {
     }
 }
 
+/// One on-page placement of a form field — a single **widget** annotation. A
+/// field can have several: the same field repeated on a duplicate page (fill one,
+/// it shows on both), or each button of a radio group. A host must render them
+/// all, so [`FormField::widgets`] lists every one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WidgetPlacement {
+    /// 1-based page number of the widget (from its `/P`; defaults to page 1).
+    pub page: Option<u32>,
+    /// Widget bounds `[x, y, width, height]` in **top-left** origin (points),
+    /// already Y-flipped from the PDF's bottom-left `/Rect`.
+    pub bounds: Option<[f64; 4]>,
+    /// For a button widget, its on-state export name — the single non-`Off` key
+    /// of the widget's `/AP /N` — i.e. which radio button this widget is (the
+    /// value stored when it is selected). `None` for text/choice widgets.
+    pub export: Option<String>,
+}
+
 /// A terminal form field with its type, value, flags and (for buttons/choices)
 /// the set of selectable options.
 #[derive(Debug, Clone)]
@@ -155,6 +172,11 @@ pub struct FormField {
     /// First widget bounds `[x, y, width, height]` in **top-left** origin
     /// (points), if the widget has a `/Rect`.
     pub bounds: Option<[f64; 4]>,
+    /// EVERY widget placement of this field — one per on-page widget. A field
+    /// repeated on a duplicate page has one per page; a radio group has one per
+    /// button. `page`/`bounds` above are this list's first entry (kept for
+    /// backward compatibility). Empty when the field has no widget at all.
+    pub widgets: Vec<WidgetPlacement>,
 }
 
 impl FormField {
@@ -478,6 +500,7 @@ mod tests {
             da_size: 0.0,
             page: None,
             bounds: None,
+            widgets: Vec::new(),
         }
     }
 
