@@ -6,6 +6,29 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.111.0] - 2026-07-01
+
+### Added — per-run text `segments` for pixel-faithful editable overlays (`TextElementInfo.segments`)
+
+`page_text_elements` / `textElements(page)` now return, for each **justified or
+per-glyph-positioned run** (a legal footer, a spread-out table cell), its
+visually contiguous **`segments`** — each with its own text and page-space box.
+A run drawn as ONE `Tj`/`TJ` but with large internal `TJ` position jumps used to
+collapse those jumps to literal spaces, so a host that painted one editable box
+per run tiled it wrong (fragments overlapped / drifted). Each segment is now
+positioned from the **same pen walk the rasterizer uses** — real glyph widths
+(`/Widths`·`/W`) plus `Tc` (char spacing), `Tw` (word spacing), `Tz` (horizontal
+scale) and `TJ` kerns — so a host paints one box per fragment, 1:1 with the
+render, while still editing the whole run via its `index`. `segments` is **empty**
+for a plain run (its own `x`/`y`/`width` already position it), so the common case
+is unchanged.
+
+Internally the content-stream extractor now tracks `Tc`/`Tw`/`Tz` and derives
+each horizontal LTR run's advance from that exact pen walk (a single source of
+truth shared by the run's own box, the next run's start position, and the
+segments), fixing sub-point inter-run drift on spaced/scaled text. Byte-identical
+for content without spacing operators or internal jumps.
+
 ## [0.110.4] - 2026-06-30
 
 ### Fixed — repacked CIDFont subset web-font cmap (`extractWebFont` no longer garbles labels)

@@ -800,6 +800,7 @@ mod tests {
                 rotation_deg: None,
                 fill_alpha: None,
                 nested: false,
+                segments: Vec::new(),
             },
             ContentElement {
                 index: 1,
@@ -815,6 +816,7 @@ mod tests {
                 rotation_deg: None,
                 fill_alpha: None,
                 nested: false,
+                segments: Vec::new(),
             },
         ];
         // Drive only the op-owner mapping + MCID assignment (no Document needed):

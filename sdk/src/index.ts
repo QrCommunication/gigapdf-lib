@@ -1220,6 +1220,28 @@ export interface TextElementInfo {
    * run is only digits/punctuation/whitespace.
    */
   direction: 'ltr' | 'rtl' | 'neutral';
+  /**
+   * The run's visually contiguous fragments when it contains internal `TJ`
+   * position jumps — justified / per-glyph-positioned text (a legal footer, a
+   * spread-out table cell) that a single overlay box cannot reproduce. Each
+   * fragment carries its own text and page-space box, computed from the SAME
+   * pen walk the rasterizer uses (glyph widths + `Tc`/`Tw`/`Tz` + kerns), so a
+   * host paints one positioned box per fragment — 1:1 with the render — while
+   * still editing the whole run via {@link index}. **Empty** for a plain run
+   * (its own `x`/`y`/`width` already position it).
+   */
+  segments: TextSegment[];
+}
+/**
+ * One visually contiguous fragment of a {@link TextElementInfo} run (see {@link
+ * TextElementInfo.segments}): its text and page-space box (origin bottom-left).
+ */
+export interface TextSegment {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 /**
  * The aggregate language signal of a document from

@@ -58,6 +58,25 @@ pub enum ElementKind {
     Path,
 }
 
+/// One **visually contiguous piece** of a text run, split at a large `TJ`
+/// position jump. A justified/positioned run (e.g. a CERFA legal footer) draws
+/// its glyphs as one `Tj`/`TJ` op but inserts big kerning displacements to place
+/// fragments — so the run's `label` collapses those gaps to literal spaces and a
+/// single overlay box cannot reproduce them (fragments overlap / drift). Each
+/// segment carries the fragment's own text and its exact page-space [`Bounds`],
+/// so a host can paint one positioned box per segment — 1:1 with the raster —
+/// while still editing the run as a whole (the segments share the run's index).
+/// A run with no large internal jump yields **no** segments (the single
+/// [`ContentElement`] already positions it), so the common case is unchanged.
+#[derive(Debug, Clone)]
+pub struct TextSegment {
+    /// The fragment's decoded text (a contiguous slice of the run's `label`).
+    pub text: String,
+    /// The fragment's bounding box in page user space — its own start `x`,
+    /// baseline-band `y`, `width` (the glyphs' real advance) and height.
+    pub bounds: Bounds,
+}
+
 /// A high-level, addressable element of a page's content: text, image or shape.
 /// `op_start..=op_end` is the inclusive operation range it occupies.
 #[derive(Debug, Clone)]
@@ -109,6 +128,12 @@ pub struct ContentElement {
     /// are page-space and correct for display). Always `false` for top-level
     /// elements.
     pub nested: bool,
+    /// For **text**: the run's visually contiguous [`TextSegment`]s when it
+    /// contains a large internal `TJ` position jump (justified/positioned text a
+    /// single box cannot reproduce). Empty for a normal run (the element's own
+    /// `bounds`/`label` already position it), and for image/path. See
+    /// [`TextSegment`].
+    pub segments: Vec<TextSegment>,
 }
 
 /// A reading-order text line: the concatenated runs that share a baseline band,
@@ -1592,6 +1617,105 @@ fn text_bounds(tm: &Matrix, ctm: &Matrix, font_size: f64, width: f64) -> Option<
     bb.build()
 }
 
+/// Split a horizontal text-show op into visually contiguous [`TextSegment`]s at
+/// large `TJ` position jumps, each with its own page-space [`Bounds`].
+///
+/// A justified/positioned run inserts big `TJ` kerning displacements to place
+/// fragments; the run's `label` collapses those to literal spaces, so one overlay
+/// box mis-tiles (fragments overlap / drift). Walking the [`ShowAtom`]s, we
+/// accumulate the text-space pen `x` (glyph advances + kerns) and start a NEW
+/// segment whenever a single displacement exceeds a quarter-em — a real gap/jump,
+/// not intra-word kerning. Each segment's box is `text_bounds` at the run matrix
+/// translated by the fragment's start `x`, so segments tile exactly as the
+/// rasterizer paints them.
+///
+/// Returns **empty** unless the run actually split (≥ 2 segments): a normal run
+/// needs none — its own [`ContentElement`] bounds already position it — keeping
+/// the common case byte-identical. Caller must gate on horizontal LTR text
+/// (RTL/vertical runs reorder/step differently and are left whole).
+/// The run's total user-space advance AND its positioned [`TextSegment`]s, both
+/// from ONE pen walk that mirrors the rasterizer's `show_text` exactly (glyph
+/// width from `/Widths`·`/W`, `+ Tc [+ Tw]`, `· Tz`; `TJ` kern `-n/1000·fs·Tz`).
+/// The caller feeds the advance back into the text matrix so the NEXT run starts
+/// where the rasterizer's pen left it — inter-run and intra-run positions stay
+/// consistent and rasterizer-exact. Segments are empty for a run with no internal
+/// jump (its own box positions it); the advance is always returned.
+fn run_layout(
+    op: &Operation,
+    tm: &Matrix,
+    ctm: &Matrix,
+    font_size: f64,
+    decoder: &TextDecoder,
+    char_spacing: f64,
+    word_spacing: f64,
+    h_scale: f64,
+) -> (f64, Vec<TextSegment>) {
+    if font_size == 0.0 {
+        return (0.0, Vec::new());
+    }
+    let (atoms, _kind) = run_atoms(std::slice::from_ref(op), 0, decoder);
+    // Split at EVERY meaningful `TJ` displacement (not only big jumps): a single
+    // overlay box renders its glyphs at their natural advance, so any kern left
+    // *inside* a segment is silently dropped and the rest of the run drifts. A
+    // per-em-fraction threshold ignores only sub-pixel micro-kerns (≈ noise);
+    // every visible justification kern becomes a segment boundary, so each segment
+    // is a contiguous glyph run positioned at its exact rasterizer pen x.
+    let split = font_size * 0.02;
+    // (text, start_x, end_x) in text space, relative to the run's matrix. Pen steps
+    // mirror the rasterizer exactly (ISO 32000-1 §9.4.4): each glyph advances by
+    // `(width + Tc [+ Tw for a single-byte space]) · Tz`, each `TJ` kern by
+    // `-n/1000 · font_size · Tz`.
+    let mut segs: Vec<(String, f64, f64)> = Vec::new();
+    let mut seg_text = String::new();
+    let mut seg_start = 0.0f64;
+    let mut cur_x = 0.0f64;
+    for atom in &atoms {
+        match atom {
+            ShowAtom::Glyph { bytes, .. } => {
+                seg_text.push_str(&decoder.decode(bytes));
+                let width = decoder
+                    .string_advance(bytes, font_size)
+                    .unwrap_or(0.5 * font_size);
+                let mut step = width + char_spacing;
+                if bytes.as_slice() == [0x20] {
+                    step += word_spacing;
+                }
+                cur_x += step * h_scale;
+            }
+            ShowAtom::Kern(n) => {
+                let disp = -n / 1000.0 * font_size * h_scale;
+                if disp.abs() > split && !seg_text.is_empty() {
+                    segs.push((std::mem::take(&mut seg_text), seg_start, cur_x));
+                    cur_x += disp;
+                    seg_start = cur_x;
+                } else {
+                    cur_x += disp;
+                }
+            }
+        }
+    }
+    if !seg_text.is_empty() {
+        segs.push((seg_text, seg_start, cur_x));
+    }
+    // `cur_x` is the run's total advance in text space — what the pen (and the
+    // next run) must move by. Segments are only worth emitting when the run
+    // actually split; otherwise the single element already positions it.
+    let advance = cur_x;
+    if segs.len() < 2 {
+        return (advance, Vec::new());
+    }
+    let segments = segs
+        .into_iter()
+        .filter(|(text, _, _)| !text.trim().is_empty())
+        .filter_map(|(text, sx, ex)| {
+            let seg_tm = Matrix::translate(sx, 0.0).then(tm);
+            text_bounds(&seg_tm, ctm, font_size, (ex - sx).max(0.0))
+                .map(|bounds| TextSegment { text, bounds })
+        })
+        .collect();
+    (advance, segments)
+}
+
 /// The user-space advance of a text-show operand, summed from real glyph widths
 /// (`Tj` string, or `TJ` array with its `1000`-em kerning adjustments applied).
 /// `None` when the font has no width table — the caller then estimates.
@@ -1828,6 +1952,12 @@ fn elements_from_ops_resolved(
     let mut tlm = Matrix::IDENTITY;
     let mut font_size = 0.0f64;
     let mut leading = 0.0f64;
+    // Text-space spacing state (ISO 32000-1 §9.3), tracked so run-segment
+    // positions match the rasterizer's pen exactly: `Tc` char spacing, `Tw` word
+    // spacing (single-byte code 32 only), `Tz` horizontal scale (as a ratio).
+    let mut char_spacing = 0.0f64;
+    let mut word_spacing = 0.0f64;
+    let mut h_scale = 1.0f64;
     let fallback = TextDecoder::winansi();
     let mut text_decoder: &TextDecoder = &fallback;
     let mut current_font: Option<String> = None;
@@ -1945,6 +2075,21 @@ fn elements_from_ops_resolved(
                     leading = l;
                 }
             }
+            b"Tc" => {
+                if let Some(&c) = nums(op).first() {
+                    char_spacing = c;
+                }
+            }
+            b"Tw" => {
+                if let Some(&w) = nums(op).first() {
+                    word_spacing = w;
+                }
+            }
+            b"Tz" => {
+                if let Some(&z) = nums(op).first() {
+                    h_scale = z / 100.0;
+                }
+            }
             b"Td" => {
                 let n = nums(op);
                 if n.len() == 2 {
@@ -1978,6 +2123,14 @@ fn elements_from_ops_resolved(
                 // previous baseline (the bug that left whole invoice blocks
                 // shifted up by their cumulative leading and dropped the run
                 // shown by each `'`).
+                // `aw ac string "` sets word/char spacing before showing.
+                if operator == b"\"" {
+                    let n = nums(op);
+                    if n.len() >= 2 {
+                        word_spacing = n[0];
+                        char_spacing = n[1];
+                    }
+                }
                 if matches!(operator, b"'" | b"\"") {
                     tlm = Matrix::translate(0.0, -leading).then(&tlm);
                     tm = tlm;
@@ -1999,11 +2152,38 @@ fn elements_from_ops_resolved(
                 // vertical mode, the horizontal width otherwise. Real glyph metrics
                 // when the font carries widths; a 0.5-em estimate otherwise. Drives
                 // both the run's bounds and the pen advance for the next run.
-                let advance = if vertical {
-                    text_run_vadvance(&op.operands, text_decoder, font_size)
+                // Horizontal LTR: ONE rasterizer-exact pen walk yields both the
+                // advance (fed back into the text matrix so the NEXT run starts at
+                // the rasterizer's pen) and the positioned segments. Vertical steps
+                // down; RTL is stored reversed — both keep their legacy advance and
+                // emit no segments.
+                let is_ltr_h = !vertical
+                    && !matches!(
+                        crate::text::run_direction(&text),
+                        crate::text::Direction::Rtl
+                    );
+                let (advance, segments) = if is_ltr_h {
+                    run_layout(
+                        op,
+                        &tm,
+                        &ctm,
+                        font_size,
+                        text_decoder,
+                        char_spacing,
+                        word_spacing,
+                        h_scale,
+                    )
+                } else if vertical {
+                    (
+                        text_run_vadvance(&op.operands, text_decoder, font_size),
+                        Vec::new(),
+                    )
                 } else {
-                    text_run_advance(&op.operands, text_decoder, font_size)
-                        .unwrap_or(char_count as f64 * 0.5 * font_size)
+                    (
+                        text_run_advance(&op.operands, text_decoder, font_size)
+                            .unwrap_or(char_count as f64 * 0.5 * font_size),
+                        Vec::new(),
+                    )
                 };
                 let bounds = if vertical {
                     let (col_w, vx, vy) = vertical_run_lead(&op.operands, text_decoder, font_size);
@@ -2043,6 +2223,7 @@ fn elements_from_ops_resolved(
                     rotation_deg: Some(if rot.abs() < 1e-6 { 0.0 } else { rot }),
                     fill_alpha: Some(fill_alpha),
                     nested,
+                    segments,
                 });
                 // Advance the pen for the next run: down the page in vertical mode
                 // (along the text-space y-axis by the run's vertical displacement),
@@ -2121,6 +2302,7 @@ fn elements_from_ops_resolved(
                     rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
                     fill_alpha: Some(fill_alpha),
                     nested,
+                    segments: Vec::new(),
                 });
             }
             // Inline image (`BI`…`EI`): like a `Do` image it fills the unit square
@@ -2144,6 +2326,7 @@ fn elements_from_ops_resolved(
                     rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
                     fill_alpha: Some(fill_alpha),
                     nested,
+                    segments: Vec::new(),
                 });
             }
             _ if is_path_construction(operator) => {
@@ -2166,6 +2349,7 @@ fn elements_from_ops_resolved(
                         rotation_deg: None,
                         fill_alpha: Some(fill_alpha),
                         nested,
+                        segments: Vec::new(),
                     });
                 }
                 path_bb = BoundsBuilder::new();
@@ -3231,6 +3415,7 @@ mod tests {
             rotation_deg: None,
             fill_alpha: None,
             nested: false,
+            segments: Vec::new(),
         };
         // "N" spans x=10..17 (right edge 17); "om et adresse" starts at 17 (gap 0
         // → join); "ailleurs" starts at 120 (large gap → space).
@@ -3270,6 +3455,7 @@ mod tests {
             rotation_deg: None,
             fill_alpha: None,
             nested: false,
+            segments: Vec::new(),
         };
         // "ASSURES" at top (y=100.5, sorts first); "cerfa" just below (y=99.5,
         // within the 0.6×h tolerance) but at the left margin (x=10).
@@ -4336,6 +4522,48 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
             Some([0.0, 0.0, 1.0]),
             "device rg keeps its blue"
         );
+    }
+
+    /// A justified/positioned run — one `TJ` with a large internal position jump —
+    /// splits into positioned [`TextSegment`]s the host tiles 1:1, while a plain run
+    /// stays whole. This is the footer "texte emmêlé" fix: the run's collapsed
+    /// literal-space label cannot reproduce the jump, the segments can.
+    #[test]
+    fn tj_position_jump_splits_run_into_positioned_segments() {
+        // "AB", a +5em rightward gap (TJ -5000 at 10pt ⇒ +50pt), then "CD".
+        let content = b"BT /F1 10 Tf 100 700 Td [(AB) -5000 (CD)] TJ ET";
+        let run = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        assert_eq!(run.segments.len(), 2, "run split at the large TJ jump");
+        assert_eq!(run.segments[0].text, "AB");
+        assert_eq!(run.segments[1].text, "CD");
+        // The second fragment starts well right of where the first ends — the gap a
+        // single overlay box would have collapsed into a literal space.
+        let ab_end = run.segments[0].bounds.x + run.segments[0].bounds.width;
+        assert!(
+            run.segments[1].bounds.x - ab_end > 40.0,
+            "big gap before CD (start {} vs AB end {})",
+            run.segments[1].bounds.x,
+            ab_end,
+        );
+        // First fragment anchors at the run's start x.
+        assert!((run.segments[0].bounds.x - 100.0).abs() < 1.0);
+    }
+
+    /// A plain run (no large internal jump) yields NO segments — its single element
+    /// already positions it, so the common path stays byte-identical.
+    #[test]
+    fn plain_run_has_no_segments() {
+        let content = b"BT /F1 10 Tf 100 700 Td (Hello world) Tj ET";
+        let run = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        assert!(run.segments.is_empty(), "no split for a plain run");
     }
 
     /// An unresolvable named space falls back to `scn` arity inference (here a

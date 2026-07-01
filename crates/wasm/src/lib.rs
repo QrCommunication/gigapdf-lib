@@ -1065,7 +1065,11 @@ pub extern "C" fn gp_elements_json(
 
 /// Every text element on a page as JSON, enriched for a host editor:
 /// `[{index,text,x,y,width,height,fontFamily,baseFont,bold,italic,fontSize,
-/// color:[r,g,b],rotation,direction}]`. Bounds are in user space (origin
+/// color:[r,g,b],rotation,direction,segments:[{text,x,y,width,height}]}]`.
+/// `segments` is non-empty only for a justified/positioned run with a large
+/// internal `TJ` jump (a legal footer): its positioned fragments, so the host
+/// paints one 1:1 overlay box per fragment yet edits the whole run via `index`.
+/// Bounds are in user space (origin
 /// bottom-left); `index` is the text-run index accepted by `gp_replace_text`;
 /// `fontFamily` is the collapsed display family and `baseFont` the raw
 /// `/BaseFont` (subset prefix kept) resolved against the run's own scope (page or
@@ -1098,7 +1102,7 @@ pub extern "C" fn gp_text_elements_json(
                 s.push_str(",\"baseFont\":");
                 json_escape(&e.base_font, &mut s);
                 s.push_str(&format!(
-                    ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{},\"direction\":\"{}\"}}",
+                    ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{},\"direction\":\"{}\",\"segments\":[",
                     e.bold,
                     e.italic,
                     fnum(e.font_size),
@@ -1108,6 +1112,25 @@ pub extern "C" fn gp_text_elements_json(
                     fnum(e.rotation_deg),
                     gigapdf_core::text::direction_str(e.direction)
                 ));
+                // Per-run positioned fragments for justified/positioned text (empty
+                // for a normal run). Each fragment carries its own page-space box so
+                // the host paints one editable overlay box per fragment — 1:1 with
+                // the raster — while editing the whole run via `index`.
+                for (j, seg) in e.segments.iter().enumerate() {
+                    if j > 0 {
+                        s.push(',');
+                    }
+                    s.push_str("{\"text\":");
+                    json_escape(&seg.text, &mut s);
+                    s.push_str(&format!(
+                        ",\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+                        fnum(seg.bounds.x),
+                        fnum(seg.bounds.y),
+                        fnum(seg.bounds.width),
+                        fnum(seg.bounds.height)
+                    ));
+                }
+                s.push_str("]}");
             }
             s.push(']');
             s

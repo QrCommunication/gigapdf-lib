@@ -2665,6 +2665,16 @@ pub struct TextElementInfo {
     /// left-to-right for Latin/Greek/Cyrillic/CJK, neutral when the run carries
     /// only digits/punctuation/whitespace.
     pub direction: crate::text::Direction,
+    /// The run's visually contiguous [`TextSegment`](crate::content::TextSegment)s
+    /// when it holds a large internal `TJ` position jump (justified/positioned text
+    /// a single overlay box can't reproduce — e.g. a legal footer). Each carries a
+    /// fragment's text + its own page-space box, so a host paints one positioned
+    /// box per segment (1:1 with the raster) yet still edits the whole run via this
+    /// element's [`index`]. **Empty** for a normal run (its own `x`/`y`/`width`
+    /// already position it) — the common case is unchanged.
+    ///
+    /// [`index`]: TextElementInfo::index
+    pub segments: Vec<crate::content::TextSegment>,
 }
 
 /// One image element from [`Document::page_image_elements`]: its placement box
@@ -5067,6 +5077,7 @@ impl Document {
                     color: e.color.unwrap_or([0.0, 0.0, 0.0]),
                     rotation_deg: e.rotation_deg.unwrap_or(0.0),
                     direction,
+                    segments: e.segments,
                 }
             })
             .collect()
