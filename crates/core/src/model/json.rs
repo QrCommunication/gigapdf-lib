@@ -839,7 +839,14 @@ impl Writer {
 
     fn image_ref(&mut self, i: &ImageRef) {
         self.obj_open();
-        self.k_u64("resource", i.resource);
+        // The resource id is a 64-bit content hash. Emitted as a JSON *string*:
+        // a bare number would be read as an IEEE-754 double by JavaScript
+        // (`JSON.parse`) — and by this module's own `Reader::u64` (f64-based
+        // scanner) — losing precision past 2^53 and orphaning the reference
+        // from its `resources.images` key (which is always a string). That
+        // silent mismatch dropped every image from `toModel()` → `modelTo*`
+        // round-trips through a JS host.
+        self.k_str("resource", &i.resource.to_string());
         self.key("alt");
         match &i.alt {
             Some(a) => self.str_val(a),
@@ -1284,6 +1291,18 @@ impl<'a> Reader<'a> {
             Some(n as u64)
         } else {
             None
+        }
+    }
+
+    /// A `u64` written either as a JSON string (`"123"`, exact — the canonical
+    /// form for 64-bit content hashes, which overflow the f64-safe integer
+    /// range) or as a legacy bare number (parsed via the f64 scanner, lossy
+    /// past 2^53).
+    fn u64_or_string(&mut self) -> Option<u64> {
+        if self.peek()? == b'"' {
+            self.string()?.parse().ok()
+        } else {
+            self.u64()
         }
     }
 
@@ -2124,7 +2143,12 @@ impl<'a> Reader<'a> {
         let mut i = ImageRef::default();
         self.object(|r, k| {
             match k {
-                "resource" => i.resource = r.u64()?,
+                // Written as a string (exact u64 content hash); also accept the
+                // legacy bare-number form for models produced by older writers.
+                // Note the number path goes through the f64 scanner and is lossy
+                // past 2^53 — that lossiness is exactly why the writer switched
+                // to strings.
+                "resource" => i.resource = r.u64_or_string()?,
                 "alt" => i.alt = r.opt_string()?,
                 _ => return None,
             }
@@ -3064,6 +3088,75 @@ mod tests {
         let j1 = doc.to_json();
         let j2 = Document::from_json(&j1).unwrap().to_json();
         assert_eq!(j1, j2, "serialization is stable across a round trip");
+    }
+
+    /// Image resource ids are full 64-bit content hashes (routinely > 2^53).
+    /// They must be written as JSON *strings* — a bare number is read as an
+    /// IEEE-754 double by JavaScript hosts (and by this module's own f64-based
+    /// number scanner), silently corrupting the id and orphaning every image
+    /// from its `resources.images` entry (the exact bug that dropped all
+    /// images from `toModel()` → `modelTo*` app exports).
+    #[test]
+    fn image_resource_id_survives_round_trip_beyond_f64_precision() {
+        const HASH: u64 = 4_234_450_195_272_151_588; // > 2^53, not f64-representable
+        let mut images = std::collections::BTreeMap::new();
+        images.insert(
+            HASH,
+            ImageResource {
+                bytes: vec![1, 2, 3],
+                format: "png".to_string(),
+            },
+        );
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Image(ImageRef {
+                            resource: HASH,
+                            alt: None,
+                        }),
+                        ..Block::default()
+                    }],
+                    ..Page::default()
+                }],
+                ..Section::default()
+            }],
+            resources: ResourceTable { images },
+            ..Document::default()
+        };
+
+        let json = doc.to_json();
+        assert!(
+            json.contains(&format!("\"resource\":\"{HASH}\"")),
+            "the image reference must be serialized as a string: {json}"
+        );
+
+        let back = Document::from_json(&json).expect("parse must succeed");
+        let BlockKind::Image(img) = &back.sections[0].pages[0].blocks[0].kind else {
+            panic!("image block expected");
+        };
+        assert_eq!(img.resource, HASH, "the exact 64-bit id must survive");
+        assert!(
+            back.resources.images.contains_key(&img.resource),
+            "the round-tripped reference must still resolve its resource"
+        );
+    }
+
+    /// Models produced by older writers (or hand-built in JS with small ids)
+    /// carry `resource` as a bare number — the reader must keep accepting it.
+    #[test]
+    fn image_resource_id_parses_from_legacy_number() {
+        // Derive the legacy form from the current writer's own envelope, so the
+        // test only exercises the one divergence (string vs bare number).
+        let json = sample_doc().to_json();
+        assert!(json.contains("\"resource\":\"7\""), "sample writes id 7");
+        let legacy = json.replace("\"resource\":\"7\"", "\"resource\":7");
+        let doc = Document::from_json(&legacy).expect("legacy numeric resource must parse");
+        assert_eq!(
+            doc,
+            sample_doc(),
+            "the legacy bare-number form must decode to the same model"
+        );
     }
 
     #[test]

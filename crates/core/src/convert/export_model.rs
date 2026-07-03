@@ -27,6 +27,7 @@ use crate::model::{
     Heading, ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, ParaBorder, Paragraph,
     Row, Section, Shape, Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
 };
+use crate::model::sheet::{MergeRange, SheetRow};
 use crate::model::{
     CellValue, NamedStyle, PageGeometry, ParagraphStyle, PlaceholderRole, StyleId, StyleTable,
 };
@@ -1752,10 +1753,17 @@ fn docx_list_format(marker: ListMarker, suffix: char) -> (&'static str, String, 
 /// Serialize a [`Document`]'s [`Sheet`]s (from every [`BlockKind::Sheet`]) to a
 /// **typed** workbook (`.xlsx`): numbers are stored as numeric cells, text as
 /// inline strings, booleans as `b`; number formats, solid fills, and merged
-/// ranges are preserved. A document with no sheet blocks yields a single empty
-/// worksheet.
+/// ranges are preserved.
+///
+/// A document with no native sheet blocks (a reconstructed PDF, a Word/HTML
+/// import…) falls back to [`sheets_from_pages`]: one worksheet per page, typed
+/// tables as real rows/cells (spans merged), and every prose block as a
+/// single-cell row in reading order — so the whole document text survives.
 pub fn xlsx_from_model(doc: &Document) -> Vec<u8> {
-    let sheets = collect_sheets(doc);
+    let mut sheets = collect_sheets(doc);
+    if sheets.is_empty() {
+        sheets = sheets_from_pages(doc);
+    }
     let mut zip = ZipWriter::new();
 
     // Build the styles table: index 0 is the default; further indices carry a
@@ -3810,7 +3818,12 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
 /// (`.ods`): numeric cells carry `office:value-type="float"`/`office:value`,
 /// text cells `string`, plus number formats, fills and merged ranges.
 pub fn ods_from_model(doc: &Document) -> Vec<u8> {
-    let sheets = collect_sheets(doc);
+    // Same native-sheets-then-per-page fallback as `xlsx_from_model`, so both
+    // spreadsheet targets carry the full document text for any source format.
+    let mut sheets = collect_sheets(doc);
+    if sheets.is_empty() {
+        sheets = sheets_from_pages(doc);
+    }
     let mut zip = ZipWriter::new();
     zip.add_stored(
         "mimetype",
@@ -5443,6 +5456,164 @@ fn collect_sheets_block(block: &Block, out: &mut Vec<Sheet>) {
         }
         _ => {}
     }
+}
+
+/// Synthesize one [`Sheet`] per page from the document's flowing blocks — the
+/// spreadsheet counterpart of [`collect_slides`]'s per-page fallback, used when
+/// the model carries no native `Block::Sheet` content (a reconstructed PDF, a
+/// Word/HTML import…).
+///
+/// Typed [`Table`]s become real rows and cells (column spans preserved as
+/// merges, header rows bold, cell shading kept as fills), and prose — headings,
+/// paragraphs, list items, block quotes, code lines — becomes single-cell rows
+/// in reading order, so **all** document text lands in the workbook. This
+/// deliberately replaces the legacy text-grid reconstruction
+/// (`Document::convert_grids_and_shapes` → `office::to_xlsx_with_shapes`),
+/// which re-derived rows/columns from raw glyph positions and could drop runs
+/// the model keeps. Images and vector shapes have no cell representation and
+/// are skipped: a spreadsheet is a data target (the picture-bearing exports are
+/// DOCX/PPTX/ODT/ODP/HTML).
+fn sheets_from_pages(doc: &Document) -> Vec<Sheet> {
+    let mut out = Vec::new();
+    let mut page_no = 0usize;
+    for section in &doc.sections {
+        for page in &section.pages {
+            page_no += 1;
+            let mut sheet = Sheet {
+                name: format!("Page {page_no}"),
+                ..Sheet::default()
+            };
+            for block in &page.blocks {
+                sheet_rows_from_block(block, &mut sheet);
+            }
+            out.push(sheet);
+        }
+    }
+    out
+}
+
+/// Append `block`'s spreadsheet representation to `sheet` (see
+/// [`sheets_from_pages`] for the mapping rules).
+fn sheet_rows_from_block(block: &Block, sheet: &mut Sheet) {
+    match &block.kind {
+        BlockKind::Table(t) => {
+            for row in &t.rows {
+                let r = sheet.rows.len();
+                let mut cells: Vec<SheetCell> = Vec::new();
+                for cell in &row.cells {
+                    let c0 = cells.len();
+                    let text = cell_plain_text(cell);
+                    let mut sc = SheetCell {
+                        fill: cell.shading,
+                        ..SheetCell::default()
+                    };
+                    if !text.is_empty() {
+                        sc.value = CellValue::Text(text);
+                    }
+                    if row.is_header {
+                        sc.style.bold = true;
+                    }
+                    cells.push(sc);
+                    // A spanning cell keeps the grid aligned with empty filler
+                    // cells and a merge range covering them.
+                    let span = (cell.col_span.max(1)) as usize;
+                    for _ in 1..span {
+                        cells.push(SheetCell::default());
+                    }
+                    if span > 1 {
+                        sheet.merges.push(MergeRange {
+                            r0: r,
+                            c0,
+                            r1: r,
+                            c1: c0 + span - 1,
+                        });
+                    }
+                }
+                sheet.rows.push(SheetRow {
+                    cells,
+                    height: row.height,
+                });
+            }
+        }
+        BlockKind::Paragraph(p) => push_sheet_text_row(sheet, para_plain_text(p), false),
+        BlockKind::Heading(h) => push_sheet_text_row(sheet, para_plain_text(&h.para), true),
+        BlockKind::List(list) => {
+            let mut n = list.start.max(1);
+            for item in &list.items {
+                let marker = if list.ordered {
+                    format!("{n}{} ", list.suffix())
+                } else if let ListMarker::Bullet(c) = list.marker {
+                    format!("{c} ")
+                } else {
+                    "• ".to_string()
+                };
+                let text: String = blocks_to_paras(&item.blocks)
+                    .iter()
+                    .map(para_plain_text)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !text.is_empty() {
+                    push_sheet_text_row(sheet, format!("{marker}{text}"), false);
+                }
+                n += 1;
+            }
+        }
+        BlockKind::CodeBlock(code) => {
+            for line in code.code.lines() {
+                if !line.trim().is_empty() {
+                    push_sheet_text_row(sheet, line.to_string(), false);
+                }
+            }
+        }
+        BlockKind::TextBox(tb) => {
+            for b in &tb.blocks {
+                sheet_rows_from_block(b, sheet);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            for b in &bq.blocks {
+                sheet_rows_from_block(b, sheet);
+            }
+        }
+        // Native sheets are handled by `collect_sheets` (this fallback only
+        // runs when there are none); slides flatten their placeholder text.
+        BlockKind::Sheet(sb) => {
+            for s in &sb.sheets {
+                for row in &s.rows {
+                    sheet.rows.push(row.clone());
+                }
+            }
+        }
+        BlockKind::Slide(sb) => {
+            for slide in &sb.slides {
+                for ph in &slide.placeholders {
+                    sheet_rows_from_block(&ph.block, sheet);
+                }
+                for shape in &slide.shapes {
+                    sheet_rows_from_block(shape, sheet);
+                }
+            }
+        }
+        // No cell representation for pictures, vector art, or rules.
+        BlockKind::Image(_) | BlockKind::Shape(_) | BlockKind::HorizontalRule => {}
+    }
+}
+
+/// Append a single-cell text row (skipping empty text); `bold` marks headings.
+fn push_sheet_text_row(sheet: &mut Sheet, text: String, bold: bool) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let mut cell = SheetCell {
+        value: CellValue::Text(text),
+        ..SheetCell::default()
+    };
+    cell.style.bold = bold;
+    sheet.rows.push(SheetRow {
+        cells: vec![cell],
+        height: None,
+    });
 }
 
 /// Collect every [`Slide`] from a document's `Block::Slide` blocks. When there
@@ -8380,6 +8551,42 @@ mod tests {
         assert!(sheet.contains(" s=\""), "styled fill cell");
         let styles = String::from_utf8(entry(&bytes, "xl/styles.xml").unwrap()).unwrap();
         assert!(styles.contains("patternType=\"solid\""), "fill defined");
+    }
+
+    /// A document with NO native `Block::Sheet` content (a reconstructed PDF, a
+    /// Word/HTML import…) synthesizes one worksheet per page from its flowing
+    /// blocks: typed tables become real rows/cells (spans merged), and every
+    /// prose block — heading, paragraph, list item — lands as a single-cell row
+    /// in reading order, so no document text is lost on the spreadsheet path.
+    #[test]
+    fn xlsx_from_model_synthesizes_sheets_from_flowing_pages() {
+        let bytes = xlsx_from_model(&sample_doc());
+        assert_eq!(&bytes[..2], b"PK");
+        let workbook = String::from_utf8(entry(&bytes, "xl/workbook.xml").unwrap()).unwrap();
+        assert!(workbook.contains("Page 1"), "per-page sheet name: {workbook}");
+        let sheet = String::from_utf8(entry(&bytes, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        for probe in ["Title", "A paragraph.", "first", "second", "spanning", "a", "b"] {
+            assert!(sheet.contains(probe), "sheet carries {probe:?}: {sheet}");
+        }
+        // The bullet marker prefixes each synthesized list row.
+        assert!(sheet.contains("• first"), "list marker kept: {sheet}");
+        // The 2-wide top-left table cell becomes a real merged range.
+        assert!(
+            sheet.contains("<mergeCell"),
+            "table col_span synthesized as a merge: {sheet}"
+        );
+    }
+
+    /// Same synthesis on the ODS side — the full flowing text must land in
+    /// `content.xml`.
+    #[test]
+    fn ods_from_model_synthesizes_sheets_from_flowing_pages() {
+        let bytes = ods_from_model(&sample_doc());
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        for probe in ["Title", "A paragraph.", "first", "spanning"] {
+            assert!(content.contains(probe), "ods carries {probe:?}");
+        }
+        assert!(content.contains("Page 1"), "per-page table name");
     }
 
     /// A one-row spreadsheet `Document` whose cells carry the given values and

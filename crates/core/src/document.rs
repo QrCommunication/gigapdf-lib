@@ -8931,168 +8931,12 @@ impl Document {
         ]
     }
 
-    /// Extract every page's editable content (positioned text, re-embedded
-    /// images, shape rectangles) into the conversion model, normalizing PDF
-    /// bottom-up user space to top-down points. This is the shared front-end for
-    /// all the Office exporters — they reconstruct real objects from this, never
-    /// a page raster.
-    fn convert_pages(&self) -> Vec<crate::convert::ConvPage> {
-        use crate::content::vector::PathSeg;
-        use crate::content::ElementKind;
-        use crate::convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
-
-        let mut pages = Vec::new();
-        for page_no in 1..=self.page_count() as u32 {
-            let Ok(page) = self.page_dict(page_no) else {
-                continue;
-            };
-            let media = self.read_media_box(page);
-            let (x0, y0) = (media[0], media[1]);
-            let page_w = (media[2] - media[0]).abs();
-            let page_h = (media[3] - media[1]).abs();
-
-            let elements = self.page_elements(page_no).unwrap_or_default();
-            // Vector paths carry the geometry + paint state (fill/stroke RGB,
-            // alpha, width, dash) the `ElementKind::Path` boxes drop. They come
-            // from the same top-level content stream as `elements`, but exclude
-            // clip-only / no-paint (`n`) paths — which the element walker keeps —
-            // so they cannot be zipped positionally against the Path elements.
-            // Shapes are therefore sourced solely from here (a single coherent
-            // source: correct colours, no stray grey rectangles for clip paths).
-            let vpaths = self.page_vector_paths(page_no).unwrap_or_default();
-            let images = self.page_images(page_no);
-            let font_styles = self.page_base_fonts(page_no);
-            // Encode each referenced image once per page (a single XObject may be
-            // drawn several times) so repeated placements share the PNG bytes.
-            let mut png_cache: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-
-            let mut conv = ConvPage {
-                width: page_w,
-                height: page_h,
-                ..ConvPage::default()
-            };
-            for element in elements {
-                let Some(b) = element.bounds else { continue };
-                let left = b.x - x0;
-                let top = page_h - (b.y - y0) - b.height;
-                match element.kind {
-                    ElementKind::Text => {
-                        if element.label.trim().is_empty() {
-                            continue;
-                        }
-                        // Recover the run's style, preferring the one resolved at
-                        // extraction against the run's OWN scope (page or form
-                        // XObject) — rebuilt from the raw `/BaseFont` (generic
-                        // class) plus the resolved family + refined bold/italic.
-                        // Fall back to the page-scope `/Font` table, then overlay
-                        // the fill colour the interpreter captured.
-                        let mut style = element
-                            .font_style
-                            .as_ref()
-                            .map(|fs| {
-                                let mut ts = crate::convert::style::parse_base_font(&fs.base_font);
-                                ts.family = fs.family.clone();
-                                ts.bold = fs.bold;
-                                ts.italic = fs.italic;
-                                ts
-                            })
-                            .or_else(|| {
-                                element
-                                    .font
-                                    .as_deref()
-                                    .and_then(|f| font_styles.get(f))
-                                    .cloned()
-                            })
-                            .unwrap_or_default();
-                        style.color = element.color;
-                        conv.texts.push(PlacedText {
-                            text: element.label,
-                            x: left,
-                            y: top,
-                            width: b.width,
-                            height: b.height,
-                            style,
-                        });
-                    }
-                    ElementKind::Image => {
-                        let key = element.label.into_bytes();
-                        if let Some(image) = images.get(&key) {
-                            let png = png_cache
-                                .entry(key)
-                                .or_insert_with(|| {
-                                    crate::raster::png::encode_png(
-                                        image.width,
-                                        image.height,
-                                        &image.rgba,
-                                    )
-                                })
-                                .clone();
-                            conv.images.push(PlacedImage {
-                                png,
-                                x: left,
-                                y: top,
-                                width: b.width,
-                                height: b.height,
-                            });
-                        }
-                    }
-                    // Shapes are emitted from `vpaths` below (geometry + paint
-                    // state), not from these bounding-box-only Path elements.
-                    ElementKind::Path => {}
-                }
-            }
-
-            // Emit one enriched shape per painted vector path. Each path's points
-            // are in PDF user space (origin bottom-left); flip to top-down points
-            // matching the rest of the model: `x' = x - x0`, `y' = page_h - (y - y0)`.
-            // The bounding rectangle is flipped the same way the element loop does
-            // (anchor at the box's top-left), so the rect fallback stays exact.
-            for vp in &vpaths {
-                let segments: Vec<PathSeg> = vp
-                    .segments
-                    .iter()
-                    .map(|seg| match *seg {
-                        PathSeg::Move(x, y) => PathSeg::Move(x - x0, page_h - (y - y0)),
-                        PathSeg::Line(x, y) => PathSeg::Line(x - x0, page_h - (y - y0)),
-                        PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => PathSeg::Cubic(
-                            x1 - x0,
-                            page_h - (y1 - y0),
-                            x2 - x0,
-                            page_h - (y2 - y0),
-                            x3 - x0,
-                            page_h - (y3 - y0),
-                        ),
-                        PathSeg::Close => PathSeg::Close,
-                    })
-                    .collect();
-                let (x, y, width, height) = match vp.bounds {
-                    Some(b) => (b.x - x0, page_h - (b.y - y0) - b.height, b.width, b.height),
-                    None => continue,
-                };
-                conv.shapes.push(PlacedShape {
-                    x,
-                    y,
-                    width,
-                    height,
-                    segments,
-                    fill: vp.fill,
-                    stroke: vp.stroke,
-                    stroke_width: vp.stroke_width,
-                    fill_alpha: vp.fill_alpha,
-                    stroke_alpha: vp.stroke_alpha,
-                    dash: vp.dash.clone(),
-                });
-            }
-            pages.push(conv);
-        }
-        pages
-    }
-
     /// Reconstruct the **unified editable document model** from this PDF — the
-    /// re-editability crux (epic #74, Phase 2). Where [`convert_pages`](Self::convert_pages)
-    /// produces flat positioned boxes for the Office exporters, this turns the
-    /// page's geometry back into *logical* blocks (paragraphs, headings, lists,
-    /// tables) so the document can be reflowed and restyled, not only re-placed.
+    /// re-editability crux (epic #74, Phase 2). Unlike a flat positioned-box
+    /// extraction, this turns the page's geometry back into *logical* blocks
+    /// (paragraphs, headings, lists, tables) so the document can be reflowed
+    /// and restyled, not only re-placed. Every `to_*` Office/web exporter now
+    /// flows through this single reconstruction.
     ///
     /// One [`Section`](crate::model::Section) is emitted per run of consecutive
     /// pages that share a MediaBox geometry; each PDF page becomes one
@@ -10095,18 +9939,28 @@ impl Document {
         crate::convert::export_model::odp_from_model(&self.reconstruct_model())
     }
 
-    /// Reconstruct each page's text into a row/column grid and export an Excel
-    /// workbook (`.xlsx`), one sheet per page. Tabular PDFs become real cells;
-    /// prose collapses to a single column so all document text is preserved.
+    /// Convert the document to an Excel workbook (`.xlsx`) via the
+    /// **reconstructed model** — the same corrected path as
+    /// [`to_docx`](Self::to_docx)/[`to_odt`](Self::to_odt): one worksheet per
+    /// page, the model's typed tables as real rows/cells (spans merged, header
+    /// rows bold, shading kept) and every prose block as a single-cell row in
+    /// reading order.
+    ///
+    /// This replaced the legacy raw-glyph grid reconstruction
+    /// (`convert_grids_and_shapes` → `office::to_xlsx_with_shapes`), which
+    /// re-derived rows/columns positionally and could silently drop text runs
+    /// the model keeps (observed on real-world letters: baked form values
+    /// vanished from the grid while `to_text`/`to_docx` kept them). The
+    /// text-grid writer remains available for host-supplied grids via
+    /// [`convert::office::to_xlsx_named`](crate::convert::office::to_xlsx_named).
     pub fn to_xlsx(&self) -> Vec<u8> {
-        let (grids, shapes) = self.convert_grids_and_shapes();
-        crate::convert::office::to_xlsx_with_shapes(&grids, &[], &shapes)
+        crate::convert::export_model::xlsx_from_model(&self.reconstruct_model())
     }
 
-    /// As [`to_xlsx`](Self::to_xlsx) but to an OpenDocument Spreadsheet (`.ods`).
+    /// As [`to_xlsx`](Self::to_xlsx) but to an OpenDocument Spreadsheet
+    /// (`.ods`), through the same reconstructed-model path.
     pub fn to_ods(&self) -> Vec<u8> {
-        let (grids, shapes) = self.convert_grids_and_shapes();
-        crate::convert::office::to_ods_with_shapes(&grids, &[], &shapes)
+        crate::convert::export_model::ods_from_model(&self.reconstruct_model())
     }
 
     /// Convert the document to an RTF document. Pairs with
@@ -10502,22 +10356,6 @@ impl Document {
         }
 
         crate::serialize::to_pdf(&objects, &trailer)
-    }
-
-    /// Per-page reconstructed table grids and floating shapes (shared by the
-    /// spreadsheet exporters), from a single [`convert_pages`](Self::convert_pages)
-    /// pass: grids drive the cells, shapes the drawing layer.
-    #[allow(clippy::type_complexity)]
-    fn convert_grids_and_shapes(
-        &self,
-    ) -> (Vec<Vec<Vec<String>>>, Vec<Vec<crate::convert::PlacedShape>>) {
-        let pages = self.convert_pages();
-        let grids = pages
-            .iter()
-            .map(|page| crate::convert::table::reconstruct(&page.texts))
-            .collect();
-        let shapes = pages.into_iter().map(|page| page.shapes).collect();
-        (grids, shapes)
     }
 
     /// Decode the page's image XObjects (Flate/raw sample grids, baseline JPEG
@@ -32083,6 +31921,97 @@ mod tests {
         assert_eq!(
             model.outline[0].page, 0,
             "heading on the first (index 0) page"
+        );
+    }
+
+    /// End-to-end guard for the whole user-facing export surface: a synthetic
+    /// PDF carrying a positioned image + body text must keep its image through
+    /// EVERY public export entry — the direct `to_*` document methods AND the
+    /// model-JSON round trip a JavaScript host performs (`toModel()` →
+    /// `modelTo*`). The latter used to corrupt the 64-bit image resource id
+    /// (bare JSON number → f64 past 2^53) and silently dropped every image
+    /// from the HTML/RTF/EPUB app exports.
+    #[test]
+    fn every_export_entry_keeps_the_positioned_image() {
+        let pdf = crate::convert::reverse::txt_to_pdf("Export fixture body text");
+        let mut doc = Document::open(&pdf).unwrap();
+        let rgba = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
+        let png = crate::raster::png::encode_png(2, 2, &rgba);
+        doc.add_image(1, &png, 100.0, 560.0, 120.0, 100.0, 1.0)
+            .unwrap();
+
+        let entry = |zip: &[u8], name: &str| {
+            crate::convert::zip::read_zip(zip)
+                .keys()
+                .any(|k| k.contains(name))
+        };
+
+        // 1. Direct document exports embed the picture.
+        assert!(entry(&doc.to_docx(), "media/image"), "docx embeds the image");
+        assert!(entry(&doc.to_pptx(), "media/image"), "pptx embeds the image");
+        assert!(entry(&doc.to_odt(), "Pictures/"), "odt embeds the image");
+        assert!(entry(&doc.to_odp(), "Pictures/"), "odp embeds the image");
+        assert!(
+            doc.to_html().contains("data:image"),
+            "html inlines the image as a data URI"
+        );
+
+        // 2. The JS-host path: model → JSON → model → `*_from_model`. The
+        //    resource id is a 64-bit content hash and must survive the JSON
+        //    envelope losslessly for the reference to keep resolving.
+        let model = doc.reconstruct_model();
+        assert_eq!(model.resources.images.len(), 1, "one interned resource");
+        let round = crate::model::Document::from_json(&model.to_json())
+            .expect("the model JSON must reparse");
+        assert_eq!(
+            round.resources.images.len(),
+            1,
+            "the resource survives the round trip"
+        );
+        assert!(
+            crate::convert::web::html_from_model(&round).contains("data:image"),
+            "modelToHtml keeps the image after a JSON round trip"
+        );
+        let rtf = String::from_utf8(crate::convert::reverse::rtf_from_model(&round)).unwrap();
+        assert!(
+            rtf.contains("\\pict"),
+            "modelToRtf keeps the image after a JSON round trip"
+        );
+        assert!(
+            entry(&crate::convert::export_model::epub_from_model(&round), "image"),
+            "modelToEpub packages the image after a JSON round trip"
+        );
+        assert!(
+            entry(
+                &crate::convert::export_model::docx_from_model(&round),
+                "media/image"
+            ),
+            "modelToDocx keeps the image after a JSON round trip"
+        );
+
+        // 3. Spreadsheet targets flow through the same reconstruction and must
+        //    carry the full document text (the legacy raw-glyph grid dropped
+        //    runs the model keeps).
+        let xlsx = crate::convert::zip::read_zip(&doc.to_xlsx());
+        let sheet1 = xlsx
+            .iter()
+            .find(|(k, _)| k.starts_with("xl/worksheets/"))
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default();
+        assert!(
+            sheet1.contains("Export fixture"),
+            "xlsx carries the document text: {sheet1}"
+        );
+        let ods = crate::convert::zip::read_zip(&doc.to_ods());
+        let content = ods
+            .get("content.xml")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default();
+        assert!(
+            content.contains("Export fixture"),
+            "ods carries the document text"
         );
     }
 

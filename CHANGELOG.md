@@ -9,6 +9,17 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.116.0] - 2026-07-03
+
+Hotfix-grade fidelity release for the JSON-bridged export path: the u64
+image-resource id was serialized as a raw JSON number, which JavaScript
+rounds beyond 2^53 — so every host export that round-trips the model through
+JSON (HTML, RTF, EPUB, Markdown) silently dropped ALL images (0→37 on a
+pitch deck). Ids are now strings (reader accepts both). PDF→XLSX/ODS also
+moved off the legacy glyph-grid path onto the reconstructed model (typed
+tables, merges, no more lost runs; per-page worksheets synthesized for
+non-spreadsheet PDFs). Details in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
+
 ## [0.115.0] - 2026-07-03
 
 Conversion-fidelity release, both directions, driven by an exhaustive

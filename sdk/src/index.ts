@@ -1442,8 +1442,17 @@ export interface GigaTable {
 
 /** A reference to an image blob in the document's resource table (`model::ImageRef`). */
 export interface GigaImageRef {
-  /** Content-hash key into `GigaDocument.resources.images`. */
-  resource: number;
+  /**
+   * Content-hash key into `GigaDocument.resources.images`.
+   *
+   * A decimal string: the underlying id is a full 64-bit hash, which does not
+   * survive `JSON.parse` as a JavaScript number (precision is lost past 2^53,
+   * silently orphaning the reference from its resource — every image was
+   * dropped from `toModel()` → `modelTo*` round-trips). The engine emits it as
+   * a string and accepts either form (`string` canonically, legacy `number`
+   * for hand-built models with small ids).
+   */
+  resource: string | number;
   alt: string | null;
 }
 

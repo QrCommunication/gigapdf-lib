@@ -6,6 +6,36 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.116.0] - 2026-07-03
+
+### Fixed — images survived NO JSON-bridged export (html, rtf, epub, md)
+
+`ImageRef.resource` — the u64 content hash keying `resources.images` — was
+serialized as a **raw JSON number**. JavaScript rounds integers beyond 2^53,
+so any host round-tripping the model through JSON (`toModel()` →
+`modelToHtml`/`modelToRtf`/`modelToEpub`/`modelToMarkdown`) corrupted every
+image id and the resource lookup failed silently: **zero images** in HTML/RTF
+output, EPUB packages with orphaned (unreferenced) images, wrong Markdown
+file names. The id is now serialized as a **string** (the Rust reader accepts
+both forms, so older JSON still loads). A pitch deck went from 0 to 37 images
+in HTML, RTF and EPUB exports. Direct exports (`toDocx`…) were unaffected.
+
+### Changed — PDF→XLSX/ODS export through the reconstructed model
+
+`toXlsx()`/`toOds()` used a legacy glyph-grid path that dropped text runs the
+model keeps (names, dates, reference numbers measurably missing on a real
+letter) and produced untyped, unstyled grids. They now export through
+`reconstruct_model` like every other format: typed tables with merged cells
+(`col_span`), bold header rows and shading — and when a PDF has no
+spreadsheet blocks, a worksheet is synthesized per page from the model
+(tables as real rows/cells, paragraphs/headings/lists as reading-order
+rows). The grid writer stays available for host-provided grids
+(`gridsToXlsx`).
+
+### SDK
+
+- `GigaImageRef.resource` is typed `string | number` (canonical: string).
+
 ## [0.115.0] - 2026-07-03
 
 Fidelity release across the whole conversion matrix, both directions —
