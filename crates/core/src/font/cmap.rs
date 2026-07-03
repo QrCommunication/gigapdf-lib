@@ -52,6 +52,14 @@ impl ToUnicode {
         self.map.get(&code).map(String::as_str)
     }
 
+    /// Iterate the parsed `code → Unicode` entries in ascending code order.
+    /// Drives the *inverse* (encode) direction of text editing: the reverse of
+    /// these entries is the exact `Unicode → code` map that round-trips a run's
+    /// extracted text back to the codes it was decoded from.
+    pub fn entries(&self) -> impl Iterator<Item = (u32, &str)> {
+        self.map.iter().map(|(&code, text)| (code, text.as_str()))
+    }
+
     /// Whether the CMap mapped nothing useful.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
@@ -897,6 +905,14 @@ impl TextDecoder {
             Some(cmap) => cmap.cid(code).unwrap_or(code),
             None => code,
         }
+    }
+
+    /// Public view of [`Self::code_to_gid_id`]: the glyph id a 2-byte character
+    /// code resolves to (code → CID via the `/Encoding` CMap → glyph id via
+    /// `/CIDToGIDMap`; each step is identity when its table is absent). Lets the
+    /// document layer record the glyphs a re-encoded run actually uses.
+    pub fn code_to_gid(&self, code: u16) -> u16 {
+        self.code_to_gid_id(code)
     }
 
     /// Map a 2-byte character code to a glyph id: code → CID (`/Encoding` CMap) →

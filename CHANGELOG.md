@@ -9,6 +9,17 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.114.1] - 2026-07-03
+
+Hotfix: `replaceText` re-encoding is now the exact inverse of decoding
+(run's `/ToUnicode`/`/Encoding`/`/Differences` first, then codes borrowed
+from sibling wrappers of the same physical program, then the program cmap).
+It previously went through the embedded cmap or blind WinAnsi and could
+return `true` while **emptying or garbling the run** on subset-heavy
+documents (dense CERFA: 140/527 identical-text replacements survived →
+**527/527**). Unknown characters now fail with `false` without mutating.
+Details in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
+
 ## [0.114.0] - 2026-07-03
 
 This release makes the editor host able to ALWAYS serve the **original

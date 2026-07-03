@@ -5029,12 +5029,21 @@ impl Document {
     }
 
     /// Replace a text run's text in place (keeps position and font).
+    ///
+    /// Font-aware: the new text is re-encoded through the **inverse of the very
+    /// decode maps extraction uses** for the run's font (its `/ToUnicode`, its
+    /// `/Encoding`+`/Differences`, the embedded program's cmap fallback), so
+    /// replacing a run with its own extracted text is a perfect no-op — even for
+    /// subset fonts whose embedded cmap is stale or absent. A character the
+    /// run's own wrapper cannot map is borrowed from a **sibling wrapper of the
+    /// same physical program** (the CERFA shape: dozens of Type0 wrappers with
+    /// partial `/ToUnicode`s over one shared `FontFile2`), with the wrapper's
+    /// `/ToUnicode` augmented so the new code extracts back. A character that no
+    /// source can map fails with `Err` **without touching the page** — never a
+    /// silently emptied or mojibake'd run.
     pub fn replace_text_run(&mut self, page_no: u32, index: usize, new_text: &str) -> Result<()> {
         let content = self.page_content(page_no)?;
-        // Font-aware: a Type0/Identity-H run stores 2-byte glyph ids, so re-encode
-        // `new_text` through the font's char→GID map; simple fonts take the
-        // WinAnsi single-byte path. This makes modify work with *any* font.
-        let edited = match self.encode_run_for_font(page_no, &content, index, new_text) {
+        let edited = match self.encode_run_for_font(page_no, &content, index, new_text)? {
             Some((bytes, kind)) => content::replace_text_run_encoded(&content, index, bytes, kind)?,
             None => content::replace_text_run(&content, index, new_text)?,
         };
@@ -5065,32 +5074,340 @@ impl Document {
         self.set_page_content(page_no, edited)
     }
 
-    /// If the `index`-th run on `page_no` is set in a Type0/Identity-H font,
-    /// encode `new_text` to its 2-byte glyph ids (returned as `Hex` bytes) and
-    /// record those gids for subsetting; otherwise `None` (the caller falls back
-    /// to single-byte WinAnsi). The bridge that lets [`replace_text_run`] handle
-    /// embedded TrueType and OpenType-CFF faces, not just base-14.
+    /// Encode `new_text` for the font the `index`-th run on `page_no` is set in
+    /// — the bridge that lets [`replace_text_run`] handle *any* font.
+    ///
+    /// - `Ok(Some((bytes, kind)))` — the run's font declares how its codes
+    ///   decode; `bytes` is `new_text` encoded through the **inverse** of that
+    ///   decode map ([`Self::encode_composite_run`] for 2-byte Type0 fonts,
+    ///   [`Self::encode_simple_run`] for single-byte fonts with a `/ToUnicode`
+    ///   or a declared `/Encoding`). By construction the codes decode back to
+    ///   `new_text`, so an identical-text replace is a perfect no-op.
+    /// - `Ok(None)` — no resolvable font, or a simple font with no declared
+    ///   decode map (base-14 & friends): the caller keeps the historical
+    ///   single-byte WinAnsi path, which *is* that font's inverse.
+    /// - `Err` — a character no source can encode. The caller must abort
+    ///   without touching the page: returning success while writing `.notdef`
+    ///   glyphs (the old behaviour) silently *empties* the run, and re-encoding
+    ///   through a stale subset cmap writes *mojibake*.
     fn encode_run_for_font(
         &mut self,
         page_no: u32,
         content: &[u8],
         index: usize,
         new_text: &str,
-    ) -> Option<(Vec<u8>, StringKind)> {
-        let res = content::text_run_font_name(content, index).ok()??;
-        let font_obj = self.page_font_object(page_no, &res)?;
-        if !self.is_identity_h_font(font_obj) {
-            return None;
+    ) -> Result<Option<(Vec<u8>, StringKind)>> {
+        let Some(res) = content::text_run_font_name(content, index)? else {
+            return Ok(None);
+        };
+        let decoders = self.page_font_decoders(page_no);
+        let Some(decoder) = decoders.get(&res) else {
+            return Ok(None);
+        };
+        let font_obj = self.page_font_object(page_no, &res);
+        if decoder.two_byte {
+            return self
+                .encode_composite_run(font_obj, decoder, new_text)
+                .map(Some);
         }
-        let ttf = self.embedded_truetype(font_obj)?;
-        let mut bytes = Vec::with_capacity(new_text.chars().count() * 2);
-        let used = self.font_used_gids.entry(font_obj).or_default();
-        for ch in new_text.chars() {
-            let gid = ttf.gid_for_unicode(ch as u32).unwrap_or(0);
-            used.insert(gid);
-            bytes.extend_from_slice(&gid.to_be_bytes());
+        // A simple font with no `/ToUnicode` and no declared `/Encoding` decodes
+        // as plain WinAnsi — the historical single-byte path already inverts it.
+        if decoder.to_unicode.is_none() && decoder.simple_encoding.is_none() {
+            return Ok(None);
         }
-        Some((bytes, StringKind::Hex))
+        Self::encode_simple_run(decoder, new_text).map(Some)
+    }
+
+    /// Encode `new_text` as the 2-byte codes of a composite (Type0) font, as the
+    /// exact inverse of the decode used by extraction, in three tiers:
+    ///
+    /// 1. the reverse of the decoder's own effective `code → text` map (its
+    ///    gap-filled `/ToUnicode`, then the embedded program's glyph-id-keyed
+    ///    fallback where the glyph id round-trips to a code) — this alone covers
+    ///    every character the run's wrapper already knows how to display;
+    /// 2. a **sibling wrapper of the same physical program** (the union the
+    ///    extraction side builds — [`Self::web_font_union_pairs`]), for a
+    ///    character this wrapper's partial `/ToUnicode` omits but a homonym
+    ///    wrapper over the same `FontFile2` maps; the borrowed code is taught to
+    ///    this wrapper's `/ToUnicode` so it extracts back;
+    /// 3. the embedded program's own cmap, same `/ToUnicode` teaching.
+    ///
+    /// A character no tier maps ⇒ `Err`, and nothing is mutated (no used-gid
+    /// tracking, no `/ToUnicode` change): the caller leaves the run intact.
+    fn encode_composite_run(
+        &mut self,
+        font_obj: Option<u32>,
+        decoder: &crate::font::cmap::TextDecoder,
+        new_text: &str,
+    ) -> Result<(Vec<u8>, StringKind)> {
+        // gid → code inversion: identity unless a `/CIDToGIDMap` reorders (then
+        // invert it, lowest CID first) or a non-Identity `/Encoding` CMap makes
+        // the code ↔ CID relation non-trivial (then gids are not borrowable).
+        let gid_to_cid: Option<BTreeMap<u16, u16>> = decoder.cid_to_gid.as_ref().map(|v| {
+            let mut inv = BTreeMap::new();
+            for (cid, &gid) in v.iter().enumerate() {
+                inv.entry(gid).or_insert(cid as u16);
+            }
+            inv
+        });
+        let code_of_gid = |gid: u16| -> Option<u16> {
+            if decoder.code_to_cid.is_some() {
+                return None;
+            }
+            match &gid_to_cid {
+                None => Some(gid),
+                Some(inv) => inv.get(&gid).copied(),
+            }
+        };
+
+        // Tier 1 — reverse of the decoder's effective decode. Lowest code wins;
+        // multi-character entries (ligatures) keep their full expansion so the
+        // greedy matcher below can consume them.
+        let mut rev: BTreeMap<String, u16> = BTreeMap::new();
+        let mut max_key_chars = 1usize;
+        if let Some(tu) = &decoder.to_unicode {
+            for (code, text) in tu.entries() {
+                if text.is_empty() || code > 0xFFFF {
+                    continue;
+                }
+                max_key_chars = max_key_chars.max(text.chars().count());
+                rev.entry(text.to_string()).or_insert(code as u16);
+            }
+        }
+        if let Some(map) = &decoder.cid_to_unicode {
+            for (&gid, text) in map {
+                if text.is_empty() {
+                    continue;
+                }
+                let Some(code) = code_of_gid(gid) else { continue };
+                // The `/ToUnicode` is consulted before this gid fallback, so a
+                // code may only serve as inverse of what it *really* decodes to.
+                if decoder.decode(&code.to_be_bytes()) != *text {
+                    continue;
+                }
+                max_key_chars = max_key_chars.max(text.chars().count());
+                rev.entry(text.clone()).or_insert(code);
+            }
+        }
+
+        let chars: Vec<char> = new_text.chars().collect();
+        let mut codes: Vec<u16> = Vec::with_capacity(chars.len());
+        // Codes borrowed from tiers 2/3, to teach the wrapper's `/ToUnicode`.
+        let mut additions: Vec<(u16, String)> = Vec::new();
+        // Tier-2/3 sources, built lazily on the first miss only.
+        let mut union: Option<BTreeMap<u32, u16>> = None;
+        let mut program: Option<Option<crate::font::truetype::TrueTypeFont>> = None;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let limit = max_key_chars.min(chars.len() - i);
+            let mut matched = false;
+            for len in (1..=limit).rev() {
+                let key: String = chars[i..i + len].iter().collect();
+                if let Some(&code) = rev.get(&key) {
+                    codes.push(code);
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+            let c = chars[i];
+            let mut borrowed: Option<u16> = None;
+            if let Some(fo) = font_obj {
+                if union.is_none() {
+                    union = Some(self.sibling_union_pairs(fo));
+                }
+                let mut gid = union
+                    .as_ref()
+                    .and_then(|u| u.get(&(c as u32)).copied())
+                    .filter(|&g| g != 0);
+                if gid.is_none() {
+                    if program.is_none() {
+                        program = Some(self.embedded_truetype(fo));
+                    }
+                    gid = program
+                        .as_ref()
+                        .and_then(|p| p.as_ref())
+                        .and_then(|t| t.gid_for_unicode(c as u32))
+                        .filter(|&g| g != 0);
+                }
+                // Only a code this wrapper currently decodes to NOTHING may be
+                // taught a new meaning — an occupied code belongs to other text.
+                borrowed = gid
+                    .and_then(code_of_gid)
+                    .filter(|&code| decoder.decode(&code.to_be_bytes()).is_empty());
+            }
+            let Some(code) = borrowed else {
+                return Err(EngineError::InvalidArgument(format!(
+                    "font cannot encode {c:?}: no wrapper of its physical program maps it"
+                )));
+            };
+            let text = c.to_string();
+            additions.push((code, text.clone()));
+            rev.insert(text, code); // repeats of `c` reuse the borrowed code
+            codes.push(code);
+            i += 1;
+        }
+
+        // Success only past this point: record used glyphs (for save-time
+        // subsetting) and teach the wrapper any borrowed codes.
+        if let Some(fo) = font_obj {
+            let used = self.font_used_gids.entry(fo).or_default();
+            for &code in &codes {
+                used.insert(decoder.code_to_gid(code));
+            }
+            if !additions.is_empty() {
+                self.augment_wrapper_to_unicode(fo, &additions);
+            }
+        }
+        let mut bytes = Vec::with_capacity(codes.len() * 2);
+        for code in codes {
+            bytes.extend_from_slice(&code.to_be_bytes());
+        }
+        Ok((bytes, StringKind::Hex))
+    }
+
+    /// Encode `new_text` as the single-byte codes of a simple font, as the exact
+    /// inverse of the decoder's effective per-byte decode (`/ToUnicode` →
+    /// `/Encoding`+`/Differences` → WinAnsi, the same order extraction uses). A
+    /// subset whose `/Differences` repacks glyphs onto arbitrary slots (space on
+    /// `0x01`, `à` on `0xE0`…) is thereby encoded through its own table — the
+    /// blind-WinAnsi path wrote whatever glyph happened to sit on the WinAnsi
+    /// byte. A character no byte decodes to ⇒ `Err` (caller aborts, run intact).
+    fn encode_simple_run(
+        decoder: &crate::font::cmap::TextDecoder,
+        new_text: &str,
+    ) -> Result<(Vec<u8>, StringKind)> {
+        let mut rev: BTreeMap<String, u8> = BTreeMap::new();
+        let mut max_key_chars = 1usize;
+        for code in 0..=255u8 {
+            let text = decoder.decode(&[code]);
+            if text.is_empty() {
+                continue;
+            }
+            max_key_chars = max_key_chars.max(text.chars().count());
+            rev.entry(text).or_insert(code);
+        }
+        let chars: Vec<char> = new_text.chars().collect();
+        let mut bytes = Vec::with_capacity(chars.len());
+        let mut i = 0usize;
+        while i < chars.len() {
+            let limit = max_key_chars.min(chars.len() - i);
+            let mut matched = false;
+            for len in (1..=limit).rev() {
+                let key: String = chars[i..i + len].iter().collect();
+                if let Some(&code) = rev.get(&key) {
+                    bytes.push(code);
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Err(EngineError::InvalidArgument(format!(
+                    "font cannot encode {:?}: no byte of its encoding maps it",
+                    chars[i]
+                )));
+            }
+        }
+        Ok((bytes, StringKind::Literal))
+    }
+
+    /// The union `Unicode → gid` map of every wrapper sharing `font_obj`'s
+    /// physical program (this wrapper's own explicit entries preferred),
+    /// resolved **by reference** through [`physical_fonts`](Self::physical_fonts)
+    /// — the encode-direction sibling of the extraction-side union
+    /// ([`web_font_union_pairs`](Self::web_font_union_pairs)). Empty when the
+    /// wrapper embeds no shareable program (nothing to borrow from).
+    fn sibling_union_pairs(&self, font_obj: u32) -> BTreeMap<u32, u16> {
+        let wrapper_id = (font_obj, 0u16);
+        let Some((stream_id, pf)) = self
+            .physical_fonts()
+            .into_iter()
+            .find(|(_, p)| p.wrapper_ids.contains(&wrapper_id))
+        else {
+            return BTreeMap::new();
+        };
+        let Some(bytes) = self
+            .objects
+            .get(&stream_id)
+            .and_then(Object::as_stream)
+            .and_then(|s| decode_stream(s).ok())
+        else {
+            return BTreeMap::new();
+        };
+        let Some(program) = Self::program_from_bytes(&bytes, pf.format) else {
+            return BTreeMap::new();
+        };
+        let prefer = self
+            .objects
+            .get(&wrapper_id)
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"BaseFont"))
+            .and_then(Object::as_name)
+            .map(|n| String::from_utf8_lossy(n).into_owned());
+        self.web_font_union_pairs(&pf, &program, prefer.as_deref())
+            .into_iter()
+            .collect()
+    }
+
+    /// Teach `font_obj`'s `/ToUnicode` the given `code → text` entries (codes
+    /// borrowed from sibling wrappers / the program cmap while re-encoding a
+    /// run), so the codes the run now uses extract back as real text. Additive
+    /// only — existing entries always win — so no other run's decoding changes;
+    /// a shared `/ToUnicode` stream only ever *gains* entries.
+    fn augment_wrapper_to_unicode(&mut self, font_obj: u32, additions: &[(u16, String)]) {
+        let font_id = (font_obj, 0u16);
+        let tu_ref = self
+            .objects
+            .get(&font_id)
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"ToUnicode"))
+            .and_then(Object::as_reference);
+        let mut merged: BTreeMap<u32, String> = self
+            .objects
+            .get(&font_id)
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"ToUnicode"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)
+            .and_then(|s| decode_stream(s).ok())
+            .map(|b| crate::font::cmap::ToUnicode::parse(&b))
+            .map(|t| {
+                t.entries()
+                    .map(|(code, text)| (code, text.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (code, text) in additions {
+            merged.entry(*code as u32).or_insert_with(|| text.clone());
+        }
+        let pairs: Vec<(u16, String)> = merged
+            .into_iter()
+            .filter(|&(code, _)| code <= 0xFFFF)
+            .map(|(code, text)| (code as u16, text))
+            .collect();
+        let body = crate::font::embed::to_unicode_cmap(&pairs);
+        let mut dict = Dictionary::new();
+        dict.set(b"Length".to_vec(), Object::Integer(body.len() as i64));
+        let stream = Object::Stream(Stream::new(dict, body));
+        match tu_ref {
+            // The wrapper's own (possibly shared) stream object: swap its body.
+            Some(id) => {
+                self.objects.insert(id, stream);
+            }
+            // No `/ToUnicode` yet (or an inline one): park the merged CMap in a
+            // fresh object and point the wrapper at it.
+            None => {
+                let id = (self.next_object_number(), 0u16);
+                self.objects.insert(id, stream);
+                if let Some(Object::Dictionary(d)) = self.objects.get_mut(&font_id) {
+                    d.set(b"ToUnicode".to_vec(), Object::Reference(id));
+                }
+            }
+        }
     }
 
     /// The object number of the font registered under resource `name` in
@@ -5108,16 +5425,6 @@ impl Document {
             Object::Reference((num, _)) => Some(*num),
             _ => None,
         }
-    }
-
-    /// True when `font_obj` is a Type0 font with the `Identity-H` encoding name
-    /// (its content codes are raw 2-byte glyph ids).
-    fn is_identity_h_font(&self, font_obj: u32) -> bool {
-        let Some(t0) = self.objects.get(&(font_obj, 0)).and_then(Object::as_dict) else {
-            return false;
-        };
-        t0.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice())
-            && t0.get(b"Encoding").and_then(Object::as_name) == Some(b"Identity-H".as_slice())
     }
 
     /// Remove a text run, preserving the rest of the page (background intact).
@@ -39071,6 +39378,183 @@ mod tests {
         assert!(coverage.contains(&0x61) && coverage.contains(&0x62));
         assert!(doc.extract_web_font_by_id("00000000", None).is_none());
         assert!(doc.web_font_coverage("00000000").is_none());
+    }
+
+    // ── replace_text_run: encode through the inverse of the run's own decode
+    //    maps + the sibling-wrapper union; never mutilate on failure ──
+
+    /// [`shared_program_fixture`]'s encode-direction twin: the same two Type0
+    /// wrappers with different **partial** `/ToUnicode`s (wrapper 1: `<0001> →
+    /// 'a'`; wrapper 2: `<0002> → 'b'`, `<0003> → 'a'`) over ONE shared
+    /// program — but the program is a glyphless TTF whose cmap maps nothing
+    /// usable, like a real subset `FontFile2`. The wrappers' `/ToUnicode`s are
+    /// then the ONLY mapping, so re-encoding through `gid_for_unicode` (the old
+    /// path) can only write `.notdef` (emptied run) or stale codes (mojibake).
+    fn shared_glyphless_fixture() -> Vec<u8> {
+        let type0 = |base: &str, cid_obj: u32, tu_obj: u32| {
+            format!(
+                "<< /Type /Font /Subtype /Type0 /BaseFont /{base} /Encoding /Identity-H \
+                 /DescendantFonts [{cid_obj} 0 R] /ToUnicode {tu_obj} 0 R >>"
+            )
+            .into_bytes()
+        };
+        let cid = |base: &str| {
+            format!(
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{base} \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                 /CIDToGIDMap /Identity /FontDescriptor 5 0 R >>"
+            )
+            .into_bytes()
+        };
+        let content = b"BT /F1 12 Tf 20 100 Td <0001> Tj ET";
+        let mut content_obj = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        content_obj.extend_from_slice(content);
+        content_obj.extend_from_slice(b"\nendstream");
+        raw_pdf_binary(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                   /Resources << /Font << /F1 6 0 R /F2 9 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, content_obj),
+            (
+                5,
+                b"<< /Type /FontDescriptor /FontName /AAAAAA+Shared /Flags 4 \
+                   /FontFile2 12 0 R >>"
+                    .to_vec(),
+            ),
+            (6, type0("AAAAAA+Shared", 7, 8)),
+            (7, cid("AAAAAA+Shared")),
+            (8, tounicode_obj("1 beginbfchar <0001> <0061> endbfchar")),
+            (9, type0("BBBBBB+Shared", 10, 11)),
+            (10, cid("BBBBBB+Shared")),
+            (
+                11,
+                tounicode_obj("2 beginbfchar <0002> <0062> <0003> <0061> endbfchar"),
+            ),
+            (
+                12,
+                fontfile2_obj(&crate::font::glyphless::build_glyphless_ttf(8)),
+            ),
+        ])
+    }
+
+    /// Replacing a run with its own extracted text is a perfect no-op even when
+    /// the shared program's cmap maps nothing (the stale/absent subset-cmap
+    /// case): the code comes from the inverse of the wrapper's own `/ToUnicode`
+    /// — never from `gid_for_unicode`, whose `.notdef` fallback silently
+    /// emptied the run while still reporting success.
+    #[test]
+    fn replace_text_run_identical_text_is_noop_with_partial_tounicode() {
+        let mut doc = Document::open(&shared_glyphless_fixture()).unwrap();
+        assert_eq!(
+            doc.page_text_elements(1)[0].text, "a",
+            "fixture decodes through the wrapper /ToUnicode"
+        );
+        doc.replace_text_run(1, 0, "a").unwrap();
+        let content = doc.page_content(1).unwrap();
+        assert!(
+            has_op(&content, b"<0001>"),
+            "identical text re-encodes to the SAME code: {}",
+            String::from_utf8_lossy(&content)
+        );
+        let after = Document::open(&doc.save()).unwrap().page_text_elements(1);
+        assert_eq!(after[0].text, "a", "text survives a save round-trip");
+    }
+
+    /// A character this wrapper's partial `/ToUnicode` omits but a sibling
+    /// wrapper of the SAME physical program maps ('b' lives only in wrapper 2)
+    /// is borrowed from the sibling — the encode-direction use of the union the
+    /// extraction side builds — and the wrapper's `/ToUnicode` learns the
+    /// borrowed code so the new text extracts back.
+    #[test]
+    fn replace_text_run_borrows_code_from_sibling_wrapper() {
+        let mut doc = Document::open(&shared_glyphless_fixture()).unwrap();
+        doc.replace_text_run(1, 0, "ab").unwrap();
+        let content = doc.page_content(1).unwrap();
+        assert!(
+            has_op(&content, b"<00010002>"),
+            "'a' from the run's own /ToUnicode, 'b' borrowed from the sibling: {}",
+            String::from_utf8_lossy(&content)
+        );
+        let texts: Vec<String> = Document::open(&doc.save())
+            .unwrap()
+            .page_text_runs(1)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.text)
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "ab"),
+            "the borrowed code extracts back after a save round-trip: {texts:?}"
+        );
+    }
+
+    /// A character NO wrapper of the program maps (and the program's own cmap
+    /// maps nothing) must fail the replace: `Err`, page untouched. The worst
+    /// possible contract is the old one — return success and write `.notdef`,
+    /// silently emptying the run.
+    #[test]
+    fn replace_text_run_unknown_char_fails_without_mutating() {
+        let mut doc = Document::open(&shared_glyphless_fixture()).unwrap();
+        assert!(
+            doc.replace_text_run(1, 0, "z").is_err(),
+            "'z' is mapped by no wrapper and no program cmap"
+        );
+        let content = doc.page_content(1).unwrap();
+        assert!(has_op(&content, b"<0001>"), "run bytes untouched");
+        assert_eq!(doc.page_text_elements(1)[0].text, "a", "run text intact");
+    }
+
+    /// A **simple** font whose `/ToUnicode` repacks glyphs onto arbitrary bytes
+    /// (space on `0x01`, `'('` on `0x20` — the CERFA `T1_*` subset shape) must
+    /// re-encode through the inverse of its own decode map. The blind-WinAnsi
+    /// path wrote `0x20` for a space, which this font displays and extracts as
+    /// `'('` — mojibake on an identical-text replace.
+    #[test]
+    fn replace_text_run_simple_font_uses_declared_encoding_inverse() {
+        let content = b"BT /F1 12 Tf 20 100 Td (\x01) Tj ET";
+        let mut content_obj = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        content_obj.extend_from_slice(content);
+        content_obj.extend_from_slice(b"\nendstream");
+        let pdf = raw_pdf_binary(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                   /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, content_obj),
+            (
+                6,
+                b"<< /Type /Font /Subtype /TrueType /BaseFont /AAAAAA+Repacked \
+                   /ToUnicode 7 0 R >>"
+                    .to_vec(),
+            ),
+            (
+                7,
+                tounicode_obj("2 beginbfchar <01> <0020> <20> <0028> endbfchar"),
+            ),
+        ]);
+        let mut doc = Document::open(&pdf).unwrap();
+        assert_eq!(
+            doc.page_text_elements(1)[0].text, " ",
+            "byte 0x01 decodes to a space via /ToUnicode"
+        );
+        // "( " needs '(' on byte 0x20 and the space on byte 0x01 — exactly the
+        // inverse of the declared map. WinAnsi would emit 0x28/0x20 instead,
+        // which this font decodes as "" (unmapped 0x28 is WinAnsi-'(', shadowed
+        // here) and "(" — an altered run.
+        doc.replace_text_run(1, 0, "( ").unwrap();
+        assert_eq!(
+            doc.page_text_elements(1)[0].text, "( ",
+            "identical round-trip through the font's own repacked encoding"
+        );
     }
 
     /// `embedded_fonts_v2` deduplicates by physical program (v1, by name, keeps

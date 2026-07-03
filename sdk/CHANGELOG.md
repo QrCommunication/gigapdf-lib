@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.114.1] - 2026-07-03
+
+### Fixed — `replaceText` no longer empties or garbles runs (re-encoding = exact inverse of decoding)
+
+`replaceText` re-encoded the new text through the **embedded program's cmap**
+(Type0) or through **blind WinAnsi** (simple fonts), ignoring the
+`/ToUnicode` / `/Encoding` / `/Differences` maps the extraction actually
+decodes with. On subset-heavy documents (repacked or absent cmaps, partial
+per-wrapper `/ToUnicode`, spaces remapped to low codes) this silently wrote
+`.notdef` gids — `replaceText` returned `true` while the run went **empty**
+— or wrong gids (mojibake). Measured on a dense CERFA: 527 identical-text
+replacements → 140 OK / 239 emptied / 148 garbled BEFORE, **527/527 OK**
+after.
+
+Re-encoding now inverts the run's own decode maps first, then borrows codes
+from **sibling wrappers of the same physical program** (resolved by
+reference, as 0.114.0 does for extraction) — borrowed codes are taught back
+to the wrapper's `/ToUnicode` so the text re-reads — then the program cmap.
+A character unknown to the program now fails with `false` **without
+mutating the run** (never again `true` + emptied).
+
 ## [0.114.0] - 2026-07-03
 
 ### Fixed — embedded web fonts resolved by PHYSICAL identity (accents no longer lost)
