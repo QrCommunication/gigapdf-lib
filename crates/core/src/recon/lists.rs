@@ -603,7 +603,7 @@ fn line_runs(line: &ReconLine, text: &str) -> Vec<Inline> {
         runs.push(Inline::Run(InlineRun {
             text: take,
             style: run_char_style(r),
-            source_index: r.source_index,
+            source_index: r.source_index.map(|i| vec![i]),
         }));
         prev = Some((r.right(), r.h, r.text.ends_with(char::is_whitespace)));
     }

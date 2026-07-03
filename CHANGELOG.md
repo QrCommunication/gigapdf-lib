@@ -9,6 +9,21 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.114.0] - 2026-07-03
+
+This release makes the editor host able to ALWAYS serve the **original
+embedded font** of every text run (fonts are now resolved by PHYSICAL
+program identity instead of by `/BaseFont` name — the served cmap is the
+union of every wrapper's `/ToUnicode`, so accented glyphs present in the
+subset are no longer dropped), fixes the **`pageBlocks` ↔ `textElements`
+index seam** (paragraph runs now resolve to the right content-stream
+operators even with images/shapes interposed; coalesced runs expose
+`source_indices`), and brings **text form-field appearances to Adobe
+parity** (comb cells, `0 Tf` auto-size shrink-to-fit, multiline word-wrap
+via `Ff` bit 13, `/Q` measured with the real `/DA` base-14 metrics, rect
+clipping) plus `setCheckboxState(name, state)` for multi-widget checkboxes
+with named on-states. Details in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
+
 ### Added — bidirectional conversion symmetry: model importers for RTF, TXT and images
 
 - WASM FFI: `gp_model_from_rtf`, `gp_model_from_txt`, `gp_model_from_image` —

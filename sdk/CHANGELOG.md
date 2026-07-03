@@ -6,6 +6,84 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.114.0] - 2026-07-03
+
+### Fixed — embedded web fonts resolved by PHYSICAL identity (accents no longer lost)
+
+A PDF often shares ONE embedded font program across MANY `/Font` wrappers
+(69 Type0 wrappers for 20 physical programs on a dense CERFA), each wrapper
+carrying only a PARTIAL `/ToUnicode` for its own codes. The web extraction
+resolved everything **by name**: the Type0 parent of a CIDFont was found by
+scanning for the first wrapper with the same `/BaseFont` — often a sibling
+with a 2-entry `/ToUnicode` — so the served cmap silently dropped accented
+characters (à/â/é/ê/è) whose glyphs DO exist in the subset.
+
+- The Type0 parent is now resolved **by reference** (`/DescendantFonts[0]` →
+  object id); the name scan survives only as a last-resort fallback.
+- `extractWebFont(name)` no longer dead-ends on a wrapper without a font
+  program: the search widens past it, so a non-embedded alias
+  (`TimesNewRoman,BoldItalic`) is served by an embedded sibling subset of the
+  same face instead of nothing.
+- The served cmap is the **union** of the mappings of EVERY wrapper
+  referencing the program (explicit `/ToUnicode` entries first — the
+  requesting wrapper wins conflicts — then inferred fills), and gains a
+  format 12 (3,10) subtable when a codepoint is beyond the BMP.
+
+### Added — physical font identity (`fontId`)
+
+- `TextElementInfo.fontId` — 8-hex content hash of the run's embedded font
+  program (empty when the wrapper embeds none), resolved in the run's scope
+  (form XObjects included): the exact run→program mapping a host needs.
+- `embeddedFontsV2()` — enumeration de-duplicated **by program**:
+  `{ fontId, format, numGlyphs, baseFonts[] }` (one fetch per program
+  instead of one per wrapper name).
+- `extractWebFontById(fontId, preferWrapper?)` and `webFontCoverage(fontId)`
+  (the mapped codepoints of the served cmap, for per-character fallback
+  decisions host-side). `extractWebFont(name)` and `embeddedFonts()` are
+  unchanged.
+
+### Fixed — `pageBlocks` ↔ `textElements` index seam (paragraph editing)
+
+`pageBlocks` emitted `source_index` in the unified element index space
+(text + images + shapes) while `textElements()` / `replaceText` count
+**top-level text runs only** — every interposed image or shape shifted the
+seam (measured up to −139 on a dense form), so a host resolving a
+paragraph's runs landed on arbitrary runs anywhere on the page. Both walks
+now share the same text-run ordinal (a cross-check test pins them
+together), and:
+
+- coalesced inline runs (paragraphs AND table cells) now carry
+  **`source_indices`** — every constituent run index; the scalar
+  `source_index` stays the first entry for backward compatibility;
+- `split_paragraphs` is geometrically hardened: a document-level leading
+  bound, an absolute 2.5×font-size gap cap and a ≥20 % horizontal-overlap
+  requirement stop far-apart lines (a footer and a header) from ever
+  fusing into one "paragraph".
+
+### Fixed — text form-field appearances match Adobe (`setTextField`)
+
+- **Comb fields** (`/MaxLen` + COMB flag): one character per cell, centred.
+- **Auto-size** (`0 Tf`): shrink-to-fit both height AND width (4 pt floor).
+- **Multiline** (`Ff` bit 13): word-wrap at the rect width even without `\n`.
+- **Quadding** (`/Q`): centred/right text measured with the metrics of the
+  base-14 face actually named by the `/DA` (was always Helvetica).
+- The appearance stream now clips to the widget rect (long values no
+  longer bleed over neighbouring content).
+
+### Added — `setCheckboxState(name, state)`
+
+Checks a specific named on-state of a checkbox with several widgets (the
+`Oui`/`non` pairs of official forms): sets `/V` and, per widget, `/AS` to
+the widget's own on-state or `/Off`. `setCheckbox(true)` (first on-state)
+is unchanged; `"Off"` unchecks everywhere.
+
+### Added — model importers for RTF, TXT and images
+
+`rtfToModel` / `txtToModel` / `imageToModel` (WASM: `gp_model_from_rtf`,
+`gp_model_from_txt`, `gp_model_from_image`) — the missing "lower into the
+unified model" bindings; the core importers already existed and are
+unchanged.
+
 ## [0.113.0] - 2026-07-01
 
 ### Added — every form-field widget placement (`FieldInfo.widgets`)

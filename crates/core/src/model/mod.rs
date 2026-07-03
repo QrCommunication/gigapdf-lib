@@ -222,13 +222,29 @@ pub enum Inline {
 }
 
 /// A styled span of text. `source_index` optionally records the originating
-/// run's index in the source document (for round-tripping back to the exact
-/// content-stream operator).
+/// top-level text-run ordinals in the source page (the index space of
+/// `Document::page_text_elements` / `Document::replace_text_run`), for
+/// round-tripping back to the exact content-stream operators.
+///
+/// A run holds **all** its source ordinals, in content order: reconstruction
+/// coalesces adjacent same-style PDF runs into one editable span (see
+/// `recon::paragraphs::coalesce_runs`), and every constituent stays addressable.
+/// `None` means the run has no page source (synthesized spacing, imported
+/// content, form-XObject text). Serialized as the legacy scalar `source_index`
+/// (the first ordinal, back-compat) **plus** the full `source_indices` array.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct InlineRun {
     pub text: String,
     pub style: CharStyle,
-    pub source_index: Option<usize>,
+    pub source_index: Option<Vec<usize>>,
+}
+
+impl InlineRun {
+    /// The first originating run ordinal — the legacy single-index view of
+    /// [`source_index`](Self::source_index).
+    pub fn first_source_index(&self) -> Option<usize> {
+        self.source_index.as_ref().and_then(|v| v.first().copied())
+    }
 }
 
 /// An ordered or unordered list.

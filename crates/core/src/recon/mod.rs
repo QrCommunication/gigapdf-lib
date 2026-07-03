@@ -151,59 +151,78 @@ pub(crate) fn body_font_size(runs: &[ReconRun], fallback: f64) -> f64 {
 ///
 /// Works for both the top-level element list and the **deep** one (text reached
 /// through form XObjects): a `nested` element is included for layout/display but
-/// gets `source_index = None`, because its element index doesn't address a
-/// top-level editable content-stream operator (the form is shared across every
-/// placement). Top-level runs keep `Some(index)` for in-place round-tripping.
+/// gets `source_index = None`, because it doesn't address a top-level editable
+/// content-stream operator (the form is shared across every placement).
+///
+/// **Index space** (the editor seam): a top-level run's `source_index` is its
+/// ordinal **among the page's top-level text runs** — the exact index
+/// [`Document::page_text_elements`](crate::Document::page_text_elements) reports
+/// and [`Document::replace_text_run`](crate::Document::replace_text_run)
+/// accepts. The counter therefore mirrors `page_text_elements` **verbatim**:
+/// every top-level `Text` element advances it — including whitespace-only and
+/// bounds-less runs that reconstruction then drops from the blocks — because
+/// those are real show operators that count in the editing index space. It is
+/// **not** [`ContentElement::index`] (the unified text+image+path index): every
+/// interposed image or shape would shift that by one and make a block's indices
+/// resolve arbitrary runs.
 pub fn runs_from_elements(
     elements: &[ContentElement],
     font_styles: &std::collections::BTreeMap<String, TextStyle>,
 ) -> Vec<ReconRun> {
-    elements
-        .iter()
-        .filter(|e| e.kind == ElementKind::Text)
-        .filter_map(|e| {
-            let b = e.bounds?;
-            if e.label.trim().is_empty() {
-                return None;
-            }
-            // Prefer the style resolved at extraction against the run's OWN scope
-            // (page or form XObject): form-XObject text must be styled with the
-            // form's fonts, not the page's. Rebuild the full `TextStyle` from the
-            // raw `/BaseFont` (for the generic class) overlaid with the resolved
-            // family + refined bold/italic. Fall back to the page-scope table only
-            // when the run carried no resolved style.
-            let mut style = e
-                .font_style
-                .as_ref()
-                .map(|fs| {
-                    let mut ts = crate::convert::style::parse_base_font(&fs.base_font);
-                    ts.family = fs.family.clone();
-                    ts.bold = fs.bold;
-                    ts.italic = fs.italic;
-                    ts
-                })
-                .or_else(|| e.font.as_deref().and_then(|f| font_styles.get(f)).cloned())
-                .unwrap_or_default();
-            style.color = e.color;
-            Some(ReconRun {
-                text: e.label.clone(),
-                x: b.x,
-                y: b.y,
-                w: b.width,
-                h: b.height,
-                size: e.font_size.unwrap_or(b.height).max(1.0),
-                style,
-                rotation: e.rotation_deg.unwrap_or(0.0),
-                // Form-XObject (nested) text is display-only — not editable by a
-                // top-level run index, so it carries no source index.
-                source_index: if e.nested { None } else { Some(e.index) },
-                // Set later by `mark_underlines` / `mark_strikes` from the page's
-                // ruling lines.
-                underline: false,
-                strike: false,
+    // Ordinal of the next top-level text run — counted exactly like
+    // `page_text_elements` (nested runs never advance it).
+    let mut top_run = 0usize;
+    let mut out = Vec::new();
+    for e in elements.iter().filter(|e| e.kind == ElementKind::Text) {
+        // Form-XObject (nested) text is display-only — not editable by a
+        // top-level run index, so it carries no source index.
+        let source_index = if e.nested {
+            None
+        } else {
+            let idx = top_run;
+            top_run += 1;
+            Some(idx)
+        };
+        let Some(b) = e.bounds else { continue };
+        if e.label.trim().is_empty() {
+            continue;
+        }
+        // Prefer the style resolved at extraction against the run's OWN scope
+        // (page or form XObject): form-XObject text must be styled with the
+        // form's fonts, not the page's. Rebuild the full `TextStyle` from the
+        // raw `/BaseFont` (for the generic class) overlaid with the resolved
+        // family + refined bold/italic. Fall back to the page-scope table only
+        // when the run carried no resolved style.
+        let mut style = e
+            .font_style
+            .as_ref()
+            .map(|fs| {
+                let mut ts = crate::convert::style::parse_base_font(&fs.base_font);
+                ts.family = fs.family.clone();
+                ts.bold = fs.bold;
+                ts.italic = fs.italic;
+                ts
             })
-        })
-        .collect()
+            .or_else(|| e.font.as_deref().and_then(|f| font_styles.get(f)).cloned())
+            .unwrap_or_default();
+        style.color = e.color;
+        out.push(ReconRun {
+            text: e.label.clone(),
+            x: b.x,
+            y: b.y,
+            w: b.width,
+            h: b.height,
+            size: e.font_size.unwrap_or(b.height).max(1.0),
+            style,
+            rotation: e.rotation_deg.unwrap_or(0.0),
+            source_index,
+            // Set later by `mark_underlines` / `mark_strikes` from the page's
+            // ruling lines.
+            underline: false,
+            strike: false,
+        });
+    }
+    out
 }
 
 /// A monotonically increasing [`BlockId`] source. One instance per
@@ -994,7 +1013,10 @@ fn lower_text_group(
                 let leading = paragraphs::group_leading(&lines, body, doc_leading);
                 let group_left = paragraphs::group_left(&lines);
                 let mut prev_bottom: Option<f64> = None;
-                for para_lines in paragraphs::split_paragraphs(&lines, body) {
+                // The REAL page-wide leading flows into the split so a short
+                // group (2 lines) is judged against what the page actually
+                // uses, never against its own single — possibly huge — step.
+                for para_lines in paragraphs::split_paragraphs(&lines, body, doc_leading) {
                     let ctx = paragraphs::ParaContext {
                         body,
                         leading,

@@ -1191,9 +1191,95 @@ pub(crate) fn parse_da_full(da: &str) -> (Option<String>, f64, [f64; 3]) {
     (font, size, color)
 }
 
+/// Layout options for a (re)generated text-field appearance, derived from the
+/// field's `/Ff` flags, `/MaxLen` and resolved `/DA` font (see
+/// [`Document::field_layout`]).
+#[derive(Debug, Clone)]
+struct TextFieldLayout {
+    /// `Some(n)` for a **comb** field (`Ff` bit 25 with a positive `/MaxLen`
+    /// of `n`, ISO 32000-1 Table 228): the value is drawn one character per
+    /// equal cell of width `rect_width / n`.
+    comb: Option<u32>,
+    /// The field is **multiline** (`Ff` bit 13): the value word-wraps to the
+    /// rectangle width even when it carries no embedded newline.
+    multiline: bool,
+    /// The face whose Core-14 AFM metrics measure the runs (quadding,
+    /// auto-size, word-wrap): the `/BaseFont` the field's `/DA` resolves to.
+    /// Non-base-14 faces fall back to Helvetica metrics inside
+    /// [`crate::font::afm::measure_winansi`].
+    measure_font: String,
+}
+
+impl Default for TextFieldLayout {
+    fn default() -> Self {
+        TextFieldLayout {
+            comb: None,
+            multiline: false,
+            measure_font: "Helvetica".to_string(),
+        }
+    }
+}
+
+/// Break one over-wide `word` at character boundaries: every full chunk is
+/// pushed to `out`, the still-open last chunk is returned. Used by
+/// [`wrap_field_text`] when a single word exceeds the field width (a viewer
+/// clips rather than overflows, so mirroring Adobe means hard-breaking).
+fn break_field_word(
+    word: &str,
+    max_width: f64,
+    width: &impl Fn(&str) -> f64,
+    out: &mut Vec<String>,
+) -> String {
+    let mut chunk = String::new();
+    for ch in word.chars() {
+        let mut next = chunk.clone();
+        next.push(ch);
+        if !chunk.is_empty() && width(&next) > max_width {
+            out.push(std::mem::take(&mut chunk));
+            chunk.push(ch);
+        } else {
+            chunk = next;
+        }
+    }
+    chunk
+}
+
+/// Greedy word-wrap of `text` to `max_width` text-space units, measured with
+/// `width`. Hard newlines are preserved; words split on spaces (a run of
+/// spaces collapses, matching a viewer's variable-text layout) and a word
+/// wider than `max_width` is hard-broken by [`break_field_word`].
+fn wrap_field_text(text: &str, max_width: f64, width: &impl Fn(&str) -> f64) -> Vec<String> {
+    let mut out = Vec::new();
+    for hard in text.split('\n') {
+        let mut line = String::new();
+        for word in hard.split(' ').filter(|w| !w.is_empty()) {
+            let candidate = if line.is_empty() {
+                word.to_string()
+            } else {
+                format!("{line} {word}")
+            };
+            if width(&candidate) <= max_width {
+                line = candidate;
+            } else {
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                line = if width(word) <= max_width {
+                    word.to_string()
+                } else {
+                    break_field_word(word, max_width, width, &mut out)
+                };
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
 /// Build a field's appearance form (dictionary without `/Length`) and its
 /// content stream, drawing `value` in `style`'s colour/size/quadding inside the
-/// widget rectangle.
+/// widget rectangle, laid out per `layout` (comb / multiline / measurement
+/// face).
 ///
 /// `font_res` is the font **resource name** the appearance's `Tf` operator and
 /// its `/Resources /Font` key use — taken from the field's `/DA` (e.g. `Helv`)
@@ -1203,57 +1289,91 @@ pub(crate) fn parse_da_full(da: &str) -> (Option<String>, f64, [f64; 3]) {
 /// added by us, so the saved PDF stays clean and Adobe draws it natively; our
 /// rasterizer draws it via the base-14 substitution in `render_fonts_for`.
 ///
-/// A `value` containing newlines is laid out as multiple top-aligned lines
-/// (multiline text and list boxes); a single line is vertically centred. `/Q`
-/// quadding offsets each line horizontally using Helvetica metrics (`align`
-/// 1 = centre, 2 = right; 0/default = left).
+/// Layout modes:
+/// * **comb** (`layout.comb = Some(n)`): the rectangle splits into `n` equal
+///   cells and each character is centred in its own cell (one `Tm` per
+///   character). Auto-size fits both the cell width and the rect height.
+/// * **multiline** (`layout.multiline`, or a `value` with newlines — list
+///   boxes): lines word-wrap to the rect width and stack top-aligned; lines
+///   past the bottom are clipped by the form's `/BBox` (ISO 32000-1 §8.10.1:
+///   a form XObject's `/BBox` clips its content).
+/// * **single line**: vertically centred; auto-size (`/DA` size `0`) also
+///   shrinks to fit the rect width like Adobe, floored at 4 pt.
+///
+/// `/Q` quadding offsets each line horizontally using the AFM metrics of
+/// `layout.measure_font` (`align` 1 = centre, 2 = right; 0/default = left) —
+/// the same metrics the string is painted with, so the offsets match a viewer.
 fn build_text_field_appearance(
     rect: [f64; 4],
     value: &str,
     style: TextFieldStyle,
     font_res: &[u8],
     font_id: ObjectId,
+    layout: &TextFieldLayout,
 ) -> (Dictionary, Vec<u8>) {
     let w = rect[2] - rect[0];
     let h = rect[3] - rect[1];
-    let lines: Vec<&str> = value.split('\n').collect();
-    let multiline = lines.len() > 1;
-
-    // Honour the `/DA` size when set; otherwise auto-size to the rectangle.
-    let size = if style.size > 0.0 {
-        style.size
-    } else if multiline {
-        (h / (lines.len() as f64 + 0.5)).clamp(6.0, 12.0)
-    } else {
-        (h * 0.6).clamp(6.0, 14.0)
-    };
-    let leading = size * 1.15;
-    let first_baseline = if multiline {
-        h - size
-    } else {
-        (h - size) / 2.0 + size * 0.2
-    };
     let [r, g, b] = style.color;
     // Inner left padding; the usable text width is the rect minus both pads.
     let pad = 2.0;
     let usable = (w - 2.0 * pad).max(0.0);
     let res = String::from_utf8_lossy(font_res).into_owned();
+    // Measure exactly as painted: WinAnsi bytes, Core-14 AFM of the `/DA` face.
+    let measure =
+        |text: &str, size: f64| crate::font::afm::measure_winansi(&layout.measure_font, text, size);
 
-    // Horizontal offset for a line under the current quadding.
-    let line_x = |line: &str| -> f64 {
-        if style.align == 0 {
-            return pad;
-        }
-        let tw = Document::helvetica_width(line, size);
-        match style.align {
-            1 => pad + ((usable - tw) / 2.0).max(0.0), // centre
-            2 => pad + (usable - tw).max(0.0),         // right
-            _ => pad,
-        }
+    let comb = layout.comb.filter(|&n| n > 0);
+    // A comb is single-line by definition; multiline wins only without comb.
+    let multiline = comb.is_none() && (layout.multiline || value.contains('\n'));
+
+    // Honour the `/DA` size when set; otherwise auto-size to the rectangle.
+    let size = if style.size > 0.0 {
+        style.size
+    } else if let Some(n) = comb {
+        // Tallest size that keeps the widest character inside its own cell
+        // (with a little air) while still fitting the rect height.
+        let cell = w / f64::from(n);
+        let fit_h = (h * 0.6).clamp(4.0, 14.0);
+        let mut buf = [0u8; 4];
+        let widest = value
+            .chars()
+            .map(|c| measure(c.encode_utf8(&mut buf), 1.0))
+            .fold(0.0f64, f64::max);
+        let fit_w = if widest > 0.0 {
+            cell * 0.8 / widest
+        } else {
+            f64::INFINITY
+        };
+        fit_h.min(fit_w).max(4.0)
+    } else if multiline {
+        // Multiline auto-size: a fixed readable size (Adobe's behaviour),
+        // shrunk only when the rect is shorter than a single line.
+        12.0f64.min((h - 2.0).max(4.0))
+    } else {
+        // Single line: fit the height, then shrink to fit the width.
+        let fit_h = (h * 0.6).clamp(6.0, 14.0);
+        let unit = measure(value, 1.0);
+        let fit_w = if unit > 0.0 { usable / unit } else { f64::INFINITY };
+        fit_h.min(fit_w).max(4.0)
     };
+    let leading = size * 1.15;
+    // Baseline of a vertically-centred single visual line (single-line & comb).
+    let single_baseline = (h - size) / 2.0 + size * 0.2;
 
     let mut content = Vec::new();
-    content.extend_from_slice(b"/Tx BMC\nq\nBT\n");
+    content.extend_from_slice(b"/Tx BMC\nq\n");
+    // Explicit clip to the widget box (what Adobe emits too): a fixed `/DA`
+    // size can overflow the rect, and multiline values can overflow the
+    // bottom — the clip guarantees nothing paints outside, whether or not a
+    // renderer also honours the form's `/BBox`.
+    content.extend_from_slice(
+        format!(
+            "0 0 {} {} re W n\nBT\n",
+            content::num(w),
+            content::num(h)
+        )
+        .as_bytes(),
+    );
     content.extend_from_slice(
         format!(
             "/{} {} Tf {} {} {} rg\n",
@@ -1266,16 +1386,60 @@ fn build_text_field_appearance(
         .as_bytes(),
     );
     content.extend_from_slice(format!("{} TL\n", content::num(leading)).as_bytes());
-    // Set the text matrix per line so each line can have its own x offset
-    // (needed for centre/right quadding); `y` steps down by `leading`.
-    for (i, line) in lines.iter().enumerate() {
-        let x = line_x(line);
-        let y = first_baseline - (i as f64) * leading;
-        content.extend_from_slice(
-            format!("1 0 0 1 {} {} Tm\n", content::num(x), content::num(y)).as_bytes(),
-        );
-        push_pdf_string(&mut content, line);
-        content.extend_from_slice(b" Tj\n");
+
+    if let Some(n) = comb {
+        // One character per equal-width cell, each centred in its cell (one
+        // `Tm` per character so the spacing is exact whatever the glyph).
+        let cell = w / f64::from(n);
+        let line = value.split('\n').next().unwrap_or("");
+        let mut buf = [0u8; 4];
+        for (i, ch) in line.chars().take(n as usize).enumerate() {
+            let s: &str = ch.encode_utf8(&mut buf);
+            let cw = measure(s, size);
+            let x = i as f64 * cell + (cell - cw) / 2.0;
+            content.extend_from_slice(
+                format!(
+                    "1 0 0 1 {} {} Tm\n",
+                    content::num(x),
+                    content::num(single_baseline)
+                )
+                .as_bytes(),
+            );
+            push_pdf_string(&mut content, s);
+            content.extend_from_slice(b" Tj\n");
+        }
+    } else {
+        let lines: Vec<String> = if multiline {
+            let line_width = |t: &str| measure(t, size);
+            wrap_field_text(value, usable, &line_width)
+        } else {
+            vec![value.to_string()]
+        };
+        let first_baseline = if multiline { h - size } else { single_baseline };
+        // Set the text matrix per line so each line can have its own x offset
+        // (needed for centre/right quadding); `y` steps down by `leading`.
+        for (i, line) in lines.iter().enumerate() {
+            let y = first_baseline - (i as f64) * leading;
+            // Entirely below the `/BBox` clip: nothing further can show.
+            if y < -size {
+                break;
+            }
+            let x = if style.align == 0 {
+                pad
+            } else {
+                let tw = measure(line, size);
+                match style.align {
+                    1 => pad + ((usable - tw) / 2.0).max(0.0), // centre
+                    2 => pad + (usable - tw).max(0.0),         // right
+                    _ => pad,
+                }
+            };
+            content.extend_from_slice(
+                format!("1 0 0 1 {} {} Tm\n", content::num(x), content::num(y)).as_bytes(),
+            );
+            push_pdf_string(&mut content, line);
+            content.extend_from_slice(b" Tj\n");
+        }
     }
     content.extend_from_slice(b"ET\nQ\nEMC\n");
 
@@ -1992,6 +2156,51 @@ pub struct EmbeddedFontInfo {
     pub format: String,
 }
 
+/// `(explicit, inferred)` `Unicode → gid` pair buckets for the by-id union
+/// cmap path (`wrapper_cmap_pairs_split` and friends).
+type SplitCmapPairs = (Vec<(u32, u16)>, Vec<(u32, u16)>);
+
+/// One **physically embedded** font program (from [`Document::physical_fonts`],
+/// keyed there by the `/FontFile*` stream's object id). Where
+/// [`EmbeddedFontInfo`] enumerates *names*, this deduplicates by *program*: a
+/// form generator routinely embeds dozens of same-family Type0 wrappers whose
+/// descriptors all reference a handful of shared programs (the CERFA pattern —
+/// 69 wrappers over ~20 programs), and only the program identity lets a host
+/// fetch the exact glyphs a run paints with.
+#[derive(Debug, Clone)]
+pub struct PhysicalFont {
+    /// Stable content identity: the first 8 hex chars of the SHA-256 of the
+    /// **decoded** program bytes. Feed it to
+    /// [`Document::extract_web_font_by_id`] / [`Document::web_font_coverage`].
+    pub font_id: String,
+    /// `"truetype"` (`/FontFile2`), `"cff"` (`/FontFile3`) or `"type1"`
+    /// (`/FontFile`).
+    pub format: &'static str,
+    /// Glyph count of the parsed program (`0` when it does not parse).
+    pub num_glyphs: u16,
+    /// Object ids of every **wrapper** font dict (Type0 composites and simple
+    /// fonts — descendant CIDFonts are reached through their Type0) whose
+    /// descriptor references this program, in ascending object-id order.
+    pub wrapper_ids: Vec<ObjectId>,
+}
+
+/// One embedded font **program** from [`Document::embedded_fonts_v2`] — the
+/// per-program (deduplicated) sibling of [`EmbeddedFontInfo`], carrying the
+/// physical identity ([`font_id`](Self::font_id)) plus every `/BaseFont` name
+/// wrapped around it.
+#[derive(Debug, Clone)]
+pub struct EmbeddedFontInfoV2 {
+    /// The program's identity — see [`PhysicalFont::font_id`].
+    pub font_id: String,
+    /// `"truetype"` / `"cff"` / `"type1"`.
+    pub format: String,
+    /// Glyph count of the parsed program (`0` when it does not parse).
+    pub num_glyphs: u16,
+    /// The `/BaseFont` names of every wrapper referencing this program
+    /// (deduplicated, sorted).
+    pub base_fonts: Vec<String>,
+}
+
 /// One embedded file attachment (from [`Document::attachments`]). Mirrors what a
 /// reader's `getAttachments()` exposes: the name-tree key, the filespec display
 /// name (`/UF` or `/F`), the optional embedded-stream MIME (`/Subtype`),
@@ -2655,6 +2864,16 @@ pub struct TextElementInfo {
     ///
     /// [`font_family`]: TextElementInfo::font_family
     pub base_font: String,
+    /// The **physical** identity of the run's embedded font program — the first
+    /// 8 hex chars of the SHA-256 of the decoded `/FontFile*` bytes, identical
+    /// to [`PhysicalFont::font_id`]. Unlike [`base_font`] (a *name*, ambiguous
+    /// when many wrapper dicts share one program), this pins the exact program,
+    /// so a host feeds it to [`Document::extract_web_font_by_id`] and always
+    /// gets the run's own glyphs. **Empty** when the run's font embeds no
+    /// program (base-14 / non-embedded faces, Type3).
+    ///
+    /// [`base_font`]: TextElementInfo::base_font
+    pub font_id: String,
     pub bold: bool,
     pub italic: bool,
     pub font_size: f64,
@@ -4018,6 +4237,10 @@ impl Document {
         else {
             return out;
         };
+        // Per-call `stream object → font_id` memo: many wrappers in one `/Font`
+        // table routinely share a single physical program (the CERFA pattern —
+        // 69 wrappers over ~20 programs), so each program is hashed once here.
+        let mut fid_memo: BTreeMap<ObjectId, String> = BTreeMap::new();
         for (name, value) in &font_dict.0 {
             let Some(font) = self.resolve(value).as_dict() else {
                 continue;
@@ -4026,6 +4249,7 @@ impl Document {
                 let base_font = String::from_utf8_lossy(base).into_owned();
                 let mut style = crate::convert::style::parse_base_font(&base_font);
                 style.refine_with_descriptor(&self.font_descriptor_style(font));
+                let font_id = self.font_id_for(font, &mut fid_memo);
                 out.insert(
                     name.clone(),
                     content::FontStyle {
@@ -4033,9 +4257,57 @@ impl Document {
                         bold: style.bold,
                         italic: style.italic,
                         base_font,
+                        font_id,
                     },
                 );
             }
+        }
+        out
+    }
+
+    /// The physical identity of `font`'s embedded program — the first 8 hex
+    /// chars of the SHA-256 of the decoded `/FontFile*` bytes (identical to the
+    /// [`PhysicalFont::font_id`] key served by [`physical_fonts`]) — resolved
+    /// through the Type0-aware carrier so it is scope-correct for page fonts and
+    /// form-XObject fonts alike. `""` when nothing is embedded. `memo` caches by
+    /// the program stream's object id so wrappers sharing one program hash once.
+    ///
+    /// [`physical_fonts`]: Self::physical_fonts
+    fn font_id_for(&self, font: &Dictionary, memo: &mut BTreeMap<ObjectId, String>) -> String {
+        let Some(descriptor) = self.web_font_descriptor(font) else {
+            return String::new();
+        };
+        for key in [b"FontFile2".as_slice(), b"FontFile3", b"FontFile"] {
+            let Some(entry) = descriptor.get(key) else {
+                continue;
+            };
+            let stream_id = entry.as_reference();
+            if let Some(id) = stream_id {
+                if let Some(cached) = memo.get(&id) {
+                    return cached.clone();
+                }
+            }
+            if let Some(bytes) = self.font_file_bytes(&descriptor, key) {
+                if !bytes.is_empty() {
+                    let fid = Self::font_id_of(&bytes);
+                    if let Some(id) = stream_id {
+                        memo.insert(id, fid.clone());
+                    }
+                    return fid;
+                }
+            }
+        }
+        String::new()
+    }
+
+    /// The stable content identity of a decoded font program: the first 8 hex
+    /// chars (4 bytes) of its SHA-256.
+    fn font_id_of(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let digest = crate::crypto::sha256(bytes);
+        let mut out = String::with_capacity(8);
+        for b in &digest[..4] {
+            let _ = write!(out, "{b:02x}");
         }
         out
     }
@@ -5065,6 +5337,7 @@ impl Document {
                         .or_else(|| fallback.map(|s| s.family.clone()))
                         .unwrap_or_else(|| "Helvetica".to_string()),
                     base_font: scoped.map(|s| s.base_font.clone()).unwrap_or_default(),
+                    font_id: scoped.map(|s| s.font_id.clone()).unwrap_or_default(),
                     bold: scoped
                         .map(|s| s.bold)
                         .or_else(|| fallback.map(|s| s.bold))
@@ -11035,20 +11308,32 @@ impl Document {
     /// Empty ⇒ no rebuild (caller keeps the embedded `cmap`).
     fn web_cmap_pairs(
         &self,
+        id: ObjectId,
         dict: &Dictionary,
         program: &crate::font::GlyphSource,
     ) -> Vec<(u32, u16)> {
-        match self.type0_for(dict) {
+        match self.type0_for(id, dict) {
             Some(type0) => self.composite_cmap_pairs(&type0, program),
             None => Vec::new(),
         }
     }
 
     /// The Type0 font dict governing `dict`: `dict` itself when it is the Type0,
-    /// or the parent Type0 whose `/DescendantFonts` references this CIDFont (the
-    /// `/ToUnicode` + `/Encoding` live on the Type0, the `/FontFile2` on the
-    /// CIDFont — either may be the dict matched by name). `None` for a simple font.
-    fn type0_for(&self, dict: &Dictionary) -> Option<Dictionary> {
+    /// or the parent Type0 whose `/DescendantFonts[0]` **reference resolves to
+    /// `id`** — this CIDFont's own object id (the `/ToUnicode` + `/Encoding` live
+    /// on the Type0, the `/FontFile2` on the CIDFont — either may be the dict
+    /// matched by name). `None` for a simple font.
+    ///
+    /// Resolution is **by reference, not by name**: a form generator routinely
+    /// embeds dozens of same-`/BaseFont` Type0 wrappers over a handful of
+    /// physical programs, each wrapper with its own (partial) `/ToUnicode`. A
+    /// name lookup picks whichever homonym enumerates first and can serve a
+    /// sibling's 2-entry `/ToUnicode` in place of this wrapper's full one —
+    /// dropping accents whose glyphs the program actually carries (the CERFA
+    /// `KWVFOU+TimesNewRoman,Bold` failure). The name-based scan is kept only as
+    /// a last-resort fallback for a CIDFont no Type0 references by id (e.g. an
+    /// inlined `/DescendantFonts` array entry).
+    fn type0_for(&self, id: ObjectId, dict: &Dictionary) -> Option<Dictionary> {
         let sub = dict.get(b"Subtype").and_then(Object::as_name);
         if sub == Some(b"Type0".as_slice()) {
             return Some(dict.clone());
@@ -11056,14 +11341,29 @@ impl Document {
         if sub != Some(b"CIDFontType2".as_slice()) && sub != Some(b"CIDFontType0".as_slice()) {
             return None;
         }
+        let by_reference = self.objects.values().find_map(|o| {
+            let d = o.as_dict()?;
+            if d.get(b"Subtype").and_then(Object::as_name) != Some(b"Type0".as_slice()) {
+                return None;
+            }
+            let first = d
+                .get(b"DescendantFonts")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .and_then(|a| a.first())?;
+            (first.as_reference() == Some(id)).then(|| d.clone())
+        });
+        if by_reference.is_some() {
+            return by_reference;
+        }
         let base = dict.get(b"BaseFont").and_then(Object::as_name);
         self.objects.values().find_map(|o| {
             let d = o.as_dict()?;
             if d.get(b"Subtype").and_then(Object::as_name) != Some(b"Type0".as_slice()) {
                 return None;
             }
-            // The Type0's first descendant must be THIS CIDFont (matched by its
-            // `/BaseFont`, which a Type0 shares with its descendant).
+            // Fallback: the Type0's first descendant matched by `/BaseFont`
+            // (which a Type0 shares with its descendant).
             let desc_obj = d
                 .get(b"DescendantFonts")
                 .map(|o| self.resolve(o))
@@ -11350,6 +11650,136 @@ impl Document {
         out
     }
 
+    /// Every physically embedded font **program**, keyed by its `/FontFile*`
+    /// stream's object id — the identity table behind
+    /// [`extract_web_font_by_id`](Self::extract_web_font_by_id) and
+    /// [`embedded_fonts_v2`](Self::embedded_fonts_v2). Built on demand by
+    /// scanning every top-level wrapper font dict (Type0 composites and simple
+    /// fonts — descendant CIDFonts are reached through their Type0) down to its
+    /// descriptor's program stream: wrappers sharing one stream share one entry,
+    /// so a document with dozens of same-family wrappers collapses to its
+    /// handful of actual programs.
+    pub fn physical_fonts(&self) -> BTreeMap<ObjectId, PhysicalFont> {
+        let mut out: BTreeMap<ObjectId, PhysicalFont> = BTreeMap::new();
+        for (id, object) in &self.objects {
+            let Some(dict) = object.as_dict() else {
+                continue;
+            };
+            if dict.get(b"Type").and_then(Object::as_name) != Some(b"Font".as_slice()) {
+                continue;
+            }
+            // Skip descendant CIDFonts: their program is reached (and their
+            // `/ToUnicode` served) through the Type0 wrapper referencing them —
+            // listing both would double-count every composite wrapper.
+            let sub = dict.get(b"Subtype").and_then(Object::as_name);
+            if sub == Some(b"CIDFontType2".as_slice()) || sub == Some(b"CIDFontType0".as_slice()) {
+                continue;
+            }
+            let Some(descriptor) = self.web_font_descriptor(dict) else {
+                continue;
+            };
+            let Some((key, format)) = [
+                (b"FontFile2".as_slice(), "truetype"),
+                (b"FontFile3".as_slice(), "cff"),
+                (b"FontFile".as_slice(), "type1"),
+            ]
+            .into_iter()
+            .find(|(key, _)| descriptor.contains(key)) else {
+                continue;
+            };
+            // The stream's object id is the dedup key; an inline (non-reference)
+            // program stream has no identity to share and is skipped.
+            let Some(stream_id) = descriptor.get(key).and_then(Object::as_reference) else {
+                continue;
+            };
+            if let Some(existing) = out.get_mut(&stream_id) {
+                existing.wrapper_ids.push(*id);
+                continue;
+            }
+            let Some(bytes) = self.font_file_bytes(&descriptor, key).filter(|b| !b.is_empty())
+            else {
+                continue;
+            };
+            let num_glyphs = Self::program_from_bytes(&bytes, format)
+                .map(|p| match &p {
+                    crate::font::GlyphSource::TrueType(f) => f.num_glyphs(),
+                    crate::font::GlyphSource::Cff(f) => f.num_glyphs(),
+                    crate::font::GlyphSource::Type1(f) => {
+                        f.name_to_gid_map().len().min(0xFFFF) as u16
+                    }
+                })
+                .unwrap_or(0);
+            out.insert(
+                stream_id,
+                PhysicalFont {
+                    font_id: Self::font_id_of(&bytes),
+                    format,
+                    num_glyphs,
+                    wrapper_ids: vec![*id],
+                },
+            );
+        }
+        out
+    }
+
+    /// Parse decoded `/FontFile*` bytes into a glyph program, mirroring
+    /// [`font_program`](Self::font_program)'s per-key handling: `truetype` ⇒ a
+    /// glyf sfnt, `cff` ⇒ a bare Type1C first then an OpenType-flavoured sfnt,
+    /// anything else ⇒ a legacy Type 1 eexec program.
+    fn program_from_bytes(bytes: &[u8], format: &str) -> Option<crate::font::GlyphSource> {
+        match format {
+            "truetype" => crate::font::truetype::TrueTypeFont::parse(bytes)
+                .map(crate::font::GlyphSource::TrueType),
+            "cff" => crate::font::cff::CffFont::parse(bytes)
+                .map(crate::font::GlyphSource::Cff)
+                .or_else(|| {
+                    crate::font::truetype::TrueTypeFont::parse(bytes)
+                        .map(crate::font::GlyphSource::TrueType)
+                }),
+            _ => crate::font::type1::parse_type1(bytes).map(crate::font::GlyphSource::Type1),
+        }
+    }
+
+    /// Enumerate the embedded fonts **deduplicated by physical program** — one
+    /// entry per `/FontFile*` stream, carrying its content identity
+    /// ([`EmbeddedFontInfoV2::font_id`]), format, glyph count and every
+    /// `/BaseFont` wrapped around it. The per-program sibling of
+    /// [`embedded_fonts`](Self::embedded_fonts) (kept intact for compatibility):
+    /// where that lists one entry per *name*, this collapses the many wrappers a
+    /// form generator emits over a handful of shared programs, and its
+    /// `font_id`s feed [`extract_web_font_by_id`](Self::extract_web_font_by_id).
+    /// Sorted by `font_id` for a deterministic output.
+    pub fn embedded_fonts_v2(&self) -> Vec<EmbeddedFontInfoV2> {
+        let mut out: Vec<EmbeddedFontInfoV2> = self
+            .physical_fonts()
+            .into_values()
+            .map(|pf| {
+                let mut base_fonts: Vec<String> = pf
+                    .wrapper_ids
+                    .iter()
+                    .filter_map(|id| {
+                        self.objects
+                            .get(id)?
+                            .as_dict()?
+                            .get(b"BaseFont")
+                            .and_then(Object::as_name)
+                            .map(|n| String::from_utf8_lossy(n).into_owned())
+                    })
+                    .collect();
+                base_fonts.sort();
+                base_fonts.dedup();
+                EmbeddedFontInfoV2 {
+                    font_id: pf.font_id,
+                    format: pf.format.to_string(),
+                    num_glyphs: pf.num_glyphs,
+                    base_fonts,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.font_id.cmp(&b.font_id));
+        out
+    }
+
     /// Find an embedded font program by (fuzzy) `/BaseFont` name and return its
     /// raw **decoded** bytes plus a format tag (`"truetype"`, `"cff"`, `"type1"`).
     /// Mirrors a host editor's "re-embed the original font when re-baking edited
@@ -11357,7 +11787,7 @@ impl Document {
     /// composites (via `/DescendantFonts`). `None` when nothing matches or the
     /// match carries no embedded program (only a `/FontDescriptor` reference).
     pub fn extract_font_program(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
-        for dict in self.matched_font_dicts(name) {
+        for (_, dict) in self.matched_font_dicts(name) {
             let Some(carrier) = self.font_carrier(&dict) else {
                 continue;
             };
@@ -11391,15 +11821,17 @@ impl Document {
 
     /// Top-level `/Font` dicts whose normalized `/BaseFont` fuzzy-matches `name`
     /// (two-direction substring, so subset prefixes and `-Regular`/`MT`/`PS`
-    /// suffix variants match without explicit stripping). Cloned up-front so the
+    /// suffix variants match without explicit stripping), each paired with its
+    /// **object id** so callers can resolve a CIDFont's parent Type0 *by
+    /// reference* ([`type0_for`](Self::type0_for)). Cloned up-front so the
     /// caller can resolve descriptors without holding `self.objects` borrowed.
-    fn matched_font_dicts(&self, name: &str) -> Vec<Dictionary> {
+    fn matched_font_dicts(&self, name: &str) -> Vec<(ObjectId, Dictionary)> {
         let target = normalize_font_name(name);
         if target.is_empty() {
             return Vec::new();
         }
-        let mut candidates: Vec<Dictionary> = Vec::new();
-        for object in self.objects.values() {
+        let mut candidates: Vec<(ObjectId, Dictionary)> = Vec::new();
+        for (id, object) in &self.objects {
             let Some(dict) = object.as_dict() else {
                 continue;
             };
@@ -11416,7 +11848,7 @@ impl Document {
                 continue;
             }
             if candidate == target || candidate.contains(&target) || target.contains(&candidate) {
-                candidates.push(dict.clone());
+                candidates.push((*id, dict.clone()));
             }
         }
         candidates
@@ -11465,6 +11897,13 @@ impl Document {
         //  2. else exact *normalized* name (prefix dropped) — keeps the variant
         //     (`…,Bold` never falls to a plain/italic face).
         //  3. else the loose two-direction match (`matched_font_dicts`).
+        //
+        // A tier only *wins* when at least one of its dicts embeds a program: an
+        // exact-raw match whose descriptor carries **no** `/FontFile*` (a
+        // metrics-only face like the CERFA `TimesNewRoman,BoldItalic`) must not
+        // pin the search to a programless tier and return `None` — widening to
+        // the normalized/fuzzy tiers serves a sister subset's own glyphs instead
+        // of nothing.
         let all = self.matched_font_dicts(name);
         let raw_target = name.trim();
         let base_of = |d: &Dictionary| {
@@ -11472,32 +11911,39 @@ impl Document {
                 .and_then(Object::as_name)
                 .map(|n| String::from_utf8_lossy(n).into_owned())
         };
-        let exact_raw: Vec<Dictionary> = all
+        let has_program = |ds: &[(ObjectId, Dictionary)]| {
+            ds.iter().any(|(_, d)| {
+                self.web_font_descriptor(d).is_some_and(|desc| {
+                    desc.contains(b"FontFile2")
+                        || desc.contains(b"FontFile3")
+                        || desc.contains(b"FontFile")
+                })
+            })
+        };
+        let exact_raw: Vec<(ObjectId, Dictionary)> = all
             .iter()
-            .filter(|d| base_of(d).is_some_and(|b| b.eq_ignore_ascii_case(raw_target)))
+            .filter(|(_, d)| base_of(d).is_some_and(|b| b.eq_ignore_ascii_case(raw_target)))
             .cloned()
             .collect();
-        let dicts = if !exact_raw.is_empty() {
+        let target = normalize_font_name(name);
+        let exact_norm: Vec<(ObjectId, Dictionary)> = all
+            .iter()
+            .filter(|(_, d)| base_of(d).is_some_and(|b| normalize_font_name(&b) == target))
+            .cloned()
+            .collect();
+        let dicts = if !exact_raw.is_empty() && has_program(&exact_raw) {
             exact_raw
+        } else if !exact_norm.is_empty() && has_program(&exact_norm) {
+            exact_norm
         } else {
-            let target = normalize_font_name(name);
-            let exact_norm: Vec<Dictionary> = all
-                .iter()
-                .filter(|d| base_of(d).is_some_and(|b| normalize_font_name(&b) == target))
-                .cloned()
-                .collect();
-            if exact_norm.is_empty() {
-                all
-            } else {
-                exact_norm
-            }
+            all
         };
 
         // Pass 1 — a program that is browser-loadable directly: a CFF (always
         // wrappable to OpenType with a `cmap` from its own charset) or a
         // TrueType that already maps Unicode. Preferred over a cmap-less subset
         // so a fuzzy name match returns a *usable* face, not an orphan stub.
-        for dict in &dicts {
+        for (id, dict) in &dicts {
             let Some(descriptor) = self.web_font_descriptor(dict) else {
                 continue;
             };
@@ -11542,7 +11988,7 @@ impl Document {
                     // yields nothing (no `/ToUnicode` to key on).
                     if let Some(pairs) = self
                         .font_program(dict)
-                        .map(|program| self.web_cmap_pairs(dict, &program))
+                        .map(|program| self.web_cmap_pairs(*id, dict, &program))
                         .filter(|p| !p.is_empty())
                     {
                         if let Some(fixed) =
@@ -11563,7 +12009,7 @@ impl Document {
         // `Unicode → gid` so full-glyph-order subsets resolve correctly; bare
         // CFF/Type1 is handed back as a last resort.
         let donor = self.web_font_donor_cmap(&dicts);
-        for dict in &dicts {
+        for (_, dict) in &dicts {
             let Some(descriptor) = self.web_font_descriptor(dict) else {
                 continue;
             };
@@ -11612,8 +12058,8 @@ impl Document {
     /// **full-glyph-order** subset (the common `code != gid` case — it kept the
     /// donor's glyph ids, only blanking unused outlines) resolves its glyphs
     /// through this instead of guessing `code == gid`.
-    fn web_font_donor_cmap(&self, dicts: &[Dictionary]) -> Option<BTreeMap<u32, u16>> {
-        for dict in dicts {
+    fn web_font_donor_cmap(&self, dicts: &[(ObjectId, Dictionary)]) -> Option<BTreeMap<u32, u16>> {
+        for (_, dict) in dicts {
             let Some(descriptor) = self.web_font_descriptor(dict) else {
                 continue;
             };
@@ -11805,6 +12251,405 @@ impl Document {
             }
         }
         pairs
+    }
+
+    /// Extract an embedded font as a **browser-loadable** sfnt by its physical
+    /// identity ([`PhysicalFont::font_id`] — the value
+    /// [`TextElementInfo::font_id`] / [`embedded_fonts_v2`] report), serving a
+    /// `cmap` built as the **union of every wrapper** referencing the program.
+    ///
+    /// This is the name-ambiguity-proof sibling of
+    /// [`extract_font_for_web`](Self::extract_font_for_web): a form generator
+    /// routinely embeds dozens of same-`/BaseFont` Type0 wrappers over a handful
+    /// of physical programs, each wrapper with its own *partial* `/ToUnicode` —
+    /// a name lookup can land on a homonym whose 2-entry `/ToUnicode` drops
+    /// accents the program actually carries. Resolving by `font_id` pins the
+    /// exact program, and the served `cmap` is rebuilt in two phases over ALL
+    /// its wrappers ([`web_font_union_pairs`](Self::web_font_union_pairs)):
+    /// explicit `/ToUnicode` entries first (`prefer_wrapper` — the run's own
+    /// `/BaseFont` — winning on conflict, then deterministic first-wins in
+    /// wrapper object-id order), inferred fills second.
+    ///
+    /// The subset is **always served as-is** — an incomplete `cmap` rebuild
+    /// never rejects the face (a partial map beats no font). Format tag mirrors
+    /// [`extract_font_for_web`]: `truetype`, `otf` (CFF wrapped/passed through
+    /// as OpenType), or the raw `cff`/`type1` last resorts. `None` only when no
+    /// embedded program carries `font_id`.
+    ///
+    /// [`embedded_fonts_v2`]: Self::embedded_fonts_v2
+    pub fn extract_web_font_by_id(
+        &self,
+        font_id: &str,
+        prefer_wrapper: Option<&str>,
+    ) -> Option<(Vec<u8>, &'static str)> {
+        let (stream_id, pf) = self
+            .physical_fonts()
+            .into_iter()
+            .find(|(_, p)| p.font_id == font_id)?;
+        let stream = self.objects.get(&stream_id)?.as_stream()?;
+        let bytes = decode_stream(stream).ok()?;
+        let program = Self::program_from_bytes(&bytes, pf.format);
+        let pairs = program
+            .as_ref()
+            .map(|p| self.web_font_union_pairs(&pf, p, prefer_wrapper))
+            .unwrap_or_default();
+        match pf.format {
+            "truetype" => {
+                if !pairs.is_empty() {
+                    if let Some(fixed) =
+                        crate::font::cff_to_otf::repair_sfnt_with_cmap(&bytes, &pairs)
+                    {
+                        return Some((fixed, "truetype"));
+                    }
+                }
+                Some((bytes, "truetype"))
+            }
+            "cff" => {
+                if Self::is_sfnt(&bytes) {
+                    if !pairs.is_empty() {
+                        if let Some(fixed) =
+                            crate::font::cff_to_otf::repair_sfnt_with_cmap(&bytes, &pairs)
+                        {
+                            return Some((fixed, "otf"));
+                        }
+                    }
+                    return Some((bytes, "otf"));
+                }
+                if let Some(otf) = crate::font::cff_to_otf::wrap(&bytes) {
+                    if !pairs.is_empty() {
+                        if let Some(fixed) =
+                            crate::font::cff_to_otf::repair_sfnt_with_cmap(&otf, &pairs)
+                        {
+                            return Some((fixed, "otf"));
+                        }
+                    }
+                    return Some((otf, "otf"));
+                }
+                Some((bytes, "cff"))
+            }
+            _ => Some((bytes, "type1")),
+        }
+    }
+
+    /// The Unicode code points mapped by the `cmap`
+    /// [`extract_web_font_by_id`](Self::extract_web_font_by_id) serves for the
+    /// program identified by `font_id` — sorted, deduplicated. Lets a host
+    /// check, before painting, whether a run's characters are covered by the
+    /// served face (and pick a fallback for the gaps). When the union rebuild
+    /// yields nothing (no wrapper contributes any mapping) this reports the
+    /// program's own embedded `cmap` — what the passthrough face would serve.
+    /// `None` when no embedded program carries `font_id`.
+    pub fn web_font_coverage(&self, font_id: &str) -> Option<Vec<u32>> {
+        let (stream_id, pf) = self
+            .physical_fonts()
+            .into_iter()
+            .find(|(_, p)| p.font_id == font_id)?;
+        let stream = self.objects.get(&stream_id)?.as_stream()?;
+        let bytes = decode_stream(stream).ok()?;
+        let program = Self::program_from_bytes(&bytes, pf.format);
+        let mut cps: Vec<u32> = program
+            .as_ref()
+            .map(|p| self.web_font_union_pairs(&pf, p, None))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(cp, _)| cp)
+            .collect();
+        if cps.is_empty() {
+            cps = match &program {
+                Some(crate::font::GlyphSource::TrueType(f)) => {
+                    f.gid_to_unicode_map().into_values().collect()
+                }
+                Some(crate::font::GlyphSource::Cff(f)) => {
+                    crate::font::cff_to_otf::cff_unicode_to_gid(f)
+                        .into_keys()
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+        }
+        cps.sort_unstable();
+        cps.dedup();
+        Some(cps)
+    }
+
+    /// The **union** `Unicode → gid` map for one physical program, built over
+    /// every wrapper font dict referencing it, in two phases:
+    ///
+    /// 1. each wrapper's **explicit** entries (its raw `/ToUnicode`, plus the
+    ///    declared `/Encoding`/`/Differences` map for a simple font) — the
+    ///    `prefer_wrapper` wrapper (matched by raw `/BaseFont`) goes first so
+    ///    the run's own declared mapping wins on conflict, the rest follow in
+    ///    ascending object-id order (deterministic first-wins);
+    /// 2. **inferred** fills (affine ASCII-gap recovery, the program's own
+    ///    `gid → Unicode` cmap, WinAnsi) — never overriding a phase-1 entry.
+    ///
+    /// This is what completes the served face when one program hides behind
+    /// many wrappers with disjoint partial `/ToUnicode`s (the CERFA case: the
+    /// canonical wrapper carries 34 `bfchar`, a homonym only 2 — the union has
+    /// all 34, accents included).
+    fn web_font_union_pairs(
+        &self,
+        pf: &PhysicalFont,
+        program: &crate::font::GlyphSource,
+        prefer_wrapper: Option<&str>,
+    ) -> Vec<(u32, u16)> {
+        let mut wrappers: Vec<(ObjectId, Dictionary)> = pf
+            .wrapper_ids
+            .iter()
+            .filter_map(|id| Some((*id, self.objects.get(id)?.as_dict()?.clone())))
+            .collect();
+        if let Some(pref) = prefer_wrapper.map(str::trim).filter(|p| !p.is_empty()) {
+            wrappers.sort_by_key(|(id, d)| {
+                let is_pref = d
+                    .get(b"BaseFont")
+                    .and_then(Object::as_name)
+                    .is_some_and(|n| String::from_utf8_lossy(n).eq_ignore_ascii_case(pref));
+                (!is_pref, *id)
+            });
+        }
+        let splits: Vec<SplitCmapPairs> = wrappers
+            .iter()
+            .map(|(_, d)| self.wrapper_cmap_pairs_split(d, program))
+            .collect();
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        let mut pairs: Vec<(u32, u16)> = Vec::new();
+        for (explicit, _) in &splits {
+            for &(cp, gid) in explicit {
+                if seen.insert(cp) {
+                    pairs.push((cp, gid));
+                }
+            }
+        }
+        for (_, inferred) in &splits {
+            for &(cp, gid) in inferred {
+                if seen.insert(cp) {
+                    pairs.push((cp, gid));
+                }
+            }
+        }
+        pairs.sort_unstable_by_key(|&(cp, _)| cp);
+        pairs
+    }
+
+    /// One wrapper's `(explicit, inferred)` cmap pairs for the union path:
+    /// composite split for a Type0 wrapper, simple split otherwise.
+    fn wrapper_cmap_pairs_split(
+        &self,
+        dict: &Dictionary,
+        program: &crate::font::GlyphSource,
+    ) -> SplitCmapPairs {
+        if dict.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice()) {
+            self.composite_cmap_pairs_split(dict, program)
+        } else {
+            self.simple_cmap_pairs_split(dict, program)
+        }
+    }
+
+    /// [`composite_cmap_pairs`](Self::composite_cmap_pairs)'s two-bucket sibling
+    /// for the by-id union path: `(explicit, inferred)` pairs, where **explicit**
+    /// comes from the wrapper's raw `/ToUnicode` entries and **inferred** from
+    /// the affine ASCII-gap recovery plus the program's own `gid → Unicode`
+    /// cmap. Unlike the single-bucket original it does NOT bail without a
+    /// `/ToUnicode` — a ToUnicode-less wrapper still contributes its
+    /// program-cmap fills — and it keeps supplementary-plane scalars (the by-id
+    /// `cmap` builder emits a format 12 subtable for them).
+    fn composite_cmap_pairs_split(
+        &self,
+        font: &Dictionary,
+        program: &crate::font::GlyphSource,
+    ) -> SplitCmapPairs {
+        let raw = font
+            .get(b"ToUnicode")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)
+            .and_then(|s| decode_stream(s).ok())
+            .map(|b| crate::font::cmap::ToUnicode::parse(&b))
+            .filter(|t| !t.is_empty());
+        let filled = raw.clone().map(|mut t| {
+            t.infer_ascii_gaps(self.document_ascii_offset(), &BTreeSet::new());
+            t
+        });
+        let code_to_cid = self.composite_code_to_cid(font);
+        let cid_to_gid = self.composite_cid_to_gid(font, Some(program));
+        let num_glyphs = match program {
+            crate::font::GlyphSource::TrueType(f) => f.num_glyphs(),
+            crate::font::GlyphSource::Cff(f) => f.num_glyphs(),
+            crate::font::GlyphSource::Type1(_) => return (Vec::new(), Vec::new()),
+        };
+        if num_glyphs == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let gid_unicode = self.cid_font_cmap_unicode(font);
+        let mut explicit: Vec<(u32, u16)> = Vec::new();
+        let mut inferred: Vec<(u32, u16)> = Vec::new();
+        let mut seen_explicit: BTreeSet<u32> = BTreeSet::new();
+        let mut seen_inferred: BTreeSet<u32> = BTreeSet::new();
+        for code in 0u32..=0xFFFF {
+            // code → CID → gid: the SAME resolution the rasterizer uses (see
+            // `composite_cmap_pairs`).
+            let cid = match &code_to_cid {
+                Some(cmap) => match cmap.cid(code as u16) {
+                    Some(c) => c as u32,
+                    None => continue,
+                },
+                None => code,
+            };
+            let gid = match &cid_to_gid {
+                Some(map) => map.get(cid as usize).copied().unwrap_or(0),
+                None => cid as u16,
+            };
+            if gid == 0 || gid as u32 >= num_glyphs as u32 {
+                continue;
+            }
+            let from_raw = raw
+                .as_ref()
+                .and_then(|t| t.decode(code))
+                .and_then(|s| s.chars().next())
+                .map(|c| c as u32);
+            let (scalar, bucket, seen) = match from_raw {
+                Some(s) => (s, &mut explicit, &mut seen_explicit),
+                None => {
+                    let fallback = filled
+                        .as_ref()
+                        .and_then(|t| t.decode(code))
+                        .and_then(|s| s.chars().next())
+                        .map(|c| c as u32)
+                        .or_else(|| {
+                            gid_unicode
+                                .as_ref()
+                                .and_then(|m| m.get(&gid))
+                                .and_then(|s| s.chars().next())
+                                .map(|c| c as u32)
+                        });
+                    let Some(s) = fallback else { continue };
+                    (s, &mut inferred, &mut seen_inferred)
+                }
+            };
+            // Skip control points (space 0x20 kept — its empty glyf is a
+            // legitimate advance-only glyph).
+            if scalar < 0x20 {
+                continue;
+            }
+            if seen.insert(scalar) {
+                bucket.push((scalar, gid));
+            }
+        }
+        (explicit, inferred)
+    }
+
+    /// [`simple_cmap_pairs`](Self::simple_cmap_pairs)'s two-bucket sibling for
+    /// the by-id union path: `(explicit, inferred)` pairs, where **explicit**
+    /// comes from the declared `/Encoding`/`/Differences` map and the raw
+    /// `/ToUnicode`, and **inferred** from the affine ASCII-gap recovery and the
+    /// WinAnsi fallback. No donor sibling is consulted (the by-id path already
+    /// targets the exact program).
+    fn simple_cmap_pairs_split(
+        &self,
+        font: &Dictionary,
+        program: &crate::font::GlyphSource,
+    ) -> SplitCmapPairs {
+        use crate::font::GlyphSource;
+        let code_to_gid = self.simple_code_to_gid(font, Some(program));
+        let num_glyphs = match program {
+            GlyphSource::TrueType(f) => f.num_glyphs(),
+            GlyphSource::Cff(f) => f.num_glyphs(),
+            GlyphSource::Type1(f) => f.name_to_gid_map().len().min(0xFFFF) as u16,
+        };
+        if num_glyphs == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let simple_encoding = self.simple_font_encoding(font, Some(program));
+        let reserved: BTreeSet<u32> = simple_encoding
+            .as_ref()
+            .map(|m| m.keys().map(|&c| c as u32).collect())
+            .unwrap_or_default();
+        let raw_tu = font
+            .get(b"ToUnicode")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)
+            .and_then(|s| decode_stream(s).ok())
+            .map(|bytes| crate::font::cmap::ToUnicode::parse(&bytes))
+            .filter(|c| !c.is_empty());
+        let filled_tu = raw_tu.clone().map(|mut c| {
+            c.infer_ascii_gaps(self.document_ascii_offset(), &reserved);
+            c
+        });
+        let in_range = |g: u16| g != 0 && (g as u32) < num_glyphs as u32;
+        let tt = match program {
+            GlyphSource::TrueType(f) => Some(f),
+            _ => None,
+        };
+        let post_names = tt.map(|f| f.post_name_to_gid()).unwrap_or_default();
+        let differences = if tt.is_some() && !post_names.is_empty() {
+            self.encoding_differences(font)
+        } else {
+            BTreeMap::new()
+        };
+        let mut explicit: Vec<(u32, u16)> = Vec::new();
+        let mut inferred: Vec<(u32, u16)> = Vec::new();
+        let mut seen_explicit: BTreeSet<u32> = BTreeSet::new();
+        let mut seen_inferred: BTreeSet<u32> = BTreeSet::new();
+        for code in 0u32..=255 {
+            let from_declared = simple_encoding
+                .as_ref()
+                .and_then(|m| m.get(&(code as u8)))
+                .and_then(|s| s.chars().next())
+                .map(|c| c as u32)
+                .or_else(|| {
+                    raw_tu
+                        .as_ref()
+                        .and_then(|t| t.decode(code))
+                        .and_then(|s| s.chars().next())
+                        .map(|c| c as u32)
+                });
+            let (cp, bucket, seen) = match from_declared {
+                Some(s) => (s, &mut explicit, &mut seen_explicit),
+                None => {
+                    let fallback = filled_tu
+                        .as_ref()
+                        .and_then(|t| t.decode(code))
+                        .and_then(|s| s.chars().next())
+                        .map(|c| c as u32)
+                        .or_else(|| {
+                            let c = crate::font::winansi_to_char(code as u8) as u32;
+                            (c != 0).then_some(c)
+                        });
+                    let Some(s) = fallback else { continue };
+                    (s, &mut inferred, &mut seen_inferred)
+                }
+            };
+            if cp < 0x20 {
+                continue;
+            }
+            // gid resolution — identical to `simple_cmap_pairs` (donor-less).
+            let gid = if let Some(map) = &code_to_gid {
+                match map.get(&code).copied() {
+                    Some(g) => g,
+                    None => continue,
+                }
+            } else if let Some(ttf) = tt {
+                let solid = |g: u16| in_range(g) && !ttf.glyph_is_empty(g);
+                ttf.gid_for_unicode(cp)
+                    .filter(|&g| solid(g))
+                    .or_else(|| {
+                        differences
+                            .get(&(code as u8))
+                            .and_then(|name| post_names.get(name).copied())
+                            .filter(|&g| solid(g))
+                    })
+                    .or_else(|| ttf.gid_for_unicode(cp).filter(|&g| in_range(g)))
+                    .unwrap_or(code as u16)
+            } else {
+                code as u16
+            };
+            if !in_range(gid) {
+                continue;
+            }
+            if seen.insert(cp) {
+                bucket.push((cp, gid));
+            }
+        }
+        (explicit, inferred)
     }
 
     /// Index of the element at page point `(x, y)` (user space), preferring the
@@ -21174,6 +22019,7 @@ impl Document {
     /// `font_id` are the field's `/DA` font resource name and the `/DR` object
     /// it resolves to (see [`Self::resolve_da_font`]) — so the appearance
     /// references the document's own font and adds nothing to the PDF.
+    #[allow(clippy::too_many_arguments)]
     fn write_text_appearance(
         &mut self,
         widget: &mut Dictionary,
@@ -21182,8 +22028,10 @@ impl Document {
         style: TextFieldStyle,
         font_res: &[u8],
         font_id: ObjectId,
+        layout: &TextFieldLayout,
     ) {
-        let (mut form, content) = build_text_field_appearance(rect, text, style, font_res, font_id);
+        let (mut form, content) =
+            build_text_field_appearance(rect, text, style, font_res, font_id, layout);
         form.set(b"Length".to_vec(), Object::Integer(content.len() as i64));
         let ap_id = (self.next_object_number(), 0u16);
         self.objects
@@ -21215,11 +22063,12 @@ impl Document {
                 return;
             }
         };
+        let layout = self.field_layout(field, &font_res, font_id);
 
         // Merged widget: the field object is itself the widget.
         if field.contains(b"Rect") {
             let rect = self.read_rect(field);
-            self.write_text_appearance(field, rect, text, style, &font_res, font_id);
+            self.write_text_appearance(field, rect, text, style, &font_res, font_id, &layout);
             return;
         }
 
@@ -21239,7 +22088,7 @@ impl Document {
                 continue;
             }
             let rect = self.read_rect(&kid);
-            self.write_text_appearance(&mut kid, rect, text, style, &font_res, font_id);
+            self.write_text_appearance(&mut kid, rect, text, style, &font_res, font_id, &layout);
             self.objects.insert(kid_id, Object::Dictionary(kid));
             wrote_any = true;
         }
@@ -21247,6 +22096,61 @@ impl Document {
         // No usable geometry: ask a viewer to regenerate from `/V`.
         if !wrote_any {
             self.set_need_appearances();
+        }
+    }
+
+    /// A field attribute that may be **inherited** from an ancestor (`/Parent`
+    /// chain, ISO 32000-1 §12.7.4.1 — `/FT`, `/Ff` and `/MaxLen` are all
+    /// inheritable): the first dict from `field` upward that carries `key`
+    /// wins. Depth-capped against cyclic `/Parent` links.
+    fn inherited_field_attr(&self, field: &Dictionary, key: &[u8]) -> Option<Object> {
+        let mut current = field.clone();
+        for _ in 0..16 {
+            if let Some(obj) = current.get(key) {
+                return Some(self.resolve(obj).clone());
+            }
+            let parent = current.get(b"Parent").and_then(Object::as_reference)?;
+            current = self.objects.get(&parent).and_then(Object::as_dict)?.clone();
+        }
+        None
+    }
+
+    /// Derive the layout of a (re)generated appearance from the field itself:
+    /// **comb** (`Ff` bit 25 with a positive `/MaxLen`, text fields only and —
+    /// per ISO 32000-1 Table 228 — only when the field is not multiline),
+    /// **multiline** (`Ff` bit 13), and the AFM **measurement face** (the
+    /// `/BaseFont` of the `/DR` font the `/DA` resolved to, falling back to
+    /// the `/DA` resource name; non-base-14 faces measure as Helvetica).
+    fn field_layout(&self, field: &Dictionary, font_res: &[u8], font_id: ObjectId) -> TextFieldLayout {
+        let ft = self.inherited_field_attr(field, b"FT");
+        let is_text = ft.as_ref().and_then(Object::as_name) == Some(b"Tx".as_slice());
+        let ff = self
+            .inherited_field_attr(field, b"Ff")
+            .as_ref()
+            .and_then(Object::as_i64)
+            .unwrap_or(0) as u32;
+        let multiline = is_text && ff & form::flags::MULTILINE != 0;
+        let comb = if is_text && !multiline && ff & form::flags::COMB != 0 {
+            self.inherited_field_attr(field, b"MaxLen")
+                .as_ref()
+                .and_then(Object::as_i64)
+                .filter(|&m| m > 0)
+                .map(|m| m as u32)
+        } else {
+            None
+        };
+        let measure_font = self
+            .objects
+            .get(&font_id)
+            .and_then(Object::as_dict)
+            .and_then(|f| f.get(b"BaseFont"))
+            .and_then(Object::as_name)
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .unwrap_or_else(|| String::from_utf8_lossy(font_res).into_owned());
+        TextFieldLayout {
+            comb,
+            multiline,
+            measure_font,
         }
     }
 
@@ -21340,6 +22244,71 @@ impl Document {
         }
         self.objects.insert(id, Object::Dictionary(dict));
         Ok(())
+    }
+
+    /// Set a checkbox to the **named** appearance state — the on-state export
+    /// of one of its widgets. A multi-widget checkbox names one export per
+    /// widget (e.g. `Oui` / `non` on French CERFA forms), so
+    /// [`Self::set_checkbox`] — which always picks the *first* on-state — can
+    /// never reach the others; this can. `/V` becomes `/state` and every
+    /// widget's `/AS` becomes `/state` (when that widget's on-state matches)
+    /// or `/Off`. Passing `"Off"` unchecks every widget.
+    ///
+    /// Returns `false` — without mutating the document — when the field does
+    /// not exist or no widget carries `state` as its on-state.
+    pub fn set_checkbox_state(&mut self, name: &str, state: &str) -> bool {
+        let Ok((id, mut dict)) = self.require_field(name) else {
+            return false;
+        };
+        let target = state.as_bytes().to_vec();
+        // `Off` is universally valid: it is every widget's "unchecked" state.
+        let off = target == b"Off";
+
+        let kids: Vec<ObjectId> = dict
+            .get(b"Kids")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(|a| a.iter().filter_map(Object::as_reference).collect())
+            .unwrap_or_default();
+
+        if kids.is_empty() {
+            // Merged widget: the field object itself carries the `/AP /N` states.
+            if !off && self.widget_on_state(&dict).as_deref() != Some(target.as_slice()) {
+                return false;
+            }
+            dict.set(b"AS".to_vec(), Object::Name(target.clone()));
+        } else {
+            // Probe every kid first so an unknown state mutates nothing.
+            let probed: Vec<(ObjectId, bool)> = kids
+                .iter()
+                .filter_map(|kid_id| {
+                    let kid = self.objects.get(kid_id).and_then(Object::as_dict)?;
+                    let is_target =
+                        self.widget_on_state(kid).as_deref() == Some(target.as_slice());
+                    Some((*kid_id, is_target))
+                })
+                .collect();
+            if !off && !probed.iter().any(|(_, m)| *m) {
+                return false;
+            }
+            for (kid_id, is_target) in probed {
+                let Some(mut kid) = self.objects.get(&kid_id).and_then(Object::as_dict).cloned()
+                else {
+                    continue;
+                };
+                let as_state = if is_target {
+                    target.clone()
+                } else {
+                    b"Off".to_vec()
+                };
+                kid.set(b"AS".to_vec(), Object::Name(as_state));
+                self.objects.insert(kid_id, Object::Dictionary(kid));
+            }
+        }
+
+        dict.set(b"V".to_vec(), Object::Name(target));
+        self.objects.insert(id, Object::Dictionary(dict));
+        true
     }
 
     /// Select one option of a radio-button group by its export value. Every
@@ -26568,6 +27537,452 @@ mod tests {
         assert!(
             after.windows(11).any(|w| w == b"/Helvetica "),
             "appearance references the field /DA font (/Helvetica) from /DR"
+        );
+    }
+
+    /// The decoded `/AP /N` content stream of a field's (merged) widget.
+    fn field_appearance_stream(doc: &Document, name: &str) -> Vec<u8> {
+        let id = doc.find_field_id(name).expect("field exists");
+        let dict = doc
+            .objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .expect("field dict");
+        // Merged widget, or first /Kids widget carrying an /AP.
+        let widget: Dictionary = if dict.contains(b"AP") {
+            dict
+        } else {
+            let kids: Vec<ObjectId> = dict
+                .get(b"Kids")
+                .map(|o| doc.resolve(o))
+                .and_then(Object::as_array)
+                .map(|a| a.iter().filter_map(Object::as_reference).collect())
+                .expect("field has /AP or /Kids");
+            kids.iter()
+                .filter_map(|kid| doc.objects.get(kid).and_then(Object::as_dict))
+                .find(|k| k.contains(b"AP"))
+                .cloned()
+                .expect("a kid widget carries /AP")
+        };
+        let ap = widget
+            .get(b"AP")
+            .map(|o| doc.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .expect("/AP dict");
+        let ap_ref = ap
+            .get(b"N")
+            .and_then(Object::as_reference)
+            .expect("/AP /N reference");
+        match doc.objects.get(&ap_ref) {
+            Some(Object::Stream(s)) => decode_stream(s).expect("decodable /AP stream"),
+            _ => panic!("/AP /N is not a stream"),
+        }
+    }
+
+    /// Every `1 0 0 1 x y Tm` x-translation in an appearance stream, in order.
+    fn appearance_tm_xs(content: &[u8]) -> Vec<f64> {
+        String::from_utf8_lossy(content)
+            .lines()
+            .filter(|l| l.trim_end().ends_with("Tm"))
+            .filter_map(|l| {
+                let toks: Vec<&str> = l.split_whitespace().collect();
+                // `1 0 0 1 x y Tm`
+                (toks.len() == 7).then(|| toks[4].parse::<f64>().ok())?
+            })
+            .collect()
+    }
+
+    /// The `Tf` point size declared in an appearance stream.
+    fn appearance_tf_size(content: &[u8]) -> f64 {
+        let text = String::from_utf8_lossy(content);
+        let toks: Vec<&str> = text.split_whitespace().collect();
+        toks.iter()
+            .position(|&t| t == "Tf")
+            .and_then(|i| toks[i - 1].parse::<f64>().ok())
+            .expect("appearance has a Tf size")
+    }
+
+    /// Set (OR) `/Ff` bits on a field, straight in the object table.
+    fn or_field_flags(doc: &mut Document, name: &str, bits: u32) {
+        let id = doc.find_field_id(name).unwrap();
+        let mut dict = doc
+            .objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap();
+        let ff = dict.get(b"Ff").and_then(Object::as_i64).unwrap_or(0) as u32 | bits;
+        dict.set(b"Ff".to_vec(), Object::Integer(i64::from(ff)));
+        doc.objects.insert(id, Object::Dictionary(dict));
+    }
+
+    /// A comb field (`Ff` COMB + `/MaxLen`) draws **one character per cell**:
+    /// 13 `Tm`/`Tj` pairs whose x-translations step by exactly `width / 13`
+    /// (digits share one advance, so the centred positions are equidistant).
+    #[test]
+    fn comb_field_draws_one_character_per_cell() {
+        let pdf = crate::convert::reverse::txt_to_pdf("comb host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default(); // font_size 0 = auto
+        doc.add_text_field(
+            1,
+            "nir",
+            [50.0, 700.0, 310.0, 720.0], // 260 wide → 13 cells of 20
+            "",
+            Some(13),
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+        or_field_flags(&mut doc, "nir", form::flags::COMB);
+
+        doc.set_text_field("nir", "1234567890123").unwrap();
+
+        let content = field_appearance_stream(&doc, "nir");
+        let xs = appearance_tm_xs(&content);
+        assert_eq!(xs.len(), 13, "one positioning per character");
+        let tj_count = content.windows(3).filter(|w| w == b" Tj").count();
+        assert_eq!(tj_count, 13, "one Tj per character");
+
+        // Regular cells: consecutive x deltas all equal the cell width (20pt).
+        let cell = 260.0 / 13.0;
+        for pair in xs.windows(2) {
+            let delta = pair[1] - pair[0];
+            assert!(
+                (delta - cell).abs() < 0.05,
+                "cell step must be {cell}, got {delta} (xs={xs:?})"
+            );
+        }
+        // Every character stays inside its own cell.
+        let size = appearance_tf_size(&content);
+        for (i, &x) in xs.iter().enumerate() {
+            let cw = crate::font::afm::measure_winansi("Helvetica", "1", size);
+            assert!(
+                x >= i as f64 * cell - 0.01 && x + cw <= (i as f64 + 1.0) * cell + 0.01,
+                "char {i} centred in its cell (x={x}, cw={cw})"
+            );
+        }
+    }
+
+    /// Auto-size (`/DA … 0 Tf`) on a single line shrinks the point size until
+    /// the value fits the rectangle width (Adobe's shrink-to-fit), instead of
+    /// clamping on height alone and overflowing.
+    #[test]
+    fn auto_size_single_line_shrinks_to_fit_width() {
+        let pdf = crate::convert::reverse::txt_to_pdf("autosize host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default(); // font_size 0 = auto
+        doc.add_text_field(
+            1,
+            "nom",
+            [50.0, 700.0, 200.0, 720.0], // 150 wide, 20 tall
+            "",
+            None,
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+
+        let long = "JEAN-CHRISTOPHE DE LA ROCHEFOUCAULD-MONTBAZON";
+        doc.set_text_field("nom", long).unwrap();
+
+        let content = field_appearance_stream(&doc, "nom");
+        let size = appearance_tf_size(&content);
+        // The height-only formula would give (20*0.6).clamp(6,14) = 12pt; the
+        // width fit must shrink well below that…
+        assert!(size < 12.0, "size shrank below the height fit (got {size})");
+        // …down to where the text actually fits the usable width (150 - 2*2).
+        let painted = crate::font::afm::measure_winansi("Helvetica", long, size);
+        assert!(
+            painted <= 146.0 + 0.1,
+            "text fits the usable width ({painted} > 146)"
+        );
+        // …but never below the 4pt floor.
+        assert!(size >= 4.0, "size floored at 4pt (got {size})");
+    }
+
+    /// The MULTILINE flag alone (no `\n` in the value) triggers word-wrap at
+    /// the rectangle width.
+    #[test]
+    fn multiline_flag_wraps_value_without_newlines() {
+        let pdf = crate::convert::reverse::txt_to_pdf("multiline host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default();
+        doc.add_text_field(
+            1,
+            "adresse",
+            [50.0, 620.0, 250.0, 720.0], // 200 wide, 100 tall
+            "",
+            None,
+            true, // multiline
+            false,
+            &style,
+        )
+        .unwrap();
+
+        let value = "12 avenue du General de Gaulle Batiment C Escalier 4 Appartement 128";
+        doc.set_text_field("adresse", value).unwrap();
+
+        let content = field_appearance_stream(&doc, "adresse");
+        let tj_count = content.windows(3).filter(|w| w == b" Tj").count();
+        assert!(
+            tj_count >= 2,
+            "flag-multiline value must wrap to several lines (got {tj_count})"
+        );
+        // Each painted line fits the usable width at the declared size.
+        let size = appearance_tf_size(&content);
+        for line in String::from_utf8_lossy(&content)
+            .lines()
+            .filter(|l| l.ends_with(" Tj"))
+        {
+            let text = line
+                .trim_end_matches(" Tj")
+                .trim_start_matches('(')
+                .trim_end_matches(')');
+            let w = crate::font::afm::measure_winansi("Helvetica", text, size);
+            assert!(w <= 196.0 + 0.1, "wrapped line '{text}' overflows ({w})");
+        }
+    }
+
+    /// `/Q` quadding measures the line with the metrics of the **real** `/DA`
+    /// font (here Times via `/TiRo` in `/DR`), not always Helvetica: the
+    /// centred x offset matches the Times width and differs from what a
+    /// Helvetica measurement would give.
+    #[test]
+    fn quadding_measures_with_the_da_font_metrics() {
+        let pdf = crate::convert::reverse::txt_to_pdf("quadding host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default();
+        doc.add_text_field(
+            1,
+            "titre",
+            [50.0, 700.0, 350.0, 720.0], // 300 wide
+            "",
+            None,
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+
+        // Register a real Times-Roman under `/DR /Font /TiRo` and point the
+        // field's `/DA` at it, centre-quadded.
+        let font_id = (doc.next_object_number(), 0u16);
+        let mut f = Dictionary::new();
+        f.set(b"Type".to_vec(), annot::name(b"Font"));
+        f.set(b"Subtype".to_vec(), annot::name(b"Type1"));
+        f.set(b"BaseFont".to_vec(), annot::name(b"Times-Roman"));
+        f.set(b"Encoding".to_vec(), annot::name(b"WinAnsiEncoding"));
+        doc.objects.insert(font_id, Object::Dictionary(f));
+        doc.register_dr_font(b"TiRo", font_id).unwrap();
+        {
+            let id = doc.find_field_id("titre").unwrap();
+            let mut dict = doc
+                .objects
+                .get(&id)
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap();
+            dict.set(
+                b"DA".to_vec(),
+                Object::String(b"/TiRo 12 Tf 0 g".to_vec(), StringKind::Literal),
+            );
+            dict.set(b"Q".to_vec(), Object::Integer(1)); // centre
+            doc.objects.insert(id, Object::Dictionary(dict));
+        }
+
+        let text = "WAVE AWAY MAYHEM";
+        doc.set_text_field("titre", text).unwrap();
+
+        let content = field_appearance_stream(&doc, "titre");
+        assert!(
+            String::from_utf8_lossy(&content).contains("/TiRo 12 Tf"),
+            "appearance uses the /DA font and size"
+        );
+        let xs = appearance_tm_xs(&content);
+        assert_eq!(xs.len(), 1, "single centred line");
+
+        let usable = 300.0 - 4.0;
+        let times_w = crate::font::afm::measure_winansi("Times-Roman", text, 12.0);
+        let helv_w = crate::font::afm::measure_winansi("Helvetica", text, 12.0);
+        assert!(
+            (times_w - helv_w).abs() > 1.0,
+            "the two faces must measure differently for this test to bite"
+        );
+        let expect_times = 2.0 + (usable - times_w) / 2.0;
+        let expect_helv = 2.0 + (usable - helv_w) / 2.0;
+        assert!(
+            (xs[0] - expect_times).abs() < 0.05,
+            "centred with Times metrics (x={}, want {expect_times})",
+            xs[0]
+        );
+        assert!(
+            (xs[0] - expect_helv).abs() > 0.4,
+            "and NOT with Helvetica metrics (x={}, helv would be {expect_helv})",
+            xs[0]
+        );
+    }
+
+    /// `set_checkbox_state` reaches **any** named export of a multi-widget
+    /// checkbox (e.g. `Oui` / `non`): `/V` takes the state, the matching kid's
+    /// `/AS` takes the state, every other kid goes `/Off`; the inverse state
+    /// works too; an unknown state returns `false` and mutates nothing.
+    #[test]
+    fn set_checkbox_state_targets_the_named_widget() {
+        let pdf = crate::convert::reverse::txt_to_pdf("checkbox host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default();
+        // Two widgets with named exports; then drop the RADIO flag so the
+        // field classifies as a checkbox (the CERFA multi-widget layout).
+        doc.add_radio_group(
+            1,
+            "RAT",
+            &[
+                ("Oui".to_string(), [50.0, 700.0, 64.0, 714.0]),
+                ("non".to_string(), [90.0, 700.0, 104.0, 714.0]),
+            ],
+            None,
+            &style,
+        )
+        .unwrap();
+        {
+            let id = doc.find_field_id("RAT").unwrap();
+            let mut dict = doc
+                .objects
+                .get(&id)
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap();
+            dict.set(b"Ff".to_vec(), Object::Integer(0));
+            doc.objects.insert(id, Object::Dictionary(dict));
+        }
+
+        // `set_checkbox(…, true)` can only reach the FIRST export ("Oui");
+        // the named API reaches "non".
+        assert!(doc.set_checkbox_state("RAT", "non"), "known state accepted");
+
+        let kid_as = |doc: &Document, export: &[u8]| -> Vec<u8> {
+            let id = doc.find_field_id("RAT").unwrap();
+            let dict = doc.objects.get(&id).and_then(Object::as_dict).unwrap();
+            let kids: Vec<ObjectId> = dict
+                .get(b"Kids")
+                .map(|o| doc.resolve(o))
+                .and_then(Object::as_array)
+                .map(|a| a.iter().filter_map(Object::as_reference).collect())
+                .unwrap();
+            for kid_id in kids {
+                let kid = doc.objects.get(&kid_id).and_then(Object::as_dict).unwrap();
+                if doc.widget_on_state(kid).as_deref() == Some(export) {
+                    return kid
+                        .get(b"AS")
+                        .and_then(Object::as_name)
+                        .unwrap_or(b"?")
+                        .to_vec();
+                }
+            }
+            panic!("no widget with export {:?}", String::from_utf8_lossy(export));
+        };
+        let field_v = |doc: &Document| -> Vec<u8> {
+            let id = doc.find_field_id("RAT").unwrap();
+            doc.objects
+                .get(&id)
+                .and_then(Object::as_dict)
+                .and_then(|d| d.get(b"V"))
+                .and_then(Object::as_name)
+                .unwrap_or(b"?")
+                .to_vec()
+        };
+
+        assert_eq!(field_v(&doc), b"non".to_vec(), "/V = /non");
+        assert_eq!(kid_as(&doc, b"non"), b"non".to_vec(), "non widget checked");
+        assert_eq!(kid_as(&doc, b"Oui"), b"Off".to_vec(), "Oui widget off");
+
+        // Inverse state.
+        assert!(doc.set_checkbox_state("RAT", "Oui"));
+        assert_eq!(field_v(&doc), b"Oui".to_vec());
+        assert_eq!(kid_as(&doc, b"Oui"), b"Oui".to_vec());
+        assert_eq!(kid_as(&doc, b"non"), b"Off".to_vec());
+
+        // Unknown state: refused, nothing mutated.
+        assert!(!doc.set_checkbox_state("RAT", "Peut-etre"));
+        assert_eq!(field_v(&doc), b"Oui".to_vec(), "unknown state left /V");
+        assert_eq!(kid_as(&doc, b"Oui"), b"Oui".to_vec(), "…and /AS untouched");
+
+        // Off unchecks everything; a missing field returns false.
+        assert!(doc.set_checkbox_state("RAT", "Off"));
+        assert_eq!(field_v(&doc), b"Off".to_vec());
+        assert_eq!(kid_as(&doc, b"Oui"), b"Off".to_vec());
+        assert_eq!(kid_as(&doc, b"non"), b"Off".to_vec());
+        assert!(!doc.set_checkbox_state("GHOST", "Oui"));
+    }
+
+    /// Comb layout must also regenerate on the `/Kids` widget layout (field
+    /// dict without `/Rect`, one kid widget carrying the rectangle) — the
+    /// comb/multiline flags travel with the *field*, the geometry with the kid.
+    #[test]
+    fn comb_regenerates_on_kids_widget_layout() {
+        let pdf = crate::convert::reverse::txt_to_pdf("comb kids host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let page_id = doc.page_object_id(1).unwrap();
+        let da = Object::String(b"/Helv 0 Tf 0 g".to_vec(), StringKind::Literal);
+        doc.ensure_acroform(&da).unwrap();
+
+        // Parent field: /FT /Tx + COMB + /MaxLen, no /Rect.
+        let parent_id = (doc.next_object_number(), 0u16);
+        doc.objects.insert(parent_id, Object::Null);
+        // Kid widget: the geometry only.
+        let mut kid = Dictionary::new();
+        kid.set(b"Type".to_vec(), annot::name(b"Annot"));
+        kid.set(b"Subtype".to_vec(), annot::name(b"Widget"));
+        kid.set(
+            b"Rect".to_vec(),
+            annot::real_array(&[100.0, 600.0, 220.0, 618.0]), // 120 wide → 6 cells of 20
+        );
+        kid.set(b"F".to_vec(), Object::Integer(4));
+        kid.set(b"P".to_vec(), Object::Reference(page_id));
+        kid.set(b"Parent".to_vec(), Object::Reference(parent_id));
+        let kid_id = (doc.next_object_number(), 0u16);
+        doc.objects.insert(kid_id, Object::Dictionary(kid));
+
+        let mut parent = Dictionary::new();
+        parent.set(b"FT".to_vec(), annot::name(b"Tx"));
+        parent.set(b"T".to_vec(), pdf_text("cle"));
+        parent.set(b"DA".to_vec(), da);
+        parent.set(
+            b"Ff".to_vec(),
+            Object::Integer(i64::from(form::flags::COMB)),
+        );
+        parent.set(b"MaxLen".to_vec(), Object::Integer(6));
+        parent.set(
+            b"Kids".to_vec(),
+            Object::Array(vec![Object::Reference(kid_id)]),
+        );
+        doc.objects.insert(parent_id, Object::Dictionary(parent));
+        doc.append_to_page_annots(page_id, kid_id);
+        doc.register_in_acroform(parent_id).unwrap();
+
+        doc.set_text_field("cle", "123456").unwrap();
+
+        // The KID's /AP /N carries the comb: 6 cells of 20pt.
+        let content = field_appearance_stream(&doc, "cle");
+        let xs = appearance_tm_xs(&content);
+        assert_eq!(xs.len(), 6, "one positioning per comb character");
+        for pair in xs.windows(2) {
+            assert!(
+                (pair[1] - pair[0] - 20.0).abs() < 0.05,
+                "kid comb cell step (xs={xs:?})"
+            );
+        }
+        // And the value round-trips.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let fields = reopened.form_fields().unwrap();
+        assert_eq!(
+            fields.iter().find(|f| f.name == "cle").unwrap().value,
+            "123456"
         );
     }
 
@@ -37499,6 +38914,255 @@ mod tests {
         assert!(
             rtf.contains("\\trowd") && rtf.contains("\\cellx"),
             "table emits a real grid: {rtf}"
+        );
+    }
+
+    // ── physical font identity: by-reference Type0 parent resolution, by-id
+    //    extraction with a union cmap, per-program dedup, fontId on runs ──
+
+    /// A `/FontFile2` stream object body wrapping `ttf`.
+    fn fontfile2_obj(ttf: &[u8]) -> Vec<u8> {
+        let mut body = format!("<< /Length {} >>\nstream\n", ttf.len()).into_bytes();
+        body.extend_from_slice(ttf);
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+
+    /// A `/ToUnicode` CMap stream object body with the given bf entries.
+    fn tounicode_obj(entries: &str) -> Vec<u8> {
+        let tu = format!(
+            "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+             1 begincodespacerange <0000> <FFFF> endcodespacerange \
+             {entries} endcmap end end"
+        );
+        let mut body = format!("<< /Length {} >>\nstream\n", tu.len()).into_bytes();
+        body.extend_from_slice(tu.as_bytes());
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+
+    /// Two Type0 wrappers (objs 6 and 9, `/BaseFont` `base1`/`base2`), each with
+    /// its own CIDFont (objs 7 and 10) and its own **different partial**
+    /// `/ToUnicode` (objs 8 and 11), both descriptors sharing ONE `/FontFile2`
+    /// program (obj 12, the bundled fallback TTF) — the CERFA shape in
+    /// miniature (dozens of wrappers over a handful of physical programs).
+    /// Wrapper 1: `<0001> → 'a'`. Wrapper 2: `<0002> → 'b'`, `<0003> → 'a'`
+    /// (an `'a'` CONFLICT with wrapper 1, at a different gid).
+    fn shared_program_fixture(base1: &str, base2: &str) -> Vec<u8> {
+        let type0 = |base: &str, cid_obj: u32, tu_obj: u32| {
+            format!(
+                "<< /Type /Font /Subtype /Type0 /BaseFont /{base} /Encoding /Identity-H \
+                 /DescendantFonts [{cid_obj} 0 R] /ToUnicode {tu_obj} 0 R >>"
+            )
+            .into_bytes()
+        };
+        let cid = |base: &str| {
+            format!(
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{base} \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                 /CIDToGIDMap /Identity /FontDescriptor 5 0 R >>"
+            )
+            .into_bytes()
+        };
+        let content = b"BT /F1 12 Tf 20 100 Td <0001> Tj ET";
+        let mut content_obj = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        content_obj.extend_from_slice(content);
+        content_obj.extend_from_slice(b"\nendstream");
+        raw_pdf_binary(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                   /Resources << /Font << /F1 6 0 R /F2 9 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, content_obj),
+            (
+                5,
+                b"<< /Type /FontDescriptor /FontName /AAAAAA+Shared /Flags 4 \
+                   /FontFile2 12 0 R >>"
+                    .to_vec(),
+            ),
+            (6, type0(base1, 7, 8)),
+            (7, cid(base1)),
+            (8, tounicode_obj("1 beginbfchar <0001> <0061> endbfchar")),
+            (9, type0(base2, 10, 11)),
+            (10, cid(base2)),
+            (
+                11,
+                tounicode_obj("2 beginbfchar <0002> <0062> <0003> <0061> endbfchar"),
+            ),
+            (12, fontfile2_obj(crate::font::bundled::FALLBACK_TTF)),
+        ])
+    }
+
+    /// The parent Type0 of a CIDFont must resolve **by reference** — with two
+    /// same-`/BaseFont` wrappers, a name lookup for the SECOND CIDFont lands on
+    /// the first homonym and serves its (wrong, 1-entry) `/ToUnicode`.
+    #[test]
+    fn type0_parent_resolves_by_reference_not_name() {
+        let doc =
+            Document::open(&shared_program_fixture("AAAAAA+Homonym", "AAAAAA+Homonym")).unwrap();
+        let cid2 = doc
+            .objects
+            .get(&(10, 0))
+            .and_then(Object::as_dict)
+            .expect("second CIDFont dict")
+            .clone();
+        let parent2 = doc.type0_for((10, 0), &cid2).expect("parent Type0 of CID 2");
+        assert_eq!(
+            parent2.get(b"ToUnicode").and_then(Object::as_reference),
+            Some((11, 0)),
+            "the SECOND CIDFont's parent is its OWN wrapper (obj 9, ToUnicode 11)"
+        );
+        let cid1 = doc
+            .objects
+            .get(&(7, 0))
+            .and_then(Object::as_dict)
+            .expect("first CIDFont dict")
+            .clone();
+        let parent1 = doc.type0_for((7, 0), &cid1).expect("parent Type0 of CID 1");
+        assert_eq!(
+            parent1.get(b"ToUnicode").and_then(Object::as_reference),
+            Some((8, 0))
+        );
+    }
+
+    /// By-id extraction serves a cmap that is the UNION of every wrapper's
+    /// explicit `/ToUnicode`; `prefer_wrapper` flips conflicts to the run's own
+    /// wrapper's entries.
+    #[test]
+    fn extract_web_font_by_id_unions_wrapper_tounicodes() {
+        let doc = Document::open(&shared_program_fixture(
+            "AAAAAA+UnionFace",
+            "BBBBBB+UnionFace",
+        ))
+        .unwrap();
+        let v2 = doc.embedded_fonts_v2();
+        assert_eq!(v2.len(), 1, "one physical program: {v2:?}");
+        let fid = v2[0].font_id.clone();
+        assert_eq!(fid.len(), 8, "font_id is 8 hex chars");
+
+        // No preference: wrapper 1 (lower object id) wins the 'a' conflict
+        // (gid 1); wrapper 2 still contributes its 'b' (gid 2) — the union.
+        let (bytes, tag) = doc
+            .extract_web_font_by_id(&fid, None)
+            .expect("by-id extraction");
+        assert_eq!(tag, "truetype");
+        let ttf = crate::font::truetype::TrueTypeFont::parse(&bytes).expect("served font parses");
+        assert_eq!(ttf.gid_for_unicode(0x61), Some(1), "'a' from wrapper 1");
+        assert_eq!(ttf.gid_for_unicode(0x62), Some(2), "'b' unioned from wrapper 2");
+
+        // Preferring wrapper 2 flips the 'a' conflict to ITS explicit entry.
+        let (bytes, _) = doc
+            .extract_web_font_by_id(&fid, Some("BBBBBB+UnionFace"))
+            .expect("by-id extraction with preference");
+        let ttf = crate::font::truetype::TrueTypeFont::parse(&bytes).unwrap();
+        assert_eq!(
+            ttf.gid_for_unicode(0x61),
+            Some(3),
+            "prefer_wrapper's explicit 'a' wins the conflict"
+        );
+        assert_eq!(ttf.gid_for_unicode(0x62), Some(2), "'b' unchanged");
+
+        // Coverage reports the served repertoire; unknown ids yield None.
+        let coverage = doc.web_font_coverage(&fid).expect("coverage");
+        assert!(coverage.contains(&0x61) && coverage.contains(&0x62));
+        assert!(doc.extract_web_font_by_id("00000000", None).is_none());
+        assert!(doc.web_font_coverage("00000000").is_none());
+    }
+
+    /// `embedded_fonts_v2` deduplicates by physical program (v1, by name, keeps
+    /// one entry per `/BaseFont`).
+    #[test]
+    fn embedded_fonts_v2_dedupes_by_physical_program() {
+        let doc = Document::open(&shared_program_fixture(
+            "AAAAAA+UnionFace",
+            "BBBBBB+UnionFace",
+        ))
+        .unwrap();
+        assert_eq!(doc.embedded_fonts().len(), 2, "v1 stays name-keyed");
+        let v2 = doc.embedded_fonts_v2();
+        assert_eq!(v2.len(), 1, "v2 collapses to the shared program: {v2:?}");
+        assert_eq!(v2[0].format, "truetype");
+        assert!(v2[0].num_glyphs > 0, "program parsed: {v2:?}");
+        assert_eq!(
+            v2[0].base_fonts,
+            vec![
+                "AAAAAA+UnionFace".to_string(),
+                "BBBBBB+UnionFace".to_string()
+            ],
+            "every wrapper name listed"
+        );
+    }
+
+    /// Every extracted text run carries the physical identity of its font's
+    /// embedded program (`font_id`), resolved against the run's own scope.
+    #[test]
+    fn text_elements_carry_physical_font_id() {
+        let doc = Document::open(&shared_program_fixture(
+            "AAAAAA+UnionFace",
+            "BBBBBB+UnionFace",
+        ))
+        .unwrap();
+        let fid = doc.embedded_fonts_v2()[0].font_id.clone();
+        let els = doc.page_text_elements(1);
+        assert!(!els.is_empty(), "fixture draws one run");
+        assert_eq!(els[0].base_font, "AAAAAA+UnionFace");
+        assert_eq!(
+            els[0].font_id, fid,
+            "the run's fontId is its program's physical identity"
+        );
+    }
+
+    /// An exact-raw `/BaseFont` match whose descriptor embeds NO program must
+    /// widen to the sister subset (same normalized name) instead of pinning the
+    /// search to the programless tier and returning `None` — the CERFA
+    /// `TimesNewRoman,BoldItalic` (metrics-only) case.
+    #[test]
+    fn web_font_widens_past_programless_exact_match() {
+        let pdf = raw_pdf_binary(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                   /Resources << /Font << /F1 6 0 R /F2 8 0 R >> >> >>"
+                    .to_vec(),
+            ),
+            (
+                5,
+                b"<< /Type /FontDescriptor /FontName /CCCCCC+NoProg,Bold /Flags 4 >>".to_vec(),
+            ),
+            (
+                6,
+                b"<< /Type /Font /Subtype /TrueType /BaseFont /CCCCCC+NoProg,Bold \
+                   /FontDescriptor 5 0 R >>"
+                    .to_vec(),
+            ),
+            (
+                7,
+                b"<< /Type /FontDescriptor /FontName /DDDDDD+NoProg,Bold /Flags 4 \
+                   /FontFile2 9 0 R >>"
+                    .to_vec(),
+            ),
+            (
+                8,
+                b"<< /Type /Font /Subtype /TrueType /BaseFont /DDDDDD+NoProg,Bold \
+                   /FontDescriptor 7 0 R >>"
+                    .to_vec(),
+            ),
+            (9, fontfile2_obj(crate::font::bundled::FALLBACK_TTF)),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        let (bytes, tag) = doc
+            .extract_font_for_web("CCCCCC+NoProg,Bold")
+            .expect("programless exact match widens to the sister subset");
+        assert_eq!(tag, "truetype");
+        assert!(
+            crate::font::truetype::TrueTypeFont::parse(&bytes).is_some(),
+            "served face parses"
         );
     }
 }

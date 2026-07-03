@@ -22,7 +22,8 @@ mod rng;
 
 use gigapdf_core::{
     Action, AfRelationship, Annotation, Bookmark, CollectionConfig, Color, ContentElement,
-    Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec,
+    Document, ElementKind, EmbeddedFontInfo, EmbeddedFontInfoV2, FieldKind, FormField,
+    GradientKind, GradientSpec,
     GradientStop, HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem,
     PageBox, PageLabelRange, PageLabelStyle, PageTransition, Permissions, RunningHeaderFooter,
     SearchMatch, TextLayerRun, TextLine, TextRun, TransitionDimension, TransitionDirection,
@@ -1064,16 +1065,19 @@ pub extern "C" fn gp_elements_json(
 }
 
 /// Every text element on a page as JSON, enriched for a host editor:
-/// `[{index,text,x,y,width,height,fontFamily,baseFont,bold,italic,fontSize,
-/// color:[r,g,b],rotation,direction,segments:[{text,x,y,width,height}]}]`.
+/// `[{index,text,x,y,width,height,fontFamily,baseFont,fontId,bold,italic,
+/// fontSize,color:[r,g,b],rotation,direction,segments:[{text,x,y,width,
+/// height}]}]`.
 /// `segments` is non-empty only for a justified/positioned run with a large
 /// internal `TJ` jump (a legal footer): its positioned fragments, so the host
 /// paints one 1:1 overlay box per fragment yet edits the whole run via `index`.
 /// Bounds are in user space (origin
 /// bottom-left); `index` is the text-run index accepted by `gp_replace_text`;
-/// `fontFamily` is the collapsed display family and `baseFont` the raw
+/// `fontFamily` is the collapsed display family, `baseFont` the raw
 /// `/BaseFont` (subset prefix kept) resolved against the run's own scope (page or
-/// form XObject); `direction` is `"ltr"`|`"rtl"`|`"neutral"` for the run's strong
+/// form XObject), and `fontId` the run's **physical** program identity (feed it
+/// to `gp_extract_web_font_by_id`; empty when the run's font embeds no program);
+/// `direction` is `"ltr"`|`"rtl"`|`"neutral"` for the run's strong
 /// characters. Host frees the returned buffer.
 #[no_mangle]
 pub extern "C" fn gp_text_elements_json(
@@ -1101,6 +1105,8 @@ pub extern "C" fn gp_text_elements_json(
                 json_escape(&e.font_family, &mut s);
                 s.push_str(",\"baseFont\":");
                 json_escape(&e.base_font, &mut s);
+                s.push_str(",\"fontId\":");
+                json_escape(&e.font_id, &mut s);
                 s.push_str(&format!(
                     ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{},\"direction\":\"{}\",\"segments\":[",
                     e.bold,
@@ -2269,6 +2275,26 @@ pub extern "C" fn gp_set_checkbox(
 ) -> i32 {
     let name = unsafe { str_arg(name_ptr, name_len) };
     edit(handle, |doc| doc.set_checkbox(name, checked != 0))
+}
+
+/// Set a checkbox to a **named** appearance state — the on-state export of one
+/// of its widgets (a multi-widget checkbox names one export per widget, e.g.
+/// `Oui` / `non`; `"Off"` unchecks). 0 on success, 1 when the field or state
+/// doesn't exist.
+#[no_mangle]
+pub extern "C" fn gp_set_checkbox_state(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+    state_ptr: *const u8,
+    state_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let state = unsafe { str_arg(state_ptr, state_len) };
+    match unsafe { handle.as_mut() } {
+        Some(doc) => i32::from(!doc.set_checkbox_state(name, state)),
+        None => -1,
+    }
 }
 
 /// Select a radio group's option by export value. 0 on success.
@@ -5247,6 +5273,96 @@ pub extern "C" fn gp_extract_web_font(
     }
 }
 
+/// Extract an embedded font as a **browser-loadable** sfnt by its **physical
+/// identity** (`fontId` — the value `gp_text_elements_json` /
+/// `gp_embedded_fonts_v2_json` report), serving a `cmap` built as the union of
+/// every wrapper font dict referencing the program (explicit `/ToUnicode`
+/// entries first — the optional `prefer_wrapper` raw `/BaseFont` winning on
+/// conflict — then inferred fills). Name-ambiguity-proof sibling of
+/// [`gp_extract_web_font`]: the subset is always served, never rejected for an
+/// incomplete map. Same encoding — first byte tags the format (1 = truetype,
+/// 2 = otf, 3 = cff, 4 = type1) followed by the sfnt bytes; null when no
+/// embedded program carries `font_id`. Pass `(0, 0)` for no `prefer_wrapper`.
+#[no_mangle]
+pub extern "C" fn gp_extract_web_font_by_id(
+    handle: *const Document,
+    id_ptr: *const u8,
+    id_len: usize,
+    prefer_ptr: *const u8,
+    prefer_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_ref() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let font_id = unsafe { str_arg(id_ptr, id_len) };
+    let prefer = unsafe { str_arg(prefer_ptr, prefer_len) };
+    let prefer = (!prefer.is_empty()).then_some(prefer);
+    match doc.extract_web_font_by_id(font_id, prefer) {
+        Some((bytes, format)) => {
+            let tag: u8 = match format {
+                "truetype" => 1,
+                "otf" => 2,
+                "cff" => 3,
+                _ => 4,
+            };
+            let mut out = Vec::with_capacity(bytes.len() + 1);
+            out.push(tag);
+            out.extend_from_slice(&bytes);
+            unsafe { bytes_into_host(out, out_len) }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// The document's embedded fonts **deduplicated by physical program** as a JSON
+/// array `[{"fontId":…,"format":"truetype"|"cff"|"type1","numGlyphs":N,
+/// "baseFonts":[…]}]` — one entry per `/FontFile*` stream, listing every
+/// `/BaseFont` wrapped around it. The per-program sibling of
+/// [`gp_embedded_fonts_json`] (kept intact); its `fontId`s feed
+/// [`gp_extract_web_font_by_id`]. Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_embedded_fonts_v2_json(
+    handle: *const Document,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_ref() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let json = embedded_fonts_v2_json(&doc.embedded_fonts_v2());
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// The Unicode code points mapped by the `cmap` [`gp_extract_web_font_by_id`]
+/// serves for `font_id`, as a JSON `number[]` (sorted, deduplicated) — lets a
+/// host check a run's characters against the served face before painting.
+/// `[]` when no embedded program carries `font_id`. Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_web_font_coverage(
+    handle: *const Document,
+    id_ptr: *const u8,
+    id_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_ref() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let font_id = unsafe { str_arg(id_ptr, id_len) };
+    let cps = doc.web_font_coverage(font_id).unwrap_or_default();
+    let mut json = String::from("[");
+    for (i, cp) in cps.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&cp.to_string());
+    }
+    json.push(']');
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Add a text-markup annotation (Highlight / Underline / StrikeOut / Squiggly)
 /// over `quads` (flat `[x0,y0,x1,y1, …]` in PDF coords). `meta` packs five
 /// `\x1f`-separated strings: subtype, contents, author, id, date. `rgb` packed
@@ -6712,6 +6828,29 @@ fn embedded_fonts_json(fonts: &[EmbeddedFontInfo]) -> String {
         out.push_str(",\"format\":");
         json_escape(&f.format, &mut out);
         out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+fn embedded_fonts_v2_json(fonts: &[EmbeddedFontInfoV2]) -> String {
+    let mut out = String::from("[");
+    for (i, f) in fonts.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"fontId\":");
+        json_escape(&f.font_id, &mut out);
+        out.push_str(",\"format\":");
+        json_escape(&f.format, &mut out);
+        out.push_str(&format!(",\"numGlyphs\":{},\"baseFonts\":[", f.num_glyphs));
+        for (j, base) in f.base_fonts.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            json_escape(base, &mut out);
+        }
+        out.push_str("]}");
     }
     out.push(']');
     out

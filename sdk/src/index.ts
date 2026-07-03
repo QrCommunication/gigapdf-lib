@@ -1172,6 +1172,32 @@ export interface EmbeddedFont {
    */
   format: "truetype" | "cff" | "type1";
 }
+/**
+ * One embedded font **program** (from {@link GigaPdfDoc.embeddedFontsV2}) —
+ * the per-program, deduplicated sibling of {@link EmbeddedFont}. A form
+ * generator routinely embeds dozens of same-family font wrappers whose
+ * descriptors all share a handful of physical programs; where
+ * {@link GigaPdfDoc.embeddedFonts} lists one entry per *name*, this lists one
+ * entry per `/FontFile*` stream, with every name wrapped around it.
+ */
+export interface EmbeddedFontV2 {
+  /**
+   * The program's stable content identity (first 8 hex chars of the SHA-256
+   * of the decoded bytes) — feed it to {@link GigaPdfDoc.extractWebFontById}
+   * / {@link GigaPdfDoc.webFontCoverage}. Matches
+   * {@link TextElementInfo.fontId}.
+   */
+  fontId: string;
+  /** Embedded program format (see {@link EmbeddedFont.format}). */
+  format: "truetype" | "cff" | "type1";
+  /** Glyph count of the parsed program (`0` when it does not parse). */
+  numGlyphs: number;
+  /**
+   * The `/BaseFont` names of every wrapper font dict referencing this program
+   * (deduplicated, sorted).
+   */
+  baseFonts: string[];
+}
 export interface Box {
   x: number;
   y: number;
@@ -1206,6 +1232,17 @@ export interface TextElementInfo {
    * Empty when the run's font carried no `/BaseFont` (e.g. a Type3 font).
    */
   baseFont: string;
+  /**
+   * The **physical** identity of the run's embedded font program — the first
+   * 8 hex chars of the SHA-256 of its decoded `/FontFile*` bytes, matching
+   * {@link EmbeddedFontV2.fontId}. Unlike {@link baseFont} (a *name*,
+   * ambiguous when many wrapper dicts share one program), this pins the exact
+   * program: feed it to {@link GigaPdfDoc.extractWebFontById} (with this
+   * run's {@link baseFont} as `preferWrapper`) to always get the run's own
+   * glyphs. Empty when the run's font embeds no program (base-14 /
+   * non-embedded faces, Type3).
+   */
+  fontId?: string;
   bold: boolean;
   italic: boolean;
   /** Effective glyph size in points. */
@@ -1315,6 +1352,12 @@ export interface GigaInlineRun {
   style: GigaCharStyle;
   /** Index of the source content-stream run for in-place round-tripping, or `null`. */
   source_index: number | null;
+  /**
+   * Every source content-stream run index this span was coalesced from (the
+   * scalar `source_index` is its first entry, kept for backward compatibility).
+   * Present since 0.114.0; older documents/readers may omit it.
+   */
+  source_indices?: number[];
 }
 
 /** Paragraph-level formatting (mirror of `model::style::ParagraphStyle`). */
@@ -4326,6 +4369,35 @@ export class GigaPdfDoc {
     return { format, bytes: buf.subarray(1) };
   }
   /**
+   * Extract an embedded font as a **browser-loadable** sfnt by its **physical
+   * identity** (`fontId` — the value {@link textElements} and
+   * {@link embeddedFontsV2} report). The name-ambiguity-proof sibling of
+   * {@link extractWebFont}: a form generator routinely embeds dozens of
+   * same-`/BaseFont` wrappers over a handful of physical programs, each with
+   * its own *partial* `/ToUnicode` — a name lookup can land on a homonym whose
+   * 2-entry map drops accents the program actually carries. Resolving by
+   * `fontId` pins the exact program, and the served `cmap` is rebuilt as the
+   * **union of every wrapper** referencing it (explicit `/ToUnicode` entries
+   * first — `preferWrapper`, the run's own {@link TextElementInfo.baseFont},
+   * winning on conflict — then inferred fills). The subset is always served
+   * as-is, never rejected for an incomplete map. `null` only when no embedded
+   * program carries `fontId`.
+   */
+  extractWebFontById(
+    fontId: string,
+    preferWrapper?: string
+  ): { format: "truetype" | "otf" | "cff" | "type1"; bytes: Uint8Array } | null {
+    const buf = this.g._withStr(fontId, (ip, il) =>
+      this.g._withOptStr(preferWrapper, (pp, pl) =>
+        this.g._buffer((o) => this.ex().gp_extract_web_font_by_id(this.h, ip, il, pp, pl, o))
+      )
+    );
+    if (buf.length === 0) return null;
+    const format =
+      buf[0] === 1 ? "truetype" : buf[0] === 2 ? "otf" : buf[0] === 3 ? "cff" : "type1";
+    return { format, bytes: buf.subarray(1) };
+  }
+  /**
    * The fonts **embedded** in the document — each `{ baseFont, format }`. Pair
    * with {@link extractFont} to pull a font's bytes out and re-embed them via
    * {@link embedFont}, e.g. to draw new text (with {@link addText}) in a face
@@ -4333,6 +4405,29 @@ export class GigaPdfDoc {
    */
   embeddedFonts(): EmbeddedFont[] {
     return this.g._json((o) => this.ex().gp_embedded_fonts_json(this.h, o));
+  }
+  /**
+   * The embedded fonts **deduplicated by physical program** — one
+   * {@link EmbeddedFontV2} per `/FontFile*` stream, carrying its `fontId`,
+   * format, glyph count and every `/BaseFont` wrapped around it. The
+   * per-program sibling of {@link embeddedFonts} (kept intact); its `fontId`s
+   * feed {@link extractWebFontById} / {@link webFontCoverage}. Sorted by
+   * `fontId` for a deterministic output.
+   */
+  embeddedFontsV2(): EmbeddedFontV2[] {
+    return this.g._json((o) => this.ex().gp_embedded_fonts_v2_json(this.h, o));
+  }
+  /**
+   * The Unicode code points mapped by the `cmap` {@link extractWebFontById}
+   * serves for `fontId` — sorted, deduplicated. Lets a host check, before
+   * painting, whether a run's characters are covered by the served face (and
+   * pick a fallback for the gaps). Empty when no embedded program carries
+   * `fontId`.
+   */
+  webFontCoverage(fontId: string): number[] {
+    return this.g._withStr(fontId, (p, l) =>
+      this.g._json<number[]>((o) => this.ex().gp_web_font_coverage(this.h, p, l, o))
+    );
   }
 
   // convert PDF → X
@@ -5718,6 +5813,21 @@ export class GigaPdfDoc {
   setCheckbox(name: string, checked: boolean): boolean {
     return (
       this.g._withStr(name, (p, l) => this.ex().gp_set_checkbox(this.h, p, l, checked ? 1 : 0)) === 0
+    );
+  }
+  /**
+   * Set a checkbox to a **named** appearance state — the on-state export of
+   * one of its widgets. A multi-widget checkbox names one export per widget
+   * (e.g. `Oui` / `non` on French CERFA forms); {@link setCheckbox} with
+   * `true` only ever reaches the first export, this reaches any of them.
+   * `"Off"` unchecks every widget. Returns `false` when the field or state
+   * doesn't exist.
+   */
+  setCheckboxState(name: string, state: string): boolean {
+    return (
+      this.g._withStr(name, (nP, nL) =>
+        this.g._withStr(state, (sP, sL) => this.ex().gp_set_checkbox_state(this.h, nP, nL, sP, sL))
+      ) === 0
     );
   }
   setRadio(name: string, value: string): boolean {

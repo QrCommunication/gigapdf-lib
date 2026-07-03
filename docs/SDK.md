@@ -220,9 +220,9 @@ count), substituted per page. Text is drawn in standard Helvetica inside the top
 |--------|---------|-------------|
 | `textRuns(page)` | `TextRunInfo[]` | Raw content-stream text runs (operator + text), in draw order. |
 | `structuredText(page)` | `TextLine[]` | Lines with bounding boxes (`x,y,w,h` + text) — for selection / extraction. |
-| `pageBlocks(page)` | `GigaBlock[]` | The **layout blocks** of one page — its structural reconstruction (paragraphs, headings, lists, tables, shapes, images) in reading order, each `GigaBlock` keeping a top-down `frame` and every text run its `source_index` back to the editable content-stream operator. The **per-page** counterpart of `toModel()` (which reconstructs the whole document at once): a continuous / lazily-virtualized editor calls this one page at a time. Out-of-range page → `[]`. |
+| `pageBlocks(page)` | `GigaBlock[]` | The **layout blocks** of one page — its structural reconstruction (paragraphs, headings, lists, tables, shapes, images) in reading order, each `GigaBlock` keeping a top-down `frame` and every text run its `source_index` back to the editable content-stream operator — the same **text-run ordinal** that `textElements()` / `replaceText` count, so the two walks resolve to the same runs. A run coalesced from several source runs (a paragraph line, a table cell) also carries `source_indices` — every constituent run index (`source_index` stays the first entry). The **per-page** counterpart of `toModel()` (which reconstructs the whole document at once): a continuous / lazily-virtualized editor calls this one page at a time. Out-of-range page → `[]`. |
 | `elements(page)` | `Element[]` | All content elements (text/image/path) with kind + bounds — the editor scene graph. |
-| `textElements(page)` | `TextElementInfo[]` | **Rich** per-run text for an editor: text + bounds (user space) + resolved `fontFamily`/`bold`/`italic` + `fontSize` + RGB `color` + `rotation`. `index` is the text-run index for `replaceText` — extract, render and edit from one model. |
+| `textElements(page)` | `TextElementInfo[]` | **Rich** per-run text for an editor: text + bounds (user space) + resolved `fontFamily`/`bold`/`italic` + `fontSize` + RGB `color` + `rotation`, plus the run's raw `baseFont` name and its `fontId` — the **physical** identity of its embedded font program (feed `extractWebFontById(fontId, baseFont)` to always serve the run's own glyphs; empty for base-14/non-embedded faces). `index` is the text-run index for `replaceText` — extract, render and edit from one model. |
 | `imageElements(page)` | `ImageElementInfo[]` | Image placements for an editor: `{ index, x, y, width, height, format, pixelWidth, pixelHeight, data, rotation, opacity }`. Bounds user space; `format` `jpeg`/`png`/`jp2`/`unknown`; `data` is the embeddable encoded bytes (JPEG/JP2 passthrough, Flate/raw RGB·Gray re-encoded to PNG); `rotation` (deg) and `opacity` (`/ca`) come from the placement CTM + `/ExtGState`. The native replacement for a reader's image extraction. |
 | `vectorPaths(page)` | `VectorPathInfo[]` | Every painted path for a shape layer: `{ segments (M/L/C/Z), bounds, fill, stroke, strokeWidth, fillAlpha, strokeAlpha, dash }`. Geometry in user space; `fill`/`stroke` are RGB `0..=1` or `null`; clip-only paths are omitted. The read-side counterpart of the SVG→PDF drawing helpers. |
 | `elementAt(page, x, y)` | `number` | Hit-test: index of the element under a point, or `-1`. |
@@ -302,7 +302,11 @@ Three ways to draw real, selectable text — **no host font files required**:
 | `embedFont(family, font)` | `number` | Embed **any** outline program — glyf TrueType (`.ttf`) or OpenType-CFF (`.otf`), auto-detected; returns the font handle for `addText` (`0` on failure). |
 | `addText(…)` / `addStandardText(…)` | `boolean` | See [Drawing](#drawing-new-content). |
 | `embeddedFonts()` | `EmbeddedFont[]` | List the fonts the PDF embeds (`{ baseFont, format: "truetype"\|"cff"\|"type1" }`). |
+| `embeddedFontsV2()` | `EmbeddedFontV2[]` | The embedded fonts deduplicated **by physical program** — one `{ fontId, format, numGlyphs, baseFonts }` per `/FontFile*` stream, with every `/BaseFont` name wrapped around it (a form generator routinely wraps a handful of programs in dozens of wrapper dicts). Its `fontId`s feed `extractWebFontById` / `webFontCoverage`; sorted by `fontId`. |
 | `extractFont(name)` | `{ format, bytes } \| null` | Pull an embedded font's program out by (fuzzy) `/BaseFont` name. |
+| `extractWebFont(name)` | `{ format, bytes } \| null` | Extract an embedded font as a **browser-loadable** sfnt by (fuzzy) `/BaseFont` name — for a host editor's `@font-face` overlay-text layer, keeping the document's own glyphs. A bare CFF (Type1C) is wrapped to OpenType; a `cmap`-less TrueType subset is repaired with a `cmap` synthesised from the PDF's code→Unicode. `format` is `"truetype"\|"otf"\|"cff"\|"type1"` (the last two are raw last-resort fallbacks). |
+| `extractWebFontById(fontId, preferWrapper?)` | `{ format, bytes } \| null` | The name-ambiguity-proof sibling of `extractWebFont`: resolve by the program's **physical identity** — the `fontId` that `textElements()` and `embeddedFontsV2()` report. The served `cmap` is the **union** of every wrapper referencing the program (explicit `/ToUnicode` entries first — `preferWrapper`, the run's own `baseFont`, wins conflicts — then inferred fills), so a wrapper's partial map no longer drops accents the subset actually carries. `null` only when no embedded program carries `fontId`. |
+| `webFontCoverage(fontId)` | `number[]` | The Unicode code points mapped by the `cmap` `extractWebFontById` serves for `fontId` — sorted, deduplicated. Lets a host check, before painting, whether a run's characters are covered by the served face (and pick a fallback for the gaps). Empty when no embedded program carries `fontId`. |
 | `neededFonts()` | `string[]` | Fonts the PDF references but does **not** embed (fetch + embed to fix tofu). |
 
 ### Annotations
@@ -331,8 +335,9 @@ Three ways to draw real, selectable text — **no host font files required**:
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `fields()` | `FieldInfo[]` | Every terminal field with kind, value, flags. |
-| `setTextField(name, value)` | `boolean` | Fill a text field. |
-| `setCheckbox(name, checked)` | `boolean` | Check/uncheck. |
+| `setTextField(name, value)` | `boolean` | Fill a text field. The regenerated appearance matches Adobe: **comb** fields (`/MaxLen` + COMB flag) place one character per cell, **auto-size** (`0 Tf`) shrinks to fit both height and width, **multiline** (`Ff` bit 13) word-wraps at the rect width even without `\n`, `/Q` centred/right quadding is measured with the real metrics of the `/DA` face, and the stream clips to the widget rect (long values no longer bleed over neighbouring content). |
+| `setCheckbox(name, checked)` | `boolean` | Check/uncheck (`true` reaches the first on-state). |
+| `setCheckboxState(name, state)` | `boolean` | Check a **named** on-state of a checkbox with several widgets — one export per widget, e.g. the `Oui`/`non` pairs of official forms: sets `/V` and, per widget, `/AS` to its own on-state or `/Off`. `"Off"` unchecks every widget. `false` when the field or state doesn't exist. |
 | `setRadio(name, value)` | `boolean` | Select a radio option by export value. |
 | `setChoice(name, values)` | `boolean` | Select dropdown/listbox option(s). |
 | `addTextField(page, name, bounds, value, opts?)` | `boolean` | Create a text field; `opts = { maxLen, multiline, password, style }`. |
@@ -639,8 +644,8 @@ All result/option shapes are exported interfaces — import them for typed code:
 
 ```ts
 import type {
-  FontInfo, EmbeddedFont, PageInfo, PageMargins, HeaderFooterSpec, HeaderFooterAlign,
-  TextLine, TextRunInfo, Element, TextElementInfo, DocumentLanguage,
+  FontInfo, EmbeddedFont, EmbeddedFontV2, PageInfo, PageMargins, HeaderFooterSpec, HeaderFooterAlign,
+  TextLine, TextRunInfo, Element, TextElementInfo, TextSegment, DocumentLanguage,
   ImageElementInfo, VectorPathInfo, PathSegment, PdfPermissions,
   SearchHit, AnnotationInfo, FieldInfo, FieldKind, FieldStyle, RadioOption,
   LinkInfo, LayerInfo, OutlineEntry, ViewerPreferences, PageLayout, PageMode,

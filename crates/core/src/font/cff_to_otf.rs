@@ -537,6 +537,12 @@ pub(crate) fn build_cmap(pairs: &[(u32, u16)]) -> Vec<u8> {
     // duplicates: strict shapers (FreeType/HarfBuzz) reject an unsorted table and
     // fall every code to `.notdef`. Enforce it here so every caller is safe
     // regardless of the order it passes pairs in.
+    //
+    // A code point beyond the BMP cannot live in a format 4 subtable (its code
+    // fields are u16): when any pair is supplementary-plane, a second
+    // **format 12** (platform 3, encoding 10) subtable covering EVERY pair is
+    // appended after the sorted-BMP (3,1) one, so astral scalars (emoji, plane-1
+    // letters) map too while OTS/legacy consumers keep their format 4.
     let mut sorted: Vec<(u32, u16)> = pairs.iter().filter(|&&(cp, _)| cp <= 0xFFFF).copied().collect();
     sorted.sort_by_key(|&(cp, _)| cp);
     sorted.dedup_by_key(|&mut (cp, _)| cp);
@@ -586,14 +592,51 @@ pub(crate) fn build_cmap(pairs: &[(u32, u16)]) -> Vec<u8> {
     let len = sub.len() as u16;
     sub[length_pos..length_pos + 2].copy_from_slice(&len.to_be_bytes());
 
-    // cmap header + one encoding record (platform 3, encoding 1) → subtable.
+    if !pairs.iter().any(|&(cp, _)| cp > 0xFFFF) {
+        // cmap header + one encoding record (platform 3, encoding 1) → subtable.
+        let mut t = Vec::new();
+        t.extend_from_slice(&0u16.to_be_bytes()); // version
+        t.extend_from_slice(&1u16.to_be_bytes()); // numTables
+        t.extend_from_slice(&3u16.to_be_bytes()); // platformID
+        t.extend_from_slice(&1u16.to_be_bytes()); // encodingID
+        t.extend_from_slice(&12u32.to_be_bytes()); // offset (4 + 8)
+        t.extend_from_slice(&sub);
+        return t;
+    }
+
+    // Format 12 subtable over the FULL (BMP + supplementary) sorted repertoire:
+    // one sequential-map group per code point (start == end, startGlyphID = gid).
+    // Groups must be ascending and non-overlapping — enforced by the sort/dedup.
+    let mut full: Vec<(u32, u16)> = pairs.to_vec();
+    full.sort_by_key(|&(cp, _)| cp);
+    full.dedup_by_key(|&mut (cp, _)| cp);
+    let mut sub12 = Vec::new();
+    sub12.extend_from_slice(&12u16.to_be_bytes()); // format
+    sub12.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    let length12 = 16u32 + full.len() as u32 * 12;
+    sub12.extend_from_slice(&length12.to_be_bytes()); // length
+    sub12.extend_from_slice(&0u32.to_be_bytes()); // language
+    sub12.extend_from_slice(&(full.len() as u32).to_be_bytes()); // nGroups
+    for &(cp, gid) in &full {
+        sub12.extend_from_slice(&cp.to_be_bytes()); // startCharCode
+        sub12.extend_from_slice(&cp.to_be_bytes()); // endCharCode
+        sub12.extend_from_slice(&(gid as u32).to_be_bytes()); // startGlyphID
+    }
+
+    // cmap header + two encoding records — (3,1) format 4 then (3,10) format 12,
+    // in the spec-mandated ascending platform/encoding order.
+    let header = 4u32 + 2 * 8;
     let mut t = Vec::new();
     t.extend_from_slice(&0u16.to_be_bytes()); // version
-    t.extend_from_slice(&1u16.to_be_bytes()); // numTables
-    t.extend_from_slice(&3u16.to_be_bytes()); // platformID
-    t.extend_from_slice(&1u16.to_be_bytes()); // encodingID
-    t.extend_from_slice(&12u32.to_be_bytes()); // offset (4 + 8)
+    t.extend_from_slice(&2u16.to_be_bytes()); // numTables
+    t.extend_from_slice(&3u16.to_be_bytes()); // platformID (3,1)
+    t.extend_from_slice(&1u16.to_be_bytes());
+    t.extend_from_slice(&header.to_be_bytes()); // offset → format 4
+    t.extend_from_slice(&3u16.to_be_bytes()); // platformID (3,10)
+    t.extend_from_slice(&10u16.to_be_bytes());
+    t.extend_from_slice(&(header + sub.len() as u32).to_be_bytes()); // offset → format 12
     t.extend_from_slice(&sub);
+    t.extend_from_slice(&sub12);
     t
 }
 
@@ -912,5 +955,64 @@ mod tests {
             cff_cid_gid_unicode_strings(&cff, &gid_unicode).is_empty(),
             "name-keyed CFF1 is not driven by the wrapping cmap"
         );
+    }
+
+    #[test]
+    fn build_cmap_bmp_only_keeps_single_format4_record() {
+        let t = build_cmap(&[(0x61, 5), (0x62, 6)]);
+        assert_eq!(u16::from_be_bytes([t[2], t[3]]), 1, "one encoding record");
+        assert_eq!(u16::from_be_bytes([t[4], t[5]]), 3, "platform 3");
+        assert_eq!(u16::from_be_bytes([t[6], t[7]]), 1, "encoding 1");
+        let off = u32::from_be_bytes([t[8], t[9], t[10], t[11]]) as usize;
+        assert_eq!(u16::from_be_bytes([t[off], t[off + 1]]), 4, "format 4");
+    }
+
+    #[test]
+    fn build_cmap_adds_format12_for_supplementary_scalars() {
+        // One BMP pair + one astral pair: the (3,1) format 4 keeps the BMP
+        // repertoire, and a second (3,10) format 12 record covers everything —
+        // format 4's u16 code fields cannot hold U+1F600.
+        let t = build_cmap(&[(0x1F600, 7), (0x61, 5)]);
+        assert_eq!(u16::from_be_bytes([t[2], t[3]]), 2, "two encoding records");
+        assert_eq!(u16::from_be_bytes([t[4], t[5]]), 3);
+        assert_eq!(u16::from_be_bytes([t[6], t[7]]), 1, "(3,1) first");
+        assert_eq!(u16::from_be_bytes([t[12], t[13]]), 3);
+        assert_eq!(u16::from_be_bytes([t[14], t[15]]), 10, "(3,10) second");
+        let off4 = u32::from_be_bytes([t[8], t[9], t[10], t[11]]) as usize;
+        assert_eq!(u16::from_be_bytes([t[off4], t[off4 + 1]]), 4);
+        let off12 = u32::from_be_bytes([t[16], t[17], t[18], t[19]]) as usize;
+        assert_eq!(u16::from_be_bytes([t[off12], t[off12 + 1]]), 12);
+        let n_groups = u32::from_be_bytes([
+            t[off12 + 12],
+            t[off12 + 13],
+            t[off12 + 14],
+            t[off12 + 15],
+        ]);
+        assert_eq!(n_groups, 2, "one group per code point, sorted");
+        let group = |i: usize| {
+            let g = off12 + 16 + i * 12;
+            (
+                u32::from_be_bytes([t[g], t[g + 1], t[g + 2], t[g + 3]]),
+                u32::from_be_bytes([t[g + 4], t[g + 5], t[g + 6], t[g + 7]]),
+                u32::from_be_bytes([t[g + 8], t[g + 9], t[g + 10], t[g + 11]]),
+            )
+        };
+        assert_eq!(group(0), (0x61, 0x61, 5));
+        assert_eq!(group(1), (0x1F600, 0x1F600, 7));
+    }
+
+    #[test]
+    fn repaired_sfnt_maps_supplementary_scalars_through_format12() {
+        // End-to-end: repairing a real sfnt with an astral pair must yield a
+        // face whose cmap resolves both the BMP and the supplementary scalar.
+        let repaired = repair_sfnt_with_cmap(
+            crate::font::bundled::FALLBACK_TTF,
+            &[(0x61, 5), (0x1F600, 7)],
+        )
+        .expect("repair succeeds");
+        let ttf =
+            crate::font::truetype::TrueTypeFont::parse(&repaired).expect("repaired face parses");
+        assert_eq!(ttf.gid_for_unicode(0x61), Some(5));
+        assert_eq!(ttf.gid_for_unicode(0x1F600), Some(7), "astral scalar via format 12");
     }
 }

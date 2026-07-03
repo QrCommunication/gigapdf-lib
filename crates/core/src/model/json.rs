@@ -685,10 +685,23 @@ impl Writer {
         self.k_str("text", &r.text);
         self.key("style");
         self.char_style(&r.style);
+        // Back-compat scalar: the FIRST originating run ordinal (or null).
         self.key("source_index");
-        match r.source_index {
+        match r.first_source_index() {
             Some(n) => self.usize(n),
             None => self.null(),
+        }
+        // Additive: the FULL ordinal list of a coalesced run, so every
+        // constituent stays addressable (replaceText/removeElement). Omitted
+        // when the run has no source (keeps unsourced-run JSON unchanged).
+        if let Some(indices) = r.source_index.as_ref().filter(|v| !v.is_empty()) {
+            self.key("source_indices");
+            self.arr_open();
+            for &i in indices {
+                self.elem();
+                self.usize(i);
+            }
+            self.arr_close();
         }
         self.obj_close();
     }
@@ -1909,25 +1922,34 @@ impl<'a> Reader<'a> {
 
     fn inline_run(&mut self) -> Option<InlineRun> {
         let mut r = InlineRun::default();
-        let mut src_seen = false;
+        // The full `source_indices` array is authoritative when present; the
+        // legacy `source_index` scalar (its first element) only seeds the field
+        // when no array member was seen — so both key orders round-trip and old
+        // single-index JSON still loads.
+        let mut indices_seen = false;
         self.object(|rd, k| {
             match k {
                 "text" => r.text = rd.string()?,
                 "style" => r.style = rd.char_style()?,
                 "source_index" => {
-                    src_seen = true;
-                    r.source_index = if rd.peek()? == b'n' {
+                    if rd.peek()? == b'n' {
                         rd.null()?;
-                        None
                     } else {
-                        Some(rd.usize()?)
-                    };
+                        let first = rd.usize()?;
+                        if !indices_seen {
+                            r.source_index = Some(vec![first]);
+                        }
+                    }
+                }
+                "source_indices" => {
+                    indices_seen = true;
+                    let v = rd.array(Reader::usize)?;
+                    r.source_index = (!v.is_empty()).then_some(v);
                 }
                 _ => return None,
             }
             Some(())
         })?;
-        let _ = src_seen;
         Some(r)
     }
 
@@ -2514,7 +2536,7 @@ mod tests {
 
                 ..Default::default()
             },
-            source_index: Some(0),
+            source_index: Some(vec![0]),
         });
         let run_b = Inline::Run(InlineRun {
             text: "café — 😀 \"quoted\"\n".to_string(),
@@ -3035,6 +3057,65 @@ mod tests {
         let j1 = doc.to_json();
         let j2 = Document::from_json(&j1).unwrap().to_json();
         assert_eq!(j1, j2, "serialization is stable across a round trip");
+    }
+
+    #[test]
+    fn coalesced_source_indices_serialize_both_views() {
+        // A coalesced run (several source ordinals) emits the legacy scalar
+        // `source_index` (the FIRST ordinal — old consumers keep working) PLUS
+        // the additive `source_indices` array, and the full list survives a
+        // round trip. An unsourced run keeps the legacy `null` and no array.
+        let block = Block {
+            id: BlockId(0),
+            frame: None,
+            rotation: Default::default(),
+            kind: BlockKind::Paragraph(Paragraph {
+                style: ParagraphStyle::default(),
+                style_ref: None,
+                runs: vec![
+                    Inline::Run(InlineRun {
+                        text: "coalesced".to_string(),
+                        style: CharStyle::default(),
+                        source_index: Some(vec![7, 9, 42]),
+                    }),
+                    Inline::Run(InlineRun {
+                        text: "unsourced".to_string(),
+                        style: CharStyle::default(),
+                        source_index: None,
+                    }),
+                ],
+            }),
+        };
+        let json = block_to_json(&block);
+        assert!(
+            json.contains("\"source_index\":7"),
+            "legacy scalar = first ordinal: {json}"
+        );
+        assert!(
+            json.contains("\"source_indices\":[7,9,42]"),
+            "full ordinal list: {json}"
+        );
+        assert!(
+            json.contains("\"source_index\":null"),
+            "unsourced run keeps the null scalar: {json}"
+        );
+        let back = block_from_json(&json).expect("parse");
+        assert_eq!(block, back, "coalesced indices survive a round trip");
+
+        // Legacy JSON (scalar only, no array) still loads as a 1-element list.
+        let legacy = json.replace(",\"source_indices\":[7,9,42]", "");
+        let back = block_from_json(&legacy).expect("parse legacy");
+        let BlockKind::Paragraph(p) = &back.kind else {
+            panic!("expected paragraph");
+        };
+        let Inline::Run(first) = &p.runs[0] else {
+            panic!("expected run");
+        };
+        assert_eq!(
+            first.source_index,
+            Some(vec![7]),
+            "legacy scalar loads as its single ordinal"
+        );
     }
 
     #[test]

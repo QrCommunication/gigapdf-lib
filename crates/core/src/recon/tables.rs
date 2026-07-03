@@ -735,7 +735,7 @@ pub fn build_table(
                 h: run.h.max(1.0),
                 text: String::new(),
                 style: None,
-                src: None,
+                src: Vec::new(),
             });
             if !cl.text.is_empty() {
                 let space = match prev.get(&key) {
@@ -757,13 +757,15 @@ pub fn build_table(
             cl.top = cl.top.max(run.top());
             cl.bottom = cl.bottom.min(run.y);
             cl.h = cl.h.max(run.h);
-            // The cell line's representative style / source index is its FIRST run
-            // (paragraph blocks are addressable by their first content-stream run).
+            // The cell line's representative style is its FIRST run; the source
+            // indices keep EVERY constituent run (the first stays the legacy
+            // representative), so a space-joined cell run addresses all its
+            // content-stream operators, not just the opener.
             if cl.style.is_none() {
                 cl.style = Some(run_char_style(run));
             }
-            if cl.src.is_none() {
-                cl.src = run.source_index;
+            if let Some(i) = run.source_index {
+                cl.src.push(i);
             }
             prev.insert(
                 key,
@@ -1037,8 +1039,9 @@ struct CellLine {
     text: String,
     /// The line's first run style (the paragraph block's representative style).
     style: Option<crate::model::CharStyle>,
-    /// The line's first run `source_index` (paragraph block addressability).
-    src: Option<usize>,
+    /// Every constituent run's `source_index`, in content order (paragraph
+    /// block addressability — the first entry is the legacy representative).
+    src: Vec<usize>,
 }
 
 /// Per-row header signals tallied while building a table's rows.
@@ -1131,7 +1134,13 @@ fn absorb_span(
 /// shape every exporter and the editor expect).
 fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> Vec<Block> {
     if lines.is_empty() {
-        return vec![cell_paragraph_block(String::new(), None, None, align, ids)];
+        return vec![cell_paragraph_block(
+            String::new(),
+            None,
+            Vec::new(),
+            align,
+            ids,
+        )];
     }
     // Top→bottom (descending top edge) for deterministic reading order.
     lines.sort_by(|a, b| {
@@ -1143,7 +1152,7 @@ fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> V
     let mut blocks: Vec<Block> = Vec::new();
     let mut text = String::new();
     let mut style: Option<crate::model::CharStyle> = None;
-    let mut src: Option<usize> = None;
+    let mut src: Vec<usize> = Vec::new();
     let mut prev: Option<&CellLine> = None;
     for line in &lines {
         let new_para = match prev {
@@ -1158,7 +1167,7 @@ fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> V
             blocks.push(cell_paragraph_block(
                 std::mem::take(&mut text),
                 style.take(),
-                src.take(),
+                std::mem::take(&mut src),
                 align,
                 ids,
             ));
@@ -1170,9 +1179,8 @@ fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> V
         if style.is_none() {
             style = line.style.clone();
         }
-        if src.is_none() {
-            src = line.src;
-        }
+        // Every line's runs stay addressable in the joined cell run.
+        src.extend(line.src.iter().copied());
         prev = Some(line);
     }
     blocks.push(cell_paragraph_block(text, style, src, align, ids));
@@ -1191,7 +1199,7 @@ const CELL_PARA_GAP_RATIO: f64 = 0.6;
 fn cell_paragraph_block(
     text: String,
     style: Option<crate::model::CharStyle>,
-    source_index: Option<usize>,
+    source_indices: Vec<usize>,
     align: Align,
     ids: &mut IdGen,
 ) -> Block {
@@ -1202,7 +1210,7 @@ fn cell_paragraph_block(
         vec![Inline::Run(InlineRun {
             text,
             style: style.unwrap_or_default(),
-            source_index,
+            source_index: (!source_indices.is_empty()).then_some(source_indices),
         })]
     };
     Block {
@@ -2551,19 +2559,35 @@ mod tests {
         let BlockKind::Table(t) = block.kind else {
             panic!("expected table");
         };
-        let cell_src = |c: &Cell| -> Option<usize> {
+        let cell_src = |c: &Cell| -> Option<Vec<usize>> {
             match &c.blocks[0].kind {
                 BlockKind::Paragraph(p) => match p.runs.first() {
-                    Some(crate::model::Inline::Run(r)) => r.source_index,
+                    Some(crate::model::Inline::Run(r)) => r.source_index.clone(),
                     _ => None,
                 },
                 _ => None,
             }
         };
-        assert_eq!(cell_src(&t.rows[0].cells[0]), Some(10), "Name cell index");
-        assert_eq!(cell_src(&t.rows[0].cells[1]), Some(11), "Age cell index");
-        assert_eq!(cell_src(&t.rows[1].cells[0]), Some(12), "Alice cell index");
-        assert_eq!(cell_src(&t.rows[1].cells[1]), Some(13), "30 cell index");
+        assert_eq!(
+            cell_src(&t.rows[0].cells[0]),
+            Some(vec![10]),
+            "Name cell index"
+        );
+        assert_eq!(
+            cell_src(&t.rows[0].cells[1]),
+            Some(vec![11]),
+            "Age cell index"
+        );
+        assert_eq!(
+            cell_src(&t.rows[1].cells[0]),
+            Some(vec![12]),
+            "Alice cell index"
+        );
+        assert_eq!(
+            cell_src(&t.rows[1].cells[1]),
+            Some(vec![13]),
+            "30 cell index"
+        );
     }
 
     #[test]

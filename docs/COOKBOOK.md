@@ -48,7 +48,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Scale page content & large-format pages (UserUnit)](#scale-page-content--large-format-pages-userunit)
 - [Compact output (object streams + cross-reference stream)](#compact-output-object-streams--cross-reference-stream) — *v0.81.0*
 - [OCR a scanned page + full-text search](#ocr-a-scanned-page--full-text-search)
-- [Fill and create form fields](#fill-and-create-form-fields)
+- [Fill and create form fields](#fill-and-create-form-fields) — *named checkbox states + Adobe-faithful text appearances: v0.114.0*
 - [Annotate (highlight, note, ink, stamp)](#annotate)
 - [Navigation: links, bookmarks & open-action](#navigation-links-bookmarks--open-action) — *full action model: v0.78.0*
 - [Sign a PDF (B · B-T · LTV · certify · verify)](#sign-a-pdf-b--b-t--ltv) — *B-T: v0.70.0 · LTV: v0.71.0 · verify + DocMDP: v0.80.0*
@@ -57,6 +57,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Change a password, drop encryption, or encrypt to a certificate](#change-a-password-drop-encryption-or-encrypt-to-a-certificate) — *v0.84.0*
 - [Move, resize, restyle, fade & reorder existing elements in place](#move-resize--restyle-existing-elements-in-place) — *opacity & z-order: v0.58.0*
 - [Render a page without a specific element (live-overlay editing)](#render-a-page-without-a-specific-element-live-overlay-editing) — *v0.58.0*
+- [Serve a document's embedded fonts in a browser (FontFace)](#serve-a-documents-embedded-fonts-in-a-browser-fontface) — *v0.114.0*
 - [Round-trip the unified editable model](#round-trip-the-unified-editable-model)
 - [Set how the document opens (ViewerPreferences · PageLayout · PageMode)](#set-how-the-document-opens-viewerpreferences--pagelayout--pagemode)
 
@@ -1201,14 +1202,24 @@ doc.close();
 
 Read or fill an existing AcroForm, or **build widgets from scratch** (each gets a
 real `/AP` appearance stream; the form is flagged `NeedAppearances`). Field rects
-are `[x0, y0, x1, y1]` in PDF user space.
+are `[x0, y0, x1, y1]` in PDF user space. Text-field values regenerate an
+**Adobe-faithful appearance**: comb fields (`/MaxLen` + COMB flag) type one
+character per cell, auto-size fields (`0 Tf`) shrink to fit, multiline fields
+(`Ff` bit 13) word-wrap at the rect width, `/Q` quadding is measured with the
+`/DA` face's real metrics, and long values clip to the widget instead of
+bleeding over neighbouring content — so an official form (a French CERFA) fills
+exactly like it does in Acrobat.
 
 ```ts
 const doc = giga.open(pdfBytes);
 
 // Fill an existing form.
 doc.setTextField("fullname", "Jane Doe");
-doc.setCheckbox("subscribe", true);
+doc.setCheckbox("subscribe", true);          // first on-state
+doc.setCheckboxState("deja_depose", "Oui");  // a NAMED on-state — a multi-widget
+                                             // checkbox names one export per
+                                             // widget (the "Oui"/"non" pairs of
+                                             // official forms); "Off" unchecks all
 doc.setRadio("plan", "Pro");                 // by export value
 doc.setChoice("langs", ["en", "fr"]);        // multi-select list box
 
@@ -1862,6 +1873,47 @@ const bg = doc.renderPageExcluding(1, [editing], 2);
 // Hide several at once; an empty list renders the full page; unknown indices
 // are ignored:
 // const clean = doc.renderPageExcluding(1, [editing, 5, 9], 2);
+
+doc.close();
+```
+
+---
+
+## Serve a document's embedded fonts in a browser (FontFace)
+
+A host editor that overlays real editable text on a rendered page wants the
+document's **own glyphs**, not a lookalike. `embeddedFontsV2()` lists one entry
+per physical font **program** (a dense form wraps a handful of programs in
+dozens of `/Font` dicts, so listing by name over-fetches); `extractWebFontById`
+serves each program as a browser-loadable sfnt whose `cmap` is the **union** of
+every wrapper's `/ToUnicode` — accents survive even when each wrapper only maps
+its own codes.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Load ONE FontFace per physical program (not one per /BaseFont name).
+for (const font of doc.embeddedFontsV2()) {
+  const web = doc.extractWebFontById(font.fontId);
+  if (!web || (web.format !== "truetype" && web.format !== "otf")) continue;
+  const face = new FontFace(`pdf-${font.fontId}`, web.bytes);
+  await face.load();
+  document.fonts.add(face);
+}
+
+// Bind each text run to its own program: TextElementInfo.fontId pins the run's
+// exact glyphs (empty for base-14 / non-embedded faces — use a host font there).
+for (const run of doc.textElements(1)) {
+  if (!run.fontId) continue;
+  // …paint the run's overlay with `font-family: pdf-${run.fontId}`. To prefer
+  // this run's own /ToUnicode in the served cmap, extract with its wrapper:
+  // doc.extractWebFontById(run.fontId, run.baseFont)
+}
+
+// Per-character fallback: check the served cmap's coverage before painting.
+const covered = new Set(doc.webFontCoverage(doc.embeddedFontsV2()[0].fontId));
+const gaps = [..."Bâtiment âgé"].filter((ch) => !covered.has(ch.codePointAt(0)!));
+// render `gaps` with a host fallback face instead of the embedded one.
 
 doc.close();
 ```

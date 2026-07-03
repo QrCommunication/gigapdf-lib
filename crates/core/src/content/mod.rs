@@ -671,6 +671,15 @@ pub struct FontStyle {
     /// `ABCDEF+TimesNewRomanPSMT`), so a host editor can target the exact embedded
     /// subset rather than only a collapsed family name.
     pub base_font: String,
+    /// The **physical** identity of the font's embedded program: the first 8 hex
+    /// chars of the SHA-256 of the decoded `/FontFile*` bytes (see
+    /// `Document::physical_fonts`). Stable across the many wrapper dicts that can
+    /// share one program (a form generator routinely embeds dozens of Type0
+    /// wrappers over a handful of physical subsets), so a host can fetch the
+    /// run's exact program with `Document::extract_web_font_by_id` regardless of
+    /// which wrapper the run resolved through. **Empty** when the font embeds no
+    /// program (descriptor without `/FontFile*`, or no descriptor at all).
+    pub font_id: String,
 }
 
 /// Per-font-resource styles for one resource scope (page or form XObject), keyed
@@ -1640,6 +1649,9 @@ fn text_bounds(tm: &Matrix, ctm: &Matrix, font_size: f64, width: f64) -> Option<
 /// where the rasterizer's pen left it — inter-run and intra-run positions stay
 /// consistent and rasterizer-exact. Segments are empty for a run with no internal
 /// jump (its own box positions it); the advance is always returned.
+// The 8 parameters mirror the rasterizer's full text state (Tc/Tw/Tz + matrices)
+// one-to-one; bundling them into a struct would only rename the coupling.
+#[allow(clippy::too_many_arguments)]
 fn run_layout(
     op: &Operation,
     tm: &Matrix,

@@ -143,9 +143,12 @@ impl StructNode {
 /// role). Built while walking the page's blocks; consumed by the rewrite.
 #[derive(Default)]
 struct PagePlan {
-    /// `ContentElement index → (leaf id, structure tag)` for every text run a
-    /// structure leaf owns on this page.
-    by_element: BTreeMap<usize, (LeafId, Vec<u8>)>,
+    /// `top-level text-run ordinal → (leaf id, structure tag)` for every text
+    /// run a structure leaf owns on this page. The key is the model runs'
+    /// `source_index` space — the ordinal among the page's top-level text
+    /// elements (the `page_text_elements` / `replace_text_run` index), not the
+    /// unified `ContentElement` index.
+    by_text_run: BTreeMap<usize, (LeafId, Vec<u8>)>,
     /// `image ordinal (0-based, element order) → (leaf id, tag)` for each image
     /// block tagged as a `/Figure`. Images carry no `source_index`, so they are
     /// bound positionally: the Nth image element ↔ the Nth image block.
@@ -427,19 +430,21 @@ fn paragraph_node(
     *leaf_seq += 1;
     let tag = role.tag();
     for src in sources {
-        plan.by_element.entry(src).or_insert((leaf_id, tag.clone()));
+        plan.by_text_run.entry(src).or_insert((leaf_id, tag.clone()));
     }
     Some(StructNode::leaf(role, leaf_id))
 }
 
-/// Collect every run's `source_index` (the page's unified `ContentElement`
-/// index) from an inline sequence, descending into links.
+/// Collect every run's source ordinals (the page's top-level text-run index
+/// space) from an inline sequence, descending into links. A coalesced run
+/// contributes **all** its constituents, so every show operator it covers is
+/// tagged (not left as an `/Artifact`).
 fn collect_run_sources(runs: &[Inline], out: &mut Vec<usize>) {
     for inline in runs {
         match inline {
             Inline::Run(run) => {
-                if let Some(src) = run.source_index {
-                    out.push(src);
+                if let Some(src) = &run.source_index {
+                    out.extend(src.iter().copied());
                 }
             }
             Inline::Link { children, .. } => collect_run_sources(children, out),
@@ -478,10 +483,16 @@ fn rewrite_page_content(
     // (text shows owned by a leaf, image `Do`s bound to a figure).
     let mut op_owner: BTreeMap<usize, (LeafId, Vec<u8>)> = BTreeMap::new();
     let mut image_ordinal: usize = 0;
+    // Ordinal of the next text run — the model runs' `source_index` space
+    // (mirrors `page_text_elements`: every text element advances it, blanks
+    // included), NOT the unified element index (which images/paths shift).
+    let mut text_ordinal: usize = 0;
     for el in elements {
         match el.kind {
             ElementKind::Text => {
-                if let Some((leaf, tag)) = plan.by_element.get(&el.index) {
+                let ordinal = text_ordinal;
+                text_ordinal += 1;
+                if let Some((leaf, tag)) = plan.by_text_run.get(&ordinal) {
                     for pos in el.op_start..=el.op_end {
                         if pos < operations.len() && is_text_show(&operations[pos].operator) {
                             op_owner.insert(pos, (*leaf, tag.clone()));
@@ -781,11 +792,11 @@ mod tests {
     /// listed in its `/K` array; MCIDs are unique and dense in content order.
     #[test]
     fn multi_run_leaf_gets_unique_mcids() {
-        // Two text elements (op positions 0 and 1) both owned by leaf 7.
+        // Two text elements (text-run ordinals 0 and 1) both owned by leaf 7.
         let mut plan = PagePlan::default();
-        plan.by_element.insert(0, (7, b"P".to_vec()));
-        plan.by_element.insert(1, (7, b"P".to_vec()));
-        let elements = vec![
+        plan.by_text_run.insert(0, (7, b"P".to_vec()));
+        plan.by_text_run.insert(1, (7, b"P".to_vec()));
+        let elements = [
             ContentElement {
                 index: 0,
                 kind: ElementKind::Text,
@@ -832,8 +843,9 @@ mod tests {
             },
         ];
         let mut op_owner: BTreeMap<usize, (LeafId, Vec<u8>)> = BTreeMap::new();
-        for el in &elements {
-            if let Some((leaf, tag)) = plan.by_element.get(&el.index) {
+        // All-text fixture: the text-run ordinal IS the enumeration index.
+        for (ordinal, el) in elements.iter().enumerate() {
+            if let Some((leaf, tag)) = plan.by_text_run.get(&ordinal) {
                 for (pos, op) in ops.iter().enumerate().take(el.op_end + 1).skip(el.op_start) {
                     if is_text_show(&op.operator) {
                         op_owner.insert(pos, (*leaf, tag.clone()));

@@ -50,15 +50,48 @@ pub(crate) struct ParaContext<'a> {
 }
 
 /// Split a group of reading-order lines into paragraphs (each a `Vec` of line
-/// references). `body` is the document body font size, used to estimate leading.
-pub fn split_paragraphs<'a>(lines: &[&'a ReconLine], body: f64) -> Vec<Vec<&'a ReconLine>> {
+/// references). `body` is the document body font size and `doc_leading` the
+/// page-wide median line step (see [`document_leading`]; pass `0.0` when
+/// unknown — the reference then falls back to `body`).
+///
+/// **Geometric coherence** (the v1.19.2 hole, lib-side): the historic rule
+/// judged the gap against the *group's own* leading only — a two-line group's
+/// single step *is* its leading, so `step > 1.5 × step` could never split and a
+/// footer line 250 pt away fused with a header line into one "paragraph". The
+/// split now triggers when any of these hold between consecutive lines:
+///
+/// 1. `step > 1.5 × min(group_leading, max(doc_leading, body))` — the group's
+///    own statistics can only *tighten* the document reference, never inflate
+///    it past what the page actually uses;
+/// 2. `step > 2.5 × line font size` — an absolute ceiling: no paragraph stacks
+///    lines further apart than 2.5× their own glyph size;
+/// 3. the lines' horizontal spans overlap by **less than 20 %** of the narrower
+///    one — vertically adjacent but side-by-side content (columns, disjoint
+///    form fields) is never one paragraph.
+///
+/// Output invariant: within a returned paragraph every line is within the
+/// ceiling of its neighbour and overlaps it horizontally; the block frame
+/// (union of its lines, computed by the builder) therefore hugs real prose.
+pub fn split_paragraphs<'a>(
+    lines: &[&'a ReconLine],
+    body: f64,
+    doc_leading: f64,
+) -> Vec<Vec<&'a ReconLine>> {
     if lines.is_empty() {
         return Vec::new();
     }
-    // Estimate the body leading from the median line-to-line vertical step (a
-    // paragraph split is judged on the group's own leading; a single-line group
-    // never splits, so the document fallback is irrelevant here → `0.0`).
-    let leading = estimate_leading(lines, body, 0.0);
+    // The document reference: the page-wide leading when known, else the body
+    // size. The group's own median step may only *lower* the reference (a
+    // tight-set group splits on smaller gaps); a group of 2 lines has no
+    // internal statistics at all — its single step IS `estimate_leading`'s
+    // median — so its own figure is ignored and the document reference alone
+    // judges the gap.
+    let doc_ref = doc_leading.max(body).max(1.0);
+    let reference = if lines.len() >= 3 {
+        estimate_leading(lines, body, doc_leading).min(doc_ref)
+    } else {
+        doc_ref
+    };
     let body_left = block_left(lines);
 
     let mut paras: Vec<Vec<&ReconLine>> = vec![vec![lines[0]]];
@@ -67,7 +100,14 @@ pub fn split_paragraphs<'a>(lines: &[&'a ReconLine], body: f64) -> Vec<Vec<&'a R
         // Vertical gap between baselines (top of cur minus top of prev, going
         // down the page → prev.top - cur.top is the step).
         let step = (prev.center_y() - cur.center_y()).abs();
-        let big_gap = step > leading * 1.5;
+        let big_gap = step > reference * 1.5;
+        // Absolute ceiling: no paragraph stacks lines further apart than 2.5×
+        // their own glyph size, whatever the (possibly inflated) leading says.
+        let ceiling = step > 2.5 * line_font_size(prev).max(line_font_size(cur));
+        // Side-by-side content: consecutive prose lines of one paragraph share
+        // their horizontal band; less than 20 % overlap (of the narrower line)
+        // means columns / disjoint fields, never one flow.
+        let disjoint = !lines_overlap_x(prev, cur);
         // First-line indent: the line starts clearly right of the block left.
         let indent = cur.left() - body_left > (body * 0.6).max(6.0);
         // Alignment change: a centred line breaking a flush-left run (or back).
@@ -76,13 +116,32 @@ pub fn split_paragraphs<'a>(lines: &[&'a ReconLine], body: f64) -> Vec<Vec<&'a R
             && (is_centered(cur, body_left, block_right(lines))
                 || is_centered(prev, body_left, block_right(lines)));
 
-        if big_gap || indent || align_break {
+        if big_gap || ceiling || disjoint || indent || align_break {
             paras.push(vec![cur]);
         } else {
             paras.last_mut().unwrap().push(cur);
         }
     }
     paras
+}
+
+/// A line's representative font size: the median of its runs' sizes, falling
+/// back to the line height (≈ glyph extent) when it has no runs.
+fn line_font_size(line: &ReconLine) -> f64 {
+    let mut sizes: Vec<f64> = line.runs.iter().map(|r| r.size.max(1.0)).collect();
+    median(&mut sizes, line.h.max(1.0)).max(1.0)
+}
+
+/// Whether two lines' horizontal spans overlap by at least 20 % of the
+/// narrower one. Degenerate (zero-width) lines count as overlapping so a lone
+/// mark never shatters its paragraph.
+fn lines_overlap_x(a: &ReconLine, b: &ReconLine) -> bool {
+    let overlap = a.right().min(b.right()) - a.left().max(b.left());
+    let narrow = a.w.min(b.w);
+    if narrow <= 0.0 {
+        return true;
+    }
+    overlap >= narrow * 0.20
 }
 
 /// Build one [`Block::Paragraph`] from a paragraph's lines with no recovered
@@ -159,7 +218,7 @@ pub(crate) fn build_paragraph_styled(
             let inline = Inline::Run(InlineRun {
                 text: r.text.clone(),
                 style,
-                source_index: r.source_index,
+                source_index: r.source_index.map(|i| vec![i]),
             });
             // Wrap the run in a Link when its box overlaps a link rect.
             match link_for_run(r, ctx.links) {
@@ -365,6 +424,12 @@ fn link_for_run(run: &ReconRun, links: &[ParaLink]) -> Option<crate::model::Link
 /// Two styles are "the same" when family, size, bold, italic, underline, strike,
 /// color and background all match. `vertical_align` (super/sub) is also compared
 /// so a superscript span stays separate from the baseline body.
+///
+/// The merged run keeps **every** constituent's source ordinal (its
+/// `source_index` vec is the concatenation, in content order) — the first entry
+/// remains the legacy single-index view. Losing the tail indices would make a
+/// coalesced span address only its first PDF run (edits/removals of the rest
+/// would silently miss).
 pub(crate) fn coalesce_runs(runs: Vec<Inline>) -> Vec<Inline> {
     let mut out: Vec<Inline> = Vec::with_capacity(runs.len());
     for r in runs {
@@ -395,7 +460,15 @@ pub(crate) fn coalesce_runs(runs: Vec<Inline>) -> Vec<Inline> {
                     }
                 });
                 match merge {
-                    Some(prev) => prev.text.push_str(&run.text),
+                    Some(prev) => {
+                        prev.text.push_str(&run.text);
+                        // Merge only happens when both sides are sourced or both
+                        // unsourced (guard above) — append the newcomer's
+                        // ordinals so the span addresses all its PDF runs.
+                        if let (Some(pv), Some(cv)) = (&mut prev.source_index, run.source_index) {
+                            pv.extend(cv);
+                        }
+                    }
                     None => out.push(Inline::Run(run)),
                 }
             }
@@ -751,7 +824,7 @@ mod tests {
         ];
         let lines = lines_of(&runs);
         let refs: Vec<&ReconLine> = lines.iter().collect();
-        let paras = split_paragraphs(&refs, 12.0);
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
         assert_eq!(paras.len(), 1, "tight lines = one paragraph");
         assert_eq!(paras[0].len(), 3);
     }
@@ -767,7 +840,7 @@ mod tests {
         ];
         let lines = lines_of(&runs);
         let refs: Vec<&ReconLine> = lines.iter().collect();
-        let paras = split_paragraphs(&refs, 12.0);
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
         assert_eq!(paras.len(), 2, "blank-line gap splits into two paragraphs");
     }
 
@@ -779,8 +852,125 @@ mod tests {
         ];
         let lines = lines_of(&runs);
         let refs: Vec<&ReconLine> = lines.iter().collect();
-        let paras = split_paragraphs(&refs, 12.0);
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
         assert_eq!(paras.len(), 2, "first-line indent breaks paragraph");
+    }
+
+    // ── geometric-coherence hardening (v1.19.2 hole, lib-side) ──────────────
+
+    #[test]
+    fn two_far_apart_lines_never_fuse_into_one_paragraph() {
+        // The historic hole: a 2-line group's single step IS its own median
+        // leading, so `step > 1.5 × own_leading` could never fire and a footer
+        // line 250 pt below a header fused into one "paragraph". Judged against
+        // the document leading (14 pt here), the 250 pt gap must split.
+        let runs = vec![
+            run("header line", 72.0, 700.0, 120.0),
+            run("footer line", 72.0, 450.0, 120.0), // 250 pt below
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 2, "250 pt apart = two paragraphs");
+        // Even with NO document leading (0.0 → body fallback) the absolute
+        // ceiling (2.5 × font size) still splits.
+        let paras = split_paragraphs(&refs, 12.0, 0.0);
+        assert_eq!(paras.len(), 2, "ceiling splits even without doc leading");
+    }
+
+    #[test]
+    fn two_normally_leaded_lines_still_fuse() {
+        // Regression guard for the hardening: ordinary 14 pt-leading prose
+        // (body 12) must keep merging into a single paragraph.
+        let runs = vec![
+            run("first prose line", 72.0, 700.0, 140.0),
+            run("second prose line", 72.0, 686.0, 140.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 1, "normal leading = one paragraph");
+        assert_eq!(paras[0].len(), 2);
+    }
+
+    #[test]
+    fn side_by_side_lines_without_horizontal_overlap_split() {
+        // Two vertically adjacent lines in disjoint horizontal bands (columns,
+        // disjoint form fields) share no prose flow: < 20 % overlap ⇒ split,
+        // whatever the vertical step says.
+        let runs = vec![
+            run("left column line", 72.0, 700.0, 100.0), // x 72..172
+            run("right column line", 300.0, 686.0, 100.0), // x 300..400, no overlap
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 2, "no horizontal overlap = two paragraphs");
+    }
+
+    #[test]
+    fn a_short_last_line_keeps_overlapping_its_paragraph() {
+        // A ragged-right closer fully inside the previous line's band overlaps
+        // ≥ 20 % of its own (narrower) width — it must NOT split.
+        let runs = vec![
+            run("a long full body line of text", 72.0, 700.0, 250.0),
+            run("short tail", 72.0, 686.0, 60.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 1, "ragged last line stays in the paragraph");
+    }
+
+    // ── coalesce_runs keeps every source ordinal ─────────────────────────────
+
+    /// Bare same-style run with a given source ordinal.
+    fn sourced_inline(text: &str, idx: usize) -> Inline {
+        Inline::Run(InlineRun {
+            text: text.to_string(),
+            style: crate::model::CharStyle {
+                size_pt: 12.0,
+                ..Default::default()
+            },
+            source_index: Some(vec![idx]),
+        })
+    }
+
+    #[test]
+    fn coalesce_accumulates_all_source_indices() {
+        // Three adjacent same-style sourced runs merge into ONE run carrying
+        // ALL their ordinals in order (first = legacy view); an unsourced run
+        // (synthesized space) never merges into a sourced one.
+        let merged = coalesce_runs(vec![
+            sourced_inline("rel", 5),
+            sourced_inline("at", 9),
+            sourced_inline("if", 12),
+        ]);
+        assert_eq!(merged.len(), 1);
+        let Inline::Run(r) = &merged[0] else {
+            panic!("expected run");
+        };
+        assert_eq!(r.text, "relatif");
+        assert_eq!(r.source_index, Some(vec![5, 9, 12]));
+        assert_eq!(r.first_source_index(), Some(5), "legacy first-index view");
+
+        let kept = coalesce_runs(vec![
+            sourced_inline("a", 1),
+            Inline::Run(InlineRun {
+                text: " ".to_string(),
+                style: crate::model::CharStyle {
+                    size_pt: 12.0,
+                    ..Default::default()
+                },
+                source_index: None,
+            }),
+            sourced_inline("b", 2),
+        ]);
+        assert_eq!(
+            kept.len(),
+            3,
+            "an unsourced spacer never merges with sourced neighbours"
+        );
     }
 
     #[test]
