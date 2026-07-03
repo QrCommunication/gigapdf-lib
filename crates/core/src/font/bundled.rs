@@ -107,6 +107,14 @@ fn fallback_face() -> Option<&'static crate::font::truetype::TrueTypeFont> {
         .as_ref()
 }
 
+/// Whether the bundled fallback face can paint `c` (has a real glyph for it).
+/// Used by importers that must pick a *visible* substitute character — e.g. a
+/// list-bullet glyph the source drew from a symbol font the engine does not
+/// bundle.
+pub fn fallback_covers(c: char) -> bool {
+    fallback_face().is_some_and(|f| f.gid_for_unicode(c as u32).is_some())
+}
+
 /// A real glyph program to draw a non-embedded base-14 font with, loaded from
 /// the engine's bundled faces (cached, parsed once). Returns the program by
 /// **reference** — the caller clones it into a [`crate::font::GlyphSource`] for

@@ -147,6 +147,10 @@ struct FontEntry {
     /// One of "serif" / "sans-serif" / "monospace" / "cursive" — from `\froman`
     /// `\fswiss` `\fmodern` `\fscript`; empty if unspecified.
     generic: &'static str,
+    /// `\fcharset2` (or a Symbol/Wingdings family name): the font's `\'xx`
+    /// bytes are **symbol codes**, not CP1252 — Word writes its list bullets as
+    /// `{\pntext\f1\'b7}` where `0xB7` in Symbol is `•`, not a middle dot.
+    symbol: bool,
 }
 
 // ────────────────────────── CP1252 high-byte table ─────────────────────────
@@ -421,7 +425,8 @@ impl<'a> Parser<'a> {
                 b'\'' if self.i + 3 < b.len() => {
                     let hex = &self.src[self.i + 2..self.i + 4];
                     if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                        self.push_char(cp1252_byte(byte));
+                        let ch = self.decode_byte(byte);
+                        self.push_char(ch);
                     }
                     self.i += 4;
                 }
@@ -719,6 +724,8 @@ impl<'a> Parser<'a> {
                     let np: Option<usize> = self.src[e..q].parse().ok();
                     match w {
                         "f" => cur_idx = np,
+                        // Charset 2 marks a symbol font (Symbol, Wingdings, …).
+                        "fcharset" => cur.symbol = np == Some(2),
                         "froman" => cur.generic = "serif",
                         "fswiss" => cur.generic = "sans-serif",
                         "fmodern" => cur.generic = "monospace",
@@ -747,11 +754,39 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn set_font(&mut self, idx: usize, entry: FontEntry) {
+    fn set_font(&mut self, idx: usize, mut entry: FontEntry) {
+        // Belt-and-braces: a Symbol/Wingdings family is a symbol font even when
+        // the writer omitted `\fcharset2`.
+        if !entry.symbol {
+            let lc = entry.name.to_ascii_lowercase();
+            entry.symbol = lc.contains("symbol") || lc.contains("wingding");
+        }
         if self.fonts.len() <= idx {
             self.fonts.resize(idx + 1, FontEntry::default());
         }
         self.fonts[idx] = entry;
+    }
+
+    /// Decode a `\'xx` byte through the **active font**: a symbol-charset font
+    /// (Symbol / Wingdings, `\fcharset2`) resolves through its own encoding —
+    /// Word writes list bullets as `{\pntext\f1\'b7\tab}` where `0xB7` in
+    /// Symbol is the bullet `•`, not the CP1252 middle dot `·`. Codes the
+    /// symbol tables don't cover (and every non-symbol font) fall back to the
+    /// plain CP1252 reading.
+    fn decode_byte(&self, byte: u8) -> char {
+        if let Some(font) = self.fonts.get(self.chr.font_idx) {
+            if font.symbol {
+                let mapped = if font.name.to_ascii_lowercase().contains("wingding") {
+                    super::office_import::wingdings_to_char(byte)
+                } else {
+                    crate::font::encoding::symbol_to_char(byte)
+                };
+                if let Some(c) = mapped {
+                    return c;
+                }
+            }
+        }
+        cp1252_byte(byte)
     }
 
     /// Parse `{\colortbl …}` into [`Self::colors`]. Each `;` terminates one entry;

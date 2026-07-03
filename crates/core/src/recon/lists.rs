@@ -466,17 +466,27 @@ pub fn build_list(
     if items.is_empty() {
         return None;
     }
-    // The list's marker is taken from its first item.
+    // The list's marker is taken from its first item — including its ordinal
+    // delimiter (`1.` vs `1)`) and its real start number, so a numbered list
+    // carved mid-sequence keeps both through the model round-trip.
     let first_idx = items
         .iter()
         .position(|l| detect_marker(&l.text()).is_some())?;
     let first_marker = detect_marker(&items[first_idx].text())?;
+    let first_info = classify_marker(&items[first_idx].text());
     let mut list = List {
         ordered: first_marker.ordered(),
         marker: first_marker.to_list_marker(),
         items: Vec::new(),
-
-        ..Default::default()
+        start: first_info
+            .as_ref()
+            .and_then(|i| i.ordinal)
+            .filter(|_| first_marker.ordered())
+            .unwrap_or(1),
+        marker_suffix: match first_info.as_ref().and_then(|i| i.delim) {
+            Some(Delim::Paren) => Some(')'),
+            _ => None,
+        },
     };
 
     // Bucket each marker line's start-X into a nesting level (0 = shallowest).

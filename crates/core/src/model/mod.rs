@@ -256,6 +256,20 @@ pub struct List {
     /// Start number for ordered lists (HTML `<ol start="N">`, DOCX `w:lvlOverride`
     /// `w:startOverride`, Markdown implicit). `1` = default (first item).
     pub start: u32,
+    /// Ordinal suffix for **ordered** markers: the punctuation Word/ODF append
+    /// after the number — DOCX `w:lvlText` `"%1."` vs `"%1)"`, ODF
+    /// `style:num-suffix`. `None` ⇒ the conventional `"."` (the pre-existing
+    /// behaviour, so the JSON stays retro-compatible: the field is only
+    /// serialized when set). Ignored for unordered lists.
+    pub marker_suffix: Option<char>,
+}
+
+impl List {
+    /// The effective ordinal suffix: [`marker_suffix`](Self::marker_suffix),
+    /// defaulting to `'.'`.
+    pub fn suffix(&self) -> char {
+        self.marker_suffix.unwrap_or('.')
+    }
 }
 
 /// One list item: a list of blocks at a given nesting `level`.

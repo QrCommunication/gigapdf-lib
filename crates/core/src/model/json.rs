@@ -736,6 +736,12 @@ impl Writer {
         if l.start != 1 {
             self.k_f64("start", l.start as f64);
         }
+        // Additive field: only emitted when set, so documents without a custom
+        // ordinal suffix serialize exactly as before (retro-compatible).
+        if let Some(suffix) = l.marker_suffix {
+            let mut tmp = [0u8; 4];
+            self.k_str("marker_suffix", suffix.encode_utf8(&mut tmp));
+        }
         self.obj_close();
     }
 
@@ -1984,6 +1990,7 @@ impl<'a> Reader<'a> {
                 "marker" => l.marker = r.list_marker()?,
                 "items" => l.items = r.array(Reader::list_item)?,
                 "start" => l.start = r.number()? as u32,
+                "marker_suffix" => l.marker_suffix = r.string()?.chars().next(),
                 _ => return None,
             }
             Some(())

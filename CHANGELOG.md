@@ -9,6 +9,25 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.115.0] - 2026-07-03
+
+Conversion-fidelity release, both directions, driven by an exhaustive
+empirical audit. Highlights: the extracted text of every Office-produced
+PDF no longer garbles bullets/accents/€ (Mac Roman cmap subtable polluted
+the synthesized `/ToUnicode` of all embedded fonts); lists round-trip
+faithfully (real bullet glyphs, numbering formats/suffixes/starts, per-level
+ordinals, nested HTML/MD exports); exported DOCX open in Word/LibreOffice
+again (VML namespaces), with sane margins, no phantom columns, positioned
+images (`wp:anchor`), dynamic page-number fields, and PPTX exports carry
+positioned shapes/pictures instead of an empty placeholder; the zip reader
+handles data-descriptor archives (real-world OOXML and every LibreOffice
+ODT/ODP previously imported empty), ODP custom-shape text and master-page
+geometry are honoured, decks paginate one slide per page with their images;
+and the DOCX display path reaches Word parity on character styles
+(strike/highlight/super/sub), table shading/borders/merges, repeating
+headers/footers with live page numbers, and multi-column sections.
+Details in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
+
 ## [0.114.1] - 2026-07-03
 
 Hotfix: `replaceText` re-encoding is now the exact inverse of decoding

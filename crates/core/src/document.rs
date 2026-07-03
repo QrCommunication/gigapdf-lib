@@ -9208,7 +9208,16 @@ impl Document {
             // max_bottom`. Clamped to ≥ 0 and to the page size; when the page has
             // no reconstructable content, default margins are kept.
             let margins = Self::estimate_page_margins(&blocks, disp_w, disp_h);
-            let column_count = Self::detect_column_count(&blocks, disp_w);
+            // The reconstruction anchors every paragraph's `indent_left_pt` at
+            // the **page** edge (`left − MediaBox x0`), but the exporters (and
+            // the Office importers that fill the same field) treat it as an
+            // indent **from the left margin**. Once the margin above is carved
+            // out of the page, keeping the page-anchored value would shift all
+            // prose right by the margin width a second time. Re-anchor: the
+            // exported position becomes `margin + (indent − margin)` — exactly
+            // the original x for every block at or past the margin.
+            Self::reanchor_left_indents(&mut blocks, margins.left);
+            let column_count = Self::detect_column_count(&blocks, disp_w, disp_h);
             let geometry = PageGeometry {
                 width: disp_w,
                 height: disp_h,
@@ -9745,41 +9754,32 @@ impl Document {
             && (a.margins.right - b.margins.right).abs() < 2.0
     }
 
-    /// Detect the number of text columns on a page by clustering the left edges
-    /// of reconstructed blocks. In a 2-column layout, blocks cluster into a left
-    /// group (left-edge near the left margin) and a right group (left-edge past
-    /// the page midline). Conservative: only reports multi-column when a clear
-    /// bimodal split exists, else defaults to 1.
-    fn detect_column_count(blocks: &[crate::model::Block], page_w: f64) -> u8 {
-        if page_w <= 0.0 {
-            return 1;
-        }
-        let mid = page_w * 0.5;
-        // Count blocks whose left edge sits clearly in the right half (past 42%
-        // of page width, which leaves room for the gutter + a tolerance).
-        let threshold = page_w * 0.42;
-        let mut right_count = 0usize;
-        let mut total = 0usize;
-        for b in blocks {
-            let Some(f) = b.frame else { continue };
-            // Only count narrow-to-medium blocks (full-width headings/tables
-            // span both columns and shouldn't count as "right" or "left").
-            if f.w > page_w * 0.6 {
-                continue;
-            }
-            total += 1;
-            if f.x >= threshold && f.x < mid * 2.0 {
-                right_count += 1;
-            }
-        }
-        // Need at least 3 blocks in the right cluster and at least 25% of
-        // non-full-width blocks on that side — conservative to avoid false
-        // positives on indented paragraphs or sidebars in a single-column doc.
-        if total >= 6 && right_count >= 3 && right_count as f64 / total as f64 >= 0.25 {
-            2
-        } else {
-            1
-        }
+    /// Detect the number of text columns on a page from the reconstructed
+    /// blocks' frames. Delegates to the hardened geometry detector
+    /// [`recon::columns::column_count_from_frames`](crate::recon::columns::column_count_from_frames):
+    /// a second column requires several narrow blocks on **both** sides, each
+    /// side running down a significant share of the page height, and the two
+    /// sides coexisting vertically — so a lone positioned cluster (a letter's
+    /// recipient address or signature block) no longer fabricates a phantom
+    /// `w:cols w:num="2"` that re-flows the whole export into two columns.
+    ///
+    /// Only **text-bearing** blocks vote: columns are a property of the prose
+    /// flow, and a decorative rule/box or a stamp image sitting mid-page must
+    /// not manufacture a side cluster (the permis-rejet false positive was a
+    /// wide letterhead rule whose centre landed right of the midline).
+    fn detect_column_count(blocks: &[crate::model::Block], page_w: f64, page_h: f64) -> u8 {
+        use crate::model::BlockKind;
+        let frames: Vec<crate::model::Rect> = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.kind,
+                    BlockKind::Paragraph(_) | BlockKind::Heading(_) | BlockKind::List(_)
+                )
+            })
+            .filter_map(|b| b.frame)
+            .collect();
+        crate::recon::columns::column_count_from_frames(&frames, page_w, page_h)
     }
 
     /// Convert a PDF date string (`D:YYYYMMDDHHmmSSOHH'mm'`, ISO 32000-1
@@ -9960,7 +9960,17 @@ impl Document {
 
     /// Estimate page margins (top-down points) from the content bounding box of
     /// the reconstructed blocks. Returns default margins when there are no blocks
-    /// with frames. Clamped to `[0, page_dim]`.
+    /// with frames.
+    ///
+    /// The raw content insets are **not** margins: a letter whose text stops
+    /// mid-page has a 500 pt+ bottom inset, and exporting that as `w:pgMar`
+    /// carves an enormous dead band out of every page (fidelity audit, gap 4).
+    /// So each side is clamped to a plausible print-margin range
+    /// (`[`[`MARGIN_MIN_PT`](Self::MARGIN_MIN_PT)`, `[`MARGIN_MAX_PT`](Self::MARGIN_MAX_PT)`]`,
+    /// further capped to a quarter of the page dimension for tiny pages), and
+    /// when the two raw insets of an axis diverge extremely (content stopping
+    /// far short of one edge) the larger side snaps to the smaller one —
+    /// intended layout margins are symmetric far more often than not.
     fn estimate_page_margins(
         blocks: &[crate::model::Block],
         page_w: f64,
@@ -9978,21 +9988,83 @@ impl Document {
                 max_bottom = max_bottom.max(f.y + f.h);
             }
         }
-        if min_x.is_finite() {
-            let left = min_x.max(0.0).min(page_w);
-            let top = min_y.max(0.0).min(page_h);
-            let right = (page_w - max_right).max(0.0).min(page_w);
-            let bottom = (page_h - max_bottom).max(0.0).min(page_h);
-            crate::model::geom::Margins {
-                top,
-                right,
-                bottom,
-                left,
+        if !min_x.is_finite() {
+            return crate::model::geom::Margins::default();
+        }
+        let raw_left = min_x.max(0.0);
+        let raw_top = min_y.max(0.0);
+        let raw_right = (page_w - max_right).max(0.0);
+        let raw_bottom = (page_h - max_bottom).max(0.0);
+
+        // Clamp one axis: each side into the plausible band, then symmetric
+        // coherence when the raw insets diverge extremely.
+        let clamp_axis = |a: f64, b: f64, page_dim: f64| -> (f64, f64) {
+            let hi = Self::MARGIN_MAX_PT.min(page_dim * 0.25).max(0.0);
+            let lo = Self::MARGIN_MIN_PT.min(hi);
+            let (mut ca, mut cb) = (a.clamp(lo, hi), b.clamp(lo, hi));
+            if (a - b).abs() > Self::MARGIN_DIVERGENCE_PT {
+                if a > b {
+                    ca = cb;
+                } else {
+                    cb = ca;
+                }
             }
-        } else {
-            crate::model::geom::Margins::default()
+            (ca, cb)
+        };
+        let (top, bottom) = clamp_axis(raw_top, raw_bottom, page_h);
+        let (left, right) = clamp_axis(raw_left, raw_right, page_w);
+        crate::model::geom::Margins {
+            top,
+            right,
+            bottom,
+            left,
         }
     }
+
+    /// Shift every paragraph-like left indent in `blocks` from its page-edge
+    /// anchor to a **margin** anchor: subtract `dx` (the estimated left margin,
+    /// points), floored at zero. Recurses through lists, text boxes and block
+    /// quotes; tables/cells keep their own inner geometry. See the call site in
+    /// [`reconstruct_model`](Self::reconstruct_model) for why.
+    fn reanchor_left_indents(blocks: &mut [crate::model::Block], dx: f64) {
+        use crate::model::BlockKind;
+        if dx <= 0.0 {
+            return;
+        }
+        for b in blocks {
+            match &mut b.kind {
+                BlockKind::Paragraph(p) => {
+                    p.style.indent_left_pt = (p.style.indent_left_pt - dx).max(0.0);
+                }
+                BlockKind::Heading(h) => {
+                    h.para.style.indent_left_pt = (h.para.style.indent_left_pt - dx).max(0.0);
+                }
+                BlockKind::List(list) => {
+                    for item in &mut list.items {
+                        Self::reanchor_left_indents(&mut item.blocks, dx);
+                    }
+                }
+                BlockKind::TextBox(tb) => Self::reanchor_left_indents(&mut tb.blocks, dx),
+                BlockKind::Blockquote(bq) => Self::reanchor_left_indents(&mut bq.blocks, dx),
+                // Tables, images, shapes, code, rules… position themselves.
+                _ => {}
+            }
+        }
+    }
+
+    /// Smallest plausible estimated page margin (points). Content flush against
+    /// the page edge still exports a hairline margin so nothing is clipped by
+    /// printers/viewers that can't reach the physical edge.
+    const MARGIN_MIN_PT: f64 = 12.0;
+
+    /// Largest plausible estimated page margin (points): 96 pt ≈ 1.33″, past
+    /// every conventional office layout. Anything beyond is content geometry
+    /// (a short page, a centered block), not a margin.
+    const MARGIN_MAX_PT: f64 = 96.0;
+
+    /// Raw-inset divergence (points) past which the two sides of an axis are
+    /// considered inconsistent and snapped to the smaller side's clamped value.
+    const MARGIN_DIVERGENCE_PT: f64 = 150.0;
 
     /// Convert the document to an editable OpenDocument Text (`.odt`) via the
     /// reconstructed model — flowing paragraphs, headings, lists, tables, images,
@@ -39648,5 +39720,86 @@ mod tests {
             crate::font::truetype::TrueTypeFont::parse(&bytes).is_some(),
             "served face parses"
         );
+    }
+
+    /// Fidelity-audit gap 4: the reconstructed section margins are the content
+    /// bounding-box insets, so a letter whose text stops mid-page exported a
+    /// 500 pt+ bottom "margin" — a huge dead band on every page of the DOCX/ODT.
+    /// The estimate must clamp each side to a plausible print band and snap an
+    /// extremely divergent axis to its smaller side (symmetric intent).
+    #[test]
+    fn estimated_page_margins_are_clamped_and_symmetric() {
+        use crate::model::{geom::Rect, Block};
+
+        let block = |x: f64, y: f64, w: f64, h: f64| Block {
+            frame: Some(Rect::new(x, y, w, h)),
+            ..Default::default()
+        };
+
+        // A permis-rejet-like last page: content from y=68 down to y=263 only
+        // (raw bottom inset ≈ 579 pt on an 842 pt page).
+        let blocks = vec![block(57.0, 68.0, 480.0, 100.0), block(57.0, 200.0, 480.0, 63.0)];
+        let m = Document::estimate_page_margins(&blocks, 595.0, 842.0);
+        assert!((m.top - 68.0).abs() < 0.01, "sane top inset kept: {}", m.top);
+        assert_eq!(
+            m.bottom, m.top,
+            "extreme bottom inset snaps to the top margin (symmetric intent)"
+        );
+        assert!((m.left - 57.0).abs() < 0.01);
+        assert!((m.right - 58.0).abs() < 0.01);
+
+        // Both insets huge (a lone centered block): each side clamps to the
+        // plausible band's ceiling instead of exporting content geometry.
+        let lone = vec![block(250.0, 400.0, 95.0, 42.0)];
+        let m = Document::estimate_page_margins(&lone, 595.0, 842.0);
+        assert!(m.top <= 96.0 && m.bottom <= 96.0 && m.left <= 96.0 && m.right <= 96.0);
+        assert!(m.top >= 12.0 && m.left >= 12.0);
+
+        // Content flush to the edges still leaves a printable hairline margin.
+        let full = vec![block(0.0, 0.0, 595.0, 842.0)];
+        let m = Document::estimate_page_margins(&full, 595.0, 842.0);
+        assert!((m.top - 12.0).abs() < 0.01 && (m.left - 12.0).abs() < 0.01);
+
+        // No framed blocks → the defaults, untouched.
+        let m = Document::estimate_page_margins(&[], 595.0, 842.0);
+        assert_eq!(m, crate::model::geom::Margins::default());
+    }
+
+    /// Companion of the margin estimate: once the left margin is carved out of
+    /// the page, the page-edge-anchored `indent_left_pt` must be re-anchored to
+    /// the margin or every paragraph shifts right by the margin width a second
+    /// time (`w:pgMar` + `w:ind` both applied). `margin + (indent − margin)`
+    /// must reproduce the original x.
+    #[test]
+    fn reconstructed_indents_reanchor_to_the_estimated_margin() {
+        use crate::model::{Block, BlockKind, Paragraph};
+
+        let para_at = |indent: f64| Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                style: crate::model::ParagraphStyle {
+                    indent_left_pt: indent,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // A margin-flush paragraph (indent == margin) and a genuinely indented
+        // one (margin + 28pt).
+        let mut blocks = vec![para_at(56.7), para_at(84.7)];
+        Document::reanchor_left_indents(&mut blocks, 56.7);
+        let indent = |b: &Block| match &b.kind {
+            BlockKind::Paragraph(p) => p.style.indent_left_pt,
+            _ => unreachable!(),
+        };
+        assert_eq!(indent(&blocks[0]), 0.0, "margin-flush prose loses the double shift");
+        assert!(
+            (indent(&blocks[1]) - 28.0).abs() < 0.01,
+            "a real indent keeps its relative depth"
+        );
+        // dx = 0 (or negative) leaves everything untouched.
+        let mut untouched = vec![para_at(10.0)];
+        Document::reanchor_left_indents(&mut untouched, 0.0);
+        assert_eq!(indent(&untouched[0]), 10.0);
     }
 }

@@ -50,6 +50,16 @@ struct PageGeom {
     w: f64,
     h: f64,
     margins: Margins,
+    /// Distance from the top page edge to the running header's top (DOCX
+    /// `w:pgMar@w:header`, points). `None` keeps the engine's default.
+    header_off: Option<f64>,
+    /// Distance from the bottom page edge to the running footer's bottom (DOCX
+    /// `w:pgMar@w:footer`, points). `None` keeps the engine's default.
+    footer_off: Option<f64>,
+    /// Text columns of the document's main (body-level) section — DOCX
+    /// `w:sectPr/w:cols@w:num`. `1` for every other format / no `w:cols`.
+    /// Surfaced as the model's [`PageGeometry::column_count`].
+    column_count: u8,
 }
 
 impl PageGeom {
@@ -59,6 +69,9 @@ impl PageGeom {
             w: A4_W,
             h: A4_H,
             margins: Margins::uniform(PROSE_MARGIN),
+            header_off: None,
+            footer_off: None,
+            column_count: 1,
         }
     }
 
@@ -68,6 +81,9 @@ impl PageGeom {
             w: A4_H,
             h: A4_W,
             margins: Margins::uniform(TABULAR_MARGIN),
+            header_off: None,
+            footer_off: None,
+            column_count: 1,
         }
     }
 
@@ -77,6 +93,9 @@ impl PageGeom {
             w: SLIDE_W,
             h: SLIDE_H,
             margins: Margins::uniform(TABULAR_MARGIN),
+            header_off: None,
+            footer_off: None,
+            column_count: 1,
         }
     }
 
@@ -84,6 +103,12 @@ impl PageGeom {
     fn render_options(&self) -> RenderOptions {
         let mut opts = RenderOptions::new(self.w, self.h);
         opts.margins = self.margins;
+        if let Some(h) = self.header_off {
+            opts.header_offset = h.max(0.0);
+        }
+        if let Some(f) = self.footer_off {
+            opts.footer_offset = f.max(0.0);
+        }
         opts
     }
 }
@@ -228,7 +253,8 @@ use crate::model::{
 };
 
 /// Convert a `PageGeom` (Office fallback/declared geometry) to the model's
-/// [`PageGeometry`], reusing the already-resolved size and margins.
+/// [`PageGeometry`], reusing the already-resolved size, margins and (DOCX
+/// `w:sectPr/w:cols`) column count.
 fn page_geometry(g: PageGeom) -> PageGeometry {
     PageGeometry {
         width: g.w,
@@ -239,7 +265,7 @@ fn page_geometry(g: PageGeom) -> PageGeometry {
             bottom: g.margins.bottom,
             left: g.margins.left,
         },
-        column_count: 1,
+        column_count: g.column_count.max(1),
     }
 }
 
@@ -1053,6 +1079,7 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         numbering: &numbering,
         footnotes: &footnotes,
         page_h: geom.h,
+        hf_tokens: false,
     };
 
     let mut pages = DocxPages::new();
@@ -2109,11 +2136,18 @@ fn docx_paragraph_model(
     let block = if let Some(level) = para.list_level {
         // A list paragraph: wrap as a one-item List so the marker/ordinal is
         // recorded (reusing the numbering resolution as in the HTML path).
-        let (ordered, marker) = docx_list_marker(ctx, num_ref.num_id, level);
-        if num_ref.num_id.is_some() {
-            // Advance the running counter so ordinals are stable across the list.
-            let _ = counters.next(num_ref.num_id.unwrap_or(0), level);
-        }
+        let (ordered, marker, marker_suffix) = docx_list_marker(ctx, num_ref.num_id, level);
+        // Advance the running counter (seeded from the level's `w:start`) and
+        // pin this item's ordinal as the one-item list's `start`, so a
+        // numbered paragraph keeps its real number ("3.") instead of
+        // re-rendering as "1." downstream.
+        let ordinal = num_ref
+            .num_id
+            .map(|nid| {
+                let seed = ctx.numbering.level(nid, level).map_or(1, |nl| nl.start);
+                counters.next(nid, level, seed)
+            })
+            .unwrap_or(1);
         Block {
             kind: BlockKind::List(List {
                 ordered,
@@ -2125,8 +2159,8 @@ fn docx_paragraph_model(
                     }],
                     level: level.min(u8::MAX as u32) as u8,
                 }],
-
-                ..Default::default()
+                start: if ordered { ordinal } else { 1 },
+                marker_suffix,
             }),
             ..Block::default()
         }
@@ -2737,17 +2771,23 @@ fn push_run_maybe_linked(runs: &mut Vec<Inline>, run: &RunStyle, text: &str) {
     });
 }
 
-/// Resolve a DOCX list paragraph's `(ordered, marker)` for the model: the
-/// numbering format from `numbering.xml` maps to a [`ListMarker`]; bullet/unknown
-/// → an unordered bullet. Reuses [`DocxNumbering::fmt`] and [`NumFmt`].
-fn docx_list_marker(ctx: &DocxCtx, num_id: Option<u32>, level: u32) -> (bool, ListMarker) {
-    match num_id.and_then(|nid| ctx.numbering.fmt(nid, level)) {
-        Some(NumFmt::Decimal) => (true, ListMarker::Decimal),
-        Some(NumFmt::LowerLetter) => (true, ListMarker::LowerAlpha),
-        Some(NumFmt::UpperLetter) => (true, ListMarker::UpperAlpha),
-        Some(NumFmt::LowerRoman) => (true, ListMarker::LowerRoman),
-        Some(NumFmt::UpperRoman) => (true, ListMarker::UpperRoman),
-        _ => (false, ListMarker::Bullet('\u{2022}')),
+/// Resolve a DOCX list paragraph's `(ordered, marker, ordinal suffix)` for the
+/// model: the numbering level from `numbering.xml` maps to a [`ListMarker`]
+/// (ordered formats keep their `w:lvlText` suffix — `Some(')')` etc., `None`
+/// for the conventional `'.'`); a bullet level carries its real resolved
+/// character; an unknown level → the depth's default bullet. Reuses
+/// [`DocxNumbering::level`] and [`NumFmt`].
+fn docx_list_marker(
+    ctx: &DocxCtx,
+    num_id: Option<u32>,
+    level: u32,
+) -> (bool, ListMarker, Option<char>) {
+    match num_id.and_then(|nid| ctx.numbering.level(nid, level)) {
+        Some(nl) => match nl.fmt.ordered_marker() {
+            Some(marker) => (true, marker, (nl.suffix != '.').then_some(nl.suffix)),
+            None => (false, ListMarker::Bullet(nl.bullet), None),
+        },
+        None => (false, ListMarker::Bullet(default_level_bullet(level)), None),
     }
 }
 
@@ -5701,17 +5741,32 @@ struct OdfModelCtx<'a> {
     cell_valign: &'a BTreeMap<String, model::CellVAlign>,
     /// `text:list-style` name → per-level [`ListMarker`] (`Some` ⇒ ordered level,
     /// `None`/gap ⇒ unordered bullet). Indexed by `text:level - 1`.
-    list_styles: &'a BTreeMap<String, Vec<Option<ListMarker>>>,
+    list_styles: &'a BTreeMap<String, Vec<Option<OdfListLevel>>>,
 }
 
 /// The list context an [`odf_walk_model`] frame inherits when it sits inside a
-/// `text:list`: the 0-based nesting `level` and the enclosing list's
+/// `text:list`: the 0-based nesting `level`, the enclosing list's
 /// `text:style-name` (used to resolve ordered-vs-unordered / number format at
-/// that level). `None` (the argument) ⇒ not inside a list (plain paragraphs).
+/// that level), and the list tree's shared **ordinal counters** (level →
+/// running 1-based ordinal; advancing a level resets deeper ones) so each
+/// numbered paragraph pins its real number into its one-item `List.start`.
+/// `None` (the argument) ⇒ not inside a list (plain paragraphs).
 #[derive(Clone, Copy)]
 struct OdfListCtx<'a> {
     level: u32,
     style: Option<&'a str>,
+    counters: &'a std::cell::RefCell<BTreeMap<u32, u32>>,
+}
+
+impl OdfListCtx<'_> {
+    /// Advance this level's ordinal (resetting deeper levels) and return it.
+    fn next_ordinal(&self, level: u32) -> u32 {
+        let mut counters = self.counters.borrow_mut();
+        counters.retain(|&l, _| l <= level);
+        let n = counters.entry(level).or_insert(0);
+        *n += 1;
+        *n
+    }
 }
 
 /// ODT → [`Document`]: `text:h`→heading, `text:p`→paragraph, `text:list`→list,
@@ -5886,7 +5941,16 @@ fn odf_walk_model(
                                 // format) from the enclosing list style at this
                                 // nesting level; default to an unordered bullet
                                 // when no number style is found.
-                                let (ordered, marker) = odf_list_marker(ctx, list_style, level);
+                                let (ordered, marker, marker_suffix) =
+                                    odf_list_marker(ctx, list_style, level);
+                                // Pin the paragraph's real running ordinal as
+                                // the one-item list's `start` (mirrors the DOCX
+                                // model path) so "2." doesn't re-render as "1.".
+                                let start = if ordered {
+                                    list.map(|l| l.next_ordinal(level)).unwrap_or(1)
+                                } else {
+                                    1
+                                };
                                 out.push(Block {
                                     kind: BlockKind::List(List {
                                         ordered,
@@ -5898,8 +5962,8 @@ fn odf_walk_model(
                                             }],
                                             level: level.min(u8::MAX as u32) as u8,
                                         }],
-
-                                        ..Default::default()
+                                        start,
+                                        marker_suffix,
                                     }),
                                     ..Block::default()
                                 });
@@ -5932,8 +5996,23 @@ fn odf_walk_model(
                         let style = attr(&attrs, "style-name")
                             .filter(|n| !n.is_empty())
                             .or(list_style);
-                        let inner = Some(OdfListCtx { level, style });
-                        odf_walk_model(x, ctx, out, Some("list"), inner, resources, outline);
+                        match list {
+                            // Nested list: share the tree's ordinal counters.
+                            Some(outer) => {
+                                let inner = Some(OdfListCtx { level, style, ..outer });
+                                odf_walk_model(x, ctx, out, Some("list"), inner, resources, outline);
+                            }
+                            // Outermost list: fresh counters for this tree.
+                            None => {
+                                let counters = std::cell::RefCell::new(BTreeMap::new());
+                                let inner = Some(OdfListCtx {
+                                    level,
+                                    style,
+                                    counters: &counters,
+                                });
+                                odf_walk_model(x, ctx, out, Some("list"), inner, resources, outline);
+                            }
+                        }
                     }
                     "table" if !sc => {
                         let table = odf_table_model(x, ctx, resources);
@@ -6785,7 +6864,7 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     let styles_xml = part(zip, "styles.xml");
     let mut styles = odf_text_styles(&styles_xml);
     styles.extend(odf_text_styles(&content));
-    let geom = odf_geom(&styles_xml, &content, PageGeom::slide_default());
+    let geom = odp_geom(&styles_xml, &content, PageGeom::slide_default());
 
     // Paragraph-level formatting (`fo:*` align/indent/spacing) and `text:list-style`
     // per-level number/bullet definitions, keyed by style name (parent chains
@@ -7266,7 +7345,12 @@ fn odp_frame_model(
                     // shared ODF walker, which handles nesting and item paragraphs.
                     "list" if !sc => {
                         let style = attr(&attrs, "style-name").filter(|n| !n.is_empty());
-                        let inner = Some(OdfListCtx { level: 0, style });
+                        let counters = std::cell::RefCell::new(BTreeMap::new());
+                        let inner = Some(OdfListCtx {
+                            level: 0,
+                            style,
+                            counters: &counters,
+                        });
                         odf_walk_model(
                             x,
                             ctx,
@@ -8286,14 +8370,33 @@ pub fn docx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 /// referenced-but-unembedded family (Calibri→Carlito) lays out with the right
 /// metrics.
 fn docx_to_pdf_with(zip: &BTreeMap<String, Vec<u8>>, host: &[ProvidedFont]) -> Vec<u8> {
-    let (body, geom) = docx_body_geom(zip);
-    render_geom_with_fonts(&body, geom, &merge_fonts(extract_embedded_fonts(zip), host))
+    let parts = docx_html_parts(zip);
+    let mut opts = parts.geom.render_options();
+    opts.header = parts.header;
+    opts.footer = parts.footer;
+    crate::html::render_with(
+        &html_doc(&parts.body),
+        &merge_fonts(extract_embedded_fonts(zip), host),
+        &opts,
+    )
 }
 
-/// Build the DOCX HTML `<body>` and resolve its page geometry, without
-/// rendering. Shared by [`docx_to_pdf`] (which then renders it) and the
-/// font-need scan ([`office_needed_fonts`]) so both see identical markup.
-fn docx_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
+/// The DOCX flow lowered to HTML: the `<body>` markup, the resolved page
+/// geometry, and the running header/footer snippets destined for the engine's
+/// per-page [`RenderOptions::header`]/[`RenderOptions::footer`] (with live
+/// `{{page}}`/`{{pages}}` tokens for `PAGE`/`NUMPAGES` fields).
+struct DocxHtmlParts {
+    body: String,
+    geom: PageGeom,
+    header: Option<String>,
+    footer: Option<String>,
+}
+
+/// Build the DOCX HTML `<body>`, its page geometry, and the running
+/// header/footer snippets, without rendering. Shared by [`docx_to_pdf`] (which
+/// then renders it) and the font-need scan ([`office_needed_fonts`]) so both
+/// see identical markup.
+fn docx_html_parts(zip: &BTreeMap<String, Vec<u8>>) -> DocxHtmlParts {
     let doc = part(zip, "word/document.xml");
     let rels = zip
         .get("word/_rels/document.xml.rels")
@@ -8311,20 +8414,49 @@ fn docx_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
         numbering: &numbering,
         footnotes: &footnotes,
         page_h: geom.h,
+        hf_tokens: false,
     };
 
     let mut body = String::new();
-    // Headers precede the main flow; footers follow it (single-flow render).
-    docx_header_footer(zip, &ctx, "header", &mut body);
     docx_body(&doc, &ctx, &mut body);
     docx_footnotes_section(&ctx, &mut body);
-    docx_header_footer(zip, &ctx, "footer", &mut body);
-    (body, geom)
+
+    // Header/footer parts go to the engine's running header/footer options —
+    // repeated on EVERY page, painted in the page margins — instead of being
+    // injected once into the flow. The token-mode context turns their
+    // PAGE/NUMPAGES fields into `{{page}}`/`{{pages}}`, substituted per page.
+    let hf_ctx = DocxCtx {
+        hf_tokens: true,
+        ..ctx
+    };
+    let running = |kind: &str| -> Option<String> {
+        let mut s = String::new();
+        docx_header_footer(zip, &hf_ctx, kind, &mut s);
+        (!s.trim().is_empty()).then_some(s)
+    };
+    let header = running("header");
+    let footer = running("footer");
+    DocxHtmlParts {
+        body,
+        geom,
+        header,
+        footer,
+    }
 }
 
-/// The DOCX HTML `<body>` only (geometry dropped) — used by the font-need scan.
+/// The DOCX HTML markup only (geometry dropped) — used by the font-need scan.
+/// The running header/footer snippets are appended so the scan also sees the
+/// font families they reference.
 fn docx_body_html(zip: &BTreeMap<String, Vec<u8>>) -> String {
-    docx_body_geom(zip).0
+    let parts = docx_html_parts(zip);
+    let mut s = parts.body;
+    if let Some(h) = &parts.header {
+        s.push_str(h);
+    }
+    if let Some(f) = &parts.footer {
+        s.push_str(f);
+    }
+    s
 }
 
 /// Per-document DOCX context threaded through the body walker: media/relationship
@@ -8338,11 +8470,20 @@ struct DocxCtx<'a> {
     /// Page height (points). Used to flip a floating drawing's top-left
     /// `wp:posOffset` into the model's lower-left [`model::Block::frame`].
     page_h: f64,
+    /// `true` while walking a header/footer part destined for the HTML engine's
+    /// running header/footer options: `PAGE`/`NUMPAGES` fields then emit the
+    /// live `{{page}}`/`{{pages}}` tokens instead of static placeholders.
+    hf_tokens: bool,
 }
 
-/// Render every `word/header*.xml` (or `footer*.xml`, per `kind`) as plain
-/// paragraphs, wrapped so they read as header/footer matter around the main
-/// flow. Parts are emitted in filename order for determinism.
+/// Render every `word/header*.xml` (or `footer*.xml`, per `kind`) as styled
+/// paragraph markup, concatenated into one running header/footer snippet for
+/// the HTML engine (painted in the page margins on every page). Parts are
+/// emitted in filename order for determinism. Rich content (tables, inline
+/// images) passes through as-is — the engine lays the snippet out with the
+/// same block layout as the body; anything taller than the margin band simply
+/// overflows toward the content box (a reasonable degradation for the rare
+/// oversized header).
 fn docx_header_footer(
     zip: &BTreeMap<String, Vec<u8>>,
     ctx: &DocxCtx,
@@ -8471,17 +8612,30 @@ fn docx_footnotes_section(ctx: &DocxCtx, out: &mut String) {
 }
 
 /// Read the section's page size/margins from the body's `w:sectPr` —
-/// `w:pgSz@w:w/@w:h` (+ `@w:orient`) and `w:pgMar@w:top/@w:right/@w:bottom/@w:left`,
-/// all in twips (`pt = twips / 20`). Falls back to A4 portrait with 1in margins.
+/// `w:pgSz@w:w/@w:h` (+ `@w:orient`), `w:pgMar@w:top/@w:right/@w:bottom/@w:left`
+/// (+ `@w:header`/`@w:footer`, the running header/footer offsets), all in twips
+/// (`pt = twips / 20`). Falls back to A4 portrait with 1in margins.
+///
+/// Size and margins come from the **first** section (enough for a single-flow
+/// render); the column count (`w:cols@w:num`) comes from the **last** `w:sectPr`
+/// — the body-level section, i.e. the document's main text flow.
 fn docx_page_geom(document_xml: &str) -> PageGeom {
     let mut geom = PageGeom::prose_default();
     let mut x = Xml::new(document_xml);
     let mut in_sect = false;
+    // Set once the first `w:sectPr` closes: later sections no longer override
+    // the size/margins (but their `w:cols` still land, last one winning).
+    let mut first_done = false;
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => match local(&name) {
-                "sectPr" => in_sect = true,
-                "pgSz" if in_sect => {
+                "sectPr" => {
+                    in_sect = true;
+                    // Each section redeclares its columns; reset so the LAST
+                    // section's `w:cols` (or its absence ⇒ 1) is what survives.
+                    geom.column_count = 1;
+                }
+                "pgSz" if in_sect && !first_done => {
                     let w = attr(&attrs, "w").and_then(twips_to_pt);
                     let h = attr(&attrs, "h").and_then(twips_to_pt);
                     if let (Some(w), Some(h)) = (w, h) {
@@ -8493,7 +8647,7 @@ fn docx_page_geom(document_xml: &str) -> PageGeom {
                     }
                     let _ = sc; // pgSz is self-closing; keep scanning for pgMar.
                 }
-                "pgMar" if in_sect => {
+                "pgMar" if in_sect && !first_done => {
                     let m = &mut geom.margins;
                     if let Some(v) = attr(&attrs, "top").and_then(twips_to_pt) {
                         m.top = v.max(0.0);
@@ -8507,13 +8661,28 @@ fn docx_page_geom(document_xml: &str) -> PageGeom {
                     if let Some(v) = attr(&attrs, "left").and_then(twips_to_pt) {
                         m.left = v.max(0.0);
                     }
+                    // Running header/footer offsets from the page edges.
+                    geom.header_off = attr(&attrs, "header")
+                        .and_then(twips_to_pt)
+                        .or(geom.header_off);
+                    geom.footer_off = attr(&attrs, "footer")
+                        .and_then(twips_to_pt)
+                        .or(geom.footer_off);
+                }
+                // `w:cols@w:num` — the section's text-column count. Every
+                // section is scanned; the last (body-level, main flow) wins.
+                "cols" if in_sect => {
+                    if let Some(n) = attr(&attrs, "num").and_then(|v| v.trim().parse::<u32>().ok())
+                    {
+                        geom.column_count = n.clamp(1, 8) as u8;
+                    }
                 }
                 _ => {}
             },
             Tok::Close(name) => {
                 if local(&name) == "sectPr" {
-                    // First section's geometry is enough for a single-flow render.
-                    break;
+                    in_sect = false;
+                    first_done = true;
                 }
             }
             Tok::Text(_) => {}
@@ -8572,14 +8741,39 @@ impl RunStyle {
         if self.italic {
             css.push_str("font-style:italic;");
         }
-        if self.underline {
-            css.push_str("text-decoration:underline;");
+        // Underline and strike-through share `text-decoration` (the engine reads
+        // each keyword independently, so both can ride in one declaration).
+        match (self.underline, self.strike) {
+            (true, true) => css.push_str("text-decoration:underline line-through;"),
+            (true, false) => css.push_str("text-decoration:underline;"),
+            (false, true) => css.push_str("text-decoration:line-through;"),
+            (false, false) => {}
         }
-        if let Some(half) = self.size_half_pt {
-            css.push_str(&format!("font-size:{}pt;", half / 2.0));
+        // Superscript/subscript runs shrink like Word paints them (~65% of the
+        // base size) and shift via `vertical-align:super/sub`.
+        let sup_sub = !matches!(self.vertical_align, model::VAlign::Baseline);
+        match (self.size_half_pt, sup_sub) {
+            (Some(half), false) => css.push_str(&format!("font-size:{}pt;", half / 2.0)),
+            (Some(half), true) => {
+                css.push_str(&format!("font-size:{}pt;", fmt_pt(half / 2.0 * 0.65)))
+            }
+            (None, true) => css.push_str("font-size:0.65em;"),
+            (None, false) => {}
+        }
+        match self.vertical_align {
+            model::VAlign::Super => css.push_str("vertical-align:super;"),
+            model::VAlign::Sub => css.push_str("vertical-align:sub;"),
+            model::VAlign::Baseline => {}
         }
         if let Some(c) = &self.color {
             css.push_str(&format!("color:#{c};"));
+        }
+        // Text highlight / run shading paints behind the glyphs.
+        if let Some(h) = &self.highlight {
+            css.push_str(&format!("background-color:#{h};"));
+        }
+        if let Some(ls) = self.letter_spacing {
+            css.push_str(&format!("letter-spacing:{}pt;", fmt_pt(ls)));
         }
         if let Some(fam) = &self.font_family {
             let family = css_font_family(fam);
@@ -8889,12 +9083,110 @@ fn jc_to_align(val: &str) -> Option<&'static str> {
     }
 }
 
-/// Walk a DOCX body region (`w:body` or a `w:tc` cell), emitting HTML into `out`.
+/// Column layout of one DOCX section (`w:sectPr/w:cols`): the column count and
+/// the gutter between columns, in points.
+#[derive(Clone, Copy)]
+struct SectCols {
+    count: u32,
+    gap_pt: f64,
+}
+
+/// Word's default column gutter when `w:cols@w:space` is absent: 720 twips
+/// (0.5in = 36pt).
+const DEFAULT_COL_GAP_PT: f64 = 36.0;
+
+/// Scan every `w:sectPr` of the document in order and read its `w:cols` — one
+/// entry per section, in flow order. A paragraph-level `w:sectPr` closes the
+/// section holding the content BEFORE it; the body-level `w:sectPr` closes the
+/// last section, so entry `i` describes the `i`-th stretch of body content.
+fn docx_section_cols(document_xml: &str) -> Vec<SectCols> {
+    let mut out: Vec<SectCols> = Vec::new();
+    let mut x = Xml::new(document_xml);
+    let mut in_sect = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "sectPr" => {
+                    out.push(SectCols {
+                        count: 1,
+                        gap_pt: DEFAULT_COL_GAP_PT,
+                    });
+                    in_sect = !sc;
+                }
+                "cols" if in_sect => {
+                    if let Some(s) = out.last_mut() {
+                        if let Some(n) =
+                            attr(&attrs, "num").and_then(|v| v.trim().parse::<u32>().ok())
+                        {
+                            s.count = n.clamp(1, 8);
+                        }
+                        if let Some(g) = attr(&attrs, "space").and_then(twips_to_pt) {
+                            s.gap_pt = g.max(0.0);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "sectPr" {
+                    in_sect = false;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    out
+}
+
+/// Open a `column-count` wrapper for a section when it declares more than one
+/// text column; returns whether a wrapper was opened (so the caller closes it).
+fn open_section_columns(out: &mut String, cols: Option<&SectCols>) -> bool {
+    match cols {
+        Some(c) if c.count > 1 => {
+            out.push_str(&format!(
+                "<div style=\"column-count:{};column-gap:{}pt\">",
+                c.count,
+                fmt_pt(c.gap_pt)
+            ));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Walk the DOCX body (`w:body`), emitting HTML into `out`. The top-level walk
+/// is section-aware: each section whose `w:sectPr/w:cols` declares more than
+/// one column has its content wrapped in a `column-count`/`column-gap`
+/// container so the engine lays it out in real text columns.
 fn docx_body(xml: &str, ctx: &DocxCtx, out: &mut String) {
+    let sections = docx_section_cols(xml);
+    let mut sect = 0usize;
+    let mut wrapped = open_section_columns(out, sections.first());
     let mut x = Xml::new(xml);
+    let mut counters = ListCounters::default();
     // Walk only the top level of this region; tables and paragraphs recurse via
     // slices so a `w:tbl` is never double-emitted as loose paragraphs.
-    docx_walk(&mut x, ctx, out, None);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, _, sc) = tok {
+            let ln = local(&name);
+            if ln == "p" && !sc {
+                if docx_paragraph(&mut x, ctx, out, &mut counters) {
+                    // A `w:pPr/w:sectPr` closed the current section: close its
+                    // column wrapper and open the next section's.
+                    if wrapped {
+                        out.push_str("</div>");
+                    }
+                    sect += 1;
+                    wrapped = open_section_columns(out, sections.get(sect));
+                }
+            } else if ln == "tbl" && !sc {
+                docx_table(&mut x, ctx, out);
+            }
+        }
+    }
+    if wrapped {
+        out.push_str("</div>");
+    }
 }
 
 /// Recursive DOCX walker. `stop` is the local tag name that ends the current
@@ -8933,11 +9225,12 @@ struct ListCounters {
 }
 
 impl ListCounters {
-    /// Advance the counter for `(num_id, level)` and return the new 1-based value,
-    /// resetting all deeper levels of the same list.
-    fn next(&mut self, num_id: u32, level: u32) -> u32 {
+    /// Advance the counter for `(num_id, level)` and return the new 1-based
+    /// value, resetting all deeper levels of the same list. The level's first
+    /// value is `start` (its `w:start`, 1 by default).
+    fn next(&mut self, num_id: u32, level: u32, start: u32) -> u32 {
         self.counts.retain(|&(n, l), _| !(n == num_id && l > level));
-        let c = self.counts.entry((num_id, level)).or_insert(0);
+        let c = self.counts.entry((num_id, level)).or_insert(start.max(1) - 1);
         *c += 1;
         *c
     }
@@ -9147,8 +9440,36 @@ fn blip_img(ctx: &DocxCtx, attrs: &[(String, String)], size: Option<(f64, f64)>)
         .and_then(|k| img_tag_sized(ctx.zip, &k, size))
 }
 
-/// Emit one `w:p` (already consumed its open tag) until `</w:p>`.
-fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut ListCounters) {
+/// One open DOCX field in the display walker (`w:fldSimple` or a `w:fldChar`
+/// `begin…end` range): the accumulated instruction text and the byte offset in
+/// the paragraph's `inner` HTML where its cached result starts (so the result
+/// can be replaced by a live value/token on close).
+struct HtmlField {
+    instr: String,
+    result_start: usize,
+}
+
+/// Close a completed field: when its instruction is one we can evaluate
+/// (`PAGE`/`NUMPAGES`), drop the cached result markup and emit the replacement
+/// — a running-head token in header/footer parts (`tokens`), a static
+/// placeholder in the body. Unknown instructions keep their cached result.
+fn finish_html_field(f: HtmlField, inner: &mut String, tokens: bool) {
+    let Some(rep) = field_code_placeholder(&f.instr, tokens) else {
+        return;
+    };
+    inner.truncate(f.result_start);
+    inner.push_str(rep);
+}
+
+/// Emit one `w:p` (already consumed its open tag) until `</w:p>`. Returns
+/// `true` when the paragraph carried a `w:pPr/w:sectPr` (a section break): the
+/// caller ([`docx_body`]) then closes the current section's column wrapper.
+fn docx_paragraph(
+    x: &mut Xml,
+    ctx: &DocxCtx,
+    out: &mut String,
+    counters: &mut ListCounters,
+) -> bool {
     let mut heading: Option<u8> = None;
     let mut style_id: Option<String> = None;
     let mut inner = String::new();
@@ -9159,8 +9480,15 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
     let mut in_ppr = false; // inside <w:pPr> (paragraph properties)
     let mut in_pbdr = false; // inside <w:pPr>/<w:pBdr> (paragraph borders)
     let mut depth = 0i32; // nesting of <w:r> runs (to scope rPr)
-    let mut field_instr = String::new(); // accumulating <w:instrText>
     let mut in_instr = false;
+    // Open fields (`w:fldSimple` / `w:fldChar` ranges), innermost last.
+    let mut hfields: Vec<HtmlField> = Vec::new();
+    // `w:pPr/w:sectPr` state: this paragraph ends a section. A
+    // `w:type w:val="continuous"` break flows on the same page; any other type
+    // (default `nextPage`) starts a new page.
+    let mut in_psect = false;
+    let mut sect_end = false;
+    let mut sect_continuous = false;
     // Absolutely-positioned drawings (`wp:anchor`) collected here and flushed as
     // paragraph siblings after the `<p>`, so they keep their page position
     // instead of being trapped in the text flow.
@@ -9183,11 +9511,18 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                     }
                     "sectPr" if in_ppr => {
                         // A section break carried on a paragraph (`w:pPr/w:sectPr`)
-                        // ends a section: the following content starts a new page
-                        // (the default `nextPage` section start). The document's
-                        // final `w:sectPr` is a direct `w:body` child, not here, so
-                        // this never adds a spurious trailing page.
-                        page_break_after = true;
+                        // ends a section. Whether it also starts a new page depends
+                        // on its `w:type` child (`continuous` flows on; the default
+                        // `nextPage` breaks) — resolved after the walk. The
+                        // document's final `w:sectPr` is a direct `w:body` child,
+                        // not here, so this never adds a spurious trailing page.
+                        sect_end = true;
+                        sect_continuous = false;
+                        in_psect = !sc;
+                    }
+                    // `w:sectPr/w:type@w:val` — the section-start kind.
+                    "type" if in_psect => {
+                        sect_continuous = matches!(attr(&attrs, "val"), Some("continuous"));
                     }
                     "rPr" if !sc => in_rpr = true,
                     "pStyle" => {
@@ -9216,6 +9551,15 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                             if let Some(lh) = line_spacing(line, attr(&attrs, "lineRule")) {
                                 para.line_height = Some(lh);
                             }
+                        }
+                    }
+                    // Run letter-spacing (`w:rPr/w:spacing@w:val`, twips) →
+                    // `letter-spacing` on the run span.
+                    "spacing" if in_rpr => {
+                        if let Some(tw) =
+                            attr(&attrs, "val").and_then(|v| v.trim().parse::<f64>().ok())
+                        {
+                            run.letter_spacing = Some(tw / TWIP_PER_PT);
                         }
                     }
                     "numPr" if in_ppr => {
@@ -9279,6 +9623,37 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                             run.underline = true;
                         }
                     }
+                    // `w:strike`/`w:dstrike` — single and double strike-through
+                    // both render as one line-through.
+                    "strike" | "dstrike" if in_rpr => {
+                        run.strike = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
+                    }
+                    // `w:vertAlign@val`: superscript / subscript / baseline.
+                    "vertAlign" if in_rpr => {
+                        run.vertical_align = ooxml_vert_align(attr(&attrs, "val"));
+                    }
+                    // `w:highlight@val` is a named colour (yellow/green/…);
+                    // map it to hex, dropping `none`/unknown tokens.
+                    "highlight" if in_rpr => {
+                        run.highlight = attr(&attrs, "val")
+                            .and_then(highlight_color)
+                            .map(|h| h.to_string());
+                    }
+                    // Run shading `w:shd@fill` (6-hex). `auto`/missing ⇒ none.
+                    // Set only when `highlight` hasn't already claimed it.
+                    "shd" if in_rpr => {
+                        if run.highlight.is_none() {
+                            if let Some(v) = attr(&attrs, "fill") {
+                                if v != "auto" && is_hex6(v) {
+                                    run.highlight = Some(v.to_ascii_uppercase());
+                                }
+                            }
+                        }
+                    }
+                    // `w:vanish` — hidden text is not painted (like Word).
+                    "vanish" if in_rpr => {
+                        run.hidden = !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                    }
                     "sz" if in_rpr => {
                         run.size_half_pt = attr(&attrs, "val").and_then(|v| v.parse().ok());
                     }
@@ -9292,6 +9667,34 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                     "instrText" => {
                         in_instr = true;
                     }
+                    // A simple field: its instruction is the attribute; the child
+                    // runs are the cached result (replaced on close when the
+                    // instruction is one we can evaluate).
+                    "fldSimple" if !sc => hfields.push(HtmlField {
+                        instr: attr(&attrs, "instr").unwrap_or("").to_string(),
+                        result_start: inner.len(),
+                    }),
+                    // Complex-field markers: `begin` opens a field (instruction
+                    // phase), `separate` starts its cached result, `end` closes
+                    // it — replacing the stale cached text by the live
+                    // placeholder/token for PAGE/NUMPAGES.
+                    "fldChar" => match attr(&attrs, "fldCharType") {
+                        Some("begin") => hfields.push(HtmlField {
+                            instr: String::new(),
+                            result_start: inner.len(),
+                        }),
+                        Some("separate") => {
+                            if let Some(f) = hfields.last_mut() {
+                                f.result_start = inner.len();
+                            }
+                        }
+                        Some("end") => {
+                            if let Some(f) = hfields.pop() {
+                                finish_html_field(f, &mut inner, ctx.hf_tokens);
+                            }
+                        }
+                        _ => {}
+                    },
                     "tab" => inner.push(' '),
                     "br" if matches!(attr(&attrs, "type"), Some("page")) => {
                         // An explicit run-level page break (`<w:br w:type="page"/>`)
@@ -9326,18 +9729,28 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                     "pPr" => in_ppr = false,
                     "pBdr" => in_pbdr = false,
                     "rPr" => in_rpr = false,
+                    "sectPr" => in_psect = false,
                     "instrText" => in_instr = false,
+                    "fldSimple" => {
+                        if let Some(f) = hfields.pop() {
+                            finish_html_field(f, &mut inner, ctx.hf_tokens);
+                        }
+                    }
                     "r" => depth = (depth - 1).max(0),
                     _ => {}
                 }
             }
             Tok::Text(t) => {
                 if in_instr {
-                    // A field instruction (e.g. " PAGE \\* MERGEFORMAT ").
-                    field_instr.push_str(&t);
-                } else if depth > 0 && !t.is_empty() {
+                    // A field instruction (e.g. " PAGE \\* MERGEFORMAT "),
+                    // routed to the innermost open field.
+                    if let Some(f) = hfields.last_mut() {
+                        f.instr.push_str(&t);
+                    }
+                } else if depth > 0 && !t.is_empty() && !run.hidden {
                     // Only surface text that lives inside a run (skip stray
-                    // property text). `w:t` content arrives here.
+                    // property text; `w:vanish` hidden runs are not painted).
+                    // `w:t` content arrives here.
                     let span = run.open_span();
                     if span.is_empty() {
                         esc(&t, &mut inner);
@@ -9351,19 +9764,21 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
         }
     }
 
+    // Flush any field a malformed document left open at `</w:p>`.
+    while let Some(f) = hfields.pop() {
+        finish_html_field(f, &mut inner, ctx.hf_tokens);
+    }
+
+    // A non-continuous section break (default `nextPage`) starts a new page.
+    if sect_end && !sect_continuous {
+        page_break_after = true;
+    }
+
     // Apply named-style + document-default formatting *under* the direct
     // properties already collected: anything the run/paragraph set inline wins;
     // the style fills the gaps. Heading level can also come from the style id.
     let resolved = ctx.styles.effective(style_id.as_deref());
     para.apply_style_defaults(&resolved);
-
-    // PAGE / NUMPAGES field codes have no live value at convert time → a small
-    // placeholder so the surrounding text still reads naturally.
-    if let Some(rep) = field_code_placeholder(&field_instr) {
-        if inner.trim().is_empty() {
-            inner.push_str(rep);
-        }
-    }
 
     // List paragraphs get a numbering prefix: the real ordinal from
     // numbering.xml when known (1./a./i.…), else a bullet.
@@ -9402,6 +9817,8 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
     // out-of-flow (`position:absolute`), they anchor to the page content box at
     // their own coordinates regardless of where they sit in the body stream.
     out.push_str(&floats);
+
+    sect_end
 }
 
 /// A block element the HTML engine treats as a hard page break
@@ -9409,32 +9826,37 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
 const PAGE_BREAK_DIV: &str = "<div style=\"page-break-before:always\"></div>";
 
 /// Resolve a list paragraph's marker: the formatted ordinal from `numbering.xml`
-/// (advancing the running counter), or a bullet when the format is bullet/
-/// unknown or the numbering is missing.
+/// (advancing the running counter, with the level's `w:lvlText` suffix — `1.`
+/// vs `1)`), the level's real bullet character for bullet formats, or the
+/// depth's default bullet when the numbering is missing.
 fn list_marker(
     ctx: &DocxCtx,
     num_id: Option<u32>,
     level: u32,
     counters: &mut ListCounters,
 ) -> String {
-    match num_id.and_then(|nid| ctx.numbering.fmt(nid, level).map(|f| (nid, f))) {
-        Some((nid, fmt)) if !matches!(fmt, NumFmt::Bullet | NumFmt::Other) => {
-            let n = counters.next(nid, level);
-            fmt.render(n)
+    match num_id.and_then(|nid| ctx.numbering.level(nid, level).map(|l| (nid, l))) {
+        Some((nid, nl)) if !matches!(nl.fmt, NumFmt::Bullet | NumFmt::Other) => {
+            let n = counters.next(nid, level, nl.start);
+            nl.fmt.render(n, nl.suffix)
         }
-        _ => "\u{2022}".to_string(),
+        Some((_, nl)) => nl.bullet.to_string(),
+        None => default_level_bullet(level).to_string(),
     }
 }
 
-/// Map a Word field instruction to a static placeholder when it's one we can't
-/// evaluate at convert time. `PAGE`/`NUMPAGES` get conventional placeholders;
-/// everything else yields `None` (left to whatever literal text the field holds).
-fn field_code_placeholder(instr: &str) -> Option<&'static str> {
+/// Map a Word field instruction to its replacement. In a header/footer part
+/// (`tokens`), `PAGE`/`NUMPAGES` become the HTML engine's running-head tokens
+/// (`{{page}}`/`{{pages}}`, substituted per page at render time); in the body —
+/// where no live value exists at convert time — they get a conventional `1`
+/// placeholder. Everything else yields `None` (the field's cached result text
+/// is kept).
+fn field_code_placeholder(instr: &str, tokens: bool) -> Option<&'static str> {
     let upper = instr.trim().to_ascii_uppercase();
     let first = upper.split_whitespace().next().unwrap_or("");
     match first {
-        "PAGE" => Some("1"),
-        "NUMPAGES" => Some("1"),
+        "PAGE" => Some(if tokens { "{{page}}" } else { "1" }),
+        "NUMPAGES" => Some(if tokens { "{{pages}}" } else { "1" }),
         _ => None,
     }
 }
@@ -9451,45 +9873,244 @@ struct CellSpan {
     v_merge_restart: bool,
 }
 
+/// Per-table border defaults from `w:tblPr/w:tblBorders`: the four outer sides
+/// plus the inner-edge defaults (`w:insideH`/`w:insideV`) every cell inherits
+/// where its own `w:tcBorders` says nothing.
+#[derive(Default)]
+struct TblBorders {
+    top: Option<BorderSide>,
+    right: Option<BorderSide>,
+    bottom: Option<BorderSide>,
+    left: Option<BorderSide>,
+    inside_h: Option<BorderSide>,
+    inside_v: Option<BorderSide>,
+    /// `w:tblBorders` was present: the table declares an explicit border
+    /// regime, so every cell side is emitted — a side resolving to nothing
+    /// becomes `border-…:none` instead of the stylesheet's default gray grid.
+    declared: bool,
+}
+
+/// One parsed `w:tc` of a buffered DOCX table row: merge metadata, the
+/// formatting read from `w:tcPr` (`w:shd`, `w:vAlign`, `w:tcBorders`, `w:tcW`),
+/// and its already-lowered inner HTML.
+#[derive(Default)]
+struct DocxHtmlCell {
+    span: CellSpan,
+    /// `w:shd@w:fill` (6-hex) — the cell's background fill.
+    shading: Option<String>,
+    /// `w:vAlign@w:val` mapped to a CSS `vertical-align` keyword.
+    valign: Option<&'static str>,
+    /// `w:tcBorders` sides `[top, right, bottom, left]`.
+    borders: [Option<BorderSide>; 4],
+    /// Which of `borders` were explicitly declared — a `w:val="nil"` side
+    /// parses to `None` but must still override the table default with "no
+    /// border" rather than fall through to it.
+    borders_set: [bool; 4],
+    /// `w:tcW@w:w` (`@w:type="dxa"`, twips) — the cell's preferred width.
+    width_pt: Option<f64>,
+    /// The cell's lowered content (paragraphs / nested tables).
+    body: String,
+}
+
 /// Emit one `w:tbl` (open already consumed) as an HTML `<table>`. Reads the
 /// `w:tblGrid` (`w:gridCol w:w`, twips) into a leading `<colgroup>` so the
-/// layout honours real column widths. Honours cell merges: `w:gridSpan` widens
-/// the cell (expanded to that many physical `<td>`s so the layout reflects the
-/// span, the first carrying a `colspan` for forward-compat); `w:vMerge` carries
-/// a `rowspan` hint and the covered continuation cells are dropped.
+/// layout honours real column widths, and `w:tblPr/w:tblBorders` as the
+/// per-cell border defaults. Rows are buffered so a vertical merge resolves to
+/// its REAL `rowspan` (counting the covered continuation rows, which are
+/// dropped) and each cell knows whether it touches the table's outer edges
+/// (outer border side vs `insideH`/`insideV` default).
 fn docx_table(x: &mut Xml, ctx: &DocxCtx, out: &mut String) {
-    out.push_str("<table>");
-    // Collect `w:gridCol w:w` widths (twips→pt) and flush them as a <colgroup>
-    // just before the first row. `w:tblGrid` always precedes the rows.
     let mut col_pts: Vec<f64> = Vec::new();
-    let mut colgroup_done = false;
+    let mut borders = TblBorders::default();
+    let mut in_tblpr = false;
+    let mut in_tblborders = false;
+    let mut rows: Vec<Vec<DocxHtmlCell>> = Vec::new();
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "gridCol" {
-                    if let Some(w) = attr(&attrs, "w").and_then(twips_to_pt) {
-                        if w > 0.0 {
-                            col_pts.push(w);
+                match ln {
+                    "tblPr" if !sc => in_tblpr = true,
+                    "tblBorders" if in_tblpr => {
+                        borders.declared = true;
+                        in_tblborders = !sc;
+                    }
+                    "top" if in_tblborders => borders.top = parse_border_side(&attrs),
+                    "right" if in_tblborders => borders.right = parse_border_side(&attrs),
+                    "bottom" if in_tblborders => borders.bottom = parse_border_side(&attrs),
+                    "left" if in_tblborders => borders.left = parse_border_side(&attrs),
+                    "insideH" if in_tblborders => borders.inside_h = parse_border_side(&attrs),
+                    "insideV" if in_tblborders => borders.inside_v = parse_border_side(&attrs),
+                    "gridCol" => {
+                        if let Some(w) = attr(&attrs, "w").and_then(twips_to_pt) {
+                            if w > 0.0 {
+                                col_pts.push(w);
+                            }
                         }
                     }
-                } else if ln == "tr" && !sc {
-                    flush_colgroup(&mut col_pts, &mut colgroup_done, out);
-                    out.push_str("<tr>");
-                } else if ln == "tc" && !sc {
-                    docx_cell(x, ctx, out);
+                    "tr" if !sc => rows.push(Vec::new()),
+                    "tc" if !sc => {
+                        let cell = docx_cell(x, ctx);
+                        match rows.last_mut() {
+                            Some(row) => row.push(cell),
+                            // A stray `w:tc` outside `w:tr` still lands somewhere.
+                            None => rows.push(vec![cell]),
+                        }
+                    }
+                    _ => {}
                 }
             }
             Tok::Close(name) => {
                 let ln = local(&name);
-                if ln == "tr" {
-                    out.push_str("</tr>");
-                } else if ln == "tbl" {
-                    break;
+                match ln {
+                    "tblPr" => in_tblpr = false,
+                    "tblBorders" => in_tblborders = false,
+                    "tbl" => break,
+                    _ => {}
                 }
             }
             Tok::Text(_) => {}
         }
+    }
+    emit_docx_table(&col_pts, &borders, &rows, out);
+}
+
+/// Emit a buffered DOCX table: the `<colgroup>`, then each row with real
+/// merges — a `w:gridSpan` cell carries `colspan` alone (the engine's table
+/// grid honours spans, so no filler `<td>`s), a `w:vMerge` restart carries the
+/// counted `rowspan` and the covered continuation cells are dropped. Each
+/// cell's border resolves per side: its own `w:tcBorders` wins, else the table
+/// default (outer `w:tblBorders` side on an outer edge, `insideH`/`insideV`
+/// inside); under an explicit border regime an unresolved side emits
+/// `border:none` so Word's "no line here" doesn't fall back to the default
+/// gray grid.
+fn emit_docx_table(
+    col_pts: &[f64],
+    tbl: &TblBorders,
+    rows: &[Vec<DocxHtmlCell>],
+    out: &mut String,
+) {
+    out.push_str("<table>");
+    if !col_pts.is_empty() {
+        out.push_str("<colgroup>");
+        for w in col_pts {
+            out.push_str(&format!("<col style=\"width:{}pt\">", fmt_pt(*w)));
+        }
+        out.push_str("</colgroup>");
+    }
+    // Starting grid column of every cell. Continuation cells still occupy their
+    // columns here, which is what makes the vertical-merge counting line up.
+    let starts: Vec<Vec<usize>> = rows
+        .iter()
+        .map(|row| {
+            let mut cur = 0usize;
+            row.iter()
+                .map(|c| {
+                    let s = cur;
+                    cur += c.span.grid_span.max(1);
+                    s
+                })
+                .collect()
+        })
+        .collect();
+    let total_cols = if col_pts.is_empty() {
+        rows.iter()
+            .map(|r| r.iter().map(|c| c.span.grid_span.max(1)).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+    } else {
+        col_pts.len()
+    };
+    let nrows = rows.len();
+    for (ri, row) in rows.iter().enumerate() {
+        out.push_str("<tr>");
+        for (ci, cell) in row.iter().enumerate() {
+            // A vertical-merge continuation cell is covered by the restart cell
+            // above: drop it (its columns are reserved by that cell's rowspan).
+            if cell.span.v_merge_continue {
+                continue;
+            }
+            let col0 = starts[ri][ci];
+            let span = cell.span.grid_span.max(1);
+            // Real rowspan: 1 + the number of consecutive rows below holding a
+            // continuation cell at this cell's grid column.
+            let mut rowspan = 1usize;
+            if cell.span.v_merge_restart {
+                for (brow, bstarts) in rows.iter().zip(&starts).skip(ri + 1) {
+                    let covered = brow
+                        .iter()
+                        .zip(bstarts)
+                        .any(|(c, s)| *s == col0 && c.span.v_merge_continue);
+                    if !covered {
+                        break;
+                    }
+                    rowspan += 1;
+                }
+            }
+            // Inline CSS: background, vertical alignment, width, borders.
+            let mut css = String::new();
+            if let Some(fill) = &cell.shading {
+                css.push_str(&format!("background-color:#{fill};"));
+            }
+            if let Some(v) = cell.valign {
+                css.push_str(&format!("vertical-align:{v};"));
+            }
+            if let Some(w) = cell.width_pt {
+                css.push_str(&format!("width:{}pt;", fmt_pt(w)));
+            }
+            if tbl.declared || cell.borders_set.iter().any(|b| *b) {
+                // Table-level defaults depend on which table edges the
+                // (possibly merged) cell touches.
+                let last_row = ri + rowspan >= nrows;
+                let last_col = total_cols > 0 && col0 + span >= total_cols;
+                let defaults: [&Option<BorderSide>; 4] = [
+                    if ri == 0 { &tbl.top } else { &tbl.inside_h },
+                    if last_col { &tbl.right } else { &tbl.inside_v },
+                    if last_row { &tbl.bottom } else { &tbl.inside_h },
+                    if col0 == 0 { &tbl.left } else { &tbl.inside_v },
+                ];
+                const SIDE: [&str; 4] =
+                    ["border-top", "border-right", "border-bottom", "border-left"];
+                for i in 0..4 {
+                    let side = if cell.borders_set[i] {
+                        &cell.borders[i]
+                    } else {
+                        defaults[i]
+                    };
+                    match side {
+                        Some(b) => {
+                            let color = b.color.as_deref().unwrap_or("000000");
+                            css.push_str(&format!(
+                                "{}:{}pt {} #{color};",
+                                SIDE[i],
+                                fmt_pt(b.width_pt),
+                                b.style
+                            ));
+                        }
+                        None => css.push_str(&format!("{}:none;", SIDE[i])),
+                    }
+                }
+            }
+            let colspan = if span > 1 {
+                format!(" colspan=\"{span}\"")
+            } else {
+                String::new()
+            };
+            let rs = if rowspan > 1 {
+                format!(" rowspan=\"{rowspan}\"")
+            } else {
+                String::new()
+            };
+            let style = if css.is_empty() {
+                String::new()
+            } else {
+                format!(" style=\"{css}\"")
+            };
+            out.push_str(&format!("<td{colspan}{rs}{style}>"));
+            out.push_str(cell.body.trim());
+            out.push_str("</td>");
+        }
+        out.push_str("</tr>");
     }
     out.push_str("</table>");
 }
@@ -9523,16 +10144,15 @@ fn fmt_pt(v: f64) -> String {
     s
 }
 
-/// Emit one `w:tc` cell (open already consumed) until `</w:tc>`, applying its
-/// `w:tcPr` merge properties. A `w:gridSpan="N"` cell is emitted as N physical
-/// `<td>`s (content + `colspan="N"` in the first, the rest empty) so the
-/// equal-width table layout still spreads the cell across N columns. A
-/// `w:vMerge` continuation cell is suppressed (its content belongs to the
-/// restart cell above); a restart cell gets a `rowspan="2"` hint.
-fn docx_cell(x: &mut Xml, ctx: &DocxCtx, out: &mut String) {
-    let mut span = CellSpan::default();
+/// Parse one `w:tc` cell (open already consumed) until `</w:tc>`: its `w:tcPr`
+/// merge and formatting properties plus the lowered inner HTML. Emission
+/// happens later in [`emit_docx_table`], once the whole table is buffered —
+/// the real `rowspan` needs the rows below, and the border defaults need the
+/// cell's position against the table edges.
+fn docx_cell(x: &mut Xml, ctx: &DocxCtx) -> DocxHtmlCell {
+    let mut cell = DocxHtmlCell::default();
     let mut in_tcpr = false;
-    let mut body = String::new();
+    let mut in_tcborders = false;
     // Cells are self-contained for numbering (a list rarely spans cells).
     let mut counters = ListCounters::default();
 
@@ -9543,56 +10163,76 @@ fn docx_cell(x: &mut Xml, ctx: &DocxCtx, out: &mut String) {
                 match ln {
                     "tcPr" if !sc => in_tcpr = true,
                     "gridSpan" if in_tcpr => {
-                        span.grid_span = attr(&attrs, "val")
+                        cell.span.grid_span = attr(&attrs, "val")
                             .and_then(|v| v.trim().parse::<usize>().ok())
                             .unwrap_or(0);
                     }
                     "vMerge" if in_tcpr => match attr(&attrs, "val") {
-                        Some("restart") => span.v_merge_restart = true,
+                        Some("restart") => cell.span.v_merge_restart = true,
                         // No val (or "continue") → this is a covered cell.
-                        _ => span.v_merge_continue = true,
+                        _ => cell.span.v_merge_continue = true,
                     },
-                    "p" if !sc => docx_paragraph(x, ctx, &mut body, &mut counters),
-                    "tbl" if !sc => docx_table(x, ctx, &mut body),
+                    // `w:shd@w:fill` — the cell's background fill (6-hex).
+                    "shd" if in_tcpr => {
+                        if let Some(f) = attr(&attrs, "fill").filter(|v| *v != "auto" && is_hex6(v))
+                        {
+                            cell.shading = Some(f.to_ascii_uppercase());
+                        }
+                    }
+                    // `w:vAlign@w:val` — vertical alignment of the cell content.
+                    "vAlign" if in_tcpr => {
+                        cell.valign = match attr(&attrs, "val") {
+                            Some("center") => Some("middle"),
+                            Some("bottom") => Some("bottom"),
+                            Some("top") => Some("top"),
+                            _ => None,
+                        };
+                    }
+                    // `w:tcW` — the cell's preferred width; only the absolute
+                    // `dxa` (twips) form maps to a point width.
+                    "tcW" if in_tcpr => {
+                        if matches!(attr(&attrs, "type"), None | Some("dxa")) {
+                            cell.width_pt =
+                                attr(&attrs, "w").and_then(twips_to_pt).filter(|w| *w > 0.0);
+                        }
+                    }
+                    "tcBorders" if in_tcpr => in_tcborders = !sc,
+                    "top" if in_tcborders => {
+                        cell.borders[0] = parse_border_side(&attrs);
+                        cell.borders_set[0] = true;
+                    }
+                    "right" if in_tcborders => {
+                        cell.borders[1] = parse_border_side(&attrs);
+                        cell.borders_set[1] = true;
+                    }
+                    "bottom" if in_tcborders => {
+                        cell.borders[2] = parse_border_side(&attrs);
+                        cell.borders_set[2] = true;
+                    }
+                    "left" if in_tcborders => {
+                        cell.borders[3] = parse_border_side(&attrs);
+                        cell.borders_set[3] = true;
+                    }
+                    "p" if !sc => {
+                        docx_paragraph(x, ctx, &mut cell.body, &mut counters);
+                    }
+                    "tbl" if !sc => docx_table(x, ctx, &mut cell.body),
                     _ => {}
                 }
             }
             Tok::Close(name) => {
                 let ln = local(&name);
-                if ln == "tcPr" {
-                    in_tcpr = false;
-                } else if ln == "tc" {
-                    break;
+                match ln {
+                    "tcPr" => in_tcpr = false,
+                    "tcBorders" => in_tcborders = false,
+                    "tc" => break,
+                    _ => {}
                 }
             }
             Tok::Text(_) => {}
         }
     }
-
-    // A vertical-merge continuation cell is covered by the restart cell above:
-    // drop it so the column count of the row above is preserved.
-    if span.v_merge_continue {
-        return;
-    }
-
-    let trimmed = body.trim();
-    let cols = span.grid_span.max(1);
-    let colspan_attr = if cols > 1 {
-        format!(" colspan=\"{cols}\"")
-    } else {
-        String::new()
-    };
-    let rowspan_attr = if span.v_merge_restart {
-        " rowspan=\"2\""
-    } else {
-        ""
-    };
-    out.push_str(&format!("<td{colspan_attr}{rowspan_attr}>{trimmed}</td>"));
-    // Pad with empty cells so the equal-column layout actually advances `cols`
-    // columns for this logically-merged cell.
-    for _ in 1..cols {
-        out.push_str("<td></td>");
-    }
+    cell
 }
 
 /// Map a DOCX style id (`Heading1`, `Title`, …) to a heading level 1..=6.
@@ -10001,16 +10641,98 @@ impl NumFmt {
         }
     }
 
-    /// Render `n` (1-based) for this format. Bullet/other formats yield `•`.
-    fn render(self, n: u32) -> String {
+    /// Render `n` (1-based) for this format, appending the level's ordinal
+    /// `suffix` (`.` or `)`, from `w:lvlText`). Bullet/other formats yield `•`.
+    fn render(self, n: u32, suffix: char) -> String {
         match self {
-            NumFmt::Decimal => format!("{n}."),
-            NumFmt::LowerLetter => format!("{}.", alpha_ordinal(n, false)),
-            NumFmt::UpperLetter => format!("{}.", alpha_ordinal(n, true)),
-            NumFmt::LowerRoman => format!("{}.", roman(n, false)),
-            NumFmt::UpperRoman => format!("{}.", roman(n, true)),
+            NumFmt::Decimal => format!("{n}{suffix}"),
+            NumFmt::LowerLetter => format!("{}{suffix}", alpha_ordinal(n, false)),
+            NumFmt::UpperLetter => format!("{}{suffix}", alpha_ordinal(n, true)),
+            NumFmt::LowerRoman => format!("{}{suffix}", roman(n, false)),
+            NumFmt::UpperRoman => format!("{}{suffix}", roman(n, true)),
             NumFmt::Bullet | NumFmt::Other => "\u{2022}".to_string(),
         }
+    }
+
+    /// The model [`ListMarker`] for an **ordered** format (`None` for
+    /// bullet/other — those carry a bullet character instead).
+    fn ordered_marker(self) -> Option<ListMarker> {
+        match self {
+            NumFmt::Decimal => Some(ListMarker::Decimal),
+            NumFmt::LowerLetter => Some(ListMarker::LowerAlpha),
+            NumFmt::UpperLetter => Some(ListMarker::UpperAlpha),
+            NumFmt::LowerRoman => Some(ListMarker::LowerRoman),
+            NumFmt::UpperRoman => Some(ListMarker::UpperRoman),
+            NumFmt::Bullet | NumFmt::Other => None,
+        }
+    }
+}
+
+/// The stock bullet glyph for a list nesting depth when the source declares
+/// none: `•`, `◦`, `▪` for levels 0/1/2, cycling deeper — the conventional
+/// Word/LibreOffice ladder. All three are covered by the bundled Liberation
+/// face, so a defaulted marker always rasterizes as real ink.
+fn default_level_bullet(level: u32) -> char {
+    ['\u{2022}', '\u{25E6}', '\u{25AA}'][(level % 3) as usize]
+}
+
+/// The ordinal suffix a `w:lvlText` template implies: the trailing punctuation
+/// after the last `%N` placeholder — Word writes `"%1."` (the default) or
+/// `"%1)"`. Absent template, a trailing placeholder (`"%1"`, `"Article %1"`) or
+/// trailing letters/digits keep the conventional `'.'`.
+fn ordinal_suffix(lvl_text: Option<&str>) -> char {
+    match lvl_text.unwrap_or("").trim().chars().last() {
+        Some(c) if !c.is_alphanumeric() && c != '%' => c,
+        _ => '.',
+    }
+}
+
+/// Resolve a bullet level's display character from its `w:lvlText` char and the
+/// level's run font (`w:rPr/w:rFonts`). Word's stock bullets are **private-use
+/// codes in a symbol font** — `F0B7` in Symbol (`•`), `F0A7` in Wingdings
+/// (`▪`) — so the raw char is first translated to its real Unicode equivalent,
+/// then guarded against the bundled Liberation face: a glyph the fallback face
+/// cannot paint degrades to the level's default bullet instead of tofu.
+fn resolve_bullet_char(lvl_text: Option<&str>, font: Option<&str>, level: u32) -> char {
+    let fallback = default_level_bullet(level);
+    let Some(c) = lvl_text.and_then(|t| t.chars().next()) else {
+        return fallback;
+    };
+    let font_lc = font.unwrap_or("").to_ascii_lowercase();
+    let code = c as u32;
+    let symbol_coded = (0xF000..=0xF0FF).contains(&code);
+    let mapped = if symbol_coded && font_lc.contains("wingding") {
+        wingdings_to_char((code & 0xFF) as u8)
+    } else if symbol_coded {
+        // Symbol is the Word default bullet font — and the safest reading for
+        // an F0xx code under an unknown symbol font.
+        crate::font::encoding::symbol_to_char((code & 0xFF) as u8)
+    } else {
+        Some(c)
+    };
+    match mapped {
+        Some(m) if crate::font::bundled::fallback_covers(m) => m,
+        _ => fallback,
+    }
+}
+
+/// The common Wingdings bullet codes → their true Unicode equivalent (`None`
+/// for anything else). The caller's coverage guard downgrades equivalents the
+/// bundled face lacks (e.g. `✓`, `➢`) to the level default. `pub(crate)` — the
+/// RTF reader resolves Wingdings-charset `\'xx` bytes through it too.
+pub(crate) fn wingdings_to_char(low: u8) -> Option<char> {
+    match low {
+        0x6C => Some('\u{25CF}'), // l — black circle ●
+        0x6D => Some('\u{25CB}'), // m — white circle ○
+        0x6E => Some('\u{25A0}'), // n — black square ■
+        0x6F..=0x71 => Some('\u{25A1}'), // o/p/q — white squares □
+        0x75 => Some('\u{25C6}'), // u — black diamond ◆
+        0x76 => Some('\u{2756}'), // v — ornamental diamond ❖
+        0xA7 => Some('\u{25AA}'), // § slot — black small square ▪ (Word level-3)
+        0xA8 => Some('\u{25A1}'), // ¨ slot — white small square □
+        0xD8 => Some('\u{27A2}'), // Ø slot — 3-D arrowhead ➢
+        0xFC => Some('\u{2713}'), // ü slot — check mark ✓
+        _ => None,
     }
 }
 
@@ -10065,42 +10787,81 @@ fn roman(n: u32, upper: bool) -> String {
     }
 }
 
-/// Resolved DOCX numbering: each `w:numId` maps to a per-level number format.
-/// Built from `word/numbering.xml`'s `w:num → w:abstractNumId → w:lvl@w:numFmt`,
-/// with each `w:num`'s `w:lvlOverride/w:lvl/w:numFmt` applied on top of its
-/// abstract definition so a list-instance that re-formats a level resolves to
-/// the overriding format.
+/// One resolved numbering level: the number format plus its `w:lvlText`-derived
+/// presentation — the ordinal suffix for numbered levels and the real bullet
+/// character for bullet levels (Symbol/Wingdings private-use codes already
+/// mapped to their Unicode equivalent and guarded against the bundled face by
+/// [`resolve_bullet_char`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NumLevel {
+    fmt: NumFmt,
+    /// Ordinal suffix (`'.'` or `')'` …) for numbered formats.
+    suffix: char,
+    /// Display character for bullet formats.
+    bullet: char,
+    /// First ordinal of the level (`w:start`, 1 by default).
+    start: u32,
+}
+
+/// Resolved DOCX numbering: each `w:numId` maps to a per-level [`NumLevel`].
+/// Built from `word/numbering.xml`'s `w:num → w:abstractNumId → w:lvl`
+/// (`w:numFmt` + `w:lvlText` + the level's `w:rPr/w:rFonts` bullet font), with
+/// each `w:num`'s `w:lvlOverride/w:lvl` applied on top of its abstract
+/// definition so a list-instance that re-formats a level resolves to the
+/// overriding definition.
 ///
-/// Only the per-level *format* is retained, because that is all the model's
-/// [`List`]/[`ListMarker`] can express. The level's `w:start` /
-/// `w:lvlOverride/w:startOverride` (restart-at-N) and `w:lvlText` (custom
-/// prefix template such as `%1)` or legal `%1.%2`) are **not** carried: the
-/// model derives ordinals positionally (no start field) and renders ordered
-/// markers with a fixed `.` suffix (no template field). See `docs/CONVERSIONS.md`.
+/// The level's `w:start` / `w:lvlOverride/w:startOverride` (restart-at-N) and
+/// multi-part legal templates (`%1.%2`) are still not carried: the model
+/// derives ordinals positionally and keeps only the template's trailing
+/// suffix. See `docs/CONVERSIONS.md`.
 #[derive(Default)]
 struct DocxNumbering {
-    /// numId → (level → format). Levels are 0-based; `w:lvlOverride` formats are
-    /// already folded in.
-    by_num: BTreeMap<u32, BTreeMap<u32, NumFmt>>,
+    /// numId → (level → resolved level). Levels are 0-based; `w:lvlOverride`
+    /// definitions are already folded in.
+    by_num: BTreeMap<u32, BTreeMap<u32, NumLevel>>,
 }
 
 impl DocxNumbering {
-    /// Format for a given list (`numId`) at `level`, if known.
-    fn fmt(&self, num_id: u32, level: u32) -> Option<NumFmt> {
+    /// The full resolved level (format + suffix + bullet char), if known.
+    fn level(&self, num_id: u32, level: u32) -> Option<NumLevel> {
         self.by_num.get(&num_id)?.get(&level).copied()
     }
 }
 
-/// Parse `word/numbering.xml`: collect `w:abstractNum` level formats, then map
-/// each `w:num@w:numId` to its `w:abstractNumId`, folding in any per-instance
-/// `w:lvlOverride/w:lvl/w:numFmt`. Returns numId → level → format.
+/// A `w:lvl` while being parsed: its pieces arrive as separate child elements.
+#[derive(Default, Clone)]
+struct RawLvl {
+    fmt: Option<NumFmt>,
+    lvl_text: Option<String>,
+    /// The level's `w:rPr/w:rFonts@w:ascii|w:hAnsi` — the bullet's symbol font.
+    font: Option<String>,
+    /// `w:start@w:val` (or `w:lvlOverride/w:startOverride`).
+    start: Option<u32>,
+}
+
+impl RawLvl {
+    /// Finalize into a [`NumLevel`] for a level at 0-based depth `level`.
+    fn resolve(&self, level: u32) -> NumLevel {
+        NumLevel {
+            fmt: self.fmt.unwrap_or(NumFmt::Bullet),
+            suffix: ordinal_suffix(self.lvl_text.as_deref()),
+            bullet: resolve_bullet_char(self.lvl_text.as_deref(), self.font.as_deref(), level),
+            start: self.start.unwrap_or(1).max(1),
+        }
+    }
+}
+
+/// Parse `word/numbering.xml`: collect `w:abstractNum` level definitions
+/// (`w:numFmt` + `w:lvlText` + the level's bullet font), then map each
+/// `w:num@w:numId` to its `w:abstractNumId`, folding in any per-instance
+/// `w:lvlOverride/w:lvl`. Returns numId → level → [`NumLevel`].
 fn parse_docx_numbering(xml: &str) -> DocxNumbering {
-    // abstractNumId → (level → format).
-    let mut abstracts: BTreeMap<u32, BTreeMap<u32, NumFmt>> = BTreeMap::new();
+    // abstractNumId → (level → raw definition).
+    let mut abstracts: BTreeMap<u32, BTreeMap<u32, RawLvl>> = BTreeMap::new();
     // numId → abstractNumId.
     let mut num_to_abstract: BTreeMap<u32, u32> = BTreeMap::new();
-    // numId → (level → overriding format) from `w:lvlOverride/w:lvl/w:numFmt`.
-    let mut num_overrides: BTreeMap<u32, BTreeMap<u32, NumFmt>> = BTreeMap::new();
+    // numId → (level → overriding definition) from `w:lvlOverride/w:lvl`.
+    let mut num_overrides: BTreeMap<u32, BTreeMap<u32, RawLvl>> = BTreeMap::new();
 
     let mut x = Xml::new(xml);
     let mut cur_abstract: Option<u32> = None;
@@ -10144,10 +10905,66 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
                         if in_num {
                             // Inside `w:lvlOverride/w:lvl`: a per-instance override.
                             if let (Some(n), Some(l)) = (cur_num, cur_override_level) {
-                                num_overrides.entry(n).or_default().insert(l, fmt);
+                                num_overrides.entry(n).or_default().entry(l).or_default().fmt =
+                                    Some(fmt);
                             }
                         } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
-                            abstracts.entry(a).or_default().insert(l, fmt);
+                            abstracts.entry(a).or_default().entry(l).or_default().fmt = Some(fmt);
+                        }
+                    }
+                }
+                // The level's marker template: `"%1."` / `"%1)"` for numbered
+                // levels, the literal bullet character (often an `F0xx`
+                // Symbol/Wingdings private-use code) for bullet levels.
+                "lvlText" => {
+                    if let Some(v) = attr(&attrs, "val") {
+                        if in_num {
+                            if let (Some(n), Some(l)) = (cur_num, cur_override_level) {
+                                num_overrides
+                                    .entry(n)
+                                    .or_default()
+                                    .entry(l)
+                                    .or_default()
+                                    .lvl_text = Some(v.to_string());
+                            }
+                        } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
+                            abstracts.entry(a).or_default().entry(l).or_default().lvl_text =
+                                Some(v.to_string());
+                        }
+                    }
+                }
+                // The level's first ordinal: `w:start` inside a `w:lvl`, or a
+                // `w:lvlOverride/w:startOverride` (restart-at-N per instance).
+                "start" | "startOverride" => {
+                    if let Some(v) = attr(&attrs, "val").and_then(|v| v.trim().parse::<u32>().ok())
+                    {
+                        if in_num {
+                            if let (Some(n), Some(l)) = (cur_num, cur_override_level) {
+                                num_overrides.entry(n).or_default().entry(l).or_default().start =
+                                    Some(v);
+                            }
+                        } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
+                            abstracts.entry(a).or_default().entry(l).or_default().start = Some(v);
+                        }
+                    }
+                }
+                // The level's run font (`w:lvl/w:rPr/w:rFonts`): the symbol face
+                // a private-use bullet code is defined in (Symbol, Wingdings, …).
+                // numbering.xml carries `w:rPr` only inside `w:lvl`, so scoping
+                // by the current level is exact.
+                "rFonts" => {
+                    let font = attr(&attrs, "ascii")
+                        .or_else(|| attr(&attrs, "hAnsi"))
+                        .filter(|v| !v.trim().is_empty())
+                        .map(|v| v.to_string());
+                    if let Some(f) = font {
+                        if in_num {
+                            if let (Some(n), Some(l)) = (cur_num, cur_override_level) {
+                                num_overrides.entry(n).or_default().entry(l).or_default().font =
+                                    Some(f);
+                            }
+                        } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
+                            abstracts.entry(a).or_default().entry(l).or_default().font = Some(f);
                         }
                     }
                 }
@@ -10169,18 +10986,46 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
         }
     }
 
-    let mut by_num: BTreeMap<u32, BTreeMap<u32, NumFmt>> = BTreeMap::new();
-    // Each `w:num` mapped to an abstract: its abstract's level formats.
+    let mut raw_by_num: BTreeMap<u32, BTreeMap<u32, RawLvl>> = BTreeMap::new();
+    // Each `w:num` mapped to an abstract: its abstract's level definitions.
     for (num_id, abstract_id) in &num_to_abstract {
         if let Some(levels) = abstracts.get(abstract_id) {
-            by_num.insert(*num_id, levels.clone());
+            raw_by_num.insert(*num_id, levels.clone());
         }
     }
-    // Apply each `w:num`'s `w:lvlOverride` formats on top (also seeds entries for
-    // an override-only `w:num` whose abstract is absent — partial numbering.xml).
+    // Apply each `w:num`'s `w:lvlOverride` on top, field-wise: an override that
+    // only re-formats a level inherits the abstract's template/font (also seeds
+    // entries for an override-only `w:num` whose abstract is absent — partial
+    // numbering.xml).
     for (num_id, over) in num_overrides {
-        by_num.entry(num_id).or_default().extend(over);
+        let levels = raw_by_num.entry(num_id).or_default();
+        for (lvl, raw) in over {
+            let entry = levels.entry(lvl).or_default();
+            if raw.fmt.is_some() {
+                entry.fmt = raw.fmt;
+            }
+            if raw.lvl_text.is_some() {
+                entry.lvl_text = raw.lvl_text;
+            }
+            if raw.font.is_some() {
+                entry.font = raw.font;
+            }
+            if raw.start.is_some() {
+                entry.start = raw.start;
+            }
+        }
     }
+    // Resolve every raw definition to its displayable form.
+    let by_num = raw_by_num
+        .into_iter()
+        .map(|(num_id, levels)| {
+            let resolved = levels
+                .into_iter()
+                .map(|(lvl, raw)| (lvl, raw.resolve(lvl)))
+                .collect();
+            (num_id, resolved)
+        })
+        .collect();
     DocxNumbering { by_num }
 }
 
@@ -11860,20 +12705,54 @@ fn pptx_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     slides.sort_by_key(|(n, _)| *n);
 
     let mut body = String::new();
+    // One page per slide: each slide's content is absolutely positioned, and
+    // the pagination engine only advances through IN-FLOW boxes — a bare break
+    // div between out-of-flow content would leave every slide stacked on the
+    // first page. So each slide gets an in-flow `position:relative` container
+    // of exactly one page-content height: it consumes its page, carries the
+    // hard break itself, and (being positioned) becomes the containing block
+    // the slide's absolute boxes resolve against — i.e. slide coordinates land
+    // on the slide's own page. `overflow:hidden` clips off-slide content like
+    // PowerPoint does (and keeps it off the next slide's page).
+    let content_h = (geom.h - geom.margins.top - geom.margins.bottom).max(1.0);
     for (idx, (n, xml)) in slides.iter().enumerate() {
-        if idx > 0 {
-            body.push_str("<div style=\"page-break-before:always\"></div>");
-        }
+        body.push_str(&slide_page_open(content_h, idx > 0));
         let rels = zip
             .get(&format!("ppt/slides/_rels/slide{n}.xml.rels"))
             .map(|b| parse_rels(&String::from_utf8_lossy(b)))
             .unwrap_or_default();
         pptx_slide(xml, zip, &rels, &theme, &mut body);
+        body.push_str("</div>");
     }
     if slides.is_empty() {
         body.push_str("<p></p>");
     }
     (body, geom)
+}
+
+/// The opening tag of a one-slide page container (see [`pptx_body_geom`]):
+/// an in-flow, positioned box of one page-content height; every slide after
+/// the first starts on a fresh page. Shared by the PPTX and ODP paths so both
+/// paginate identically. Close with `</div>`.
+///
+/// The height is shaved by a hair (0.05pt, invisible — the slide content is
+/// absolutely positioned and unaffected): `fmt_pt` rounds to 2 decimals, and a
+/// page height that isn't 2-decimal-exact (ODF A4 = 29.7cm = 841.88976…pt)
+/// would round the container *taller than the page*, overshooting every page
+/// boundary by a fraction of a point — the following `page-break-before` then
+/// skips a whole page, interleaving a blank page after every slide.
+/// Undershooting is always safe: the hard break re-synchronises each slide to
+/// the next page boundary exactly.
+fn slide_page_open(content_h: f64, break_before: bool) -> String {
+    format!(
+        "<div style=\"position:relative;height:{}pt;overflow:hidden{}\">",
+        fmt_pt((content_h - 0.05).max(1.0)),
+        if break_before {
+            ";page-break-before:always"
+        } else {
+            ""
+        },
+    )
 }
 
 /// The PPTX HTML `<body>` only — used by the font-need scan.
@@ -12253,6 +13132,12 @@ fn pptx_shape(
     let mut xfrm = XfrmBox::default();
     let mut have_xfrm = false;
     let mut body = String::new();
+    // Image rel targets, resolved to zip keys. Deferred: in a `p:pic` the
+    // `p:blipFill/a:blip` precedes the `p:spPr/a:xfrm`, so the shape's box is
+    // unknown when the blip streams by — the `<img>` is emitted after the walk,
+    // sized to the shape extent (without a size the engine's default ~64pt box
+    // shrank every full-bleed slide picture to a thumbnail).
+    let mut pics: Vec<String> = Vec::new();
 
     while let Some(tok) = x.next() {
         match &tok {
@@ -12273,12 +13158,12 @@ fn pptx_shape(
                 }
                 "blip" => {
                     if let Some(rid) = attr(attrs, "embed").or_else(|| attr(attrs, "link")) {
-                        if let Some(t) = rels
-                            .get(rid)
-                            .map(|t| resolve_target("ppt", t))
-                            .and_then(|k| img_tag(zip, &k))
-                        {
-                            body.push_str(&t);
+                        // Slide rels resolve from the slide part's own folder
+                        // (`ppt/slides/`), so `../media/img.png` →
+                        // `ppt/media/img.png` — the package-root resolver
+                        // dropped the `ppt/` prefix and lost every image.
+                        if let Some(k) = rels.get(rid).map(|t| resolve_rel_part("ppt/slides", t)) {
+                            pics.push(k);
                         }
                     }
                 }
@@ -12288,6 +13173,17 @@ fn pptx_shape(
             _ => {}
         }
     }
+
+    // Images paint behind the shape's text (a blip is the pic content or the
+    // shape's picture fill), sized to the shape box when one is known.
+    let size = (have_xfrm && xfrm.is_placed()).then_some((xfrm.w, xfrm.h));
+    let mut imgs = String::new();
+    for key in &pics {
+        if let Some(t) = img_tag_sized(zip, key, size) {
+            imgs.push_str(&t);
+        }
+    }
+    let body = format!("{imgs}{body}");
 
     if body.trim().is_empty() {
         return;
@@ -12322,9 +13218,11 @@ fn pptx_content(
                 "p" if !sc => pptx_content_paragraph(x, theme, out),
                 "blip" => {
                     if let Some(rid) = attr(attrs, "embed").or_else(|| attr(attrs, "link")) {
+                        // Slide-part rels: resolve from `ppt/slides/` (see
+                        // `pptx_shape`), not the package root.
                         if let Some(t) = rels
                             .get(rid)
-                            .map(|t| resolve_target("ppt", t))
+                            .map(|t| resolve_rel_part("ppt/slides", t))
                             .and_then(|k| img_tag(zip, &k))
                         {
                             out.push_str(&t);
@@ -13694,33 +14592,105 @@ fn odf_page_geom(xml: &str, fallback: PageGeom) -> PageGeom {
     while let Some(tok) = x.next() {
         if let Tok::Open(name, attrs, _) = tok {
             if local(&name) == "page-layout-properties" {
-                if let Some(w) = attr(&attrs, "page-width").and_then(parse_odf_pt) {
-                    geom.w = clamp_page_dim(w);
-                }
-                if let Some(h) = attr(&attrs, "page-height").and_then(parse_odf_pt) {
-                    geom.h = clamp_page_dim(h);
-                }
-                if let Some(all) = attr(&attrs, "margin").and_then(parse_odf_pt) {
-                    geom.margins = Margins::uniform(all.max(0.0));
-                }
-                if let Some(v) = attr(&attrs, "margin-top").and_then(parse_odf_pt) {
-                    geom.margins.top = v.max(0.0);
-                }
-                if let Some(v) = attr(&attrs, "margin-right").and_then(parse_odf_pt) {
-                    geom.margins.right = v.max(0.0);
-                }
-                if let Some(v) = attr(&attrs, "margin-bottom").and_then(parse_odf_pt) {
-                    geom.margins.bottom = v.max(0.0);
-                }
-                if let Some(v) = attr(&attrs, "margin-left").and_then(parse_odf_pt) {
-                    geom.margins.left = v.max(0.0);
-                }
+                apply_page_layout_props(&attrs, &mut geom);
                 // First page layout is the document default — stop here.
                 break;
             }
         }
     }
     geom
+}
+
+/// Fold one `style:page-layout-properties` open tag's size/margin attributes
+/// into `geom` (shared by [`odf_page_geom`] and [`odp_geom`]).
+fn apply_page_layout_props(attrs: &[(String, String)], geom: &mut PageGeom) {
+    if let Some(w) = attr(attrs, "page-width").and_then(parse_odf_pt) {
+        geom.w = clamp_page_dim(w);
+    }
+    if let Some(h) = attr(attrs, "page-height").and_then(parse_odf_pt) {
+        geom.h = clamp_page_dim(h);
+    }
+    if let Some(all) = attr(attrs, "margin").and_then(parse_odf_pt) {
+        geom.margins = Margins::uniform(all.max(0.0));
+    }
+    if let Some(v) = attr(attrs, "margin-top").and_then(parse_odf_pt) {
+        geom.margins.top = v.max(0.0);
+    }
+    if let Some(v) = attr(attrs, "margin-right").and_then(parse_odf_pt) {
+        geom.margins.right = v.max(0.0);
+    }
+    if let Some(v) = attr(attrs, "margin-bottom").and_then(parse_odf_pt) {
+        geom.margins.bottom = v.max(0.0);
+    }
+    if let Some(v) = attr(attrs, "margin-left").and_then(parse_odf_pt) {
+        geom.margins.left = v.max(0.0);
+    }
+}
+
+/// Resolve ODP/ODG slide geometry through the **master-page chain**: the first
+/// `draw:page`'s `draw:master-page-name` (content.xml) names a
+/// `style:master-page` (styles.xml) whose `style:page-layout-name` names the
+/// `style:page-layout` carrying the real slide size. The "first page-layout
+/// wins" heuristic of [`odf_geom`] is wrong for presentations — LibreOffice
+/// lists the **notes** layout (A4 portrait) before the slide layout, so a 16:9
+/// deck imported as portrait A4 and cropped nearly half of every slide. Any
+/// missing link falls back to [`odf_geom`]'s heuristic.
+fn odp_geom(styles_xml: &str, content_xml: &str, fallback: PageGeom) -> PageGeom {
+    odp_master_geom(styles_xml, content_xml, fallback)
+        .unwrap_or_else(|| odf_geom(styles_xml, content_xml, fallback))
+}
+
+/// The master-page-chain resolution behind [`odp_geom`]; `None` when any link
+/// (master name → master page → layout name → layout) is missing.
+fn odp_master_geom(styles_xml: &str, content_xml: &str, fallback: PageGeom) -> Option<PageGeom> {
+    // 1. The master page the deck's first slide uses (absent → first master).
+    let mut master: Option<String> = None;
+    let mut x = Xml::new(content_xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == "page" {
+                master = attr(&attrs, "master-page-name").map(str::to_string);
+                break;
+            }
+        }
+    }
+
+    // 2. That master's page-layout name.
+    let mut layout: Option<String> = None;
+    let mut x = Xml::new(styles_xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == "master-page"
+                && master
+                    .as_deref()
+                    .is_none_or(|m| attr(&attrs, "name") == Some(m))
+            {
+                layout = attr(&attrs, "page-layout-name").map(str::to_string);
+                break;
+            }
+        }
+    }
+    let layout = layout?;
+
+    // 3. That layout's page-layout-properties.
+    let mut geom = fallback;
+    let mut in_layout = false;
+    let mut x = Xml::new(styles_xml);
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "page-layout" => in_layout = attr(&attrs, "name") == Some(layout.as_str()),
+                "page-layout-properties" if in_layout => {
+                    apply_page_layout_props(&attrs, &mut geom);
+                    return Some(geom);
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "page-layout" => in_layout = false,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Normalise an ODF `table:formula` to a bare expression: strip the OpenFormula
@@ -13807,19 +14777,31 @@ fn odf_num_format_marker(fmt: &str) -> Option<ListMarker> {
     }
 }
 
-/// Build a `list-style-name → per-level marker` map from an ODF part. Each
+/// One resolved ODF list level: ordered-vs-bullet, its [`ListMarker`] (the
+/// number format, or the real bullet character), and the ordinal suffix
+/// (`style:num-suffix`, `'.'` by default). Mirrors the DOCX [`NumLevel`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OdfListLevel {
+    ordered: bool,
+    marker: ListMarker,
+    suffix: char,
+}
+
+/// Build a `list-style-name → per-level definition` map from an ODF part. Each
 /// `text:list-style` declares one entry per nesting depth: a
-/// `text:list-level-style-number` (carrying `style:num-format`) marks that level
-/// **ordered** (its [`ListMarker`] from [`odf_num_format_marker`], falling back to
-/// `Decimal` for an unrecognised but numeric style); a
-/// `text:list-level-style-bullet`/`-image` marks it **unordered** (`None`).
+/// `text:list-level-style-number` (carrying `style:num-format` +
+/// `style:num-suffix`) marks that level **ordered** (its [`ListMarker`] from
+/// [`odf_num_format_marker`], falling back to `Decimal` for an unrecognised but
+/// numeric style); a `text:list-level-style-bullet` marks it **unordered** with
+/// its real `text:bullet-char` (private-use symbol codes mapped and guarded by
+/// [`resolve_bullet_char`]); a `-image` level gets the depth's default bullet.
 ///
 /// The returned `Vec` is indexed by `text:level - 1` (so a list walked at level
 /// `n` reads index `n`); a gap or out-of-range level resolves to `None`
-/// (unordered), the safe default when no number style is found. Automatic styles
-/// (content.xml) override same-named entries from styles.xml, as elsewhere.
-fn odf_list_styles(xml: &str) -> BTreeMap<String, Vec<Option<ListMarker>>> {
-    let mut map: BTreeMap<String, Vec<Option<ListMarker>>> = BTreeMap::new();
+/// (unordered default bullet). Automatic styles (content.xml) override
+/// same-named entries from styles.xml, as elsewhere.
+fn odf_list_styles(xml: &str) -> BTreeMap<String, Vec<Option<OdfListLevel>>> {
+    let mut map: BTreeMap<String, Vec<Option<OdfListLevel>>> = BTreeMap::new();
     let mut x = Xml::new(xml);
     let mut cur_name: Option<String> = None;
     while let Some(tok) = x.next() {
@@ -13835,23 +14817,38 @@ fn odf_list_styles(xml: &str) -> BTreeMap<String, Vec<Option<ListMarker>>> {
                             .and_then(|v| v.trim().parse::<usize>().ok())
                             .filter(|&l| l >= 1)
                             .unwrap_or(1);
-                        let marker = if local(&name) == "list-level-style-number" {
+                        let idx = level - 1;
+                        let resolved = if local(&name) == "list-level-style-number" {
                             // An unrecognised numeric style still reads as ordered
                             // (Decimal) — only bullet/image levels are unordered.
-                            Some(
-                                attr(&attrs, "num-format")
+                            OdfListLevel {
+                                ordered: true,
+                                marker: attr(&attrs, "num-format")
                                     .and_then(odf_num_format_marker)
                                     .unwrap_or(ListMarker::Decimal),
-                            )
+                                suffix: attr(&attrs, "num-suffix")
+                                    .and_then(|s| s.chars().next())
+                                    .unwrap_or('.'),
+                            }
                         } else {
-                            None
+                            // Bullet level: its declared `text:bullet-char`
+                            // (guarded against the bundled face); an image level
+                            // or a missing char → the depth's default bullet.
+                            OdfListLevel {
+                                ordered: false,
+                                marker: ListMarker::Bullet(resolve_bullet_char(
+                                    attr(&attrs, "bullet-char"),
+                                    None,
+                                    idx as u32,
+                                )),
+                                suffix: '.',
+                            }
                         };
                         let levels = map.entry(nm.clone()).or_default();
-                        let idx = level - 1;
                         if levels.len() <= idx {
                             levels.resize(idx + 1, None);
                         }
-                        levels[idx] = marker;
+                        levels[idx] = Some(resolved);
                     }
                 }
                 _ => {}
@@ -13867,19 +14864,26 @@ fn odf_list_styles(xml: &str) -> BTreeMap<String, Vec<Option<ListMarker>>> {
     map
 }
 
-/// Resolve an ODF list paragraph's `(ordered, marker)` for the model from the
-/// enclosing `text:list`'s `style_name` at nesting `level` (0-based, mapped to
-/// the style's `text:level - 1` index). A `text:list-level-style-number` level
-/// is ordered with its number-format [`ListMarker`]; a bullet/image level, an
-/// out-of-range level, or an unknown style → an unordered bullet. Mirrors
-/// [`docx_list_marker`].
-fn odf_list_marker(ctx: &OdfModelCtx, style_name: Option<&str>, level: u32) -> (bool, ListMarker) {
-    let marker = style_name
+/// Resolve an ODF list paragraph's `(ordered, marker, ordinal suffix)` for the
+/// model from the enclosing `text:list`'s `style_name` at nesting `level`
+/// (0-based, mapped to the style's `text:level - 1` index). A
+/// `text:list-level-style-number` level is ordered with its number-format
+/// [`ListMarker`] and `style:num-suffix` (`Some(')')` etc., `None` for the
+/// conventional `'.'`); a bullet level carries its real character; an
+/// out-of-range level or an unknown style → the depth's default bullet.
+/// Mirrors [`docx_list_marker`].
+fn odf_list_marker(
+    ctx: &OdfModelCtx,
+    style_name: Option<&str>,
+    level: u32,
+) -> (bool, ListMarker, Option<char>) {
+    let resolved = style_name
         .and_then(|n| ctx.list_styles.get(n))
         .and_then(|levels| levels.get(level as usize).copied().flatten());
-    match marker {
-        Some(m) => (true, m),
-        None => (false, ListMarker::Bullet('\u{2022}')),
+    match resolved {
+        Some(l) if l.ordered => (true, l.marker, (l.suffix != '.').then_some(l.suffix)),
+        Some(l) => (false, l.marker, None),
+        None => (false, ListMarker::Bullet(default_level_bullet(level)), None),
     }
 }
 
@@ -14469,6 +15473,10 @@ fn odt_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     styles.extend(odf_text_styles(&content));
     let mut cols = odf_column_widths(&styles_xml);
     cols.extend(odf_column_widths(&content));
+    // List styles (per-level ordinal/bullet definitions) — automatic styles in
+    // content.xml override the named ones, as elsewhere.
+    let mut lists = odf_list_styles(&styles_xml);
+    lists.extend(odf_list_styles(&content));
 
     let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
     let mut body = String::new();
@@ -14477,7 +15485,9 @@ fn odt_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
         zip,
         &styles,
         &cols,
+        &lists,
         &mut body,
+        None,
         None,
         None,
     );
@@ -14497,18 +15507,67 @@ fn odf_geom(styles_xml: &str, content_xml: &str, fallback: PageGeom) -> PageGeom
     odf_page_geom(content_xml, from_styles)
 }
 
+/// Running state of one `text:list` tree on the ODT HTML path: the list
+/// style's per-level definitions (resolved once at the outermost `text:list`),
+/// its ordinal counters, and the marker pending for the current
+/// `text:list-item` — consumed by the item's **first** paragraph so following
+/// paragraphs of the same item render marker-less (continuation text).
+#[derive(Default)]
+struct OdfHtmlListState {
+    levels: Vec<Option<OdfListLevel>>,
+    /// level → running 1-based ordinal (advancing a level resets deeper ones).
+    counters: BTreeMap<u32, u32>,
+    /// The marker string the next paragraph should carry.
+    pending: Option<String>,
+}
+
+impl OdfHtmlListState {
+    /// The display marker for the item that just opened at `level`: the real
+    /// ordinal (with the level's `style:num-suffix`) for a numbered level, the
+    /// level's bullet character otherwise.
+    fn item_marker(&mut self, level: u32) -> String {
+        match self.levels.get(level as usize).copied().flatten() {
+            Some(l) if l.ordered => {
+                // Advancing this level restarts any deeper sub-list numbering.
+                self.counters.retain(|&lvl, _| lvl <= level);
+                let n = self.counters.entry(level).or_insert(0);
+                *n += 1;
+                let suffix = l.suffix;
+                match l.marker {
+                    ListMarker::LowerAlpha => format!("{}{suffix}", alpha_ordinal(*n, false)),
+                    ListMarker::UpperAlpha => format!("{}{suffix}", alpha_ordinal(*n, true)),
+                    ListMarker::LowerRoman => format!("{}{suffix}", roman(*n, false)),
+                    ListMarker::UpperRoman => format!("{}{suffix}", roman(*n, true)),
+                    _ => format!("{n}{suffix}"),
+                }
+            }
+            Some(l) => match l.marker {
+                ListMarker::Bullet(c) => c.to_string(),
+                _ => default_level_bullet(level).to_string(),
+            },
+            None => default_level_bullet(level).to_string(),
+        }
+    }
+}
+
 /// Recursive ODF text walker (shared by ODT body and table cells). `stop` ends
 /// the region. Handles `text:h`, `text:p`, `table:table`, and `text:list`
-/// (nested lists indent and bullet their paragraphs). `list_level` is `Some(n)`
-/// when walking inside a list (`n` = nesting depth, 0-based).
+/// (nested lists indent their paragraphs and carry real markers — the
+/// `text:list-style`'s per-level ordinal or bullet character, resolved through
+/// `lists`). `list_level` is `Some(n)` when walking inside a list (`n` =
+/// nesting depth, 0-based); `list_state` is the enclosing list tree's marker
+/// state (`None` outside a list).
+#[allow(clippy::too_many_arguments)]
 fn odf_walk(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
     cols: &BTreeMap<String, f64>,
+    lists: &BTreeMap<String, Vec<Option<OdfListLevel>>>,
     out: &mut String,
     stop: Option<&str>,
     list_level: Option<u32>,
+    mut list_state: Option<&mut OdfHtmlListState>,
 ) {
     while let Some(tok) = x.next() {
         match tok {
@@ -14528,23 +15587,80 @@ fn odf_walk(
                     "p" if !sc => {
                         let inner = odf_inline(x, zip, styles, "p");
                         match list_level {
-                            // A paragraph inside a list item → bullet + indent.
+                            // A paragraph inside a list item → marker + indent.
+                            // Only the item's first paragraph consumes the
+                            // pending marker; continuation paragraphs indent
+                            // without one.
                             Some(lvl) if !inner.trim().is_empty() => {
                                 let indent = (lvl as f64 + 1.0) * LIST_LEVEL_INDENT_PT;
-                                out.push_str(&format!(
-                                    "<p style=\"margin-left:{indent}pt\">\u{2022} {inner}</p>"
-                                ));
+                                let marker = match list_state.as_deref_mut() {
+                                    Some(state) => state.pending.take(),
+                                    // Defensive: a list level without state
+                                    // (never built today) keeps a default bullet.
+                                    None => Some(default_level_bullet(lvl).to_string()),
+                                };
+                                match marker {
+                                    Some(m) => out.push_str(&format!(
+                                        "<p style=\"margin-left:{indent}pt\">{m} {inner}</p>"
+                                    )),
+                                    None => out.push_str(&format!(
+                                        "<p style=\"margin-left:{indent}pt\">{inner}</p>"
+                                    )),
+                                }
                             }
                             _ => out.push_str(&format!("<p>{inner}</p>")),
                         }
                     }
-                    // text:list nests; descend with a deeper level. text:list-item
-                    // is transparent — its paragraphs are handled at this level.
-                    "list" if !sc => {
-                        let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
-                        odf_walk(x, zip, styles, cols, out, Some("list"), next);
+                    // A list item opens: stage its marker (ordinal or bullet)
+                    // for the item's first paragraph. `text:list-header` is the
+                    // unnumbered variant — no marker, no counter advance.
+                    "list-item" if !sc => {
+                        if let (Some(state), Some(lvl)) = (list_state.as_deref_mut(), list_level) {
+                            state.pending = Some(state.item_marker(lvl));
+                        }
                     }
-                    "table" if !sc => odf_table(x, zip, styles, cols, out),
+                    // text:list nests; descend with a deeper level. The
+                    // outermost list resolves its `text:style-name` into the
+                    // per-level definitions and owns the ordinal counters;
+                    // nested lists share them (a nested `text:list` numbers
+                    // within its parent's tree).
+                    "list" if !sc => match list_state.as_deref_mut() {
+                        Some(state) => {
+                            let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
+                            odf_walk(
+                                x,
+                                zip,
+                                styles,
+                                cols,
+                                lists,
+                                out,
+                                Some("list"),
+                                next,
+                                Some(state),
+                            );
+                        }
+                        None => {
+                            let mut state = OdfHtmlListState {
+                                levels: attr(&attrs, "style-name")
+                                    .and_then(|n| lists.get(n))
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                ..OdfHtmlListState::default()
+                            };
+                            odf_walk(
+                                x,
+                                zip,
+                                styles,
+                                cols,
+                                lists,
+                                out,
+                                Some("list"),
+                                Some(0),
+                                Some(&mut state),
+                            );
+                        }
+                    },
+                    "table" if !sc => odf_table(x, zip, styles, cols, lists, out),
                     _ => {}
                 }
             }
@@ -14636,6 +15752,7 @@ fn odf_table(
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
     cols: &BTreeMap<String, f64>,
+    lists: &BTreeMap<String, Vec<Option<OdfListLevel>>>,
     out: &mut String,
 ) {
     out.push_str("<table>");
@@ -14656,7 +15773,17 @@ fn odf_table(
                         .unwrap_or(1)
                         .min(64);
                     let mut cell = String::new();
-                    odf_walk(x, zip, styles, cols, &mut cell, Some("table-cell"), None);
+                    odf_walk(
+                        x,
+                        zip,
+                        styles,
+                        cols,
+                        lists,
+                        &mut cell,
+                        Some("table-cell"),
+                        None,
+                        None,
+                    );
                     let cell = cell.trim().to_string();
                     for _ in 0..repeat {
                         out.push_str("<td>");
@@ -14920,7 +16047,7 @@ fn odp_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     let styles_xml = part(zip, "styles.xml");
     let mut styles = odf_text_styles(&styles_xml);
     styles.extend(odf_text_styles(&content));
-    let mut geom = odf_geom(&styles_xml, &content, PageGeom::slide_default());
+    let mut geom = odp_geom(&styles_xml, &content, PageGeom::slide_default());
     // Slides bleed to the edges: drop the prose content margins so absolutely
     // positioned `draw:frame`s (whose `svg:x/y` are page-relative) land at the
     // right place — the layout engine's initial containing block is the page box.
@@ -14928,14 +16055,17 @@ fn odp_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     let mut body = String::new();
     let mut x = Xml::new(&content);
     let mut first = true;
+    // One page per `draw:page` — same in-flow page container as the PPTX path
+    // (see `pptx_body_geom`): absolutely-positioned slide boxes resolve against
+    // it, so each slide's coordinates land on its own page.
+    let content_h = (geom.h - geom.margins.top - geom.margins.bottom).max(1.0);
     while let Some(tok) = x.next() {
         if let Tok::Open(name, _, sc) = &tok {
             if local(name) == "page" && !sc {
-                if !first {
-                    body.push_str("<div style=\"page-break-before:always\"></div>");
-                }
+                body.push_str(&slide_page_open(content_h, !first));
                 first = false;
                 odp_page(&mut x, zip, &styles, &mut body);
+                body.push_str("</div>");
             }
         }
     }
@@ -14974,6 +16104,13 @@ fn odp_page(
                     "frame" if !sc && odp_frame_box(&attrs).is_some() => {
                         let bx = odp_frame_box(&attrs).unwrap();
                         odp_frame(x, zip, styles, bx, out);
+                    }
+                    // A draw shape (LibreOffice emits its standard slide text
+                    // boxes as `draw:custom-shape`, NOT `draw:frame`): its
+                    // `text:p` children carry the visible text — render it at
+                    // the shape's page box like a frame.
+                    ln if !sc && odf_is_draw_shape(ln) => {
+                        odp_shape(x, zip, styles, &attrs, ln, out);
                     }
                     "p" if !sc => {
                         let inner = odf_inline(x, zip, styles, "p");
@@ -15196,6 +16333,55 @@ fn odp_frame(
         fmt_pt(fh),
         body,
     ));
+}
+
+/// Render an ODP draw shape (`draw:custom-shape`/`draw:rect`/…; open consumed,
+/// `close` = its local name) from the slide-display path. LibreOffice emits its
+/// standard slide text boxes as `draw:custom-shape` — NOT `draw:frame`/
+/// `draw:text-box` — so the shape's `text:p` children carry most of a deck's
+/// visible text; skipping them rendered such decks as blank pages. The
+/// paragraphs are collected exactly like a frame body (the flat tokenizer also
+/// reaches `text:p` nested in `text:list` items); a shape positioned via
+/// `svg:x`/`svg:y` (or a `draw:transform` translate) becomes an
+/// absolutely-positioned `<div>` at its page box, an unpositioned one flows. A
+/// text-less shape emits nothing — its vector geometry is out of scope for this
+/// HTML path (the model path lowers it via [`odp_shape_model`]). Consumes the
+/// subtree up to the matching close tag.
+fn odp_shape(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+    attrs: &[(String, String)],
+    close: &str,
+    out: &mut String,
+) {
+    let mut body = String::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _, sc) if local(&name) == "p" && !sc => {
+                let inner = odf_inline(x, zip, styles, "p");
+                if !inner.trim().is_empty() {
+                    body.push_str(&format!("<p>{}</p>", inner.trim()));
+                }
+            }
+            Tok::Close(name) if local(&name) == close => break,
+            _ => {}
+        }
+    }
+    if body.is_empty() {
+        return;
+    }
+    match odp_frame_box_xf(attrs) {
+        Some((fx, fy, fw, fh)) => out.push_str(&format!(
+            "<div style=\"position:absolute;left:{}pt;top:{}pt;width:{}pt;height:{}pt\">{}</div>",
+            fmt_pt(fx),
+            fmt_pt(fy),
+            fmt_pt(fw),
+            fmt_pt(fh),
+            body,
+        )),
+        None => out.push_str(&body),
+    }
 }
 
 // ════════════════════════════════ legacy OLE2 ═════════════════════════════════
@@ -17115,6 +18301,7 @@ mod tests {
             numbering: &numbering,
             footnotes: &footnotes,
             page_h: A4_H,
+            hf_tokens: false,
         };
         let mut body = String::new();
         docx_body(document_xml, &ctx, &mut body);
@@ -18008,7 +19195,8 @@ mod tests {
 
     #[test]
     fn docx_gridspan_expands_to_physical_cells() {
-        // A 2-column gridSpan cell becomes "<td colspan=2>…</td><td></td>".
+        // A 2-column gridSpan cell carries a real `colspan` — the engine's
+        // table grid honours spans, so NO filler `<td>` is emitted.
         let doc = r#"<w:document xmlns:w="x"><w:body>
             <w:tbl>
               <w:tr>
@@ -18022,12 +19210,12 @@ mod tests {
           </w:body></w:document>"#;
         let html = docx_html(doc);
         assert!(html.contains("colspan=\"2\""), "colspan emitted: {html}");
-        // The spanning cell carries the content; a single empty <td> pads the
-        // row to 2 physical columns so the equal-width layout spreads it.
+        // The spanning cell alone closes its row: no phantom empty cell.
         assert!(
-            html.contains("Wide</p></td><td></td>"),
-            "padded cell: {html}"
+            html.contains("Wide</p></td></tr>"),
+            "no filler cell after the span: {html}"
         );
+        assert!(!html.contains("<td></td>"), "no empty <td> filler: {html}");
         let pdf = office_to_pdf(&build_docx(doc, None, &[])).expect("docx converts");
         let text = norm(&opens(&pdf).to_text());
         for needle in ["Wide", "L", "R"] {
@@ -18069,7 +19257,7 @@ mod tests {
 
     #[test]
     fn docx_gridspan_still_works_with_tblgrid() {
-        // gridSpan expansion (colspan + padding) is unaffected by the colgroup.
+        // gridSpan (a bare colspan, no filler cells) is unaffected by the colgroup.
         let doc = r#"<w:document xmlns:w="x"><w:body>
             <w:tbl>
               <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>
@@ -18084,8 +19272,8 @@ mod tests {
             "colspan still emitted: {html}"
         );
         assert!(
-            html.contains("Wide</p></td><td></td>"),
-            "padding intact: {html}"
+            html.contains("Wide</p></td></tr>"),
+            "span closes the row, no filler: {html}"
         );
         assert!(
             html.contains("<colgroup>"),
@@ -18138,7 +19326,8 @@ mod tests {
             }
         }
         let mut out = String::new();
-        odf_table(&mut x, &zip, &styles, &cols, &mut out);
+        let lists = BTreeMap::new();
+        odf_table(&mut x, &zip, &styles, &cols, &lists, &mut out);
         assert!(
             out.contains(
                 "<colgroup><col style=\"width:85.04pt\"><col style=\"width:28.35pt\"></colgroup>"
@@ -18186,6 +19375,270 @@ mod tests {
         let pdf = office_to_pdf(&build_docx(doc, None, &[])).expect("docx converts");
         let text = norm(&opens(&pdf).to_text());
         assert!(text.contains("Merged") && text.contains("Bottom"), "{text}");
+    }
+
+    // ── DOCX display fidelity: character styles, table formatting, running
+    //    header/footer with live page tokens, multi-column sections ──
+
+    #[test]
+    fn docx_run_strike_highlight_super_sub_letter_spacing_emit_css() {
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p>
+            <w:r><w:rPr><w:strike/></w:rPr><w:t>barre</w:t></w:r>
+            <w:r><w:rPr><w:highlight w:val="yellow"/></w:rPr><w:t>surligne</w:t></w:r>
+            <w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>2</w:t></w:r>
+            <w:r><w:rPr><w:vertAlign w:val="subscript"/></w:rPr><w:t>o</w:t></w:r>
+            <w:r><w:rPr><w:spacing w:val="40"/></w:rPr><w:t>large</w:t></w:r>
+            <w:r><w:rPr><w:shd w:val="clear" w:fill="00FF00"/></w:rPr><w:t>fond</w:t></w:r>
+          </w:p>
+        </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(
+            html.contains("text-decoration:line-through"),
+            "strike: {html}"
+        );
+        assert!(
+            html.contains("background-color:#FFFF00"),
+            "named highlight: {html}"
+        );
+        assert!(
+            html.contains("background-color:#00FF00"),
+            "run shading: {html}"
+        );
+        assert!(html.contains("vertical-align:super"), "superscript: {html}");
+        assert!(html.contains("vertical-align:sub"), "subscript: {html}");
+        // Super/sub shrink like Word paints them (~65% of the inherited size).
+        assert!(html.contains("font-size:0.65em"), "sup/sub shrink: {html}");
+        // `w:spacing w:val="40"` twips = 2pt of letter spacing.
+        assert!(
+            html.contains("letter-spacing:2pt"),
+            "letter spacing: {html}"
+        );
+    }
+
+    #[test]
+    fn docx_underline_and_strike_share_one_text_decoration() {
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:r><w:rPr><w:u w:val="single"/><w:strike/></w:rPr><w:t>both</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(
+            html.contains("text-decoration:underline line-through"),
+            "combined decoration: {html}"
+        );
+    }
+
+    #[test]
+    fn docx_vanish_hidden_run_is_not_painted() {
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p>
+            <w:r><w:rPr><w:vanish/></w:rPr><w:t>secret</w:t></w:r>
+            <w:r><w:t>visible</w:t></w:r>
+          </w:p>
+        </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(!html.contains("secret"), "hidden run dropped: {html}");
+        assert!(html.contains("visible"), "normal run kept: {html}");
+    }
+
+    #[test]
+    fn docx_cell_shading_valign_and_border_resolution() {
+        // tblBorders: 1pt red outer frame, 0.5pt inner grid. Cell A adds a fill
+        // + vAlign center; cell B overrides its bottom border via tcBorders.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:tbl>
+              <w:tblPr><w:tblBorders>
+                <w:top w:val="single" w:sz="8" w:color="FF0000"/>
+                <w:bottom w:val="single" w:sz="8" w:color="FF0000"/>
+                <w:left w:val="single" w:sz="8" w:color="FF0000"/>
+                <w:right w:val="single" w:sz="8" w:color="FF0000"/>
+                <w:insideH w:val="single" w:sz="4"/>
+                <w:insideV w:val="single" w:sz="4"/>
+              </w:tblBorders></w:tblPr>
+              <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>
+              <w:tr>
+                <w:tc><w:tcPr><w:shd w:val="clear" w:fill="4472C4"/><w:vAlign w:val="center"/></w:tcPr><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+                <w:tc><w:tcPr><w:tcBorders><w:bottom w:val="double" w:sz="16" w:color="00AA00"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc>
+              </w:tr>
+            </w:tbl>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        // Cell fill (hex background) + vertical alignment.
+        assert!(
+            html.contains("background-color:#4472C4"),
+            "cell shading: {html}"
+        );
+        assert!(
+            html.contains("vertical-align:middle"),
+            "vAlign center → middle: {html}"
+        );
+        // Cell A (first row/col): outer top+left 1pt red, inner bottom 0.5pt.
+        assert!(
+            html.contains("border-top:1pt solid #FF0000"),
+            "outer top from tblBorders: {html}"
+        );
+        assert!(
+            html.contains("border-left:1pt solid #FF0000"),
+            "outer left from tblBorders: {html}"
+        );
+        assert!(
+            html.contains("border-bottom:0.5pt solid #000000"),
+            "insideH default on an inner edge: {html}"
+        );
+        // Cell B: its own tcBorders bottom (2pt double green) beats the default.
+        assert!(
+            html.contains("border-bottom:2pt double #00AA00"),
+            "tcBorders wins over tblBorders: {html}"
+        );
+    }
+
+    #[test]
+    fn docx_vmerge_counts_real_rowspan_over_three_rows() {
+        // restart + TWO continuation rows → rowspan="3", continuations dropped,
+        // and no phantom empty cells anywhere.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:tbl>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Tall</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>r1</w:t></w:r></w:p></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:p><w:r><w:t>r2</w:t></w:r></w:p></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:p><w:r><w:t>r3</w:t></w:r></w:p></w:tc>
+              </w:tr>
+            </w:tbl>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(
+            html.contains("<td rowspan=\"3\"><p>Tall</p></td>"),
+            "counted rowspan: {html}"
+        );
+        assert!(!html.contains("<td></td>"), "no phantom cells: {html}");
+    }
+
+    #[test]
+    fn docx_running_header_footer_use_engine_tokens_and_repeat_per_page() {
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:r><w:t>First page body</w:t></w:r></w:p>
+          <w:p><w:r><w:br w:type="page"/></w:r></w:p>
+          <w:p><w:r><w:t>Second page body</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let header = r#"<w:hdr xmlns:w="x"><w:p><w:r><w:t>RunningHead</w:t></w:r></w:p></w:hdr>"#;
+        // Word-style footer: "Page {PAGE} / {NUMPAGES}" as complex fields with
+        // STALE cached results ("9") that must be replaced by live tokens.
+        let footer = r#"<w:ftr xmlns:w="x"><w:p>
+          <w:r><w:t xml:space="preserve">Page </w:t></w:r>
+          <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+          <w:r><w:instrText> PAGE </w:instrText></w:r>
+          <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+          <w:r><w:t>9</w:t></w:r>
+          <w:r><w:fldChar w:fldCharType="end"/></w:r>
+          <w:r><w:t xml:space="preserve"> / </w:t></w:r>
+          <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+          <w:r><w:instrText> NUMPAGES </w:instrText></w:r>
+          <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+          <w:r><w:t>9</w:t></w:r>
+          <w:r><w:fldChar w:fldCharType="end"/></w:r>
+        </w:p></w:ftr>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored("word/document.xml", doc.as_bytes());
+        z.add_stored("word/header1.xml", header.as_bytes());
+        z.add_stored("word/footer1.xml", footer.as_bytes());
+        let bytes = z.finish();
+
+        // The parts ride in the engine's running header/footer options — with
+        // live tokens — and are NOT duplicated into the body flow.
+        let parts = docx_html_parts(&read_zip(&bytes));
+        let header_html = parts.header.expect("running header built");
+        assert!(
+            header_html.contains("RunningHead"),
+            "header text: {header_html}"
+        );
+        assert!(
+            !parts.body.contains("RunningHead"),
+            "body free of header markup: {}",
+            parts.body
+        );
+        let footer_html = parts.footer.expect("running footer built");
+        assert!(
+            footer_html.contains("Page {{page}} / {{pages}}"),
+            "PAGE/NUMPAGES become live tokens: {footer_html}"
+        );
+        assert!(
+            !footer_html.contains('9'),
+            "stale cached field results dropped: {footer_html}"
+        );
+
+        // Rendered: two pages, the header repeated on EACH, live page numbers.
+        let pdf = office_to_pdf(&bytes).expect("docx converts");
+        let rendered = opens(&pdf);
+        assert_eq!(rendered.page_count(), 2, "two pages");
+        // Runs can split at word boundaries: compare whitespace-squashed text.
+        let page_squashed = |n: u32| -> String {
+            rendered
+                .page_text_runs(n)
+                .expect("page text runs")
+                .iter()
+                .flat_map(|r| r.text.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let p1 = page_squashed(1);
+        let p2 = page_squashed(2);
+        assert!(p1.contains("RunningHead"), "header on page 1: {p1}");
+        assert!(p2.contains("RunningHead"), "header on page 2: {p2}");
+        assert!(p1.contains("Page1/2"), "live footer on page 1: {p1}");
+        assert!(p2.contains("Page2/2"), "live footer on page 2: {p2}");
+        assert!(p1.contains("Firstpagebody"), "body on page 1: {p1}");
+        assert!(p2.contains("Secondpagebody"), "body on page 2: {p2}");
+    }
+
+    #[test]
+    fn docx_section_columns_wrap_html_and_reach_model() {
+        // Section 1 (single column) ends at a CONTINUOUS paragraph-level
+        // sectPr; section 2 (the body-level sectPr) declares two columns.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:r><w:t>Single column intro</w:t></w:r></w:p>
+          <w:p><w:pPr><w:sectPr><w:type w:val="continuous"/><w:pgSz w:w="11906" w:h="16838"/></w:sectPr></w:pPr></w:p>
+          <w:p><w:r><w:t>Two column text</w:t></w:r></w:p>
+          <w:sectPr><w:cols w:num="2" w:space="708"/><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>
+        </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("column-count:2"), "column-count: {html}");
+        // `w:space="708"` twips = 35.4pt of gutter.
+        assert!(html.contains("column-gap:35.4pt"), "column gap: {html}");
+        // Only the SECOND section is wrapped.
+        let wrap = html.find("column-count:2").expect("wrapper present");
+        let intro = html.find("Single column intro").expect("intro present");
+        let two = html.find("Two column text").expect("column text present");
+        assert!(
+            intro < wrap && wrap < two,
+            "wrapper opens between the sections: {html}"
+        );
+        // A continuous section break flows on — no forced page break.
+        assert!(
+            !html.contains("page-break-before"),
+            "continuous break keeps the page: {html}"
+        );
+
+        // The model's section geometry carries the real column count.
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored("word/document.xml", doc.as_bytes());
+        let model = docx_to_model(&read_zip(&z.finish()));
+        assert_eq!(
+            model.sections[0].geometry.column_count, 2,
+            "model column_count"
+        );
     }
 
     #[test]
@@ -18597,6 +20050,7 @@ mod tests {
             numbering: &numbering,
             footnotes: &footnotes,
             page_h: A4_H,
+            hf_tokens: false,
         };
         let mut body = String::new();
         docx_body(
@@ -18634,6 +20088,7 @@ mod tests {
             numbering: &numbering,
             footnotes: &footnotes,
             page_h: A4_H,
+            hf_tokens: false,
         };
         let mut body = String::new();
         docx_body(document_xml, &ctx, &mut body);
@@ -18881,13 +20336,16 @@ mod tests {
         let zip = read_zip(&odt);
         let styles = BTreeMap::new();
         let cols = BTreeMap::new();
+        let lists = BTreeMap::new();
         let mut body = String::new();
         odf_walk(
             &mut Xml::new(&String::from_utf8_lossy(&zip["content.xml"])),
             &zip,
             &styles,
             &cols,
+            &lists,
             &mut body,
+            None,
             None,
             None,
         );
@@ -18895,9 +20353,11 @@ mod tests {
             body.contains("\u{2022} Alpha"),
             "bullet on top item: {body}"
         );
+        // With no declared list style, the nested level takes the depth
+        // ladder's default bullet (`◦`), not the top-level `•`.
         assert!(
-            body.contains("\u{2022} Beta"),
-            "bullet on nested item: {body}"
+            body.contains("\u{25E6} Beta"),
+            "level-1 default bullet on nested item: {body}"
         );
         assert!(body.contains("margin-left:36pt"), "level-0 indent: {body}");
         assert!(body.contains("margin-left:72pt"), "level-1 indent: {body}");
@@ -20523,9 +21983,13 @@ mod tests {
         </w:numbering>"#;
         let n = parse_docx_numbering(numbering);
         // Level 0 unchanged (decimal); level 1 overridden (lowerRoman).
-        assert_eq!(n.fmt(3, 0), Some(NumFmt::Decimal), "level 0 stays decimal");
         assert_eq!(
-            n.fmt(3, 1),
+            n.level(3, 0).map(|l| l.fmt),
+            Some(NumFmt::Decimal),
+            "level 0 stays decimal"
+        );
+        assert_eq!(
+            n.level(3, 1).map(|l| l.fmt),
             Some(NumFmt::LowerRoman),
             "level 1 overridden to lowerRoman"
         );
@@ -25365,5 +26829,181 @@ mod tests {
         let pdf = docx_to_pdf(&zip);
         let text = norm(&opens(&pdf).to_text());
         assert!(text.contains("Direct DOCX body"), "body in: {text}");
+    }
+
+    #[test]
+    fn odp_custom_shape_text_positions_on_slide() {
+        // LibreOffice emits its standard slide text boxes as `draw:custom-shape`
+        // (NOT `draw:frame`/`draw:text-box`): the shape's `text:p` must surface,
+        // absolutely positioned at the shape's `svg:x/y/width/height` box —
+        // skipping it rendered such decks as blank pages.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:text="t" xmlns:svg="s">
+  <office:body><office:presentation>
+    <draw:page draw:name="p1">
+      <draw:custom-shape svg:x="1cm" svg:y="2cm" svg:width="10cm" svg:height="2cm">
+        <text:p>Custom Shape Text</text:p>
+        <draw:enhanced-geometry draw:type="ooxml-rect"/>
+      </draw:custom-shape>
+    </draw:page>
+  </office:presentation></office:body>
+</office:document-content>"#;
+        let parts = odf_parts(b"application/vnd.oasis.opendocument.presentation", content);
+        let (body, _) = odp_body_geom(&parts);
+        let div = body
+            .find("position:absolute;left:28.35pt;top:56.69pt;width:283.46pt")
+            .expect("shape box → absolute div at 1cm/2cm/10cm");
+        assert!(
+            body[div..].contains("Custom Shape Text"),
+            "shape text inside the positioned div: {body}"
+        );
+
+        let text = norm(&opens(&odp_to_pdf(&parts)).to_text());
+        assert!(text.contains("Custom Shape Text"), "text in PDF: {text}");
+    }
+
+    #[test]
+    fn odp_slides_paginate_one_page_each() {
+        // Positioned (absolute) slide content does not advance the flow, so
+        // pagination must come from the per-slide page containers: 3 slides →
+        // exactly 3 pages, each slide's text on ITS page (everything used to
+        // stack on page 1).
+        let content = r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:text="t" xmlns:svg="s">
+  <office:body><office:presentation>
+    <draw:page draw:name="p1"><draw:custom-shape svg:x="1cm" svg:y="1cm" svg:width="10cm" svg:height="2cm"><text:p>Deck Page One</text:p></draw:custom-shape></draw:page>
+    <draw:page draw:name="p2"><draw:custom-shape svg:x="1cm" svg:y="1cm" svg:width="10cm" svg:height="2cm"><text:p>Deck Page Two</text:p></draw:custom-shape></draw:page>
+    <draw:page draw:name="p3"><draw:custom-shape svg:x="1cm" svg:y="1cm" svg:width="10cm" svg:height="2cm"><text:p>Deck Page Three</text:p></draw:custom-shape></draw:page>
+  </office:presentation></office:body>
+</office:document-content>"#;
+        let parts = odf_parts(b"application/vnd.oasis.opendocument.presentation", content);
+        let doc = opens(&odp_to_pdf(&parts));
+        assert_eq!(doc.page_count(), 3, "one page per draw:page, no blanks");
+        for (i, needle) in ["Deck Page One", "Deck Page Two", "Deck Page Three"]
+            .iter()
+            .enumerate()
+        {
+            let runs = doc.page_text_runs((i + 1) as u32).unwrap();
+            let joined = norm(&runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" "));
+            assert!(
+                joined.contains(needle),
+                "slide {} text on page {}: {joined:?}",
+                i + 1,
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn odp_pagination_survives_non_two_decimal_page_height() {
+        // A4 = 29.7cm = 841.88976…pt: the per-slide page container's height is
+        // serialised with 2 decimals, so it must round DOWN — rounding up made
+        // every container overshoot its page boundary by a fraction of a point
+        // and the following hard break then skipped a page (blank page after
+        // every slide: 11 slides → 21 pages).
+        let content = r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:text="t" xmlns:svg="s" xmlns:style="st" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:page-layout style:name="PM0">
+      <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" fo:margin="0cm"/>
+    </style:page-layout>
+  </office:automatic-styles>
+  <office:body><office:presentation>
+    <draw:page draw:name="p1"><draw:custom-shape svg:x="1cm" svg:y="1cm" svg:width="10cm" svg:height="2cm"><text:p>A4 Slide One</text:p></draw:custom-shape></draw:page>
+    <draw:page draw:name="p2"><draw:custom-shape svg:x="1cm" svg:y="1cm" svg:width="10cm" svg:height="2cm"><text:p>A4 Slide Two</text:p></draw:custom-shape></draw:page>
+  </office:presentation></office:body>
+</office:document-content>"#;
+        let parts = odf_parts(b"application/vnd.oasis.opendocument.presentation", content);
+        let doc = opens(&odp_to_pdf(&parts));
+        assert_eq!(doc.page_count(), 2, "no blank page interleaved");
+    }
+
+    #[test]
+    fn odp_geom_resolves_master_page_layout_not_first_layout() {
+        // LibreOffice presentations list the NOTES page layout (A4 portrait)
+        // BEFORE the slide layout in styles.xml; the geometry must follow the
+        // master-page chain (draw:page → style:master-page →
+        // style:page-layout-name), not "first layout wins" — which imported a
+        // 16:9 deck as portrait A4 and cropped nearly half of every slide.
+        let styles = r#"<office:document-styles xmlns:office="o" xmlns:style="st" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:page-layout style:name="PM0">
+      <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm"/>
+    </style:page-layout>
+    <style:page-layout style:name="PM1">
+      <style:page-layout-properties fo:page-width="33.867cm" fo:page-height="19.05cm" fo:margin="0cm"/>
+    </style:page-layout>
+  </office:automatic-styles>
+  <office:master-styles>
+    <style:master-page style:name="DEFAULT" style:page-layout-name="PM1"/>
+  </office:master-styles>
+</office:document-styles>"#;
+        let content = r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:text="t">
+  <office:body><office:presentation>
+    <draw:page draw:name="p1" draw:master-page-name="DEFAULT"><text:p>x</text:p></draw:page>
+  </office:presentation></office:body>
+</office:document-content>"#;
+        let geom = odp_geom(styles, content, PageGeom::slide_default());
+        assert!(
+            (geom.w - 960.0).abs() < 0.1 && (geom.h - 540.0).abs() < 0.1,
+            "slide layout (16:9) resolved through the master page, got {}x{}",
+            geom.w,
+            geom.h
+        );
+    }
+
+    #[test]
+    fn pptx_slides_paginate_one_page_each() {
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "ppt/presentation.xml",
+            br#"<p:presentation xmlns:p="p" xmlns:a="a"><p:sldSz cx="12192000" cy="6858000"/></p:presentation>"#,
+        );
+        for (n, t) in [(1, "Deck Alpha"), (2, "Deck Beta"), (3, "Deck Gamma")] {
+            // A positioned shape (a:xfrm) — absolute content that does not
+            // advance the flow; pagination must come from the page container.
+            let sld = format!(
+                r#"<p:sld xmlns:p="p" xmlns:a="a"><p:cSld><p:spTree><p:sp><p:spPr><a:xfrm><a:off x="914400" y="914400"/><a:ext cx="4572000" cy="914400"/></a:xfrm></p:spPr><p:txBody><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+            );
+            z.add_stored(&format!("ppt/slides/slide{n}.xml"), sld.as_bytes());
+        }
+        let zip = read_zip(&z.finish());
+        let doc = opens(&pptx_to_pdf(&zip));
+        assert_eq!(doc.page_count(), 3, "one page per slide, no blanks");
+        for (i, needle) in ["Deck Alpha", "Deck Beta", "Deck Gamma"].iter().enumerate() {
+            let runs = doc.page_text_runs((i + 1) as u32).unwrap();
+            let joined = norm(&runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" "));
+            assert!(
+                joined.contains(needle),
+                "slide {} text on page {}: {joined:?}",
+                i + 1,
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn pptx_slide_image_resolves_slide_relative_target() {
+        // Slide rels resolve from `ppt/slides/`: the ubiquitous
+        // `../media/img.png` target must map to `ppt/media/img.png` — the
+        // package-root resolver dropped the `ppt/` prefix, silently losing
+        // every slide image (an image-only deck rendered fully blank).
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "ppt/presentation.xml",
+            br#"<p:presentation xmlns:p="p"><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#,
+        );
+        z.add_stored(
+            "ppt/slides/slide1.xml",
+            br#"<p:sld xmlns:p="p" xmlns:a="a" xmlns:r="r"><p:cSld><p:spTree><p:pic><p:blipFill><a:blip r:embed="rId3"/></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="9144000" cy="6858000"/></a:xfrm></p:spPr></p:pic></p:spTree></p:cSld></p:sld>"#,
+        );
+        z.add_stored(
+            "ppt/slides/_rels/slide1.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#,
+        );
+        z.add_stored("ppt/media/image1.png", b"fake-png-payload");
+        let zip = read_zip(&z.finish());
+        let body = pptx_body_html(&zip);
+        assert!(
+            body.contains("<img src=\"data:image/png;base64,"),
+            "slide image resolved and inlined: {body}"
+        );
     }
 }

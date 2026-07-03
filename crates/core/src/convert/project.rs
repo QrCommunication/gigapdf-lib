@@ -123,17 +123,43 @@ fn line_advance(cs: &CharStyle, line_height: LineHeight) -> f64 {
     h.max(MIN_LINE_HEIGHT)
 }
 
-/// The ordinal/bullet prefix for the `index`-th (zero-based) item of a list.
-fn list_prefix(list: &List, index: usize) -> String {
-    let n = index + 1;
-    match list.marker {
-        ListMarker::Bullet(c) => format!("{c} "),
-        ListMarker::Decimal => format!("{n}. "),
-        ListMarker::LowerAlpha => format!("{}. ", alpha(n, false)),
-        ListMarker::UpperAlpha => format!("{}. ", alpha(n, true)),
-        ListMarker::LowerRoman => format!("{}. ", roman(n).to_lowercase()),
-        ListMarker::UpperRoman => format!("{}. ", roman(n)),
-    }
+/// The ordinal/bullet prefix of every item of `list` (one entry per item, in
+/// order). Ordinals run **per nesting level**: a deeper run keeps its own
+/// 1-based sequence and resets once a shallower item advances — how word
+/// processors number multi-level lists. Level-0 ordinals seed from the list's
+/// [`start`](List::start) (so a one-item list carved out of a longer numbered
+/// flow keeps its real number — the Office importers pin each numbered
+/// paragraph's ordinal there); every ordinal carries the list's
+/// [suffix](List::suffix) (`.` by default, `)` for `1)`-style sources).
+fn list_prefixes(list: &List) -> Vec<String> {
+    let s = list.suffix();
+    // level → last emitted ordinal at that level.
+    let mut counters: std::collections::BTreeMap<u8, usize> = std::collections::BTreeMap::new();
+    list.items
+        .iter()
+        .map(|item| {
+            if let ListMarker::Bullet(c) = list.marker {
+                return format!("{c} ");
+            }
+            counters.retain(|&l, _| l <= item.level);
+            let seed = if item.level == 0 {
+                list.start.max(1) as usize - 1
+            } else {
+                0
+            };
+            let n = counters.entry(item.level).or_insert(seed);
+            *n += 1;
+            let n = *n;
+            match list.marker {
+                ListMarker::Bullet(_) => unreachable!("handled above"),
+                ListMarker::Decimal => format!("{n}{s} "),
+                ListMarker::LowerAlpha => format!("{}{s} ", alpha(n, false)),
+                ListMarker::UpperAlpha => format!("{}{s} ", alpha(n, true)),
+                ListMarker::LowerRoman => format!("{}{s} ", roman(n).to_lowercase()),
+                ListMarker::UpperRoman => format!("{}{s} ", roman(n)),
+            }
+        })
+        .collect()
 }
 
 /// Spreadsheet-style letters for `n` (1→A, 26→Z, 27→AA), upper or lower case.
@@ -341,8 +367,9 @@ impl Flow {
     }
 
     fn flow_list(&mut self, list: &List, indent: f64) {
+        let prefixes = list_prefixes(list);
         for (i, item) in list.items.iter().enumerate() {
-            let prefix = list_prefix(list, i);
+            let prefix = prefixes[i].clone();
             let item_indent = indent + f64::from(item.level) * 18.0;
             // Render the first paragraph prefixed with the bullet/ordinal; any
             // remaining blocks of the item flow underneath at the item indent.
@@ -473,8 +500,9 @@ fn cell_text(blocks: &[Block]) -> String {
             BlockKind::Heading(h) => parts.push(paragraph_text(&h.para)),
             BlockKind::TextBox(tb) => parts.push(cell_text(&tb.blocks)),
             BlockKind::List(l) => {
+                let prefixes = list_prefixes(l);
                 for (i, item) in l.items.iter().enumerate() {
-                    parts.push(format!("{}{}", list_prefix(l, i), cell_text(&item.blocks)));
+                    parts.push(format!("{}{}", prefixes[i], cell_text(&item.blocks)));
                 }
             }
             _ => {}
@@ -582,8 +610,9 @@ fn place_text_box(page: &mut ConvPage, tb: &TextBox, frame: Rect) {
 /// Place a list at `frame`, one line per item with its bullet/ordinal prefix.
 fn place_list_box(page: &mut ConvPage, list: &List, frame: Rect) {
     let mut y = frame.y;
+    let prefixes = list_prefixes(list);
     for (i, item) in list.items.iter().enumerate() {
-        let prefix = list_prefix(list, i);
+        let prefix = &prefixes[i];
         let indent = f64::from(item.level) * 18.0;
         let text = format!("{prefix}{}", cell_text(&item.blocks));
         let cs = first_cell_style(&item.blocks).unwrap_or_default();
@@ -673,8 +702,9 @@ fn place_blocks_at(
                 *y += line_advance(&cs, h.para.style.line_height);
             }
             BlockKind::List(l) => {
+                let prefixes = list_prefixes(l);
                 for (i, item) in l.items.iter().enumerate() {
-                    let prefix = list_prefix(l, i);
+                    let prefix = &prefixes[i];
                     let text = format!("{prefix}{}", cell_text(&item.blocks));
                     let cs = first_cell_style(&item.blocks).unwrap_or_default();
                     if !text.is_empty() {
@@ -1302,18 +1332,38 @@ mod tests {
 
     #[test]
     fn list_prefix_for_each_marker() {
-        let mk = |marker: ListMarker| List {
+        // N same-level items: the prefix of the last one exercises ordinal N.
+        let mk = |marker: ListMarker, n: usize| List {
+            marker_suffix: None,
             ordered: true,
             marker,
-            items: vec![],
+            items: vec![ListItem::default(); n],
             start: 1,
         };
-        assert_eq!(list_prefix(&mk(ListMarker::Bullet('•')), 0), "• ");
-        assert_eq!(list_prefix(&mk(ListMarker::Decimal), 2), "3. ");
-        assert_eq!(list_prefix(&mk(ListMarker::LowerAlpha), 0), "a. ");
-        assert_eq!(list_prefix(&mk(ListMarker::UpperAlpha), 1), "B. ");
-        assert_eq!(list_prefix(&mk(ListMarker::LowerRoman), 3), "iv. ");
-        assert_eq!(list_prefix(&mk(ListMarker::UpperRoman), 8), "IX. ");
+        let last = |l: &List| list_prefixes(l).last().unwrap().clone();
+        assert_eq!(last(&mk(ListMarker::Bullet('•'), 1)), "• ");
+        assert_eq!(last(&mk(ListMarker::Decimal, 3)), "3. ");
+        assert_eq!(last(&mk(ListMarker::LowerAlpha, 1)), "a. ");
+        assert_eq!(last(&mk(ListMarker::UpperAlpha, 2)), "B. ");
+        assert_eq!(last(&mk(ListMarker::LowerRoman, 4)), "iv. ");
+        assert_eq!(last(&mk(ListMarker::UpperRoman, 9)), "IX. ");
+        // `start` seeds level 0; a `)` suffix rides every ordinal; a deeper
+        // item numbers within its own level (and resets on return).
+        let numbered = List {
+            ordered: true,
+            marker: ListMarker::Decimal,
+            items: vec![
+                ListItem::default(),
+                ListItem {
+                    level: 1,
+                    ..Default::default()
+                },
+                ListItem::default(),
+            ],
+            start: 4,
+            marker_suffix: Some(')'),
+        };
+        assert_eq!(list_prefixes(&numbered), vec!["4) ", "1) ", "5) "]);
     }
 
     #[test]
@@ -1364,6 +1414,7 @@ mod tests {
     #[test]
     fn ordered_list_lowers_with_numbered_prefixes() {
         let list = List {
+            marker_suffix: None,
             ordered: true,
             marker: ListMarker::Decimal,
             items: vec![
@@ -1489,6 +1540,7 @@ mod tests {
     #[test]
     fn absolute_list_box_places_each_item_with_prefix_and_indent() {
         let list = List {
+            marker_suffix: None,
             ordered: false,
             marker: ListMarker::Bullet('*'),
             items: vec![
@@ -1724,6 +1776,7 @@ mod tests {
         // Item 1: leads with a non-paragraph (a nested list) → the `_ =>` arm.
         // Item 2: empty → still emits the bare marker (the else branch).
         let nested = List {
+            marker_suffix: None,
             ordered: false,
             marker: ListMarker::Bullet('-'),
             items: vec![ListItem {
@@ -1733,6 +1786,7 @@ mod tests {
             start: 1,
         };
         let list = List {
+            marker_suffix: None,
             ordered: true,
             marker: ListMarker::Decimal,
             items: vec![

@@ -226,6 +226,7 @@ fn emit_list(el: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Elem
         marker,
         items,
         start,
+        marker_suffix: None,
     }))
 }
 

@@ -6,6 +6,82 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.115.0] - 2026-07-03
+
+Fidelity release across the whole conversion matrix, both directions —
+driven by an exhaustive empirical audit (real-world corpus + synthetic
+feature documents).
+
+### Fixed — extracted text of every Office-produced PDF (bullets, accents, €…)
+
+The gid→Unicode map merged ALL cmap subtables with "lowest codepoint wins",
+so the **Mac Roman** subtable injected its raw bytes as Unicode: the bullet
+glyph was declared as `¥` (and `é`/`€`/`–`/curly quotes were wrong) in the
+`/ToUnicode` of every font embedded by the HTML→PDF renderer. The rasterized
+page was correct, but extraction/search/copy-paste — and any editor overlay
+built on extracted text — showed `¥` instead of `•`. Subtables are now
+merged with strict priority and Mac Roman is translated. A real 72-page
+Word document went from 216 `¥` / 0 `•` to 216 `•`.
+
+### Fixed — lists are faithful in BOTH directions
+
+- DOCX/ODT import: real bullet characters (`w:lvlText`, Symbol/Wingdings
+  PUA resolved, per-level defaults `•`/`◦`/`▪`), numbering formats with
+  their real suffix (`1.` vs `a)`), `w:start`/overrides honoured; ODT
+  numbered lists no longer render as bullets.
+- Model: `List.marker_suffix` (additive JSON field) + per-level ordinal
+  counters everywhere (model→PDF no longer prints a running global count).
+- Exports: DOCX `numbering.xml` carries `%1{suffix}` + start; ODT
+  `style:num-suffix`; HTML nests real `<ul>/<ol>` (+ `start`); Markdown
+  indents by level with per-level ordinals. RTF `\'xx` bytes now decode
+  through Symbol/Wingdings charsets (`•` instead of `·`).
+
+### Fixed — exported files open and look right ([EXPORT])
+
+- **PDF→DOCX was refused by Word/LibreOffice** whenever a reconstructed
+  header/footer contained a shape: the VML markup lacked its `xmlns:v`
+  declaration. All four corpus exports now convert cleanly.
+- Reconstructed section margins are clamped (no more 578 pt bottom
+  margins) and left indents are re-anchored to the estimated margin (text
+  no longer shifts right by a double offset).
+- A letter no longer exports with **phantom two-column layout**: column
+  detection now requires real side-by-side text spans.
+- **PDF→PPTX slides are no longer empty**: framed blocks become positioned
+  shapes/pictures (37 media exported from a pitch deck that previously
+  exported zero).
+- Positioned images export as `wp:anchor` at their exact page offset
+  (was: inlined at a default size); footers matching "Page N / M" emit
+  dynamic `PAGE`/`NUMPAGES` fields.
+
+### Fixed — real-world files open at all ([IMPORT])
+
+- The zip reader now parses the **End-Of-Central-Directory / central
+  directory** (zip64 included): OOXML/ODF files written with streaming
+  **data descriptors** — 3 of 8 real-world files in the audit corpus, and
+  every LibreOffice ODT/ODP — previously imported as EMPTY documents.
+- ODP: text inside `draw:custom-shape` (LibreOffice's standard text box)
+  is now read and positioned; slide geometry comes from the master page
+  (a 16:9 deck no longer imports as A4 portrait).
+- **One slide = one page**: PPTX/ODP decks no longer stack every slide on
+  1-2 pages (11-slide and 39-slide decks paginate exactly); slide images
+  are resolved from the slide part (they were all silently dropped) and
+  sized to their real frame.
+
+### Fixed — opening a Word file looks like Word (display path)
+
+- Character styles now render: strikethrough, highlight (`w:highlight`,
+  run `w:shd`), superscript/subscript, letter-spacing, hidden runs.
+- Tables: cell shading, vertical alignment, real border resolution
+  (`w:tcBorders`/`w:tblBorders`, `nil` respected), **real `w:vMerge`
+  rowspans** and `gridSpan` colspans (no more phantom cells or hard-coded
+  spans), cell widths.
+- Headers/footers repeat on **every page** through the renderer's
+  header/footer bands, with live `PAGE`/`NUMPAGES` fields (`Page 2 / 2`
+  on page 2); `w:pgMar` header/footer offsets honoured.
+- Multi-column sections render with real CSS columns (`w:cols` + gap) and
+  `column_count` reaches the model; continuous section breaks no longer
+  force a page break.
+
 ## [0.114.1] - 2026-07-03
 
 ### Fixed — `replaceText` no longer empties or garbles runs (re-encoding = exact inverse of decoding)

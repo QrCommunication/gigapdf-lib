@@ -408,8 +408,8 @@ pub fn docx_from_model(doc: &Document) -> Vec<u8> {
         .map(|(i, s)| {
             let n = i + 1;
             SectionHf {
-                header: s.header.as_ref().map(|h| docx_blocks(h, &mut ctx)),
-                footer: s.footer.as_ref().map(|f| docx_blocks(f, &mut ctx)),
+                header: s.header.as_ref().map(|h| docx_hdrftr_blocks(h, &mut ctx)),
+                footer: s.footer.as_ref().map(|f| docx_hdrftr_blocks(f, &mut ctx)),
                 number: n,
             }
         })
@@ -499,9 +499,11 @@ struct DocxCtx<'a> {
     /// `"jpeg"`), so the media part, relationship target and `[Content_Types]`
     /// `Default` all carry the resource's real format.
     images: Vec<(Vec<u8>, &'static str)>,
-    /// One marker per list *instance* emitted; its position + 1 is the list's
-    /// `w:numId`, and the marker drives the generated `numbering.xml` format.
-    list_markers: Vec<ListMarker>,
+    /// One `(marker, ordinal suffix, start)` per list *instance* emitted; its
+    /// position + 1 is the list's `w:numId`, and the triple drives the generated
+    /// `numbering.xml` format (`w:numFmt`, the `w:lvlText` template's suffix,
+    /// and the level-0 `w:start`).
+    list_markers: Vec<(ListMarker, char, u32)>,
     /// Next unique drawing/object id.
     obj_id: usize,
     resources: &'a crate::model::ResourceTable,
@@ -659,7 +661,7 @@ fn docx_block(block: &Block, ctx: &mut DocxCtx, out: &mut String) {
         BlockKind::Heading(h) => out.push_str(&docx_heading(h, ctx)),
         BlockKind::List(list) => docx_list(list, ctx, out),
         BlockKind::Table(table) => out.push_str(&docx_table(table, ctx)),
-        BlockKind::Image(img) => out.push_str(&docx_image_para(img, ctx)),
+        BlockKind::Image(img) => out.push_str(&docx_image_para(img, block.frame, ctx)),
         BlockKind::Shape(shape) => out.push_str(&docx_shape_para(shape, ctx)),
         BlockKind::TextBox(tb) => docx_textbox(tb, ctx, out),
         BlockKind::CodeBlock(cb) => out.push_str(&docx_code(cb)),
@@ -902,7 +904,7 @@ fn docx_rpr(style: &CharStyle) -> String {
 /// Emit a [`List`] as a sequence of numbered paragraphs (one `w:numId` for the
 /// whole list). Nested block content inside an item keeps its own numbering.
 fn docx_list(list: &List, ctx: &mut DocxCtx, out: &mut String) {
-    ctx.list_markers.push(list.marker);
+    ctx.list_markers.push((list.marker, list.suffix(), list.start.max(1)));
     let num_id = ctx.list_markers.len();
     for item in &list.items {
         for (i, b) in item.blocks.iter().enumerate() {
@@ -1117,9 +1119,35 @@ fn docx_slides(slides: &SlideBlock, ctx: &mut DocxCtx, out: &mut String) {
     }
 }
 
-/// A block-level image, wrapped in its own (inline-drawing) paragraph.
-fn docx_image_para(img: &ImageRef, ctx: &mut DocxCtx) -> String {
-    format!("<w:p>{}</w:p>", docx_inline_image(img, ctx))
+/// A block-level image, wrapped in its own paragraph. A **positioned** block
+/// (`frame = Some(rect)`, e.g. every image the PDF reconstruction places)
+/// floats at its page coordinates via `wp:anchor`, sized to its real frame — a
+/// logo or figure keeps its place instead of collapsing into the text flow at a
+/// default extent. A frameless image (a flow import) stays a `wp:inline`.
+fn docx_image_para(
+    img: &ImageRef,
+    frame: Option<crate::model::Rect>,
+    ctx: &mut DocxCtx,
+) -> String {
+    match frame {
+        Some(r) => format!("<w:p>{}</w:p>", docx_anchored_image(img, r, ctx)),
+        None => format!("<w:p>{}</w:p>", docx_inline_image(img, ctx)),
+    }
+}
+
+/// The shared `<a:graphic>` picture payload of both the inline and the anchored
+/// drawing (ECMA-376 `pic:pic` referencing an already-registered `rId`).
+fn docx_pic_graphic(id: usize, rid: usize, cx: i64, cy: i64) -> String {
+    format!(
+        "<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+<pic:nvPicPr><pic:cNvPr id=\"{id}\" name=\"img{id}\"/><pic:cNvPicPr/></pic:nvPicPr>\
+<pic:blipFill><a:blip xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:embed=\"rId{rid}\"/>\
+<a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
+<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"
+    )
 }
 
 fn docx_inline_image(img: &ImageRef, ctx: &mut DocxCtx) -> String {
@@ -1134,19 +1162,44 @@ fn docx_inline_image(img: &ImageRef, ctx: &mut DocxCtx) -> String {
     let (cx, cy) = (emu(96.0), emu(96.0));
     let mut alt = String::new();
     esc(img.alt.as_deref().unwrap_or(""), &mut alt);
+    let graphic = docx_pic_graphic(id, rid, cx, cy);
     format!(
         "<w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
 <wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
 <wp:docPr id=\"{id}\" name=\"img{id}\" descr=\"{alt}\"/><wp:cNvGraphicFramePr/>\
-<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
-<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
-<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
-<pic:nvPicPr><pic:cNvPr id=\"{id}\" name=\"img{id}\"/><pic:cNvPicPr/></pic:nvPicPr>\
-<pic:blipFill><a:blip xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:embed=\"rId{rid}\"/>\
-<a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
-<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
-<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>\
-</wp:inline></w:drawing></w:r>"
+{graphic}</wp:inline></w:drawing></w:r>"
+    )
+}
+
+/// A floating picture anchored at its model frame (top-down page points →
+/// `wp:posOffset` EMU from the page edges), sized to the frame. `behindDoc` is
+/// `0` (the picture was painted with the page content, not as a watermark) and
+/// the wrap is `wp:wrapNone`: the source PDF laid its text without any notion
+/// of wrapping, so reserving wrap bands around each picture (`wrapSquare`)
+/// would push the prose into pages the source never had — an image-rich page
+/// must keep its own pagination.
+fn docx_anchored_image(img: &ImageRef, r: crate::model::Rect, ctx: &mut DocxCtx) -> String {
+    let (bytes, ext) = match ctx.resolve_image(img.resource) {
+        Some(b) if !b.0.is_empty() => b,
+        _ => return String::new(),
+    };
+    let id = ctx.next_obj();
+    let rid = ctx.add_image(bytes, ext);
+    let (cx, cy) = (emu(r.w.max(1.0)), emu(r.h.max(1.0)));
+    let (x, y) = (emu(r.x.max(0.0)), emu(r.y.max(0.0)));
+    let mut alt = String::new();
+    esc(img.alt.as_deref().unwrap_or(""), &mut alt);
+    let graphic = docx_pic_graphic(id, rid, cx, cy);
+    format!(
+        "<w:r><w:drawing><wp:anchor distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" \
+simplePos=\"0\" relativeHeight=\"{id}\" behindDoc=\"0\" locked=\"0\" layoutInCell=\"1\" \
+allowOverlap=\"1\"><wp:simplePos x=\"0\" y=\"0\"/>\
+<wp:positionH relativeFrom=\"page\"><wp:posOffset>{x}</wp:posOffset></wp:positionH>\
+<wp:positionV relativeFrom=\"page\"><wp:posOffset>{y}</wp:posOffset></wp:positionV>\
+<wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
+<wp:wrapNone/>\
+<wp:docPr id=\"{id}\" name=\"img{id}\" descr=\"{alt}\"/><wp:cNvGraphicFramePr/>\
+{graphic}</wp:anchor></w:drawing></w:r>"
     )
 }
 
@@ -1159,14 +1212,158 @@ fn docx_shape_para(shape: &Shape, ctx: &mut DocxCtx) -> String {
     format!("<w:p>{}</w:p>", docx_vml_shape(id, &placed, ""))
 }
 
+/// Serialize a running header/footer block list. Identical to [`docx_blocks`]
+/// except that a paragraph whose whole text is a **page-number caption**
+/// (`Page 1`, `Page 1 / 2`, `1/2`, `- 3 -`, …) is re-emitted with dynamic
+/// `PAGE` / `NUMPAGES` fields instead of the frozen digits the reconstruction
+/// captured from one physical page — so every page of the exported document
+/// numbers itself.
+///
+/// **Limits**: the reconstruction keeps *one* representative footer copy, so
+/// only its literal text is available here; a caption whose digits are mixed
+/// into prose (`"3 of 10 — © ACME"`) is conservatively left frozen rather than
+/// risking a wrong field split.
+fn docx_hdrftr_blocks(blocks: &[Block], ctx: &mut DocxCtx) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        if let BlockKind::Paragraph(p) = &b.kind {
+            if let Some(xml) = docx_page_number_para(p) {
+                out.push_str(&xml);
+                continue;
+            }
+        }
+        docx_block(b, ctx, &mut out);
+    }
+    out
+}
+
+/// One piece of a recognized page-number caption: a literal chunk, the current
+/// page number (with its frozen source digits as the cached field result), or
+/// the page total.
+enum PageNumTok {
+    Lit(String),
+    Current(String),
+    Total(String),
+}
+
+/// Parse a header/footer paragraph text as a page-number caption. `None` when
+/// the text is anything else (the paragraph then renders verbatim). Recognized
+/// forms — the **entire** trimmed text must match, `page` case-insensitively:
+///
+/// * `Page N` — and `Page N / M`, `Page N of M`, `Page N sur M`, `Page N de M`
+/// * `N / M` (also unspaced `N/M`, with or without the `Page ` prefix)
+/// * `- N -`
+fn parse_page_number_text(text: &str) -> Option<Vec<PageNumTok>> {
+    use PageNumTok::{Current, Lit, Total};
+    let is_int = |s: &str| !s.is_empty() && s.len() <= 6 && s.bytes().all(|b| b.is_ascii_digit());
+    // Normalize an unspaced `N/M` token into `N / M` so one tokenizer serves.
+    let mut toks: Vec<String> = Vec::new();
+    for t in text.split_whitespace() {
+        match t.split_once('/') {
+            Some((n, m)) if is_int(n) && is_int(m) => {
+                toks.push(n.to_string());
+                toks.push("/".to_string());
+                toks.push(m.to_string());
+            }
+            _ => toks.push(t.to_string()),
+        }
+    }
+    let is_page_word = |s: &str| s.eq_ignore_ascii_case("page");
+    let is_sep = |s: &str| matches!(s, "/" | "-") || ["of", "sur", "de"].contains(&s.to_ascii_lowercase().as_str());
+    match toks.as_slice() {
+        // `Page N`
+        [w, n] if is_page_word(w) && is_int(n) => {
+            Some(vec![Lit(format!("{w} ")), Current(n.clone())])
+        }
+        // `Page N / M` (any recognized separator word)
+        [w, n, sep, m] if is_page_word(w) && is_int(n) && is_sep(sep) && is_int(m) => Some(vec![
+            Lit(format!("{w} ")),
+            Current(n.clone()),
+            Lit(format!(" {sep} ")),
+            Total(m.clone()),
+        ]),
+        // `N / M`
+        [n, sep, m] if is_int(n) && sep == "/" && is_int(m) => Some(vec![
+            Current(n.clone()),
+            Lit(format!(" {sep} ")),
+            Total(m.clone()),
+        ]),
+        // `- N -`
+        [d1, n, d2] if d1 == "-" && d2 == "-" && is_int(n) => Some(vec![
+            Lit("- ".to_string()),
+            Current(n.clone()),
+            Lit(" -".to_string()),
+        ]),
+        _ => None,
+    }
+}
+
+/// Render a header/footer paragraph whose text is a page-number caption as a
+/// `<w:p>` mixing literal runs with `PAGE`/`NUMPAGES` `w:fldSimple` fields (the
+/// frozen digits stay as the cached field result, so a non-updating viewer
+/// still shows something sensible). `None` when the paragraph is not a pure
+/// page-number caption (any non-run inline, or an unrecognized text shape).
+fn docx_page_number_para(p: &Paragraph) -> Option<String> {
+    // Conservative: only plain runs qualify (a link/image/comment in the middle
+    // means this is not a simple caption).
+    let mut text = String::new();
+    let mut style: Option<&CharStyle> = None;
+    for inline in &p.runs {
+        match inline {
+            Inline::Run(r) => {
+                if style.is_none() && !r.text.trim().is_empty() {
+                    style = Some(&r.style);
+                }
+                text.push_str(&r.text);
+            }
+            _ => return None,
+        }
+    }
+    let toks = parse_page_number_text(text.trim())?;
+
+    let default_style = CharStyle::default();
+    let rpr = docx_rpr(style.unwrap_or(&default_style));
+    let mut runs = String::new();
+    for tok in toks {
+        match tok {
+            PageNumTok::Lit(s) => {
+                let mut t = String::new();
+                esc(&s, &mut t);
+                runs.push_str(&format!(
+                    "<w:r>{rpr}<w:t xml:space=\"preserve\">{t}</w:t></w:r>"
+                ));
+            }
+            PageNumTok::Current(cached) => runs.push_str(&format!(
+                "<w:fldSimple w:instr=\" PAGE \"><w:r>{rpr}<w:t>{cached}</w:t></w:r></w:fldSimple>"
+            )),
+            PageNumTok::Total(cached) => runs.push_str(&format!(
+                "<w:fldSimple w:instr=\" NUMPAGES \"><w:r>{rpr}<w:t>{cached}</w:t></w:r></w:fldSimple>"
+            )),
+        }
+    }
+    Some(format!(
+        "<w:p><w:pPr>{}</w:pPr>{runs}</w:p>",
+        docx_style_ppr_props(&p.style)
+    ))
+}
+
 fn docx_hdrftr_xml(tag: &str, inner: &str) -> String {
     let inner = if inner.is_empty() { "<w:p/>" } else { inner };
+    // The VML namespaces (`v`, `o`, `w10`) are declared on the part root exactly
+    // as on `word/document.xml`: a header/footer whose blocks include a
+    // [`Shape`] renders through `docx_vml_shape` (`<v:rect>`/`<v:shape>`), and a
+    // part using the `v:` prefix without declaring it is not well-formed XML —
+    // Word and LibreOffice then refuse to open the *whole package*. The classic
+    // trigger is a letterhead rule (a thin line) lifted into the running header.
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <w:{tag} xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
 xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
 xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
-xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">{inner}</w:{tag}>"
+xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+xmlns:v=\"urn:schemas-microsoft-com:vml\" \
+xmlns:o=\"urn:schemas-microsoft-com:office:office\" \
+xmlns:w10=\"urn:schemas-microsoft-com:office:word\">{inner}</w:{tag}>"
     )
 }
 
@@ -1490,23 +1687,26 @@ fn docx_named_rpr(style: &CharStyle) -> String {
 }
 
 /// numbering.xml with one abstract+concrete numbering per list instance. The
-/// `markers` slice is one [`ListMarker`] per list; entry `i` drives the abstract
-/// num `i + 1` (matching the `w:numId` written on paragraphs). Every level of a
-/// given list shares that list's format (bullet char or ordinal style).
-fn docx_numbering_xml(markers: &[ListMarker]) -> String {
+/// `markers` slice is one `(marker, ordinal suffix, start)` per list; entry `i`
+/// drives the abstract num `i + 1` (matching the `w:numId` written on
+/// paragraphs). Every level of a given list shares that list's format (bullet
+/// char or ordinal style + suffix); the list's `start` seeds level 0's
+/// `w:start` (deeper levels restart at 1).
+fn docx_numbering_xml(markers: &[(ListMarker, char, u32)]) -> String {
     let mut abstracts = String::new();
     let mut nums = String::new();
-    for (i, marker) in markers.iter().enumerate() {
+    for (i, (marker, suffix, start)) in markers.iter().enumerate() {
         let n = i + 1;
-        let (num_fmt, lvl_text_tmpl, bullet_font) = docx_list_format(*marker);
+        let (num_fmt, lvl_text_tmpl, bullet_font) = docx_list_format(*marker, *suffix);
         let mut lvls = String::new();
         for lvl in 0..9 {
             let indent = twips(18.0 + 18.0 * lvl as f64);
+            let lvl_start = if lvl == 0 { *start } else { 1 };
             // `%N` placeholders are 1-based on the level for ordered lists; the
             // template is constant (the bullet char) for bullet lists.
             let lvl_text = lvl_text_tmpl.replace("%N", &format!("%{}", lvl + 1));
             lvls.push_str(&format!(
-                "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"{num_fmt}\"/>\
+                "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"{lvl_start}\"/><w:numFmt w:val=\"{num_fmt}\"/>\
 <w:lvlText w:val=\"{lvl_text}\"/><w:lvlJc w:val=\"left\"/>\
 <w:pPr><w:ind w:left=\"{indent}\" w:hanging=\"360\"/></w:pPr>{bullet_font}</w:lvl>",
             ));
@@ -1524,20 +1724,21 @@ fn docx_numbering_xml(markers: &[ListMarker]) -> String {
     )
 }
 
-/// Map a [`ListMarker`] to its OOXML numbering shape:
+/// Map a `(marker, ordinal suffix)` to its OOXML numbering shape:
 /// `(w:numFmt value, w:lvlText template, optional <w:rPr> bullet font)`.
 ///
 /// The template uses the sentinel `%N`, replaced per level with `%<level>` for
-/// ordered lists; bullet lists embed the literal bullet character.
-fn docx_list_format(marker: ListMarker) -> (&'static str, String, &'static str) {
+/// ordered lists (followed by the list's ordinal `suffix` — `%1.` or `%1)`);
+/// bullet lists embed the literal bullet character.
+fn docx_list_format(marker: ListMarker, suffix: char) -> (&'static str, String, &'static str) {
     let bullet_font =
         "<w:rPr><w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/></w:rPr>";
     match marker {
-        ListMarker::Decimal => ("decimal", "%N.".to_string(), ""),
-        ListMarker::LowerAlpha => ("lowerLetter", "%N.".to_string(), ""),
-        ListMarker::UpperAlpha => ("upperLetter", "%N.".to_string(), ""),
-        ListMarker::LowerRoman => ("lowerRoman", "%N.".to_string(), ""),
-        ListMarker::UpperRoman => ("upperRoman", "%N.".to_string(), ""),
+        ListMarker::Decimal => ("decimal", format!("%N{suffix}"), ""),
+        ListMarker::LowerAlpha => ("lowerLetter", format!("%N{suffix}"), ""),
+        ListMarker::UpperAlpha => ("upperLetter", format!("%N{suffix}"), ""),
+        ListMarker::LowerRoman => ("lowerRoman", format!("%N{suffix}"), ""),
+        ListMarker::UpperRoman => ("upperRoman", format!("%N{suffix}"), ""),
         ListMarker::Bullet(c) => {
             let mut esc_c = String::new();
             esc(&c.to_string(), &mut esc_c);
@@ -4445,8 +4646,12 @@ fn odf_span_style(name: &str, style: &CharStyle) -> String {
 }
 
 /// ODF list style: a per-level bullet or number definition from the marker.
+/// Ordered levels carry the list's real ordinal suffix (`style:num-suffix` —
+/// `.` by default, `)` for `1)`-style sources) so it round-trips.
 fn odf_list_style(name: &str, list: &List) -> String {
     let mut levels = String::new();
+    let mut suffix = String::new();
+    esc(&list.suffix().to_string(), &mut suffix);
     for lvl in 1..=9u32 {
         if list.ordered {
             let fmt = match list.marker {
@@ -4457,7 +4662,7 @@ fn odf_list_style(name: &str, list: &List) -> String {
                 _ => "1",
             };
             levels.push_str(&format!(
-                "<text:list-level-style-number text:level=\"{lvl}\" style:num-suffix=\".\" style:num-format=\"{fmt}\">\
+                "<text:list-level-style-number text:level=\"{lvl}\" style:num-suffix=\"{suffix}\" style:num-format=\"{fmt}\">\
 <style:list-level-properties text:space-before=\"{sb}pt\" text:min-label-width=\"18pt\"/>\
 </text:list-level-style-number>",
                 sb = 18 * (lvl - 1),
@@ -5257,31 +5462,89 @@ fn collect_slides(doc: &Document) -> Vec<Slide> {
     if !out.is_empty() {
         return out;
     }
-    // Fallback: one slide per page, blocks → a single Body placeholder.
+    // Fallback: one slide per page. Blocks that carry a `frame` (the PDF
+    // reconstruction positions *every* block) become free-floating positioned
+    // shapes — text boxes, `p:pic` pictures, `p:sp` shapes, `a:tbl` frames at
+    // their real page coordinates — instead of collapsing into one flowing Body
+    // placeholder, which discarded every position and produced a near-empty
+    // slide (no media, one text stub) from an image-rich deck. Frameless blocks
+    // (flow imports without geometry) keep the Body-placeholder fallback.
     for section in &doc.sections {
         for page in &section.pages {
             if page.blocks.is_empty() {
                 continue;
             }
-            let body_block = Block {
-                kind: BlockKind::TextBox(TextBox {
-                    blocks: page.blocks.clone(),
-                }),
-                ..Block::default()
+            let (framed, flow): (Vec<&Block>, Vec<&Block>) =
+                page.blocks.iter().partition(|b| b.frame.is_some());
+            let shapes: Vec<Block> = framed.into_iter().map(slide_shape_block).collect();
+            let placeholders = if flow.is_empty() {
+                Vec::new()
+            } else {
+                let body_block = Block {
+                    kind: BlockKind::TextBox(TextBox {
+                        blocks: flow.into_iter().cloned().collect(),
+                    }),
+                    ..Block::default()
+                };
+                vec![crate::model::Placeholder {
+                    role: PlaceholderRole::Body,
+                    block: body_block,
+                }]
             };
             out.push(Slide {
                 geometry: section.geometry,
-                shapes: Vec::new(),
-                placeholders: vec![crate::model::Placeholder {
-                    role: PlaceholderRole::Body,
-                    block: body_block,
-                }],
+                shapes,
+                placeholders,
                 notes: None,
                 background: None,
             });
         }
     }
     out
+}
+
+/// Adapt one positioned page block into a slide shape. The reconstruction
+/// anchors a paragraph's `indent_left_pt` at the **page** left edge, but a
+/// positioned slide text box already supplies that offset through its own
+/// frame — keeping the indent would shift the text right a second time inside
+/// the box. Strip the frame's own X from every nested left indent (floored at
+/// zero, so deeper genuine indents keep their *relative* depth).
+fn slide_shape_block(block: &Block) -> Block {
+    let dx = block.frame.map(|f| f.x).unwrap_or(0.0);
+    if dx <= 0.0 {
+        return block.clone();
+    }
+    strip_left_indent(block, dx)
+}
+
+/// Clone `block` with every nested paragraph-like left indent reduced by `dx`
+/// points, floored at zero (the recursion mirrors [`indent_block_left`]).
+fn strip_left_indent(block: &Block, dx: f64) -> Block {
+    let mut b = block.clone();
+    match &mut b.kind {
+        BlockKind::Paragraph(p) => p.style.indent_left_pt = (p.style.indent_left_pt - dx).max(0.0),
+        BlockKind::Heading(h) => {
+            h.para.style.indent_left_pt = (h.para.style.indent_left_pt - dx).max(0.0)
+        }
+        BlockKind::List(list) => {
+            for item in &mut list.items {
+                item.blocks = item
+                    .blocks
+                    .iter()
+                    .map(|ib| strip_left_indent(ib, dx))
+                    .collect();
+            }
+        }
+        BlockKind::TextBox(tb) => {
+            tb.blocks = tb.blocks.iter().map(|ib| strip_left_indent(ib, dx)).collect();
+        }
+        BlockKind::Blockquote(bq) => {
+            bq.blocks = bq.blocks.iter().map(|ib| strip_left_indent(ib, dx)).collect();
+        }
+        // Code/rule/table/image/shape/sheet/slide keep their own geometry.
+        _ => {}
+    }
+    b
 }
 
 /// A worksheet → a plain [`Table`] of its cells' display text (for the DOCX/ODT
@@ -5716,12 +5979,30 @@ impl<'a> MdWriter<'a> {
 
     /// Render a list at nesting `level` (0 = top). Each item's first paragraph
     /// (or heading) carries the marker; remaining item blocks are indented
-    /// continuation, and nested lists recurse with `level + 1`.
+    /// continuation, and nested lists recurse deeper. An item's own
+    /// [`ListItem::level`] adds to `level`, so a flat item list with recorded
+    /// depths (the Office importers) emits real Markdown nesting; ordered
+    /// ordinals run per depth (a shallower item resets deeper counters) and
+    /// honour the list's [`start`](List::start) and `)`-style suffix (the only
+    /// non-`.` ordinal marker CommonMark accepts).
     fn list(&self, list: &List, level: usize, out: &mut String) {
-        let indent = "    ".repeat(level); // 4 spaces per nesting level
-        for (i, item) in list.items.iter().enumerate() {
+        let suffix = if list.suffix() == ')' { ')' } else { '.' };
+        // depth → last emitted ordinal at that depth.
+        let mut counters: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for item in &list.items {
+            let depth = level + item.level as usize;
+            let indent = "    ".repeat(depth); // 4 spaces per nesting level
             let marker = if list.ordered {
-                format!("{}.", i + 1)
+                counters.retain(|&l, _| l <= depth);
+                let seed = if depth == level {
+                    list.start.max(1) as usize - 1
+                } else {
+                    0
+                };
+                let n = counters.entry(depth).or_insert(seed);
+                *n += 1;
+                format!("{n}{suffix}")
             } else {
                 "-".to_string()
             };
@@ -5756,7 +6037,7 @@ impl<'a> MdWriter<'a> {
             // Remaining blocks of the item.
             for b in rest {
                 match &b.kind {
-                    BlockKind::List(nested) => self.list(nested, level + 1, out),
+                    BlockKind::List(nested) => self.list(nested, depth + 1, out),
                     BlockKind::Paragraph(p) => {
                         let t = self.inlines(&p.runs);
                         let t = t.trim();
@@ -10862,13 +11143,18 @@ style:print-orientation=\"landscape\""
 
     #[test]
     fn markdown_renders_nested_ordered_and_unordered_lists() {
+        // A list block nested inside an item is already one level deeper by
+        // *structure*; its items' own `level` is relative to that sub-list
+        // (0 = its first depth), matching the HTML importer's shape. An item
+        // `level` now adds real indentation, so double-encoding the nesting
+        // (nested block *and* level 1) would indent twice.
         let nested = Block {
             kind: BlockKind::List(List {
                 ordered: false,
                 marker: ListMarker::Bullet('•'),
                 items: vec![ListItem {
                     blocks: vec![para("sub")],
-                    level: 1,
+                    level: 0,
                 }],
 
                 ..Default::default()
@@ -11996,6 +12282,272 @@ style:print-orientation=\"landscape\""
                 "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\""
             ) && rels.contains("Target=\"slide2.xml\""),
             "PPTX slide-2 relationship: {rels}"
+        );
+    }
+
+    // ─────────────── fidelity-audit regression tests (gaps 1/2/4/5/6/9) ───────────────
+
+    /// A thin horizontal-rule [`Shape`] block (the classic letterhead filet).
+    fn rule_shape_block() -> Block {
+        Block {
+            kind: BlockKind::Shape(Shape {
+                segments: vec![PathSeg::Move(0.0, 0.0), PathSeg::Line(500.0, 0.0)],
+                fill: None,
+                stroke: Some([0.0, 0.0, 0.0]),
+                stroke_width: 0.75,
+                dash: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Every element opened with an `ns:` prefix in `xml` must have that prefix
+    /// declared (`xmlns:ns=`) — the exact failure mode that made a whole DOCX
+    /// package unreadable was `<v:rect>` in a header part that never declared
+    /// `xmlns:v`.
+    fn assert_prefixes_declared(xml: &str, part: &str) {
+        let mut i = 0;
+        let bytes = xml.as_bytes();
+        while let Some(off) = xml[i..].find('<') {
+            let start = i + off + 1;
+            let rest = &xml[start..];
+            // Element names only (skip closing tags, PIs, comments).
+            if rest.starts_with(['/', '?', '!']) {
+                i = start;
+                continue;
+            }
+            let name_end = rest.find([' ', '>', '/']).unwrap_or(rest.len());
+            let name = &rest[..name_end];
+            if let Some((prefix, _)) = name.split_once(':') {
+                assert!(
+                    xml.contains(&format!("xmlns:{prefix}=")),
+                    "{part}: prefix `{prefix}:` used but xmlns:{prefix} is not declared"
+                );
+            }
+            i = start + name_end.min(bytes.len() - start);
+        }
+    }
+
+    #[test]
+    fn hdrftr_with_shape_declares_vml_namespaces() {
+        // Gap 1 (P0): a header/footer containing a shape renders VML
+        // (`<v:rect>`/`<v:shape>`); the part root must declare the VML
+        // namespaces or Word/LibreOffice refuse the whole file.
+        let doc = Document {
+            sections: vec![Section {
+                header: Some(vec![rule_shape_block()]),
+                footer: Some(vec![rule_shape_block(), para("mentions légales")]),
+                pages: vec![Page {
+                    blocks: vec![para("body")],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc);
+        let files = read_zip(&bytes);
+        for part in ["word/header1.xml", "word/footer1.xml", "word/document.xml"] {
+            let xml = String::from_utf8(files.get(part).unwrap().clone()).unwrap();
+            assert!(
+                xml.contains("xmlns:v=\"urn:schemas-microsoft-com:vml\""),
+                "{part} declares xmlns:v: {xml}"
+            );
+            assert_prefixes_declared(&xml, part);
+        }
+        let header = String::from_utf8(files.get("word/header1.xml").unwrap().clone()).unwrap();
+        assert!(
+            header.contains("<v:shape") || header.contains("<v:rect"),
+            "the header shape actually rendered as VML: {header}"
+        );
+    }
+
+    #[test]
+    fn hdrftr_page_number_caption_becomes_dynamic_fields() {
+        // Gap 9: a reconstructed footer freezes one page's number ("Page 1 / 2");
+        // the DOCX export must swap the digits for PAGE / NUMPAGES fields so
+        // every page numbers itself.
+        let doc = Document {
+            sections: vec![Section {
+                footer: Some(vec![para("Page 1 / 2")]),
+                pages: vec![
+                    Page {
+                        blocks: vec![para("one")],
+                        absolute: false,
+                    },
+                    Page {
+                        blocks: vec![para("two")],
+                        absolute: false,
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc);
+        let files = read_zip(&bytes);
+        let footer = String::from_utf8(files.get("word/footer1.xml").unwrap().clone()).unwrap();
+        assert!(
+            footer.contains("<w:fldSimple w:instr=\" PAGE \">"),
+            "current page is a dynamic PAGE field: {footer}"
+        );
+        assert!(
+            footer.contains("<w:fldSimple w:instr=\" NUMPAGES \">"),
+            "page total is a dynamic NUMPAGES field: {footer}"
+        );
+        assert!(
+            footer.contains("Page </w:t>"),
+            "the literal `Page ` prefix survives: {footer}"
+        );
+    }
+
+    #[test]
+    fn page_number_caption_parser_is_conservative() {
+        // Recognized shapes…
+        for ok in ["Page 3", "Page 1 / 2", "page 2 sur 10", "Page 4 of 9", "3 / 12", "3/12", "- 7 -"] {
+            assert!(
+                parse_page_number_text(ok).is_some(),
+                "`{ok}` is a page-number caption"
+            );
+        }
+        // …and everything else renders verbatim (frozen is better than wrong).
+        for no in [
+            "Chapitre 1",
+            "Page",
+            "3",
+            "Page trois",
+            "3 of 10 — © ACME",
+            "01/02/2026",
+            "Article 313-1",
+        ] {
+            assert!(
+                parse_page_number_text(no).is_none(),
+                "`{no}` must NOT be treated as a page-number caption"
+            );
+        }
+    }
+
+    #[test]
+    fn positioned_image_block_floats_via_wp_anchor() {
+        // Gap 5: an image block carrying a frame (every reconstructed image
+        // does) must anchor at its page position with its real size, not
+        // collapse into the flow as a default-sized inline drawing.
+        let mut doc = image_doc("png");
+        doc.sections[0].pages[0].blocks[0].frame =
+            Some(crate::model::Rect::new(56.7, 700.0, 112.6, 85.1));
+        let bytes = docx_from_model(&doc);
+        let files = read_zip(&bytes);
+        let xml = String::from_utf8(files.get("word/document.xml").unwrap().clone()).unwrap();
+        assert!(xml.contains("<wp:anchor "), "framed image anchors: {xml}");
+        assert!(
+            xml.contains(&format!("<wp:posOffset>{}</wp:posOffset>", emu(56.7))),
+            "X offset in EMU from the frame: {xml}"
+        );
+        assert!(
+            xml.contains(&format!("<wp:posOffset>{}</wp:posOffset>", emu(700.0))),
+            "Y offset in EMU from the frame: {xml}"
+        );
+        assert!(
+            xml.contains(&format!("<wp:extent cx=\"{}\" cy=\"{}\"/>", emu(112.6), emu(85.1))),
+            "extent = the frame size: {xml}"
+        );
+        assert!(
+            xml.contains("behindDoc=\"0\""),
+            "the picture sits with the content, not behind it: {xml}"
+        );
+
+        // A frameless image (flow import) keeps the inline drawing.
+        let bytes = docx_from_model(&image_doc("png"));
+        let files = read_zip(&bytes);
+        let xml = String::from_utf8(files.get("word/document.xml").unwrap().clone()).unwrap();
+        assert!(
+            xml.contains("<wp:inline ") && !xml.contains("<wp:anchor "),
+            "frameless image stays inline: {xml}"
+        );
+    }
+
+    #[test]
+    fn pdf_fallback_slides_position_framed_blocks_as_shapes() {
+        // Gap 2 (PPTX near-empty): the page fallback must turn framed blocks
+        // into positioned slide shapes — `p:pic` with embedded media for
+        // images, positioned text boxes for prose — instead of flattening
+        // everything into one Body placeholder that ignores `Block::frame`.
+        let mut resources = crate::model::ResourceTable::default();
+        resources.images.insert(
+            9,
+            crate::model::ImageResource {
+                bytes: vec![0x89, b'P', b'N', b'G', 1, 2, 3],
+                format: "png".to_string(),
+            },
+        );
+        let image = Block {
+            frame: Some(crate::model::Rect::new(100.0, 50.0, 200.0, 150.0)),
+            kind: BlockKind::Image(ImageRef {
+                resource: 9,
+                alt: None,
+            }),
+            ..Default::default()
+        };
+        let mut text = para("hello slide");
+        text.frame = Some(crate::model::Rect::new(72.0, 300.0, 300.0, 40.0));
+        // The reconstruction anchors indents at the page edge; inside a
+        // positioned box that offset must be stripped (or the text shifts
+        // right a second time).
+        if let BlockKind::Paragraph(p) = &mut text.kind {
+            p.style.indent_left_pt = 72.0;
+        }
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![image, text],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            resources,
+            ..Default::default()
+        };
+
+        let bytes = pptx_from_model(&doc);
+        let files = read_zip(&bytes);
+        let slide = String::from_utf8(files.get("ppt/slides/slide1.xml").unwrap().clone()).unwrap();
+        assert!(
+            files.keys().any(|k| k.starts_with("ppt/media/")),
+            "the slide's image media is embedded: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+        assert!(slide.contains("<p:pic>"), "framed image → p:pic: {slide}");
+        assert!(
+            slide.contains(&format!("<a:off x=\"{}\" y=\"{}\"/>", emu(100.0), emu(50.0))),
+            "picture offset from its frame: {slide}"
+        );
+        assert!(
+            slide.contains(&format!("<a:off x=\"{}\" y=\"{}\"/>", emu(72.0), emu(300.0))),
+            "text box offset from its frame: {slide}"
+        );
+        assert!(slide.contains("hello slide"), "the prose survives: {slide}");
+        assert!(
+            !slide.contains(&format!("marL=\"{}\"", (72.0f64 * 12700.0) as i64)),
+            "page-anchored indent stripped inside the positioned box: {slide}"
+        );
+
+        // A frameless page (flow import) keeps the Body-placeholder fallback.
+        let flow_doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![para("flowing text")],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = pptx_from_model(&flow_doc);
+        let files = read_zip(&bytes);
+        let slide = String::from_utf8(files.get("ppt/slides/slide1.xml").unwrap().clone()).unwrap();
+        assert!(
+            slide.contains("<p:ph type=\"body\""),
+            "frameless blocks keep the Body placeholder: {slide}"
         );
     }
 }

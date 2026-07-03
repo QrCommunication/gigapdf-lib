@@ -148,8 +148,165 @@ impl ZipWriter {
 /// Read a ZIP archive into a map of `entry name → uncompressed bytes`, for the
 /// reverse Office converters (OOXML/ODF are ZIPs of XML). Supports the two
 /// methods we and office suites emit: stored (0) and DEFLATE (8); other methods
-/// are skipped. Walks local file headers (sufficient for well-formed archives).
+/// are skipped.
+///
+/// The **central directory** — located through the End Of Central Directory
+/// record — is the authoritative index: it always carries the real sizes and
+/// offsets, even for entries *streamed with data descriptors* (general-purpose
+/// flag bit 3, where the local header stores zeroed sizes — LibreOffice ODF and
+/// several OOXML producers emit exactly that, which breaks any pure
+/// local-header walk after the first streamed entry). Archives without a
+/// findable EOCD/central directory fall back to the legacy local-header walk,
+/// preserving the old tolerance for truncated or EOCD-less blobs.
 pub fn read_zip(zip: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+    read_zip_central(zip).unwrap_or_else(|| read_zip_local(zip))
+}
+
+/// Little-endian field readers over the raw archive (bounds already validated
+/// by the callers before each access).
+fn le16(b: &[u8], off: usize) -> usize {
+    u16::from_le_bytes([b[off], b[off + 1]]) as usize
+}
+fn le32(b: &[u8], off: usize) -> usize {
+    u32::from_le_bytes(b[off..off + 4].try_into().unwrap()) as usize
+}
+fn le64(b: &[u8], off: usize) -> usize {
+    u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) as usize
+}
+
+/// Locate the End Of Central Directory record (`PK\x05\x06`): a backward scan
+/// from the end over the maximal window it can occupy (22 fixed bytes + up to
+/// 64 KiB archive comment). A candidate is accepted when its own comment length
+/// fits inside the file (tolerating trailing junk after the comment). `None`
+/// when no EOCD is present (streamed/truncated blob → local-header fallback).
+fn find_eocd(zip: &[u8]) -> Option<usize> {
+    if zip.len() < 22 {
+        return None;
+    }
+    let lo = zip.len().saturating_sub(22 + 0xFFFF);
+    let mut pos = zip.len() - 22;
+    loop {
+        if zip[pos..pos + 4] == [0x50, 0x4b, 0x05, 0x06] && pos + 22 + le16(zip, pos + 20) <= zip.len()
+        {
+            return Some(pos);
+        }
+        if pos == lo {
+            return None;
+        }
+        pos -= 1;
+    }
+}
+
+/// Read the archive through its central directory (see [`read_zip`]). `None`
+/// when no EOCD is found or the directory it points at is unusable — the caller
+/// then falls back to the local-header walk.
+fn read_zip_central(zip: &[u8]) -> Option<std::collections::BTreeMap<String, Vec<u8>>> {
+    use crate::filters::inflate::inflate;
+    let eocd = find_eocd(zip)?;
+    let mut count = le16(zip, eocd + 10); // total entries (this disk)
+    let mut cd_offset = le32(zip, eocd + 16);
+
+    // ZIP64: a masked count/offset redirects through the ZIP64 EOCD locator
+    // (`PK\x06\x07`, 20 bytes immediately before the EOCD) to the ZIP64 EOCD
+    // record (`PK\x06\x06`). Only the fields we need are read.
+    if count == 0xFFFF || cd_offset == 0xFFFF_FFFF {
+        if eocd < 20 || zip[eocd - 20..eocd - 16] != [0x50, 0x4b, 0x06, 0x07] {
+            return None;
+        }
+        let z64 = le64(zip, eocd - 20 + 8);
+        if z64 + 56 > zip.len() || zip[z64..z64 + 4] != [0x50, 0x4b, 0x06, 0x06] {
+            return None;
+        }
+        count = le64(zip, z64 + 32); // total entries
+        cd_offset = le64(zip, z64 + 48); // central directory offset
+    }
+
+    if cd_offset + 46 > zip.len() || zip[cd_offset..cd_offset + 4] != [0x50, 0x4b, 0x01, 0x02] {
+        return None; // the directory the EOCD points at is not there
+    }
+
+    let mut out = std::collections::BTreeMap::new();
+    let mut pos = cd_offset;
+    let mut seen = 0usize;
+    while seen < count && pos + 46 <= zip.len() && zip[pos..pos + 4] == [0x50, 0x4b, 0x01, 0x02] {
+        let method = le16(zip, pos + 10);
+        let mut comp = le32(zip, pos + 20);
+        let uncomp = le32(zip, pos + 24);
+        let nlen = le16(zip, pos + 28);
+        let elen = le16(zip, pos + 30);
+        let clen = le16(zip, pos + 32);
+        let mut lho = le32(zip, pos + 42); // local header offset
+        let end = pos + 46 + nlen + elen + clen;
+        if end > zip.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&zip[pos + 46..pos + 46 + nlen]).to_string();
+
+        // ZIP64 extended-information extra field (id 0x0001): holds 8-byte
+        // replacements for exactly the header fields that were masked with
+        // 0xFFFFFFFF, in the fixed order uncompressed size, compressed size,
+        // local header offset.
+        if comp == 0xFFFF_FFFF || uncomp == 0xFFFF_FFFF || lho == 0xFFFF_FFFF {
+            let mut ep = pos + 46 + nlen;
+            let e_end = ep + elen;
+            while ep + 4 <= e_end {
+                let id = le16(zip, ep);
+                let sz = le16(zip, ep + 2);
+                if ep + 4 + sz > e_end {
+                    break;
+                }
+                if id == 0x0001 {
+                    let mut fp = ep + 4;
+                    let fe = ep + 4 + sz;
+                    if uncomp == 0xFFFF_FFFF && fp + 8 <= fe {
+                        fp += 8; // uncompressed size — unused by decoding
+                    }
+                    if comp == 0xFFFF_FFFF && fp + 8 <= fe {
+                        comp = le64(zip, fp);
+                        fp += 8;
+                    }
+                    if lho == 0xFFFF_FFFF && fp + 8 <= fe {
+                        lho = le64(zip, fp);
+                    }
+                    break;
+                }
+                ep += 4 + sz;
+            }
+        }
+
+        // Resolve the payload through the entry's LOCAL header: its own
+        // name/extra lengths can differ from the central copy, so the data
+        // start comes from there — but the sizes come from the central record
+        // (real even when the local ones were zeroed by flag bit 3).
+        if lho + 30 <= zip.len() && zip[lho..lho + 4] == [0x50, 0x4b, 0x03, 0x04] {
+            let data = lho + 30 + le16(zip, lho + 26) + le16(zip, lho + 28);
+            if data + comp <= zip.len() {
+                let payload = &zip[data..data + comp];
+                let bytes = match method {
+                    0 => Some(payload.to_vec()),
+                    8 => inflate(payload).ok(),
+                    _ => None,
+                };
+                if let Some(bytes) = bytes {
+                    out.insert(name, bytes);
+                }
+            }
+        }
+        pos = end;
+        seen += 1;
+    }
+    // An EOCD that promised entries but yielded none (offsets all lied) is
+    // useless — let the local walk have a go instead of returning `{}`.
+    if out.is_empty() && count > 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Legacy fallback: walk local file headers front-to-back. Sufficient only for
+/// archives written without data descriptors (each local header then carries
+/// its real compressed size); kept for EOCD-less/truncated blobs.
+fn read_zip_local(zip: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
     use crate::filters::inflate::inflate;
     let mut out = std::collections::BTreeMap::new();
     let mut i = 0;
@@ -263,11 +420,152 @@ mod tests {
             Some(b"hello".as_slice())
         );
 
-        // Patch the first entry's method to an unsupported value (e.g. 99) → it
-        // is skipped (None branch), so the map no longer contains it.
+        // Patch the entry's method to an unsupported value (99) in BOTH the
+        // local header and the central directory record (the central copy is
+        // the authoritative one for the EOCD-driven reader) → the entry is
+        // skipped (None branch), so the map no longer contains it.
         archive[8] = 99;
         archive[9] = 0;
+        let cd = archive
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .unwrap();
+        archive[cd + 10] = 99;
+        archive[cd + 11] = 0;
         let map2 = read_zip(&archive);
         assert!(!map2.contains_key("ok.txt"));
+    }
+
+    /// Append one **streamed** entry (general-purpose flag bit 3): the local
+    /// header carries ZEROED crc/sizes, the payload is followed by a data
+    /// descriptor, and only the central directory record (accumulated in `cd`)
+    /// carries the real values — the layout LibreOffice and several OOXML
+    /// producers emit, which a pure local-header walk cannot traverse.
+    fn add_streamed_entry(out: &mut Vec<u8>, cd: &mut Vec<u8>, name: &str, data: &[u8]) {
+        let crc = crc32(data);
+        let payload = deflate(data);
+        let offset = out.len() as u32;
+        let nb = name.as_bytes();
+
+        // Local header: flag bit 3, crc/sizes zero.
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&(1u16 << 3).to_le_bytes()); // flags: data descriptor
+        out.extend_from_slice(&8u16.to_le_bytes()); // method: deflate
+        out.extend_from_slice(&0u16.to_le_bytes()); // time
+        out.extend_from_slice(&0u16.to_le_bytes()); // date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc: deferred
+        out.extend_from_slice(&0u32.to_le_bytes()); // comp size: deferred
+        out.extend_from_slice(&0u32.to_le_bytes()); // uncomp size: deferred
+        out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(nb);
+        out.extend_from_slice(&payload);
+        // Data descriptor (signature form).
+        out.extend_from_slice(&0x0807_4b50u32.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+
+        // Central directory record with the REAL values.
+        cd.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        cd.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        cd.extend_from_slice(&(1u16 << 3).to_le_bytes()); // flags
+        cd.extend_from_slice(&8u16.to_le_bytes()); // method
+        cd.extend_from_slice(&0u16.to_le_bytes()); // time
+        cd.extend_from_slice(&0u16.to_le_bytes()); // date
+        cd.extend_from_slice(&crc.to_le_bytes());
+        cd.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        cd.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        cd.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        cd.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        cd.extend_from_slice(&0u16.to_le_bytes()); // disk start
+        cd.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        cd.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        cd.extend_from_slice(&offset.to_le_bytes());
+        cd.extend_from_slice(nb);
+    }
+
+    /// Finish a hand-built streamed archive: append the central directory and
+    /// an EOCD (with `comment` trailing bytes when non-empty).
+    fn finish_streamed(mut out: Vec<u8>, cd: Vec<u8>, count: u16, comment: &[u8]) -> Vec<u8> {
+        let cd_offset = out.len() as u32;
+        let cd_size = cd.len() as u32;
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk with CD
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+        out.extend_from_slice(comment);
+        out
+    }
+
+    #[test]
+    fn read_zip_reads_data_descriptor_entries_through_central_directory() {
+        // Three entries, the first two streamed (flag bit 3, zeroed local sizes
+        // + data descriptors): a local-header walk dies on the first one, but
+        // the central directory recovers ALL of them.
+        let mut out = Vec::new();
+        let mut cd = Vec::new();
+        let a = b"<office:document-content>".repeat(30);
+        let b = b"slide two body".repeat(20);
+        add_streamed_entry(&mut out, &mut cd, "content.xml", &a);
+        add_streamed_entry(&mut out, &mut cd, "styles.xml", &b);
+        let archive = finish_streamed(out, cd, 2, b"");
+
+        let map = read_zip(&archive);
+        assert_eq!(map.len(), 2, "both streamed entries recovered");
+        assert_eq!(map.get("content.xml"), Some(&a));
+        assert_eq!(map.get("styles.xml"), Some(&b));
+
+        // Prove the fixture really defeats the legacy walk (the regression
+        // this guards): the local path stops at the first zero-size entry.
+        let legacy = read_zip_local(&archive);
+        assert!(
+            !legacy.contains_key("styles.xml"),
+            "fixture must exercise the data-descriptor layout"
+        );
+    }
+
+    #[test]
+    fn read_zip_finds_eocd_behind_archive_comment() {
+        let mut out = Vec::new();
+        let mut cd = Vec::new();
+        let data = b"commented archive payload".repeat(10);
+        add_streamed_entry(&mut out, &mut cd, "doc.xml", &data);
+        let archive = finish_streamed(out, cd, 1, b"built by a suite that loves comments");
+
+        let map = read_zip(&archive);
+        assert_eq!(map.get("doc.xml"), Some(&data));
+    }
+
+    #[test]
+    fn read_zip_falls_back_to_local_walk_without_eocd() {
+        // A ZipWriter archive (no data descriptors) with its EOCD chopped off:
+        // the central path can't engage, the legacy local walk still recovers
+        // every entry (old tolerance preserved).
+        let mut zip = ZipWriter::new();
+        zip.add_stored("a.bin", &[9, 8, 7]);
+        let xml = b"<x/>".repeat(30);
+        zip.add_deflated("b.xml", &xml);
+        let mut archive = zip.finish();
+        let eocd = archive
+            .windows(4)
+            .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])
+            .unwrap();
+        archive.truncate(eocd);
+
+        let map = read_zip(&archive);
+        assert_eq!(
+            map.get("a.bin").map(|v| v.as_slice()),
+            Some([9u8, 8, 7].as_slice())
+        );
+        assert_eq!(map.get("b.xml"), Some(&xml));
     }
 }

@@ -164,6 +164,28 @@ mod tests {
         );
     }
 
+    /// Regression: the Mac Roman (platform 1) cmap subtable must never poison
+    /// the gid→Unicode map. Liberation carries one; its raw byte codes are
+    /// numerically lower than the real scalars (`0xA5` — Mac Roman `•` — vs
+    /// `U+2022`), so a "lowest code point wins across all subtables" merge
+    /// turned every extracted bullet into `¥` and every accent into a C1
+    /// control (the user-visible "Word bullet lists lose their dots" bug).
+    #[test]
+    fn gid_to_unicode_prefers_unicode_subtables_over_mac_roman() {
+        let ttf = TrueTypeFont::parse(crate::font::bundled::FALLBACK_TTF).unwrap();
+        let map = ttf.gid_to_unicode_map();
+        for ch in ['\u{2022}', 'é', 'à', '€', '–', '“', '°'] {
+            let gid = ttf
+                .gid_for_unicode(ch as u32)
+                .unwrap_or_else(|| panic!("bundled face covers {ch:?}"));
+            assert_eq!(
+                map.get(&gid).copied(),
+                Some(ch as u32),
+                "glyph of {ch:?} must map back to itself, not a Mac Roman byte"
+            );
+        }
+    }
+
     #[test]
     fn scaled_advances_normalises_to_1000_em() {
         let ttf = TrueTypeFont::parse(crate::font::bundled::FALLBACK_TTF).unwrap();

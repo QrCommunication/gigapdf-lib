@@ -444,6 +444,99 @@ impl ReconLine {
     }
 }
 
+// ─────────────────── geometry-level column count (w:cols export) ───────────────────
+
+/// A block wider than this fraction of the page spans the whole measure
+/// (title, full-width paragraph, table) — it belongs to every column and says
+/// nothing about a split, so it is excluded from the side clusters.
+const COL_MAX_BLOCK_FRAC: f64 = 0.6;
+
+/// Each side of a genuine column split must hold at least this many
+/// narrow-to-medium blocks. One isolated block (an address, a signature, a
+/// stamp) must never fabricate a column.
+const COL_MIN_BLOCKS: usize = 3;
+
+/// Each side cluster must cover at least this fraction of the page height —
+/// a real column runs down the page; a corner cluster (a signature block at
+/// the bottom right of a letter) does not.
+const COL_MIN_HEIGHT_FRAC: f64 = 0.25;
+
+/// The two side clusters must **coexist vertically**: their Y spans must
+/// overlap by at least this fraction of the smaller span. A right-hand cluster
+/// sitting entirely *below* the left-hand prose (the classic letter signature)
+/// shares no reading band with it and is not a column.
+const COL_OVERLAP_FRAC: f64 = 0.5;
+
+/// Side classification: a block whose horizontal centre is left of
+/// `0.45 × page_w` counts to the left cluster, right of `0.55 × page_w` to the
+/// right one; the ambiguous middle band votes for neither.
+const COL_LEFT_CENTER_FRAC: f64 = 0.45;
+const COL_RIGHT_CENTER_FRAC: f64 = 0.55;
+
+/// Detect the **page-geometry column count** (the value exported as DOCX
+/// `w:cols` / ODT column sets) from the reconstructed blocks' frames (model
+/// **top-down** rects, `y` growing downward).
+///
+/// Hardened against the phantom-gutter false positive (fidelity audit, gap 3):
+/// a single positioned cluster on one side of the page — the recipient address
+/// or signature block of a one-column letter — used to read as a second
+/// column, and Word then re-flowed the *whole* document into two columns. A
+/// split is now reported only when **both** sides are populated
+/// ([`COL_MIN_BLOCKS`] narrow blocks each), **both** run down a significant
+/// share of the page ([`COL_MIN_HEIGHT_FRAC`]), and the two sides **coexist
+/// vertically** ([`COL_OVERLAP_FRAC`]) — the property that distinguishes real
+/// side-by-side columns from stacked one-column content.
+///
+/// Conservative by design: any doubt yields `1` (a one-column export of a
+/// two-column page loses reading comfort; a two-column export of a one-column
+/// page destroys the layout).
+pub fn column_count_from_frames(
+    frames: &[crate::model::Rect],
+    page_w: f64,
+    page_h: f64,
+) -> u8 {
+    if page_w <= 0.0 || page_h <= 0.0 {
+        return 1;
+    }
+    // Y span (top-down: min top, max bottom) of a cluster of frames.
+    let span = |fs: &[&crate::model::Rect]| -> Option<(f64, f64)> {
+        let top = fs.iter().map(|f| f.y).fold(f64::INFINITY, f64::min);
+        let bottom = fs.iter().map(|f| f.y + f.h).fold(f64::NEG_INFINITY, f64::max);
+        (top.is_finite() && bottom.is_finite()).then_some((top, bottom))
+    };
+
+    let mut left: Vec<&crate::model::Rect> = Vec::new();
+    let mut right: Vec<&crate::model::Rect> = Vec::new();
+    for f in frames {
+        // Full-width blocks span all columns; degenerate boxes carry no vote.
+        if f.w <= 0.0 || f.w > page_w * COL_MAX_BLOCK_FRAC {
+            continue;
+        }
+        let center = f.x + f.w / 2.0;
+        if center < page_w * COL_LEFT_CENTER_FRAC {
+            left.push(f);
+        } else if center > page_w * COL_RIGHT_CENTER_FRAC {
+            right.push(f);
+        }
+    }
+    if left.len() < COL_MIN_BLOCKS || right.len() < COL_MIN_BLOCKS {
+        return 1;
+    }
+    let (Some((l_top, l_bot)), Some((r_top, r_bot))) = (span(&left), span(&right)) else {
+        return 1;
+    };
+    let (l_span, r_span) = (l_bot - l_top, r_bot - r_top);
+    let min_height = page_h * COL_MIN_HEIGHT_FRAC;
+    if l_span < min_height || r_span < min_height {
+        return 1;
+    }
+    let overlap = l_bot.min(r_bot) - l_top.max(r_top);
+    if overlap < l_span.min(r_span) * COL_OVERLAP_FRAC {
+        return 1;
+    }
+    2
+}
+
 /// A total-order wrapper over `f64` for use in a sortable rank tuple. PDF
 /// coordinates here are finite (NaN can't reach this layer — runs without a
 /// computable box are dropped upstream), so a plain `partial_cmp` with an
@@ -771,6 +864,84 @@ mod tests {
         );
         let order = reading_order(&lines);
         assert_eq!(order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn letter_signature_cluster_is_not_a_second_column() {
+        // Fidelity-audit gap 3 (permis-rejet.pdf): a one-column letter whose
+        // recipient-address / signature cluster sits at the *bottom right*.
+        // The old block-count heuristic read that cluster as a second column
+        // (`w:cols w:num="2"`), and Word re-flowed the whole letter into two
+        // columns. The right-hand cluster neither runs down a significant
+        // share of the page nor coexists vertically with the left prose, so
+        // the page must report a single column.
+        use crate::model::Rect;
+        let frames = vec![
+            // Left prose column (top half of an A4 page).
+            Rect::new(57.0, 160.0, 160.0, 12.0),
+            Rect::new(57.0, 185.0, 95.0, 12.0),
+            Rect::new(57.0, 208.0, 242.0, 12.0),
+            Rect::new(57.0, 228.0, 88.0, 12.0),
+            Rect::new(57.0, 284.0, 36.0, 12.0),
+            Rect::new(57.0, 459.0, 78.0, 12.0),
+            // Bottom-right signature cluster (the phantom "column").
+            Rect::new(482.0, 645.0, 53.0, 12.0),
+            Rect::new(398.0, 659.0, 137.0, 12.0),
+            Rect::new(366.0, 673.0, 169.0, 12.0),
+            Rect::new(437.0, 756.0, 98.0, 12.0),
+        ];
+        assert_eq!(
+            column_count_from_frames(&frames, 595.0, 842.0),
+            1,
+            "a corner cluster must not fabricate a second column"
+        );
+    }
+
+    #[test]
+    fn genuine_two_column_frames_report_two() {
+        // The inverse calibration: a real two-column page — narrow blocks on
+        // BOTH sides, both columns running down most of the page, vertically
+        // coexisting — must still report two columns.
+        use crate::model::Rect;
+        let mut frames = Vec::new();
+        for i in 0..6 {
+            let y = 80.0 + 110.0 * f64::from(i);
+            frames.push(Rect::new(60.0, y, 220.0, 90.0)); // left column
+            frames.push(Rect::new(320.0, y, 220.0, 90.0)); // right column
+        }
+        // A full-width title spanning both columns must not veto the split.
+        frames.push(Rect::new(60.0, 40.0, 480.0, 24.0));
+        assert_eq!(column_count_from_frames(&frames, 595.0, 842.0), 2);
+    }
+
+    #[test]
+    fn column_count_needs_both_sides_populated_and_tall() {
+        use crate::model::Rect;
+        // Two blocks only on the right → below COL_MIN_BLOCKS → single column.
+        let sparse = vec![
+            Rect::new(60.0, 100.0, 200.0, 500.0),
+            Rect::new(60.0, 620.0, 200.0, 100.0),
+            Rect::new(60.0, 740.0, 200.0, 60.0),
+            Rect::new(340.0, 100.0, 200.0, 300.0),
+            Rect::new(340.0, 420.0, 200.0, 300.0),
+        ];
+        assert_eq!(column_count_from_frames(&sparse, 595.0, 842.0), 1);
+        // A short right-hand strip beside a tall left column → not a column.
+        let short = vec![
+            Rect::new(60.0, 100.0, 200.0, 200.0),
+            Rect::new(60.0, 320.0, 200.0, 200.0),
+            Rect::new(60.0, 540.0, 200.0, 200.0),
+            Rect::new(340.0, 100.0, 200.0, 30.0),
+            Rect::new(340.0, 140.0, 200.0, 30.0),
+            Rect::new(340.0, 180.0, 200.0, 30.0),
+        ];
+        assert_eq!(
+            column_count_from_frames(&short, 595.0, 842.0),
+            1,
+            "a short side strip (< 25% of the page height) is not a column"
+        );
+        // No frames at all → single column.
+        assert_eq!(column_count_from_frames(&[], 595.0, 842.0), 1);
     }
 
     #[test]

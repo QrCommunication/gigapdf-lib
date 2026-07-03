@@ -66,6 +66,10 @@ struct CmapSub {
     offset: usize,
     /// Higher score = preferred (Unicode tables first).
     score: u8,
+    /// Subtable platform id (0 = Unicode, 1 = Macintosh, 3 = Windows). A
+    /// Macintosh subtable's codes are **Mac OS Roman bytes**, not Unicode
+    /// scalars — they must be translated before being treated as characters.
+    platform: u16,
 }
 
 impl TrueTypeFont {
@@ -154,7 +158,11 @@ impl TrueTypeFont {
                     (3, 0) => 1, // symbol
                     _ => 0,
                 };
-                cmap.push(CmapSub { offset: sub, score });
+                cmap.push(CmapSub {
+                    offset: sub,
+                    score,
+                    platform,
+                });
             }
             cmap.sort_by(|a, b| b.score.cmp(&a.score));
         }
@@ -362,24 +370,56 @@ impl TrueTypeFont {
     }
 
     /// Build a glyph-id → Unicode-scalar map across the **whole** cmap (all
-    /// planes, including supplementary code points via format-12 subtables). The
-    /// lowest code point wins when several map to one glyph. Drives full-coverage
-    /// `/ToUnicode` generation and Type0-without-ToUnicode extraction (so a glyph
-    /// id can be turned back into real text instead of `U+FFFD`).
+    /// planes, including supplementary code points via format-12 subtables).
+    /// Drives full-coverage `/ToUnicode` generation and
+    /// Type0-without-ToUnicode extraction (so a glyph id can be turned back
+    /// into real text instead of `U+FFFD`).
+    ///
+    /// Subtables are consulted **by priority** (Unicode tables first, matching
+    /// [`CmapSub::score`]): a lower-priority subtable only *fills gaps* — it
+    /// never overrides a glyph the Unicode tables already resolved. Within one
+    /// subtable the lowest code point wins (the canonical scalar when several
+    /// map to one glyph). Macintosh (platform 1) subtables carry **Mac OS
+    /// Roman bytes**, not Unicode: their codes are translated through
+    /// [`mac_roman_to_char`](crate::font::encoding::mac_roman_to_char) first.
+    /// Without both rules, the Mac subtable of an ordinary font (Liberation,
+    /// Arial, …) poisons the map — its raw byte `0xA5` (Mac Roman `•`) is
+    /// numerically lower than `U+2022`, so every extracted bullet became `¥`
+    /// and every accented letter a C1 control (`é` → `U+008E`).
     pub fn gid_to_unicode_map(&self) -> std::collections::BTreeMap<u16, u32> {
         let mut map: std::collections::BTreeMap<u16, u32> = std::collections::BTreeMap::new();
-        // Prefer the highest-scoring subtable (full Unicode first) so a glyph's
-        // canonical scalar wins; later (lower-score) subtables only fill gaps.
+        // `self.cmap` is sorted by descending score. Collect each subtable in
+        // isolation, then merge: earlier (higher-priority) entries win.
         for sub in &self.cmap {
-            self.collect_cmap_entries(sub.offset, &mut map);
+            let mut local: std::collections::BTreeMap<u16, u32> =
+                std::collections::BTreeMap::new();
+            self.collect_cmap_entries(sub.offset, sub.platform == 1, &mut local);
+            for (gid, cp) in local {
+                map.entry(gid).or_insert(cp);
+            }
         }
         map
     }
 
     /// Walk one cmap subtable, inserting `gid → codepoint` pairs (keeping the
-    /// lowest codepoint already recorded for a glyph).
-    fn collect_cmap_entries(&self, sub: usize, map: &mut std::collections::BTreeMap<u16, u32>) {
+    /// lowest codepoint already recorded for a glyph). `mac` marks a Macintosh
+    /// (platform 1) subtable whose single-byte codes are Mac OS Roman and must
+    /// be mapped to Unicode before being recorded.
+    fn collect_cmap_entries(
+        &self,
+        sub: usize,
+        mac: bool,
+        map: &mut std::collections::BTreeMap<u16, u32>,
+    ) {
         let mut record = |gid: u16, cp: u32| {
+            let cp = if mac {
+                match u8::try_from(cp) {
+                    Ok(byte) => crate::font::encoding::mac_roman_to_char(byte) as u32,
+                    Err(_) => return, // a Mac subtable never maps codes > 0xFF
+                }
+            } else {
+                cp
+            };
             if gid != 0 {
                 map.entry(gid)
                     .and_modify(|e| {

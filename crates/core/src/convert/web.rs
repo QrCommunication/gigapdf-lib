@@ -346,12 +346,47 @@ fn html_list(list: &List, doc: &Document, out: &mut String) {
         String::new()
     };
     out.push_str(&format!("<{tag}{type_attr}{start_attr}>"));
-    for item in &list.items {
-        out.push_str("<li>");
-        html_blocks(&item.blocks, doc, out);
-        out.push_str("</li>");
-    }
+    // Item nesting levels become nested <ul>/<ol> inside the parent's <li>
+    // (the HTML content model), so a level-1 item round-trips as a real
+    // sub-list instead of flattening to its parent's depth.
+    html_list_items(&list.items, 0, tag, type_attr, doc, out);
     out.push_str(&format!("</{tag}>"));
+}
+
+/// Emit the `<li>`s of `items` expected at nesting `level`; a following run of
+/// deeper items becomes a nested list *inside* the preceding `<li>` (or inside
+/// an empty `<li>` when the run has no parent item — a list that jumps
+/// straight to a deeper level).
+fn html_list_items(
+    items: &[crate::model::ListItem],
+    level: u8,
+    tag: &str,
+    type_attr: &str,
+    doc: &Document,
+    out: &mut String,
+) {
+    let mut i = 0;
+    while i < items.len() {
+        // A run of deeper items with no opening item at this level nests inside
+        // a bare <li> (a list that jumps straight to a deeper level stays valid).
+        let own = items[i].level <= level;
+        out.push_str("<li>");
+        if own {
+            html_blocks(&items[i].blocks, doc, out);
+        }
+        let run_start = if own { i + 1 } else { i };
+        let mut j = run_start;
+        while j < items.len() && items[j].level > level {
+            j += 1;
+        }
+        if j > run_start {
+            out.push_str(&format!("<{tag}{type_attr}>"));
+            html_list_items(&items[run_start..j], level + 1, tag, type_attr, doc, out);
+            out.push_str(&format!("</{tag}>"));
+        }
+        out.push_str("</li>");
+        i = j.max(i + 1);
+    }
 }
 
 fn html_table(table: &Table, doc: &Document, out: &mut String) {
@@ -1135,6 +1170,7 @@ mod tests {
             level: 0,
         };
         let list = List {
+            marker_suffix: None,
             ordered: true,
             marker: ListMarker::LowerRoman,
             items: vec![li("one"), li("two")],
@@ -1150,6 +1186,7 @@ mod tests {
 
         // An unordered list is a plain <ul> with no type/start.
         let ul = List {
+            marker_suffix: None,
             ordered: false,
             marker: ListMarker::Bullet('•'),
             items: vec![li("x")],
