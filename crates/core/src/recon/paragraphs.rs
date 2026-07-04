@@ -2,8 +2,10 @@
 //! Within one paragraph the lines are stacked at a regular leading; a new
 //! paragraph begins when:
 //!   * the inter-line gap exceeds `1.5 × leading` (a blank-line break), or
-//!   * a line is indented like a first line (its left jumps right of the body
-//!     left by more than a small threshold), or
+//!   * a line is indented like a first line (its left jumps right of the
+//!     **previous line's** left by more than a small threshold — judged
+//!     line-to-line so an entirely indented span, a quote block, stays one
+//!     paragraph instead of re-splitting on every line), or
 //!   * the alignment visibly changes (a centred line after a flush-left block).
 //!
 //! [`ParagraphStyle::align`] is derived from how the lines' starts and ends vary
@@ -14,7 +16,8 @@
 use super::lines::ReconLine;
 use super::{median, run_char_style, IdGen, ParaLink, ReconRun};
 use crate::model::{
-    Align, Block, BlockKind, Inline, InlineRun, LineHeight, Paragraph, ParagraphStyle, Rect, VAlign,
+    Align, Block, BlockKind, Inline, InlineRun, LineHeight, ParaBorder, Paragraph, ParagraphStyle,
+    Rect, VAlign,
 };
 
 /// Geometry + decoration context a paragraph needs to recover its
@@ -36,6 +39,12 @@ pub(crate) struct ParaContext<'a> {
     /// so a first-line indent is measured against the body, not just this
     /// paragraph's own (possibly already-indented) lines.
     pub group_left: f64,
+    /// The prose **group's** right margin (max line-right across the whole
+    /// group) — with [`group_left`](Self::group_left) it is the body measure
+    /// [`line_break_softness`] judges word-wrap against (a deliberately short
+    /// block must not self-satisfy the ratio through its own widest line).
+    /// `0` (the default) ⇒ unknown: the paragraph's own box stands in.
+    pub group_right: f64,
     /// The page's MediaBox left edge (points): `indent_left_pt` is the block's
     /// left margin relative to this, so a host re-lays the paragraph in the same
     /// horizontal position.
@@ -44,6 +53,10 @@ pub(crate) struct ParaContext<'a> {
     /// emitted paragraph in this group, or `None` for the first. Drives
     /// `space_before_pt` from the inter-paragraph gap.
     pub prev_bottom: Option<f64>,
+    /// Top edge (PDF user-space `y`, higher = further up) of the **next**
+    /// paragraph in this group, or `None` for the last. Drives `space_after_pt`
+    /// from the gap to the following block, symmetric to `prev_bottom`.
+    pub next_top: Option<f64>,
     /// Hyperlink rectangles (already mapped to the model target), in PDF user
     /// space. A run whose box overlaps a rect is wrapped in [`Inline::Link`].
     pub links: &'a [ParaLink],
@@ -60,14 +73,33 @@ pub(crate) struct ParaContext<'a> {
 /// footer line 250 pt away fused with a header line into one "paragraph". The
 /// split now triggers when any of these hold between consecutive lines:
 ///
-/// 1. `step > 1.5 × min(group_leading, max(doc_leading, body))` — the group's
-///    own statistics can only *tighten* the document reference, never inflate
-///    it past what the page actually uses;
+/// 1. `step > 1.5 × reference` — the reference is the group's **own regular
+///    pace** (the median of its gaps) when the group is metronomic (≥ 3 lines,
+///    every gap within ±20 % of their median: a deliberately loose-set
+///    paragraph on a dense page keeps its lines), and otherwise
+///    `min(group_leading, max(doc_leading, body))` — irregular statistics can
+///    only *tighten* the document reference, never inflate it past what the
+///    page actually uses;
 /// 2. `step > 2.5 × line font size` — an absolute ceiling: no paragraph stacks
-///    lines further apart than 2.5× their own glyph size;
+///    lines further apart than 2.5× their own glyph size (this keeps splitting
+///    a "regular" far-apart lattice — footer/header never fuse, whatever the
+///    pace says);
 /// 3. the lines' horizontal spans overlap by **less than 20 %** of the narrower
 ///    one — vertically adjacent but side-by-side content (columns, disjoint
 ///    form fields) is never one paragraph.
+///
+/// The **indent** break is judged against the *previous line*, not the group's
+/// min-left: a sudden rightward jump of the line start is an indented opener
+/// (new paragraph), while an entirely indented span (a quote block) or a
+/// centred paragraph no longer re-splits on every line. A return to flush
+/// (negative jump) is a boundary too — except straight after a lone indented
+/// opener, the classic first-line-indent pattern (opener indented, continuation
+/// flush = the SAME paragraph; `paragraph_style` reads that very shape back as
+/// `first_line_pt`). The mirror shape — a flush **lone** opener whose following
+/// lines all continue at one deeper column (a bibliography entry, a definition)
+/// — is a **hanging indent** and stays one paragraph too, confirmed by
+/// look-ahead so a genuine indented opener still splits (`paragraph_style`
+/// reads the hanging shape back as a *negative* `first_line_pt`).
 ///
 /// Output invariant: within a returned paragraph every line is within the
 /// ceiling of its neighbour and overlaps it horizontally; the block frame
@@ -81,22 +113,30 @@ pub fn split_paragraphs<'a>(
         return Vec::new();
     }
     // The document reference: the page-wide leading when known, else the body
-    // size. The group's own median step may only *lower* the reference (a
-    // tight-set group splits on smaller gaps); a group of 2 lines has no
-    // internal statistics at all — its single step IS `estimate_leading`'s
-    // median — so its own figure is ignored and the document reference alone
-    // judges the gap.
+    // size. A metronomic group (≥ 3 lines, all gaps within ±20 % of their
+    // median) is judged on its OWN pace, unclamped — a legitimate 16 pt-leaded
+    // paragraph on a 10 pt-dense page must not shatter line by line (the
+    // ceiling and disjoint guards below still split far-apart/side-by-side
+    // content). An irregular group's own median step may only *lower* the
+    // reference (a tight-set group splits on smaller gaps); a group of 2 lines
+    // has no internal statistics at all — its single step IS
+    // `estimate_leading`'s median — so its own figure is ignored and the
+    // document reference alone judges the gap.
     let doc_ref = doc_leading.max(body).max(1.0);
     let reference = if lines.len() >= 3 {
-        estimate_leading(lines, body, doc_leading).min(doc_ref)
+        match regular_step(lines) {
+            Some(step) => step,
+            None => estimate_leading(lines, body, doc_leading).min(doc_ref),
+        }
     } else {
         doc_ref
     };
     let body_left = block_left(lines);
+    let indent_threshold = (body * 0.6).max(6.0);
 
     let mut paras: Vec<Vec<&ReconLine>> = vec![vec![lines[0]]];
-    for pair in lines.windows(2) {
-        let (prev, cur) = (pair[0], pair[1]);
+    for i in 1..lines.len() {
+        let (prev, cur) = (lines[i - 1], lines[i]);
         // Vertical gap between baselines (top of cur minus top of prev, going
         // down the page → prev.top - cur.top is the step).
         let step = (prev.center_y() - cur.center_y()).abs();
@@ -108,8 +148,33 @@ pub fn split_paragraphs<'a>(
         // their horizontal band; less than 20 % overlap (of the narrower line)
         // means columns / disjoint fields, never one flow.
         let disjoint = !lines_overlap_x(prev, cur);
-        // First-line indent: the line starts clearly right of the block left.
-        let indent = cur.left() - body_left > (body * 0.6).max(6.0);
+        // Indent break, judged against the PREVIOUS line (see the doc above):
+        // a sudden rightward jump opens an indented paragraph; a return to
+        // flush closes an indented span — unless the indented "span" is a lone
+        // opener (the classic first-line indent, which the continuation
+        // belongs to).
+        let left_delta = cur.left() - prev.left();
+        let indent = if left_delta > indent_threshold {
+            // A rightward jump normally opens an indented paragraph — EXCEPT
+            // the **hanging-indent** shape (bibliographies, definition lists):
+            // a flush LONE opener whose following lines all continue at one
+            // deeper column. Judged by look-ahead: the next line must confirm
+            // the continuation column at a normal step, so a genuine indented
+            // opener (whose next line returns flush, or which stands alone)
+            // still splits exactly as before.
+            let lone_opener = paras.last().is_some_and(|p| p.len() == 1);
+            let modest_hang = left_delta <= body * 6.0;
+            let confirmed = lines.get(i + 1).is_some_and(|next| {
+                (next.left() - cur.left()).abs() <= indent_threshold
+                    && (cur.center_y() - next.center_y()).abs() <= reference * 1.5
+                    && lines_overlap_x(cur, next)
+            });
+            !(lone_opener && modest_hang && confirmed)
+        } else if left_delta < -indent_threshold {
+            paras.last().is_some_and(|p| p.len() > 1)
+        } else {
+            false
+        };
         // Alignment change: a centred line breaking a flush-left run (or back).
         let align_break = align_of_line(prev, body_left, block_right(lines))
             != align_of_line(cur, body_left, block_right(lines))
@@ -123,6 +188,32 @@ pub fn split_paragraphs<'a>(
         }
     }
     paras
+}
+
+/// The group's own **regular pace**: `Some(median gap)` when the group has at
+/// least two inter-line gaps and every gap sits within ±20 % of their median —
+/// a metronomic stack, the strongest signal that the leading is intentional,
+/// however loose it looks against the page median. `None` when the pace is
+/// irregular (or the group too short to have two gaps): the caller then falls
+/// back to the document-clamped reference. The absolute `ceiling` and
+/// `disjoint` guards in [`split_paragraphs`] stay active regardless, so a
+/// "regular" far-apart lattice (stacked footers, form rows) still splits.
+fn regular_step(lines: &[&ReconLine]) -> Option<f64> {
+    let gaps: Vec<f64> = lines
+        .windows(2)
+        .map(|w| (w[0].center_y() - w[1].center_y()).abs())
+        .collect();
+    if gaps.len() < 2 {
+        return None;
+    }
+    let mut sorted = gaps.clone();
+    let med = median(&mut sorted, 0.0);
+    if med <= 0.0 {
+        return None;
+    }
+    gaps.iter()
+        .all(|g| (g - med).abs() <= med * 0.20)
+        .then_some(med.max(1.0))
 }
 
 /// A line's representative font size: the median of its runs' sizes, falling
@@ -165,10 +256,15 @@ pub fn build_paragraph(
 /// - `line_height = Multiple(leading / body_size)` when a multi-line paragraph
 ///   has a measurable leading distinct from a single-spaced body.
 /// - `first_line_pt` = the first line's left minus the body left, when the
-///   opener is indented to the right of the rest of the group.
+///   opener is indented to the right of the rest of the group; **negative**
+///   for the hanging-indent shape (flush opener, indented continuations), with
+///   `indent_left_pt` then anchored to the continuation column (the DOCX
+///   convention).
 /// - `indent_left_pt` = the block's left margin minus the page's left edge.
 /// - `space_before_pt` = the gap from the previous paragraph's bottom to this
 ///   paragraph's top, beyond one line of leading (the normal single step).
+/// - `space_after_pt` = the mirror gap down to the next paragraph's top
+///   ([`ParaContext::next_top`]), beyond one line of leading.
 pub(crate) fn build_paragraph_styled(
     para: &[&ReconLine],
     ctx: &ParaContext,
@@ -233,7 +329,18 @@ pub(crate) fn build_paragraph_styled(
     }
 
     let align = paragraph_align(para, left, right);
-    let style = paragraph_style(para, ctx, align, left, right, y, h);
+    let mut style = paragraph_style(para, ctx, align, left, right, y, h);
+    // Wrap-vs-deliberate classification of each emitted `LineBreak`, judged
+    // against the enclosing group's measure when the caller supplied one
+    // (`ParaContext::group_left..group_right`); a default context falls back
+    // to the paragraph's own box. Additive: the breaks themselves and the
+    // runs/`source_index` seam are untouched.
+    let (m_left, m_right) = if ctx.group_right > ctx.group_left {
+        (ctx.group_left, ctx.group_right)
+    } else {
+        (left, right)
+    };
+    style.soft_breaks = line_break_softness(para, style.align, m_left, m_right);
     // Coalesce adjacent `Inline::Run`s that share the same character style
     // (family, size, bold/italic/underline/strike, color, background) into a
     // single run. PDF often splits a single logical sentence into dozens of
@@ -290,28 +397,49 @@ fn paragraph_style(
         LineHeight::Normal
     };
 
-    // First-line indent: the opener sits to the right of the group's body left
-    // (the same jump that triggered a paragraph split). Measured against the
-    // group left, not this block's own left (which equals the indented opener).
-    let first_line_pt = {
-        let opener_left = para.first().map(|l| l.left()).unwrap_or(left);
-        let indent = opener_left - ctx.group_left;
-        let threshold = (body * 0.6).max(6.0);
-        if indent > threshold {
+    // First-line indent (positive) or hanging indent (negative). The positive
+    // case: the opener sits to the right of the group's body left (the same
+    // jump that triggered a paragraph split), measured against the group left,
+    // not this block's own left (which equals the indented opener). The
+    // **hanging** case (bibliographies, definition lists): the opener sits
+    // flush and every continuation line agrees on one deeper column — encoded
+    // the DOCX way: `indent_left` is the continuation column and a *negative*
+    // `first_line` pulls the opener back out of it.
+    let opener_left = para.first().map(|l| l.left()).unwrap_or(left);
+    let threshold = (body * 0.6).max(6.0);
+    let hang = hanging_indent(para, opener_left, threshold);
+    let (first_line_pt, block_left) = match hang {
+        Some(cont_left) => (round2(-(cont_left - opener_left)), cont_left),
+        None => {
+            let indent = opener_left - ctx.group_left;
+            let first = if indent > threshold {
+                round2(indent)
+            } else {
+                0.0
+            };
+            (first, left)
+        }
+    };
+
+    // Left indent: the block's left margin relative to the page's left edge —
+    // for a hanging paragraph that margin is the continuation column (the
+    // opener juts out of it by `first_line_pt`).
+    let indent_left_pt = {
+        let indent = block_left - ctx.page_left;
+        if indent > 1.0 {
             round2(indent)
         } else {
             0.0
         }
     };
 
-    // Left indent: the block's left margin relative to the page's left edge.
-    let indent_left_pt = {
-        let indent = left - ctx.page_left;
-        if indent > 1.0 {
-            round2(indent)
-        } else {
-            0.0
-        }
+    // A hanging paragraph's continuation lines all sit inset from the block
+    // left (set by the jutting opener), which the per-line classifier misreads
+    // as a right-aligned block. The flush-left opener disproves that reading.
+    let align = if hang.is_some() && align == Align::Right {
+        Align::Left
+    } else {
+        align
     };
 
     // Space-before: the inter-paragraph gap beyond a normal single line step.
@@ -331,16 +459,87 @@ fn paragraph_style(
         _ => 0.0,
     };
 
+    // Space-after: the mirror figure, from this paragraph's bottom to the next
+    // paragraph's top (`ctx.next_top`). Note the recovered geometry is reported
+    // on BOTH sides of a gap (the next paragraph sees the same gap as its
+    // `space_before_pt`) — attribution is the exporters' concern.
+    let space_after_pt = match ctx.next_top {
+        Some(next_top) if ctx.leading > 0.0 => {
+            let gap = y - next_top - (ctx.leading - body).max(0.0);
+            if gap > body * 0.25 {
+                round2(gap)
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    };
+
     ParagraphStyle {
         align,
         space_before_pt,
-        space_after_pt: 0.0,
+        space_after_pt,
         indent_left_pt,
         indent_right_pt: 0.0,
         first_line_pt,
         line_height,
+        direction: para_direction(para),
         ..Default::default()
     }
+}
+
+/// Unicode strong-script heuristic for the paragraph's base direction: `Rtl`
+/// when **more than 60 %** of the paragraph's strong (letter) characters sit in
+/// the right-to-left blocks — Hebrew `U+0590..=U+05FF`, Arabic
+/// `U+0600..=U+06FF` + Supplement `U+0750..=U+077F` + Presentation Forms
+/// `U+FB50..=U+FDFF` / `U+FE70..=U+FEFF`. Digits, punctuation and whitespace
+/// are direction-neutral and never counted, so a Latin document (or a mostly
+/// Latin paragraph quoting a few RTL words) stays `None` (LTR).
+fn para_direction(para: &[&ReconLine]) -> Option<crate::model::Direction> {
+    let (mut rtl, mut strong) = (0usize, 0usize);
+    for line in para {
+        for run in &line.runs {
+            for c in run.text.chars() {
+                if is_strong_rtl(c) {
+                    rtl += 1;
+                    strong += 1;
+                } else if c.is_alphabetic() {
+                    strong += 1;
+                }
+            }
+        }
+    }
+    (strong > 0 && rtl * 100 > strong * 60).then_some(crate::model::Direction::Rtl)
+}
+
+/// Whether `c` belongs to the strong right-to-left Unicode blocks (Hebrew +
+/// Arabic incl. supplement and presentation forms). See [`para_direction`].
+fn is_strong_rtl(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0590..=0x05FF | 0x0600..=0x06FF | 0x0750..=0x077F | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF
+    )
+}
+
+/// Detect the **hanging-indent** shape of a multi-line paragraph: the opener
+/// sits at the block's left edge and every continuation line agrees on one
+/// column deeper than `threshold` to its right. Returns that continuation
+/// column, or `None` when the shape doesn't hold (a straggler line, a positive
+/// first-line indent, a single line). Conservative by construction — any
+/// disagreement between continuation lines vetoes the reading.
+fn hanging_indent(para: &[&ReconLine], opener_left: f64, threshold: f64) -> Option<f64> {
+    if para.len() < 2 {
+        return None;
+    }
+    let conts = &para[1..];
+    let cont_left = conts.iter().map(|l| l.left()).fold(f64::INFINITY, f64::min);
+    if cont_left - opener_left <= threshold {
+        return None;
+    }
+    conts
+        .iter()
+        .all(|l| (l.left() - cont_left).abs() <= threshold)
+        .then_some(cont_left)
 }
 
 /// The line's dominant baseline (`y`, PDF user space) and body font size,
@@ -524,12 +723,27 @@ pub(crate) fn group_left(lines: &[&ReconLine]) -> f64 {
     block_left(lines)
 }
 
+/// The group's right margin (max line-right) — exposed for
+/// [`ParaContext::group_right`] so [`line_break_softness`] judges wrap against
+/// the whole group's measure, not one paragraph's own box.
+pub(crate) fn group_right(lines: &[&ReconLine]) -> f64 {
+    block_right(lines)
+}
+
 /// A paragraph's union-box bottom edge (PDF user-space `y`, lower = further down
 /// the page) — fed to the next paragraph's [`ParaContext::prev_bottom`] to
 /// recover inter-paragraph `space_before`.
 pub(crate) fn paragraph_bottom(para: &[&ReconLine]) -> f64 {
     let (_, y, _, _) = union_box(para);
     y
+}
+
+/// A paragraph's union-box **top** edge (PDF user-space `y + h`) — fed to the
+/// previous paragraph's [`ParaContext::next_top`] to recover inter-paragraph
+/// `space_after` (the mirror of [`paragraph_bottom`]).
+pub(crate) fn paragraph_top(para: &[&ReconLine]) -> f64 {
+    let (_, y, _, h) = union_box(para);
+    y + h
 }
 
 /// Estimate body leading from consecutive line steps. When the group has no
@@ -654,6 +868,296 @@ fn paragraph_align(lines: &[&ReconLine], left: f64, right: f64) -> Align {
         }
     }
     Align::Left
+}
+
+// ── line-break softness (wrap vs deliberate break) ──────────────────────────
+
+/// Classify each of a paragraph's line breaks as **soft** (`true` — the break
+/// is a consequence of word-wrap, so an editor/exporter may re-flow across it)
+/// or **hard** (`false` — the line ends short on purpose: a poem verse, an
+/// address line, a heading fragment).
+///
+/// Entry `k` describes the break between line `k` and line `k + 1`; the vector
+/// therefore has `para.len() - 1` entries (empty for a single-line paragraph).
+/// A break is soft when the line it closes ran (nearly) the full body width —
+/// its right edge reaches ≥ 85 % of the measure — or when the whole paragraph
+/// is justified (every inner line is stretched flush by definition, so its
+/// physical right edge *is* the wrap signal). `left`/`right` are the **body
+/// measure** to judge wrap against — the enclosing column/prose-group margins,
+/// not the paragraph's own box (a deliberately short block, an address, would
+/// otherwise self-satisfy the ratio through its own widest line).
+///
+/// This is the reliable-signal producer for the reflowable-export work: the
+/// emitted [`Inline::LineBreak`]s are **unchanged** (the editor seam depends on
+/// the exact lines/runs structure), and the flags are not yet persisted on the
+/// model — every candidate carrier (`ParagraphStyle`, `Paragraph`) is built
+/// exhaustively by the Office importers, so the additive field lands together
+/// with those call sites in a later wave.
+pub fn line_break_softness(
+    para: &[&ReconLine],
+    align: Align,
+    left: f64,
+    right: f64,
+) -> Vec<bool> {
+    if para.len() < 2 {
+        return Vec::new();
+    }
+    let measure = right - left;
+    para[..para.len() - 1]
+        .iter()
+        .map(|line| {
+            if align == Align::Justify {
+                return true;
+            }
+            measure > 0.0 && line.right() - left >= measure * 0.85
+        })
+        .collect()
+}
+
+// ── paragraph borders & background (drawn box decorations) ──────────────────
+
+/// One painted page path, pre-classified for paragraph border/background
+/// correlation. All coordinates are **PDF user space**. The caller filters the
+/// page's vector paths first — table grid paths and consumed underline/strike
+/// rules never become decoration candidates (no double-claiming).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageDecor {
+    /// The source `VectorPath::index`, so a claimed decoration can be consumed
+    /// (not re-emitted as a standalone [`crate::model::Shape`] block).
+    pub index: usize,
+    pub shape: DecorShape,
+}
+
+/// The geometry of a decoration candidate: an axis-aligned rectangle (filled
+/// and/or stroked), or a thin ruling line (one border side).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DecorShape {
+    /// An axis-aligned rectangle path (`x0 < x1`, `y0 < y1`).
+    Box {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        fill: Option<[f64; 3]>,
+        stroke: Option<[f64; 3]>,
+        stroke_width: f64,
+    },
+    /// A thin horizontal ruling line at `y`, spanning `x0..x1`.
+    HRule {
+        y: f64,
+        x0: f64,
+        x1: f64,
+        color: [f64; 3],
+        width: f64,
+    },
+    /// A thin vertical ruling line at `x`, spanning `y0..y1`.
+    VRule {
+        x: f64,
+        y0: f64,
+        y1: f64,
+        color: [f64; 3],
+        width: f64,
+    },
+}
+
+/// Recovered box decorations of one paragraph: its shading, its per-side
+/// borders (`[top, right, bottom, left]`, all set or none — a partial surround
+/// is never claimed), and the path indices consumed by the claim.
+pub(crate) struct ParaDecorations {
+    pub background: Option<[f64; 3]>,
+    pub borders: Option<[Option<ParaBorder>; 4]>,
+    pub claimed: Vec<usize>,
+}
+
+/// How far a decoration may extend beyond the paragraph's text box and still
+/// count as *its* frame (the padding of an encadré). Anything looser belongs
+/// to a larger region (a page background, a box around several paragraphs) and
+/// is left alone — the conservative stance: at the slightest doubt, claim
+/// nothing.
+fn decor_hug_margin(body: f64) -> f64 {
+    (body * 1.5).max(12.0)
+}
+
+/// Whether a fill colour is (near-)white — a white rectangle under text is a
+/// masking artifact, not shading, and must not become `background`.
+fn near_white(c: [f64; 3]) -> bool {
+    c.iter().all(|v| *v >= 0.99)
+}
+
+/// Correlate a paragraph's lines with the page's drawn boxes/rules (fix: the
+/// CERFA encadré). Recovers:
+///
+/// * **`background`** — a *filled*, non-white rectangle covering ≥ 90 % of the
+///   paragraph's box while hugging it (no side extends past the text by more
+///   than [`decor_hug_margin`]). The topmost-painted match wins (painter's
+///   order — it is the one actually visible behind the text).
+/// * **`borders`** — a *stroked* rectangle hugging all four sides, or four
+///   individual ruling lines (top/bottom spanning ≥ 85 % of the width within
+///   the hug band, left/right the same for the height). All four sides or
+///   nothing: a partial rule set stays ordinary shapes.
+///
+/// Guards, per the conservative brief: a rectangle that extends beyond the
+/// paragraph on any side by more than the hug margin (page backgrounds, a box
+/// around *several* paragraphs) is never claimed; table-owned paths were
+/// filtered out by the caller before this ever runs. `claimed` returns exactly
+/// the path indices this paragraph consumed so the page builder can drop them
+/// from the standalone-shape pass (the same hygiene as underline/strike rules
+/// — a claimed decoration must not draw twice).
+pub(crate) fn paragraph_decorations(
+    para: &[&ReconLine],
+    decors: &[PageDecor],
+    body: f64,
+) -> ParaDecorations {
+    let mut out = ParaDecorations {
+        background: None,
+        borders: None,
+        claimed: Vec::new(),
+    };
+    if para.is_empty() || decors.is_empty() {
+        return out;
+    }
+    let (px, py, pw, ph) = union_box(para);
+    let (px1, py1) = (px + pw, py + ph);
+    let area = pw * ph;
+    if area <= 0.0 {
+        return out;
+    }
+    let hug = decor_hug_margin(body);
+    // A box "hugs" the paragraph when no edge strays past the text box by more
+    // than the padding margin (it may sit inside by a hair — glyph boxes
+    // overshoot their ink).
+    let hugs = |x0: f64, y0: f64, x1: f64, y1: f64| {
+        x0 >= px - hug && y0 >= py - hug && x1 <= px1 + hug && y1 <= py1 + hug
+    };
+
+    // Background: the topmost-painted (last, painter's order) filled rect that
+    // covers ≥ 90 % of the paragraph box and hugs it.
+    let mut background: Option<(usize, [f64; 3])> = None;
+    // Border box: the topmost-painted stroked rect hugging all four sides.
+    let mut border_box: Option<(usize, [f64; 3], f64)> = None;
+    for d in decors {
+        let DecorShape::Box {
+            x0,
+            y0,
+            x1,
+            y1,
+            fill,
+            stroke,
+            stroke_width,
+        } = d.shape
+        else {
+            continue;
+        };
+        if !hugs(x0, y0, x1, y1) {
+            continue;
+        }
+        let cover_w = (x1.min(px1) - x0.max(px)).max(0.0);
+        let cover_h = (y1.min(py1) - y0.max(py)).max(0.0);
+        let covers = cover_w * cover_h >= area * 0.90;
+        if let Some(f) = fill {
+            if covers && !near_white(f) {
+                background = Some((d.index, f));
+            }
+        }
+        if let Some(s) = stroke {
+            // A border outline must trace the paragraph's frame: every side
+            // within the hug band of its edge (covering alone is not enough —
+            // a small stroked swatch inside the text must not become a frame).
+            let traces = (x0 - px).abs() <= hug
+                && (x1 - px1).abs() <= hug
+                && (y0 - py).abs() <= hug
+                && (y1 - py1).abs() <= hug;
+            if traces {
+                border_box = Some((d.index, s, stroke_width));
+            }
+        }
+    }
+    if let Some((idx, fill)) = background {
+        out.background = Some(fill);
+        out.claimed.push(idx);
+    }
+    if let Some((idx, color, width)) = border_box {
+        let side = ParaBorder {
+            width_pt: width.max(0.5),
+            style: "solid".to_string(),
+            color,
+        };
+        out.borders = Some([
+            Some(side.clone()),
+            Some(side.clone()),
+            Some(side.clone()),
+            Some(side),
+        ]);
+        if !out.claimed.contains(&idx) {
+            out.claimed.push(idx);
+        }
+        return out;
+    }
+
+    // Four individual rules forming the frame: a top + bottom rule spanning the
+    // paragraph's width and a left + right rule spanning its height, each within
+    // the hug band of its side. All four or nothing.
+    let mut top: Option<(usize, [f64; 3], f64)> = None;
+    let mut bottom: Option<(usize, [f64; 3], f64)> = None;
+    let mut leftr: Option<(usize, [f64; 3], f64)> = None;
+    let mut rightr: Option<(usize, [f64; 3], f64)> = None;
+    for d in decors {
+        match d.shape {
+            DecorShape::HRule {
+                y,
+                x0,
+                x1,
+                color,
+                width,
+            } => {
+                // The rule must span the paragraph's width without straying far
+                // past either end (a page-wide separator is not this frame).
+                let span = (x1.min(px1) - x0.max(px)).max(0.0);
+                if span < pw * 0.85 || x0 < px - hug || x1 > px1 + hug {
+                    continue;
+                }
+                if (y - py1).abs() <= hug {
+                    top = Some((d.index, color, width));
+                } else if (y - py).abs() <= hug {
+                    bottom = Some((d.index, color, width));
+                }
+            }
+            DecorShape::VRule {
+                x,
+                y0,
+                y1,
+                color,
+                width,
+            } => {
+                let span = (y1.min(py1) - y0.max(py)).max(0.0);
+                if span < ph * 0.85 || y0 < py - hug || y1 > py1 + hug {
+                    continue;
+                }
+                if (x - px).abs() <= hug {
+                    leftr = Some((d.index, color, width));
+                } else if (x - px1).abs() <= hug {
+                    rightr = Some((d.index, color, width));
+                }
+            }
+            DecorShape::Box { .. } => {}
+        }
+    }
+    if let (Some(t), Some(b), Some(l), Some(r)) = (top, bottom, leftr, rightr) {
+        let side = |(_, color, width): (usize, [f64; 3], f64)| {
+            Some(ParaBorder {
+                width_pt: width.max(0.5),
+                style: "solid".to_string(),
+                color,
+            })
+        };
+        out.borders = Some([side(t), side(r), side(b), side(l)]);
+        for idx in [t.0, r.0, b.0, l.0] {
+            if !out.claimed.contains(&idx) {
+                out.claimed.push(idx);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -922,6 +1426,184 @@ mod tests {
         assert_eq!(paras.len(), 1, "ragged last line stays in the paragraph");
     }
 
+    // ── fix a1: indent judged against the PREVIOUS line ─────────────────────
+
+    #[test]
+    fn an_indented_quote_span_stays_one_paragraph() {
+        // A fully indented span (a quote block) inside a flush group: the old
+        // rule compared every line to the GROUP's min-left, so each indented
+        // line re-triggered the indent break and the quote shattered line by
+        // line. Judged line-to-line, the split fires once entering the quote
+        // (+30 pt jump), never inside it (delta 0), and once leaving it (the
+        // multi-line indented run is not a lone first-line opener).
+        let runs = vec![
+            run("body flush line one", 72.0, 700.0, 150.0),
+            run("body flush line two", 72.0, 686.0, 150.0),
+            run("quoted line one xx", 102.0, 672.0, 150.0),
+            run("quoted line two xx", 102.0, 658.0, 150.0),
+            run("quoted line three ", 102.0, 644.0, 150.0),
+            run("body resumes here x", 72.0, 630.0, 150.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 3, "body / quote / body — the quote is ONE paragraph");
+        assert_eq!(paras[0].len(), 2, "flush body before the quote");
+        assert_eq!(paras[1].len(), 3, "the 3 indented lines hold together");
+        assert_eq!(paras[2].len(), 1, "flush body after the quote reopens");
+    }
+
+    #[test]
+    fn a_first_line_indented_opener_keeps_its_continuation() {
+        // The classic first-line indent: the opener sits +30 pt right, the
+        // continuation returns flush. The negative jump straight after a LONE
+        // indented opener is NOT a boundary — the three lines are one
+        // paragraph, and `paragraph_style` reads the very same shape back as
+        // `first_line_pt` (a1 keeps split and style recovery coherent).
+        let runs = vec![
+            run("indented opening line", 102.0, 700.0, 150.0),
+            run("flush continuation aa", 72.0, 686.0, 150.0),
+            run("flush continuation bb", 72.0, 672.0, 150.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let body = 12.0;
+        let paras = split_paragraphs(&refs, body, 14.0);
+        assert_eq!(paras.len(), 1, "first-line indent = one paragraph");
+        assert_eq!(paras[0].len(), 3);
+        // Coherence with the style recovery: the opener's indent is exactly
+        // what `paragraph_style` reports as the first-line indent.
+        let ctx = ParaContext {
+            body,
+            leading: group_leading(&refs, body, 14.0),
+            group_left: group_left(&refs),
+            page_left: 72.0,
+            prev_bottom: None,
+            next_top: None,
+            links: &[],
+            ..Default::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&paras[0], &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            (p.style.first_line_pt - 30.0).abs() < 1.0,
+            "first-line indent ≈ 30, got {}",
+            p.style.first_line_pt
+        );
+    }
+
+    #[test]
+    fn a_sudden_indent_jump_still_opens_a_paragraph() {
+        // Regression guard: the indent break must still fire on a genuine
+        // rightward jump against the previous line (an indented opener after
+        // flush prose).
+        let runs = vec![
+            run("flush body line one x", 72.0, 700.0, 150.0),
+            run("flush body line two x", 72.0, 686.0, 150.0),
+            run("indented new opener xx", 102.0, 672.0, 150.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 2, "the +30 pt jump opens a new paragraph");
+        assert_eq!(paras[1].len(), 1);
+    }
+
+    // ── fix a3: a metronomic group is judged on its own pace ─────────────────
+
+    #[test]
+    fn a_regular_loose_leaded_group_on_a_dense_page_stays_one_paragraph() {
+        // A legitimate 16 pt-leaded paragraph on a page whose median leading is
+        // 10 pt: the old reference clamped the group to the page
+        // (`min(16, 10) = 10`), so every 16 pt step read as a blank-line break
+        // and the paragraph shattered line by line. A metronomic group (all
+        // gaps within ±20 % of their median) is now judged on ITS pace.
+        let runs = vec![
+            run("loose leaded line one", 72.0, 700.0, 150.0),
+            run("loose leaded line two", 72.0, 684.0, 150.0),
+            run("loose leaded line three", 72.0, 668.0, 150.0),
+            run("loose leaded line four", 72.0, 652.0, 150.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        // body 10, page median leading 10 — a dense page.
+        let paras = split_paragraphs(&refs, 10.0, 10.0);
+        assert_eq!(paras.len(), 1, "regular 16 pt pace = one paragraph");
+        assert_eq!(paras[0].len(), 4);
+    }
+
+    #[test]
+    fn a_regular_far_apart_lattice_still_splits_on_the_ceiling() {
+        // The v1.19.2 guard survives fix a3: a *regular* lattice of far-apart
+        // lines (stacked footers / form rows at a metronomic 100 pt step) must
+        // NOT ride the own-pace exception into one paragraph — the absolute
+        // ceiling (2.5 × font size) still splits it.
+        let runs = vec![
+            run("far line one", 72.0, 700.0, 120.0),
+            run("far line two", 72.0, 600.0, 120.0),
+            run("far line three", 72.0, 500.0, 120.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 3, "the ceiling splits a regular far-apart stack");
+    }
+
+    #[test]
+    fn an_irregular_group_keeps_the_document_clamped_reference() {
+        // Irregular gaps (14, 46, 14) disqualify the own-pace exception: the
+        // blank-line break inside the group still splits it in two, exactly as
+        // before fix a3.
+        let runs = vec![
+            run("para one a", 72.0, 700.0, 100.0),
+            run("para one b", 72.0, 686.0, 100.0),
+            run("para two a", 72.0, 640.0, 100.0),
+            run("para two b", 72.0, 626.0, 100.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 2, "irregular pace → document reference → split");
+    }
+
+    // ── fix a6: recovered spacing/indents reach the pageBlocks JSON ──────────
+
+    #[test]
+    fn recovered_indent_and_spacing_serialize_into_block_json() {
+        // The pageBlocks JSON (`model::json::block_to_json`, the exact shape
+        // `gp_page_blocks_json` streams per block) must carry the recovered
+        // `indent_left_pt` / `space_before_pt` so a host can re-lay the
+        // paragraph. Block left 100 on a page whose MediaBox left is 72
+        // → indent 28; a 40 pt gap over a 14 pt leading → space_before 38.
+        let runs = vec![run("an indented spaced paragraph", 100.0, 600.0, 200.0)];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            leading: 14.0,
+            group_left: 100.0,
+            page_left: 72.0,
+            prev_bottom: Some(612.0 + 40.0),
+            next_top: None,
+            links: &[],
+            ..Default::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let json = crate::model::json::block_to_json(&block);
+        assert!(
+            json.contains("\"indent_left_pt\":28"),
+            "indent_left_pt serialized: {json}"
+        );
+        assert!(
+            json.contains("\"space_before_pt\":38"),
+            "space_before_pt serialized: {json}"
+        );
+    }
+
     // ── coalesce_runs keeps every source ordinal ─────────────────────────────
 
     /// Bare same-style run with a given source ordinal.
@@ -1181,7 +1863,9 @@ mod tests {
             group_left,
             page_left: 72.0,
             prev_bottom: None,
+            next_top: None,
             links: &[],
+            ..Default::default()
         };
         let mut ids = IdGen::default();
         let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
@@ -1225,7 +1909,9 @@ mod tests {
             group_left: 72.0,
             page_left: 72.0,
             prev_bottom: Some(612.0 + 40.0),
+            next_top: None,
             links: &[],
+            ..Default::default()
         };
         let mut ids = IdGen::default();
         let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
@@ -1258,7 +1944,9 @@ mod tests {
             group_left: group_left(&refs),
             page_left: 72.0,
             prev_bottom: None,
+            next_top: None,
             links: &[],
+            ..Default::default()
         };
         let mut ids = IdGen::default();
         let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
@@ -1318,7 +2006,7 @@ mod tests {
                     Inline::LineBreak => out.push(' '),
                     Inline::Link { children, .. } => walk(children, out),
                     Inline::Image(_) => {}
-                    Inline::CommentRef { .. } => {}
+                    Inline::CommentRef { .. } | Inline::FootnoteRef { .. } => {}
                 }
             }
         }
@@ -1377,5 +2065,405 @@ mod tests {
             !p.runs.iter().any(|i| matches!(i, Inline::Link { .. })),
             "a run outside every rect stays a plain Run"
         );
+    }
+
+    // ── V3c fix 1: hanging indent (negative first_line + continuation left) ──
+
+    #[test]
+    fn hanging_indent_stays_one_paragraph_and_recovers_negative_first_line() {
+        // A bibliography-style entry: the opener flush at x=72, both
+        // continuation lines at x=100. The split must keep the three lines as
+        // ONE paragraph (the +28 pt jump is a hanging continuation, not an
+        // indented opener), and the style must encode the DOCX convention:
+        // indent_left = the continuation column (100 − 72 = 28 over the page
+        // left) and first_line = −28 pulls the opener back out.
+        let runs = vec![
+            run("Doe, J. (2021). A rather long", 72.0, 700.0, 200.0),
+            run("reference title that wraps on", 100.0, 686.0, 200.0),
+            run("two continuation lines here.", 100.0, 672.0, 195.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let body = 12.0;
+        let paras = split_paragraphs(&refs, body, 14.0);
+        assert_eq!(paras.len(), 1, "hanging entry = one paragraph");
+        assert_eq!(paras[0].len(), 3);
+
+        let ctx = ParaContext {
+            body,
+            leading: group_leading(&refs, body, 14.0),
+            group_left: group_left(&refs),
+            page_left: 72.0,
+            prev_bottom: None,
+            next_top: None,
+            links: &[],
+            ..Default::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&paras[0], &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            (p.style.first_line_pt - -28.0).abs() < 1.0,
+            "hanging first_line ≈ −28, got {}",
+            p.style.first_line_pt
+        );
+        assert!(
+            (p.style.indent_left_pt - 28.0).abs() < 1.0,
+            "indent_left anchored to the continuation column ≈ 28, got {}",
+            p.style.indent_left_pt
+        );
+        assert_ne!(
+            p.style.align,
+            Align::Right,
+            "the inset continuations must not misread as right-aligned"
+        );
+    }
+
+    #[test]
+    fn negative_first_line_survives_the_block_json() {
+        // The pageBlocks JSON must transport the hanging indent's negative
+        // first_line verbatim (no clamping, no drop).
+        let runs = vec![
+            run("Flush hanging opener line", 72.0, 700.0, 200.0),
+            run("continuation over here aa", 100.0, 686.0, 200.0),
+            run("continuation over here bb", 100.0, 672.0, 200.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            leading: 14.0,
+            group_left: 72.0,
+            page_left: 72.0,
+            prev_bottom: None,
+            next_top: None,
+            links: &[],
+            ..Default::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let json = crate::model::json::block_to_json(&block);
+        assert!(
+            json.contains("\"first_line_pt\":-28"),
+            "negative first_line serialized as-is: {json}"
+        );
+    }
+
+    #[test]
+    fn a_two_line_flush_then_indented_pair_still_splits() {
+        // Regression guard for the hanging look-ahead: without a confirming
+        // third line, [flush, indented] keeps the historic reading (an indented
+        // opener starts its own paragraph).
+        let runs = vec![
+            run("flush left line", 72.0, 700.0, 110.0),
+            run("indented opener", 100.0, 686.0, 110.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let paras = split_paragraphs(&refs, 12.0, 14.0);
+        assert_eq!(paras.len(), 2, "no third line to confirm a hanging shape");
+    }
+
+    // ── V3c fix 3: space_after from the gap to the next paragraph ────────────
+
+    #[test]
+    fn gap_after_a_paragraph_recovers_space_after() {
+        // Mirror of the space_before test: a paragraph whose bottom sits 40 pt
+        // above the next paragraph's top, at 14 pt leading over a 12 pt body.
+        // gap = bottom − next_top − (leading − body) = 600 − 560 − 2 = 38.
+        let runs = vec![run("a closing paragraph body", 72.0, 600.0, 200.0)];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            leading: 14.0,
+            group_left: 72.0,
+            page_left: 72.0,
+            prev_bottom: None,
+            next_top: Some(600.0 - 40.0),
+            links: &[],
+            ..Default::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            (p.style.space_after_pt - 38.0).abs() < 1.0,
+            "space_after ≈ 38, got {}",
+            p.style.space_after_pt
+        );
+        // A single-step follow-on (no extra gap) stays quiet: at a 14 pt
+        // leading over 12 pt line boxes, the next line's TOP sits just
+        // `leading − body` = 2 pt under this paragraph's bottom.
+        let quiet = ParaContext {
+            next_top: Some(600.0 - (14.0 - 12.0)),
+            ..ctx
+        };
+        let block = build_paragraph_styled(&refs, &quiet, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(p.style.space_after_pt, 0.0, "a plain line step is no gap");
+    }
+
+    // ── V3c fix 4: line-break softness (wrap vs deliberate break) ────────────
+
+    /// Softness flags for a hand-built stack of lines with the given widths,
+    /// judged against a `measure`-wide body column starting at x = 72.
+    fn softness_of(widths: &[f64], measure: f64, align: Align) -> Vec<bool> {
+        let runs: Vec<ReconRun> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, w)| run("line text", 72.0, 700.0 - 14.0 * i as f64, *w))
+            .collect();
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        line_break_softness(&refs, align, 72.0, 72.0 + measure)
+    }
+
+    #[test]
+    fn justified_paragraph_breaks_are_all_soft() {
+        // Four justified lines → three breaks, every one a wrap artifact.
+        let flags = softness_of(&[300.0, 300.0, 300.0, 120.0], 300.0, Align::Justify);
+        assert_eq!(flags, vec![true, true, true]);
+    }
+
+    #[test]
+    fn short_address_lines_break_hard() {
+        // Three deliberately short lines (an address block) inside a 468 pt
+        // body column: every line ends well inside 85 % of the measure, so
+        // each break is a deliberate one — never re-flowed away.
+        let flags = softness_of(&[150.0, 90.0, 110.0], 468.0, Align::Left);
+        assert_eq!(flags, vec![false, false]);
+    }
+
+    #[test]
+    fn mixed_wrap_and_short_lines_classify_per_break() {
+        // A full-measure first line wraps (soft), a short second line before
+        // the closer is a deliberate break (hard).
+        let flags = softness_of(&[300.0, 140.0, 295.0], 300.0, Align::Left);
+        assert_eq!(flags, vec![true, false]);
+        // Single-line paragraph → no breaks to classify.
+        assert!(softness_of(&[200.0], 300.0, Align::Left).is_empty());
+    }
+
+    /// M1 wiring: `build_paragraph_styled` now ATTACHES the softness flags to
+    /// `ParagraphStyle::soft_breaks`, judged against the group measure carried
+    /// by `ParaContext::group_right` — one flag per emitted `LineBreak`.
+    #[test]
+    fn build_paragraph_attaches_soft_breaks() {
+        let runs = [
+            run("a full-measure wrapping line xx", 72.0, 700.0, 300.0),
+            run("short verse", 72.0, 686.0, 120.0),
+            run("the closing line of the stanza", 72.0, 672.0, 260.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            leading: 14.0,
+            group_left: 72.0,
+            group_right: 372.0,
+            page_left: 72.0,
+            links: &[],
+            ..Default::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        let breaks = p
+            .runs
+            .iter()
+            .filter(|i| matches!(i, Inline::LineBreak))
+            .count();
+        assert_eq!(breaks, 2, "two emitted LineBreaks (unchanged)");
+        assert_eq!(
+            p.style.soft_breaks,
+            vec![true, false],
+            "full-measure line wraps (soft), the short verse breaks hard"
+        );
+    }
+
+    // ── M1 fix 1: Unicode strong-script direction heuristic ──────────────────
+
+    /// A paragraph dominated by Hebrew/Arabic strong letters reads RTL; Latin
+    /// prose (and RTL below the 60 % bar) stays unspecified.
+    #[test]
+    fn paragraph_direction_heuristic_flags_rtl_only() {
+        let build = |text: &str| {
+            let runs = [run(text, 72.0, 700.0, 200.0)];
+            let lines = lines_of(&runs);
+            let refs: Vec<&ReconLine> = lines.iter().collect();
+            let mut ids = IdGen::default();
+            let block =
+                build_paragraph_styled(&refs, &ParaContext::default(), &mut ids, Rect::new);
+            match block.kind {
+                BlockKind::Paragraph(p) => p.style.direction,
+                other => panic!("expected paragraph, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            build("שלום עולם — ברוכים הבאים"),
+            Some(crate::model::Direction::Rtl),
+            "Hebrew-dominated paragraph reads RTL"
+        );
+        assert_eq!(
+            build("مرحبا بالعالم"),
+            Some(crate::model::Direction::Rtl),
+            "Arabic-dominated paragraph reads RTL"
+        );
+        assert_eq!(
+            build("Plain latin prose, digits 123 and punctuation."),
+            None,
+            "Latin prose stays unspecified (LTR)"
+        );
+        assert_eq!(
+            build("mostly latin words quoting שלום once here"),
+            None,
+            "a short RTL quote below 60 % never flips the paragraph"
+        );
+    }
+
+    // ── V3c fix 2: paragraph borders & background from drawn boxes ───────────
+
+    /// A paragraph of two body lines spanning x 72..372, y 672..712.
+    fn boxed_para_refs(runs_out: &mut Vec<ReconRun>) -> (f64, f64, f64, f64) {
+        runs_out.push(run("first framed body line goes here", 72.0, 700.0, 300.0));
+        runs_out.push(run("second framed body line closes.", 72.0, 686.0, 300.0));
+        (72.0, 686.0, 372.0, 712.0)
+    }
+
+    fn boxd(index: usize, x0: f64, y0: f64, x1: f64, y1: f64, fill: Option<[f64; 3]>, stroke: Option<[f64; 3]>) -> PageDecor {
+        PageDecor {
+            index,
+            shape: DecorShape::Box {
+                x0,
+                y0,
+                x1,
+                y1,
+                fill,
+                stroke,
+                stroke_width: 1.0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_stroked_box_around_a_paragraph_becomes_four_borders() {
+        let mut runs = Vec::new();
+        let (x0, y0, x1, y1) = boxed_para_refs(&mut runs);
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        // The encadré: a stroked rect 4 pt outside the text box on every side.
+        let decors = [boxd(
+            7,
+            x0 - 4.0,
+            y0 - 4.0,
+            x1 + 4.0,
+            y1 + 4.0,
+            None,
+            Some([0.0, 0.0, 0.0]),
+        )];
+        let d = paragraph_decorations(&refs, &decors, 12.0);
+        let borders = d.borders.expect("all four borders recovered");
+        assert!(borders.iter().all(Option::is_some), "four sides set");
+        assert_eq!(d.claimed, vec![7], "the box path is consumed");
+        assert!(d.background.is_none(), "no fill → no shading");
+    }
+
+    #[test]
+    fn a_gray_filled_rect_behind_a_paragraph_becomes_background() {
+        let mut runs = Vec::new();
+        let (x0, y0, x1, y1) = boxed_para_refs(&mut runs);
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let decors = [boxd(
+            3,
+            x0 - 2.0,
+            y0 - 2.0,
+            x1 + 2.0,
+            y1 + 2.0,
+            Some([0.85, 0.85, 0.85]),
+            None,
+        )];
+        let d = paragraph_decorations(&refs, &decors, 12.0);
+        assert_eq!(d.background, Some([0.85, 0.85, 0.85]));
+        assert_eq!(d.claimed, vec![3]);
+        assert!(d.borders.is_none(), "no stroke → no borders");
+    }
+
+    #[test]
+    fn white_page_wide_or_partial_rects_claim_nothing() {
+        let mut runs = Vec::new();
+        let (x0, y0, x1, y1) = boxed_para_refs(&mut runs);
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let decors = [
+            // A white mask under the text: never shading.
+            boxd(1, x0, y0, x1, y1, Some([1.0, 1.0, 1.0]), None),
+            // A page-wide background: strays far past the hug margin.
+            boxd(2, 0.0, 0.0, 612.0, 792.0, Some([0.9, 0.9, 0.9]), None),
+            // A partial swatch covering only a corner of the paragraph.
+            boxd(4, x0, y0, x0 + 60.0, y0 + 10.0, Some([0.8, 0.8, 0.8]), None),
+            // A stroked box around something else entirely.
+            boxd(5, x0, y1 + 100.0, x1, y1 + 160.0, None, Some([0.0; 3])),
+        ];
+        let d = paragraph_decorations(&refs, &decors, 12.0);
+        assert!(d.background.is_none(), "no background claimed");
+        assert!(d.borders.is_none(), "no borders claimed");
+        assert!(d.claimed.is_empty(), "nothing consumed");
+    }
+
+    #[test]
+    fn four_ruling_lines_forming_a_frame_become_borders() {
+        let mut runs = Vec::new();
+        let (x0, y0, x1, y1) = boxed_para_refs(&mut runs);
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let black = [0.0, 0.0, 0.0];
+        let rule_h = |index, y| PageDecor {
+            index,
+            shape: DecorShape::HRule {
+                y,
+                x0: x0 - 2.0,
+                x1: x1 + 2.0,
+                color: black,
+                width: 0.6,
+            },
+        };
+        let rule_v = |index, x| PageDecor {
+            index,
+            shape: DecorShape::VRule {
+                x,
+                y0: y0 - 2.0,
+                y1: y1 + 2.0,
+                color: black,
+                width: 0.6,
+            },
+        };
+        // All four sides → borders; drop one side → nothing (all-or-nothing).
+        let full = [
+            rule_h(10, y1 + 3.0),
+            rule_h(11, y0 - 3.0),
+            rule_v(12, x0 - 3.0),
+            rule_v(13, x1 + 3.0),
+        ];
+        let d = paragraph_decorations(&refs, &full, 12.0);
+        assert!(
+            d.borders.is_some_and(|b| b.iter().all(Option::is_some)),
+            "four rules → four borders"
+        );
+        assert_eq!(d.claimed.len(), 4, "all four rules consumed");
+
+        let partial = [rule_h(10, y1 + 3.0), rule_h(11, y0 - 3.0)];
+        let d = paragraph_decorations(&refs, &partial, 12.0);
+        assert!(d.borders.is_none(), "top+bottom only is not a frame");
+        assert!(d.claimed.is_empty());
     }
 }

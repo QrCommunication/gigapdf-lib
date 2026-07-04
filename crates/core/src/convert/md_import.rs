@@ -68,12 +68,11 @@ pub fn md_to_model(md: &str) -> Document {
     Document {
         sections: vec![Section {
             geometry: crate::model::PageGeometry::default(),
-            header: None,
-            footer: None,
             pages: vec![Page {
                 blocks,
                 absolute: false,
             }],
+            ..Default::default()
         }],
         ..Document::default()
     }
@@ -873,6 +872,7 @@ fn try_image(chars: &[char], start: usize) -> Option<(Inline, usize)> {
         Inline::Image(ImageRef {
             resource: fnv1a(url.as_bytes()),
             alt: (!alt.is_empty()).then(|| alt.to_string()),
+            ..Default::default()
         }),
         paren + 1,
     ))
@@ -1189,7 +1189,7 @@ mod tests {
                 Inline::Link { children, .. } => collect(children, out),
                 Inline::LineBreak => out.push('\n'),
                 Inline::Image(_) => {}
-                Inline::CommentRef { .. } => {}
+                Inline::CommentRef { .. } | Inline::FootnoteRef { .. } => {}
             }
         }
     }

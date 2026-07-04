@@ -209,6 +209,21 @@ impl Mat {
     }
 }
 
+/// A `stroke-dasharray` / `stroke-dashoffset` pair, inherited down the tree.
+///
+/// Fixed-capacity so [`Paint`] stays `Copy`: SVG dash lists beyond 8 entries
+/// are vanishingly rare — longer lists keep their first 8 values (documented
+/// truncation). An odd-length list is repeated to even length at walk time,
+/// per the SVG spec.
+#[derive(Debug, Clone, Copy)]
+struct DashSpec {
+    /// The dash lengths, user units (`pat[..len]` are meaningful).
+    pat: [f64; 8],
+    len: u8,
+    /// `stroke-dashoffset` — where along the cycle the pattern starts.
+    offset: f64,
+}
+
 /// Inherited paint state while walking the SVG tree.
 #[derive(Debug, Clone, Copy)]
 struct Paint {
@@ -217,6 +232,8 @@ struct Paint {
     stroke_w: f64,
     fill_opacity: f64,
     stroke_opacity: f64,
+    /// `stroke-dasharray` (+ offset); `None` ⇔ solid strokes.
+    dash: Option<DashSpec>,
 }
 
 impl Paint {
@@ -228,8 +245,35 @@ impl Paint {
             stroke_w: 1.0,
             fill_opacity: 1.0,
             stroke_opacity: 1.0,
+            dash: None,
         }
     }
+}
+
+/// Parse a `stroke-dasharray` value: comma/whitespace separated lengths.
+/// `none` (or an empty / all-zero / any-negative list, per the SVG error
+/// rules) disables dashing.
+fn parse_dasharray(v: &str) -> Option<DashSpec> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("none") || v.is_empty() {
+        return None;
+    }
+    let vals: Vec<f64> = v
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .filter_map(parse_len)
+        .collect();
+    if vals.is_empty() || vals.iter().any(|d| *d < 0.0) || vals.iter().all(|d| *d == 0.0) {
+        return None;
+    }
+    let mut pat = [0.0; 8];
+    let len = vals.len().min(8);
+    pat[..len].copy_from_slice(&vals[..len]);
+    Some(DashSpec {
+        pat,
+        len: len as u8,
+        offset: 0.0,
+    })
 }
 
 /// A resolved fill: a flat colour or a gradient (coords already in prim space).
@@ -380,6 +424,113 @@ fn raster_to_svg(raster: &FilterRaster, rect: [f64; 4]) -> SvgRaster {
         pw: raster.w as u32,
         ph: raster.h as u32,
     }
+}
+
+/// `preserveAspectRatio` scaling mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AspectMode {
+    /// Uniform scale so the whole viewBox fits the viewport (letterboxed).
+    #[default]
+    Meet,
+    /// Uniform scale so the viewBox covers the viewport (overflow clipped).
+    Slice,
+    /// `preserveAspectRatio="none"` — non-uniform stretch onto the viewport.
+    Stretch,
+}
+
+/// Parsed `preserveAspectRatio`: alignment fractions (`0` = min edge, `0.5` =
+/// mid, `1` = max edge) plus the scaling mode. Default: `xMidYMid meet`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreserveAspectRatio {
+    pub align_x: f64,
+    pub align_y: f64,
+    pub mode: AspectMode,
+}
+
+impl Default for PreserveAspectRatio {
+    fn default() -> Self {
+        Self {
+            align_x: 0.5,
+            align_y: 0.5,
+            mode: AspectMode::Meet,
+        }
+    }
+}
+
+/// Parse a `preserveAspectRatio` attribute value (`none`, or
+/// `x{Min|Mid|Max}Y{Min|Mid|Max} [meet|slice]`). Unrecognised alignment
+/// tokens fall back to the `mid` default per axis.
+pub fn parse_preserve_aspect_ratio(v: &str) -> PreserveAspectRatio {
+    let mut it = v.split_whitespace();
+    let align = it.next().unwrap_or("").to_ascii_lowercase();
+    if align == "none" {
+        return PreserveAspectRatio {
+            align_x: 0.5,
+            align_y: 0.5,
+            mode: AspectMode::Stretch,
+        };
+    }
+    let align_x = if align.starts_with("xmin") {
+        0.0
+    } else if align.starts_with("xmax") {
+        1.0
+    } else {
+        0.5
+    };
+    let align_y = if align.ends_with("ymin") {
+        0.0
+    } else if align.ends_with("ymax") {
+        1.0
+    } else {
+        0.5
+    };
+    let mode = match it.next() {
+        Some(m) if m.eq_ignore_ascii_case("slice") => AspectMode::Slice,
+        _ => AspectMode::Meet,
+    };
+    PreserveAspectRatio {
+        align_x,
+        align_y,
+        mode,
+    }
+}
+
+/// The `preserveAspectRatio` declared on an `<svg>` element (attribute
+/// lookup is case-insensitive), defaulting to `xMidYMid meet` per the spec.
+pub fn preserve_aspect_ratio_of(svg: &Element) -> PreserveAspectRatio {
+    svg.attr("preserveaspectratio")
+        .map(parse_preserve_aspect_ratio)
+        .unwrap_or_default()
+}
+
+/// Map a `vb_w × vb_h` viewBox into the viewport rect `(x, y, w, h)` under
+/// `par`. The painter stretches the viewBox onto whatever rect it is given,
+/// so honouring `preserveAspectRatio` is a matter of handing it the right
+/// **target rect**: `meet` shrinks and aligns it inside the viewport, `slice`
+/// grows it past the viewport (the `bool` says the caller must clip the draw
+/// to the original viewport), `none` keeps the plain stretch.
+pub fn place_viewport(
+    par: PreserveAspectRatio,
+    vb_w: f64,
+    vb_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> ((f64, f64, f64, f64), bool) {
+    if vb_w <= 0.0 || vb_h <= 0.0 || w <= 0.0 || h <= 0.0 || par.mode == AspectMode::Stretch {
+        return ((x, y, w, h), false);
+    }
+    let (sx, sy) = (w / vb_w, h / vb_h);
+    let s = match par.mode {
+        AspectMode::Slice => sx.max(sy),
+        _ => sx.min(sy),
+    };
+    let (dw, dh) = (vb_w * s, vb_h * s);
+    let dx = x + (w - dw) * par.align_x;
+    let dy = y + (h - dh) * par.align_y;
+    let overflows = dw > w + 1e-9 || dh > h + 1e-9;
+    ((dx, dy, dw, dh), par.mode == AspectMode::Slice && overflows)
 }
 
 /// Parse SVG markup. Returns `None` if there's no `<svg>` or it has no drawable
@@ -898,6 +1049,186 @@ fn anchor_of(e: &Element) -> Anchor {
     }
 }
 
+/// Flatten path segments into per-subpath polylines (cubics subdivided —
+/// step count from the control-polygon length, an arc-length upper bound —
+/// `Close` returns to the subpath start), in the segments' own coordinates.
+fn flatten_subpaths(segs: &[Seg]) -> Vec<Vec<(f64, f64)>> {
+    let dist = |a: (f64, f64), b: (f64, f64)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    let mut subs: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut cur: Vec<(f64, f64)> = Vec::new();
+    let mut start = (0.0, 0.0);
+    let mut pos = (0.0, 0.0);
+    for s in segs {
+        match *s {
+            Seg::Move(x, y) => {
+                if cur.len() > 1 {
+                    subs.push(std::mem::take(&mut cur));
+                } else {
+                    cur.clear();
+                }
+                pos = (x, y);
+                start = pos;
+                cur.push(pos);
+            }
+            Seg::Line(x, y) => {
+                if cur.is_empty() {
+                    cur.push(pos);
+                }
+                pos = (x, y);
+                cur.push(pos);
+            }
+            Seg::Cubic(x1, y1, x2, y2, x, y) => {
+                if cur.is_empty() {
+                    cur.push(pos);
+                }
+                let poly = dist(pos, (x1, y1)) + dist((x1, y1), (x2, y2)) + dist((x2, y2), (x, y));
+                let steps = ((poly / 2.0).ceil() as usize).clamp(8, 48);
+                let (p0x, p0y) = pos;
+                for k in 1..=steps {
+                    let t = k as f64 / steps as f64;
+                    let mt = 1.0 - t;
+                    let bx = mt * mt * mt * p0x
+                        + 3.0 * mt * mt * t * x1
+                        + 3.0 * mt * t * t * x2
+                        + t * t * t * x;
+                    let by = mt * mt * mt * p0y
+                        + 3.0 * mt * mt * t * y1
+                        + 3.0 * mt * t * t * y2
+                        + t * t * t * y;
+                    cur.push((bx, by));
+                }
+                pos = (x, y);
+            }
+            Seg::Close => {
+                if !cur.is_empty() {
+                    cur.push(start);
+                    subs.push(std::mem::take(&mut cur));
+                }
+                pos = start;
+            }
+        }
+    }
+    if cur.len() > 1 {
+        subs.push(cur);
+    }
+    subs
+}
+
+/// Cut flattened subpaths into the **on** runs of a dash pattern: each dash
+/// becomes a `Move` + `Line…` run. The pattern walks each subpath from
+/// `offset` (odd-length lists double up, negative offsets wrap — the SVG
+/// rules); `scale` converts the user-unit dash lengths into the (already
+/// CTM-baked) segment space. An all-zero pattern yields no output (the
+/// caller falls back to a solid stroke).
+fn dash_segs(subs: &[Vec<(f64, f64)>], dash: &DashSpec, scale: f64) -> Vec<Seg> {
+    let n = dash.len as usize;
+    let mut pat: Vec<f64> = dash.pat[..n].iter().map(|d| d * scale).collect();
+    if n % 2 == 1 {
+        let dup = pat.clone();
+        pat.extend(dup);
+    }
+    let total: f64 = pat.iter().sum();
+    if total <= 1e-9 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for sub in subs {
+        // Phase the cycle by the offset (wrapped into [0, total)).
+        let mut phase = (dash.offset * scale) % total;
+        if phase < 0.0 {
+            phase += total;
+        }
+        let mut idx = 0usize;
+        let mut rem = pat[0];
+        let mut on = true;
+        while phase > 0.0 {
+            if phase >= rem {
+                phase -= rem;
+                idx = (idx + 1) % pat.len();
+                rem = pat[idx];
+                on = !on;
+            } else {
+                rem -= phase;
+                phase = 0.0;
+            }
+        }
+        let mut pen_down = false;
+        for win in sub.windows(2) {
+            let (x0, y0) = win[0];
+            let (x1, y1) = win[1];
+            let seg_len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+            if seg_len <= 1e-12 {
+                continue;
+            }
+            let (ux, uy) = ((x1 - x0) / seg_len, (y1 - y0) / seg_len);
+            let mut t = 0.0;
+            while t < seg_len - 1e-9 {
+                let step = rem.min(seg_len - t);
+                if on {
+                    if !pen_down {
+                        out.push(Seg::Move(x0 + ux * t, y0 + uy * t));
+                        pen_down = true;
+                    }
+                    out.push(Seg::Line(x0 + ux * (t + step), y0 + uy * (t + step)));
+                }
+                t += step;
+                rem -= step;
+                if rem <= 1e-9 {
+                    // Advance the cycle, skipping zero-length entries (the
+                    // positive `total` guarantees this terminates).
+                    loop {
+                        idx = (idx + 1) % pat.len();
+                        rem = pat[idx];
+                        on = !on;
+                        if !on {
+                            pen_down = false;
+                        }
+                        if rem > 1e-9 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Push the stroke prim for `segs`: pre-cut into dash runs when a
+/// `stroke-dasharray` is active (the PDF emitter draws prim geometry as-is,
+/// with no dash state), else the plain outline.
+#[allow(clippy::too_many_arguments)]
+fn push_stroke(
+    out: &mut Vec<Prim>,
+    segs: &[Seg],
+    stroke: Rgb,
+    stroke_w: f64,
+    fill_opacity: f64,
+    stroke_opacity: f64,
+    dash: Option<DashSpec>,
+    scale: f64,
+) {
+    let final_segs = match dash {
+        Some(d) => {
+            let cut = dash_segs(&flatten_subpaths(segs), &d, scale);
+            if cut.is_empty() {
+                segs.to_vec()
+            } else {
+                cut
+            }
+        }
+        None => segs.to_vec(),
+    };
+    out.push(Prim {
+        segs: final_segs,
+        fill: None,
+        stroke: Some(stroke),
+        stroke_w,
+        fill_opacity,
+        stroke_opacity,
+    });
+}
+
 /// Bake the transform into the segments and record the primitive (skipping the
 /// invisible: empty geometry, or no fill and no stroke). `fill_url` is a paint
 /// server id from `fill="url(#id)"`, resolved against `grads` (gradients) or
@@ -933,14 +1264,16 @@ fn push(
             if let Some(tiles) = tiled {
                 out.extend(tiles);
                 if let Some(stroke) = paint.stroke {
-                    out.push(Prim {
-                        segs,
-                        fill: None,
-                        stroke: Some(stroke),
-                        stroke_w: paint.stroke_w * ctm.scale_hint(),
-                        fill_opacity: paint.fill_opacity,
-                        stroke_opacity: paint.stroke_opacity,
-                    });
+                    push_stroke(
+                        out,
+                        &segs,
+                        stroke,
+                        paint.stroke_w * ctm.scale_hint(),
+                        paint.fill_opacity,
+                        paint.stroke_opacity,
+                        paint.dash,
+                        ctm.scale_hint(),
+                    );
                 }
                 return;
             }
@@ -955,6 +1288,31 @@ fn push(
         None => paint.fill.map(Fill::Solid),
     };
     if fill.is_none() && paint.stroke.is_none() {
+        return;
+    }
+    // A dashed stroke is emitted as its own prim whose geometry is pre-cut
+    // into the pattern's ON runs; the fill (if any) keeps the full outline.
+    if let (Some(stroke), Some(dash)) = (paint.stroke, paint.dash) {
+        if fill.is_some() {
+            out.push(Prim {
+                segs: segs.clone(),
+                fill,
+                stroke: None,
+                stroke_w: 0.0,
+                fill_opacity: paint.fill_opacity,
+                stroke_opacity: paint.stroke_opacity,
+            });
+        }
+        push_stroke(
+            out,
+            &segs,
+            stroke,
+            paint.stroke_w * ctm.scale_hint(),
+            paint.fill_opacity,
+            paint.stroke_opacity,
+            Some(dash),
+            ctm.scale_hint(),
+        );
         return;
     }
     out.push(Prim {
@@ -1122,6 +1480,14 @@ fn inherit_paint(e: &Element, mut p: Paint) -> Paint {
     if let Some(w) = e.attr("stroke-width").and_then(parse_len) {
         p.stroke_w = w;
     }
+    if let Some(v) = e.attr("stroke-dasharray") {
+        p.dash = parse_dasharray(v);
+    }
+    if let Some(o) = e.attr("stroke-dashoffset").and_then(parse_len) {
+        if let Some(d) = &mut p.dash {
+            d.offset = o;
+        }
+    }
     if let Some(o) = e.attr("opacity").and_then(parse_f64) {
         p.fill_opacity *= o.clamp(0.0, 1.0);
         p.stroke_opacity *= o.clamp(0.0, 1.0);
@@ -1141,6 +1507,14 @@ fn inherit_paint(e: &Element, mut p: Paint) -> Paint {
                 "stroke-width" => {
                     if let Some(w) = parse_len(&v) {
                         p.stroke_w = w;
+                    }
+                }
+                "stroke-dasharray" => p.dash = parse_dasharray(&v),
+                "stroke-dashoffset" => {
+                    if let Some(o) = parse_len(&v) {
+                        if let Some(d) = &mut p.dash {
+                            d.offset = o;
+                        }
                     }
                 }
                 "opacity" => {
@@ -2141,6 +2515,26 @@ pub fn parse_data_uri(src: &str) -> Option<SvgImage> {
     parse_svg(&markup)
 }
 
+/// [`parse_data_uri`] plus the `<svg>`'s `preserveAspectRatio` (needed by the
+/// HTML layout to place the image into its CSS box without distortion).
+pub(crate) fn parse_data_uri_with_aspect(src: &str) -> Option<(SvgImage, PreserveAspectRatio)> {
+    let rest = src.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = rest[..comma].to_ascii_lowercase();
+    if !meta.contains("svg") {
+        return None;
+    }
+    let data = &rest[comma + 1..];
+    let markup = if meta.contains("base64") {
+        String::from_utf8(base64_decode(data)?).ok()?
+    } else {
+        percent_decode(data)
+    };
+    let nodes = dom::parse(&markup);
+    let el = find_svg(&nodes)?;
+    Some((from_element(el)?, preserve_aspect_ratio_of(el)))
+}
+
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -3033,5 +3427,133 @@ mod tests {
         assert_eq!(font_size_of(texts[1], 12.0), 10.0);
         assert!(matches!(anchor_of(texts[2]), Anchor::Start));
         assert_eq!(font_size_of(texts[2], 12.0), 12.0, "inherited fallback");
+    }
+
+    // ── preserveAspectRatio ──
+
+    #[test]
+    fn preserve_aspect_ratio_meet_centres_without_distortion() {
+        // A 100×100 viewBox into a 200×100 viewport under the default
+        // xMidYMid meet: uniform scale 1, centred horizontally, no clip.
+        let par = PreserveAspectRatio::default();
+        let ((dx, dy, dw, dh), clip) = place_viewport(par, 100.0, 100.0, 0.0, 0.0, 200.0, 100.0);
+        assert!(!clip, "meet never clips");
+        assert!(
+            (dw - 100.0).abs() < 1e-9 && (dh - 100.0).abs() < 1e-9,
+            "undistorted square ({dw}×{dh})"
+        );
+        assert!(
+            (dx - 50.0).abs() < 1e-9 && dy.abs() < 1e-9,
+            "centred ({dx},{dy})"
+        );
+    }
+
+    #[test]
+    fn preserve_aspect_ratio_slice_covers_and_flags_the_clip() {
+        let par = parse_preserve_aspect_ratio("xMidYMid slice");
+        let ((_, dy, dw, dh), clip) = place_viewport(par, 100.0, 100.0, 0.0, 0.0, 200.0, 100.0);
+        assert!(clip, "slice overflow must be clipped");
+        assert!(
+            (dw - 200.0).abs() < 1e-9 && (dh - 200.0).abs() < 1e-9,
+            "covers the viewport ({dw}×{dh})"
+        );
+        assert!((dy + 50.0).abs() < 1e-9, "overflow centred vertically ({dy})");
+        // Alignment variants pin the corresponding edge.
+        let pinned = parse_preserve_aspect_ratio("xMinYMin slice");
+        let ((px, py, ..), _) = place_viewport(pinned, 100.0, 100.0, 0.0, 0.0, 200.0, 100.0);
+        assert!(px.abs() < 1e-9 && py.abs() < 1e-9, "xMinYMin pins top-left");
+        let maxed = parse_preserve_aspect_ratio("xMaxYMax meet");
+        let ((mx, ..), _) = place_viewport(maxed, 100.0, 100.0, 0.0, 0.0, 200.0, 100.0);
+        assert!((mx - 100.0).abs() < 1e-9, "xMax pins the right edge ({mx})");
+        // `none` stretches with no clip.
+        let none = parse_preserve_aspect_ratio("none");
+        let ((_, _, nw, nh), nclip) = place_viewport(none, 100.0, 100.0, 0.0, 0.0, 200.0, 100.0);
+        assert!(
+            !nclip && (nw - 200.0).abs() < 1e-9 && (nh - 100.0).abs() < 1e-9,
+            "none = plain stretch ({nw}×{nh})"
+        );
+    }
+
+    // ── stroke-dasharray ──
+
+    #[test]
+    fn stroke_dasharray_cuts_a_line_into_the_expected_dashes() {
+        // A 100-long line with `10 10`: ON runs at 0/20/40/60/80 ⇒ 5 dashes,
+        // each dash a Move + Line run in the stroke prim.
+        let svg = r##"<svg viewBox="0 0 100 10"><line x1="0" y1="5" x2="100" y2="5" stroke="#000000" stroke-dasharray="10 10"/></svg>"##;
+        let img = parse_svg(svg).expect("parsed");
+        let stroke = img
+            .prims
+            .iter()
+            .find(|p| p.stroke.is_some())
+            .expect("a stroke prim");
+        let moves = stroke
+            .segs
+            .iter()
+            .filter(|s| matches!(s, Seg::Move(..)))
+            .count();
+        assert_eq!(moves, 5, "10-on/10-off over 100 units ⇒ 5 dashes");
+        // `stroke-dashoffset` shifts the phase: offset 10 starts OFF, so the
+        // ON runs move to 10/30/50/70/90 — still 5, but starting at x=10.
+        let shifted = r##"<svg viewBox="0 0 100 10"><line x1="0" y1="5" x2="100" y2="5" stroke="#000000" stroke-dasharray="10 10" stroke-dashoffset="-10"/></svg>"##;
+        let simg = parse_svg(shifted).expect("parsed");
+        let sprim = simg
+            .prims
+            .iter()
+            .find(|p| p.stroke.is_some())
+            .expect("stroke prim");
+        let first_move = sprim
+            .segs
+            .iter()
+            .find_map(|s| match s {
+                Seg::Move(x, _) => Some(*x),
+                _ => None,
+            })
+            .expect("a dash start");
+        assert!(
+            (first_move - 10.0).abs() < 1e-6,
+            "dashoffset phases the pattern (first dash at {first_move})"
+        );
+    }
+
+    #[test]
+    fn stroke_dasharray_on_a_circle_keeps_fill_and_dashes_the_outline() {
+        // Circumference 2π·40 ≈ 251.3; a 20/20 cycle ⇒ 6 full cycles + a
+        // partial seventh ⇒ 6–7 dash starts. The fill stays one solid prim.
+        let svg = r##"<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="#eeeeee" stroke="#000000" stroke-dasharray="20 20"/></svg>"##;
+        let img = parse_svg(svg).expect("parsed");
+        assert!(
+            img.prims
+                .iter()
+                .any(|p| p.fill.is_some() && p.stroke.is_none()),
+            "the fill keeps its own full-outline prim"
+        );
+        let dash = img
+            .prims
+            .iter()
+            .find(|p| p.stroke.is_some())
+            .expect("dashed stroke prim");
+        let moves = dash
+            .segs
+            .iter()
+            .filter(|s| matches!(s, Seg::Move(..)))
+            .count();
+        assert!(
+            (6..=7).contains(&moves),
+            "≈251.3 / (20+20) ⇒ 6–7 dashes, got {moves}"
+        );
+        // Solid strokes are untouched: no dasharray ⇒ single combined prim.
+        let solid = r##"<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="#eeeeee" stroke="#000000"/></svg>"##;
+        let simg = parse_svg(solid).expect("parsed");
+        assert_eq!(simg.prims.len(), 1, "no dash ⇒ one combined fill+stroke prim");
+        // `stroke-dasharray: none` and an all-zero list disable dashing too.
+        let none = r##"<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" stroke="#000000" fill="none" stroke-dasharray="none"/></svg>"##;
+        let nimg = parse_svg(none).expect("parsed");
+        let nmoves = nimg.prims[0]
+            .segs
+            .iter()
+            .filter(|s| matches!(s, Seg::Move(..)))
+            .count();
+        assert_eq!(nmoves, 1, "dasharray:none keeps the solid outline");
     }
 }

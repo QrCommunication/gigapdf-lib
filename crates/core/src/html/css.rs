@@ -112,6 +112,50 @@ pub enum VShift {
     /// to points (positive = raise the run, matching CSS). Percentages resolve
     /// against the element's own font-size at parse time.
     Points(f64),
+    /// `top` / `text-top` — the run's top hugs the line box top. Resolved to a
+    /// point offset at line-assembly time (the line height isn't known during
+    /// the cascade), so `Style::valign_shift` stays `0.0` for it.
+    Top,
+    /// `middle` — the run is centred within the line box (resolved at line
+    /// assembly, like [`VShift::Top`]).
+    Middle,
+    /// `bottom` / `text-bottom` — the run's bottom hugs the line box bottom
+    /// (resolved at line assembly).
+    Bottom,
+}
+
+/// CSS `white-space` — how whitespace collapses and where lines may break.
+/// The legacy [`Style::pre`] flag stays in lock-step (`Pre`/`PreWrap` ⇒ `pre`)
+/// so every existing consumer of `pre` behaves exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WhiteSpace {
+    /// `normal` (the default) — collapse whitespace, wrap freely.
+    #[default]
+    Normal,
+    /// `nowrap` — collapse whitespace, never wrap.
+    Nowrap,
+    /// `pre` — preserve whitespace and newlines, never wrap.
+    Pre,
+    /// `pre-wrap` — preserve whitespace and newlines, but wrap when needed.
+    PreWrap,
+    /// `pre-line` — collapse runs of spaces but preserve newlines; wraps.
+    PreLine,
+}
+
+/// CSS `object-fit` — how an `<img>`'s pixels map into its layout box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObjectFit {
+    /// `fill` (the default) — stretch to the box, ignoring the aspect ratio.
+    #[default]
+    Fill,
+    /// `contain` — largest scaled size that fits inside the box (letterboxed).
+    Contain,
+    /// `cover` — smallest scaled size that covers the box (clipped).
+    Cover,
+    /// `none` — intrinsic size, centred, clipped to the box.
+    None,
+    /// `scale-down` — the smaller of `none` and `contain`.
+    ScaleDown,
 }
 
 /// CSS `position`.
@@ -136,6 +180,24 @@ pub enum Position {
     /// limitation — true scroll-sticky behaviour is not modelled). Still
     /// occupies its normal space.
     Sticky,
+}
+
+/// CSS `writing-mode`. The vertical modes are supported at a pragmatic first
+/// level: the block's content is laid out **horizontally**, then the whole
+/// subtree is rotated 90° (clockwise for `vertical-rl`, counter-clockwise for
+/// `vertical-lr`) with the box's width/height swapped — the "rotated label"
+/// approximation that matches the real-world uses (table headers, spine
+/// labels). True vertical CJK line layout (upright glyphs, vertical metrics,
+/// line stacking) is out of scope and documented as such.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WritingMode {
+    /// `horizontal-tb` — normal horizontal layout (the default).
+    #[default]
+    HorizontalTb,
+    /// `vertical-rl` — rendered as the horizontal layout rotated 90° clockwise.
+    VerticalRl,
+    /// `vertical-lr` — rendered rotated 90° counter-clockwise.
+    VerticalLr,
 }
 
 /// CSS `align-items` / `align-self` cross-axis alignment (basic flex).
@@ -301,12 +363,18 @@ pub enum CssGradient {
     Conic(ConicGradient),
 }
 
-/// One gradient colour stop: an RGB colour and an optional position
-/// (`0.0..=1.0`, `None` = auto-placed). Shared by linear / radial / conic.
+/// One gradient colour stop: an RGB colour, an optional position
+/// (`0.0..=1.0`, `None` = auto-placed) and the stop's own opacity. Shared by
+/// linear / radial / conic.
 #[derive(Debug, Clone, Copy)]
 pub struct GradientStop {
     pub color: [f64; 3],
     pub pos: Option<f64>,
+    /// Stop opacity, `0..=1`. `1.0` for plain colours; a `transparent` stop is
+    /// **kept** with `0.0` (its colour borrowed from the nearest opaque
+    /// neighbour so the ramp fades out in place rather than towards black),
+    /// and an `rgba()`/`#rgba` stop carries its own alpha.
+    pub alpha: f64,
 }
 
 /// A fully-resolved computed style for one element.
@@ -470,6 +538,12 @@ pub struct Style {
     pub inset: [Option<Len>; 4],
     /// `z-index` paint order (higher paints later/on top). 0 by default.
     pub z_index: i32,
+    /// `writing-mode` — vertical blocks render as a horizontal layout rotated
+    /// ±90° (the pragmatic "rotated label" model; see the layout note). Kept
+    /// **non-inherited** here (a deliberate deviation from CSS, which inherits
+    /// it) so exactly the declaring block rotates — descendants would
+    /// otherwise double-rotate under the rotation approximation.
+    pub writing_mode: WritingMode,
     /// `overflow: hidden|clip|scroll|auto` — clip descendants to this box.
     pub overflow_clip: bool,
     /// `display: flow-root` — establish a new block formatting context (so
@@ -549,6 +623,60 @@ pub struct Style {
     /// the origin = box centre and the page Y-flip). `None` = no transform. Not
     /// inherited.
     pub transform: Option<[f64; 6]>,
+    /// `white-space` (inherited). The legacy [`Style::pre`] flag is kept in
+    /// lock-step (`Pre`/`PreWrap` ⇒ `pre = true`) for existing consumers.
+    pub white_space: WhiteSpace,
+    /// `overflow-wrap: break-word|anywhere` / `word-break: break-all|break-word`
+    /// — an over-long word may be broken mid-word to fit the line. Inherited.
+    pub break_word: bool,
+    /// `text-overflow: ellipsis` — with `white-space: nowrap` + `overflow:
+    /// hidden`, an over-long line is truncated with `…`. Not inherited.
+    pub text_overflow_ellipsis: bool,
+    /// `object-fit` on a replaced element (`<img>`). Not inherited.
+    pub object_fit: ObjectFit,
+    /// `max-height` — clamps the used box height in points (content overflows,
+    /// visible by default). Not inherited.
+    pub max_height: Option<f64>,
+    /// The **full** `font-family` fallback list, in source order (names
+    /// de-quoted, generic keywords included). [`Style::font_family`] stays the
+    /// first entry for compatibility; the font resolver walks this list and uses
+    /// the first family it actually has. Empty when no `font-family` was ever
+    /// declared. Inherited.
+    pub font_families: Vec<String>,
+    /// CSS custom properties (`--name: value`) in scope for this element —
+    /// the parent's map plus this element's own declarations (which win).
+    /// `var(--name[, fallback])` substitution reads from here. Inherited.
+    pub custom_props: std::collections::BTreeMap<String, String>,
+    /// The element's **own** `opacity` declaration (the last one to cascade),
+    /// before composition with the inherited (ancestor-effective) opacity.
+    /// `None` when the element declares no opacity. [`Stylesheet::computed`]
+    /// folds it multiplicatively into [`Style::opacity`] once per element, so
+    /// `opacity: 0.5` under an `opacity: 0.5` parent is 0.25 effective — not
+    /// 0.5 overwriting the parent. Not inherited (each element composes anew).
+    pub own_opacity: Option<f64>,
+    /// `counter-reset` pairs (name, start value). Consumed by the generated
+    ///-content pass (`::before`/`::after` counters). Not inherited.
+    pub counter_reset: Vec<(String, i64)>,
+    /// `counter-increment` pairs (name, delta). Not inherited.
+    pub counter_increment: Vec<(String, i64)>,
+    /// `transform-origin` as `(x, y)` — each axis a length (points from the
+    /// box's top-left) or a percentage of the border-box dimension (keywords
+    /// map to 0% / 50% / 100%). `None` = the initial `50% 50%` (box centre),
+    /// which is exactly the previous hard-coded pivot. Not inherited.
+    pub transform_origin: Option<(Len, Len)>,
+    /// `caption-side` — where a `<table>`'s `<caption>` box renders. Inherited
+    /// (set once on the table, reaching the caption element itself).
+    pub caption_side: CaptionSide,
+}
+
+/// CSS `caption-side` — table-caption placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptionSide {
+    /// `top` (the default) — the caption box renders above the table grid.
+    #[default]
+    Top,
+    /// `bottom` — the caption box renders below the grid.
+    Bottom,
 }
 
 /// CSS `float` side.
@@ -722,6 +850,7 @@ impl Default for Style {
             position: Position::Static,
             inset: [None; 4],
             z_index: 0,
+            writing_mode: WritingMode::HorizontalTb,
             overflow_clip: false,
             establishes_bfc: false,
             flex_wrap: false,
@@ -746,15 +875,44 @@ impl Default for Style {
             box_shadow_extra: Vec::new(),
             text_shadows: Vec::new(),
             transform: None,
+            white_space: WhiteSpace::Normal,
+            break_word: false,
+            text_overflow_ellipsis: false,
+            object_fit: ObjectFit::Fill,
+            max_height: None,
+            font_families: Vec::new(),
+            custom_props: std::collections::BTreeMap::new(),
+            own_opacity: None,
+            counter_reset: Vec::new(),
+            counter_increment: Vec::new(),
+            transform_origin: None,
+            caption_side: CaptionSide::Top,
         }
     }
 }
 
-/// A CSS length: absolute points or a percentage of the container.
+/// A CSS length: absolute points, a percentage of the container, or a mixed
+/// `calc()` linear form of both.
 #[derive(Debug, Clone, Copy)]
 pub enum Len {
     Pt(f64),
     Percent(f64),
+    /// `calc()` mixing absolute and percent terms: resolves to
+    /// `pt + (pct/100)·base` against the same base the `Percent` arm uses.
+    Calc { pt: f64, pct: f64 },
+}
+
+impl Len {
+    /// Resolve against the containing dimension `base` (what a bare `%` would
+    /// be a fraction of).
+    #[inline]
+    pub fn resolve(self, base: f64) -> f64 {
+        match self {
+            Len::Pt(p) => p,
+            Len::Percent(pc) => base * pc / 100.0,
+            Len::Calc { pt, pct } => pt + base * pct / 100.0,
+        }
+    }
 }
 
 /// A single `grid-template-columns` / `grid-template-rows` track sizing.
@@ -793,8 +951,15 @@ pub struct GridAreaRect {
 
 // ─── selectors ──────────────────────────────────────────────────────────────
 
+/// Tag of the synthetic elements materialising `::before`/`::after` generated
+/// content (see [`apply_pseudo_elements`]). Chosen so no author selector ever
+/// matches it, and filtered out of structural pseudo-class sibling counts so
+/// injecting a `::before` never shifts a real child's `:first-child`/
+/// `:nth-child` position.
+pub(crate) const PSEUDO_ELEMENT_TAG: &str = "gp-pseudo";
+
 /// An `[attr]` / `[attr=val]` attribute condition on a compound selector.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct AttrCond {
     name: String,
     /// `Some(v)` for `[attr=v]`/`[attr^=v]`/… ; `None` for bare `[attr]`
@@ -822,26 +987,32 @@ enum AttrOp {
     DashPrefix,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Compound {
     tag: Option<String>,
     classes: Vec<String>,
     id: Option<String>,
     /// `[attr]` / `[attr=val]` conditions (all must hold).
     attrs: Vec<AttrCond>,
-    /// Structural pseudo-classes (`:first-child`, `:nth-child(…)`, …) — all must
-    /// hold. Dynamic / unrecognised pseudo-classes (`:hover`, …) are not stored,
-    /// so they keep over-matching (the rule still applies) as before.
+    /// Structural pseudo-classes (`:first-child`, `:nth-child(…)`, `:not(…)`,
+    /// …) — all must hold. Dynamic pseudo-classes that can never apply on
+    /// static paged output (`:hover`, `:focus`, …) and unrecognised ones are
+    /// stored as [`PseudoClass::Unsupported`], which never matches — the rule
+    /// is inert instead of over-matching every element.
     pseudo: Vec<PseudoClass>,
     /// `true` if the compound carries a pseudo-**element** (`::before`/`::after`).
-    /// We don't generate pseudo-elements, so such a compound never matches a real
-    /// element (rather than wrongly styling the element itself).
+    /// Such a compound never matches a real element (rather than wrongly styling
+    /// the element itself); `::before`/`::after` rules with `content` are instead
+    /// materialised as generated children by [`apply_pseudo_elements`].
     pseudo_element: bool,
+    /// The pseudo-element's name (`before`, `after`, `first-line`, …), captured
+    /// so the generated-content pass can find `::before`/`::after` rules. The
+    /// legacy single-colon spellings (`:before`/`:after`) land here too.
+    pseudo_element_name: Option<String>,
 }
 
 /// A structural pseudo-class we can evaluate against the DOM tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)] // names mirror the CSS `:*-child` pseudo-classes
+#[derive(Debug, Clone, PartialEq)]
 enum PseudoClass {
     FirstChild,
     LastChild,
@@ -851,6 +1022,35 @@ enum PseudoClass {
         a: i32,
         b: i32,
     },
+    /// `nth-last-child(an + b)`, 1-based counting from the LAST sibling.
+    NthLastChild {
+        a: i32,
+        b: i32,
+    },
+    /// `nth-of-type(an + b)`, 1-based among same-tag siblings.
+    NthOfType {
+        a: i32,
+        b: i32,
+    },
+    FirstOfType,
+    LastOfType,
+    OnlyOfType,
+    /// `:root` — the document root element (no parent).
+    Root,
+    /// `:empty` — no element children and no non-empty text.
+    Empty,
+    /// `:link` / `:any-link` — an `<a>`/`<area>` with an `href`. On static
+    /// print output every link is unvisited, so both behave alike.
+    AnyLink,
+    /// `:not(<compound list>)` — matches when NONE of the inner compounds
+    /// match. An inner compound carrying an [`PseudoClass::Unsupported`] (or a
+    /// pseudo-element) makes the whole selector inert — never "not(false) ⇒
+    /// true" over-matching on a constraint we can't evaluate.
+    Not(Vec<Compound>),
+    /// A dynamic or unrecognised pseudo-class (`:hover`, `:focus`, vendor
+    /// extensions, malformed arguments). Never matches, per CSS's
+    /// invalid-selector handling — the rule is inert instead of over-applied.
+    Unsupported,
 }
 
 /// How a compound relates to the one before it in the selector chain.
@@ -879,7 +1079,13 @@ struct Selector {
 #[derive(Debug, Clone)]
 struct Rule {
     selectors: Vec<Selector>,
+    /// Normal (non-`!important`) declarations, values already stripped of any
+    /// importance suffix.
     decls: Vec<(String, String)>,
+    /// `!important` declarations (suffix stripped). Applied in a second cascade
+    /// pass so they win over every later/higher-specificity normal declaration
+    /// and over a normal inline `style="…"`, per the CSS cascade origins.
+    important: Vec<(String, String)>,
     order: usize,
 }
 
@@ -962,7 +1168,8 @@ fn parse_compound(s: &str) -> Compound {
             b':' => {
                 i += 1;
                 // `::name` is a pseudo-element — flag it and skip the name.
-                if i < bytes.len() && bytes[i] == b':' {
+                let double_colon = i < bytes.len() && bytes[i] == b':';
+                if double_colon {
                     i += 1;
                     c.pseudo_element = true;
                 }
@@ -971,26 +1178,45 @@ fn parse_compound(s: &str) -> Compound {
                     i += 1;
                 }
                 let name = s[start..i].to_ascii_lowercase();
-                // Optional functional `(arg)`, e.g. `nth-child(2n + 1)`.
+                // Optional functional `(arg)`, e.g. `nth-child(2n + 1)`. Parens
+                // are balanced so `:not(:nth-child(2))` captures its full arg.
                 let mut arg = "";
                 if i < bytes.len() && bytes[i] == b'(' {
                     i += 1;
                     let astart = i;
-                    while i < bytes.len() && bytes[i] != b')' {
+                    let mut depth = 1usize;
+                    while i < bytes.len() {
+                        match bytes[i] {
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
                         i += 1;
                     }
-                    arg = &s[astart..i];
+                    arg = &s[astart..i.min(bytes.len())];
                     if i < bytes.len() {
                         i += 1; // consume ')'
                     }
                 }
-                // Pseudo-elements never match a real element. Structural
-                // pseudo-classes are recorded; dynamic / unknown ones (`:hover`)
-                // are ignored, so the rule keeps over-matching as before.
+                // The legacy single-colon spellings of the CSS 2.1 pseudo-
+                // elements (`:before`, `:after`, …) are pseudo-elements too.
+                if !double_colon && is_pseudo_element_name(&name) {
+                    c.pseudo_element = true;
+                }
+                if c.pseudo_element && c.pseudo_element_name.is_none() {
+                    c.pseudo_element_name = Some(name.clone());
+                }
+                // Pseudo-elements never match a real element; pseudo-classes
+                // are recorded — including `Unsupported` for the dynamic /
+                // unknown ones, which makes the rule inert instead of letting
+                // it over-match every element.
                 if !c.pseudo_element {
-                    if let Some(p) = parse_pseudo_class(&name, arg) {
-                        c.pseudo.push(p);
-                    }
+                    c.pseudo.push(parse_pseudo_class(&name, arg));
                 }
             }
             _ => i += 1,
@@ -999,16 +1225,65 @@ fn parse_compound(s: &str) -> Compound {
     c
 }
 
-/// Map a structural pseudo-class name (+ functional argument) to a [`PseudoClass`].
-/// Returns `None` for dynamic or unrecognised pseudo-classes (`:hover`, `:focus`,
-/// `:not(…)`, …) so callers leave them as over-matches.
-fn parse_pseudo_class(name: &str, arg: &str) -> Option<PseudoClass> {
+/// The CSS 2.1 pseudo-element names that are also valid with a single colon
+/// (`:before` ≡ `::before`), plus the modern ones documents write.
+fn is_pseudo_element_name(name: &str) -> bool {
+    matches!(
+        name,
+        "before"
+            | "after"
+            | "first-line"
+            | "first-letter"
+            | "marker"
+            | "placeholder"
+            | "selection"
+            | "backdrop"
+    )
+}
+
+/// Map a pseudo-class name (+ functional argument) to a [`PseudoClass`].
+/// Structural classes are evaluated against the tree; everything dynamic or
+/// unrecognised — `:hover`, vendor extensions, a malformed `nth-*` argument —
+/// becomes [`PseudoClass::Unsupported`], which never matches (the selector is
+/// inert, per CSS invalid-selector handling, instead of over-matching).
+fn parse_pseudo_class(name: &str, arg: &str) -> PseudoClass {
+    let nth = |arg: &str, mk: fn(i32, i32) -> PseudoClass| {
+        parse_nth(arg)
+            .map(|(a, b)| mk(a, b))
+            .unwrap_or(PseudoClass::Unsupported)
+    };
     match name {
-        "first-child" => Some(PseudoClass::FirstChild),
-        "last-child" => Some(PseudoClass::LastChild),
-        "only-child" => Some(PseudoClass::OnlyChild),
-        "nth-child" => parse_nth(arg).map(|(a, b)| PseudoClass::NthChild { a, b }),
-        _ => None,
+        "first-child" => PseudoClass::FirstChild,
+        "last-child" => PseudoClass::LastChild,
+        "only-child" => PseudoClass::OnlyChild,
+        "nth-child" => nth(arg, |a, b| PseudoClass::NthChild { a, b }),
+        "nth-last-child" => nth(arg, |a, b| PseudoClass::NthLastChild { a, b }),
+        "nth-of-type" => nth(arg, |a, b| PseudoClass::NthOfType { a, b }),
+        "nth-last-of-type" => PseudoClass::Unsupported,
+        "first-of-type" => PseudoClass::FirstOfType,
+        "last-of-type" => PseudoClass::LastOfType,
+        "only-of-type" => PseudoClass::OnlyOfType,
+        "root" => PseudoClass::Root,
+        "empty" => PseudoClass::Empty,
+        "link" | "any-link" => PseudoClass::AnyLink,
+        // `:not(<list>)`: parse each comma component as a compound. An inner
+        // pseudo-element or an empty list can't be evaluated → Unsupported.
+        "not" => {
+            let inner: Vec<Compound> = arg
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(parse_compound)
+                .collect();
+            if inner.is_empty() || inner.iter().any(|c| c.pseudo_element) {
+                PseudoClass::Unsupported
+            } else {
+                PseudoClass::Not(inner)
+            }
+        }
+        // `:is()`/`:where()` with a single compound could be supported later;
+        // for now they (and everything else) are unsupported → inert.
+        _ => PseudoClass::Unsupported,
     }
 }
 
@@ -1044,43 +1319,112 @@ fn parse_nth(arg: &str) -> Option<(i32, i32)> {
 }
 
 /// Does `el` satisfy a compound's pseudo constraints? A pseudo-element compound
-/// never matches a real element; structural pseudo-classes are evaluated against
-/// `el`'s position among its parent's element children. With no parent (the root)
-/// the structural tests pass, so a rule is never dropped on a top-level element.
+/// never matches a real element; pseudo-classes are evaluated against the tree
+/// (see [`pseudo_classes_ok`]).
 fn pseudo_ok(compound: &Compound, el: &Element, parent: Option<&Element>) -> bool {
     if compound.pseudo_element {
         return false;
     }
-    if compound.pseudo.is_empty() {
-        return true;
-    }
-    let Some(parent) = parent else { return true };
-    let siblings: Vec<&Element> = parent
-        .children
+    pseudo_classes_ok(compound, el, parent)
+}
+
+/// [`pseudo_ok`] without the pseudo-element bail — shared with the generated-
+/// content pass, which matches an `x::before` selector against the real `x`.
+/// Structural pseudo-classes are evaluated against `el`'s position among its
+/// parent's element children; positional tests with no parent (a top-level
+/// element) keep passing, so a rule is never dropped on the root.
+fn pseudo_classes_ok(compound: &Compound, el: &Element, parent: Option<&Element>) -> bool {
+    compound
+        .pseudo
         .iter()
-        .filter_map(|c| match c {
-            Node::Element(e) => Some(e),
-            _ => None,
-        })
-        .collect();
-    let count = siblings.len();
-    let Some(pos) = siblings.iter().position(|e| std::ptr::eq(*e, el)) else {
-        return true; // `el` not found under `parent` — don't drop the rule
+        .all(|p| pseudo_class_matches(p, el, parent))
+}
+
+/// Evaluate one pseudo-class against `el` (with its `parent`, when known).
+fn pseudo_class_matches(p: &PseudoClass, el: &Element, parent: Option<&Element>) -> bool {
+    // `an + b` membership for a 1-based index.
+    let nth = |a: i32, b: i32, idx: i32| {
+        if a == 0 {
+            idx == b
+        } else {
+            let diff = idx - b;
+            diff % a == 0 && diff / a >= 0
+        }
     };
-    let idx = (pos + 1) as i32; // 1-based
-    compound.pseudo.iter().all(|p| match p {
-        PseudoClass::FirstChild => idx == 1,
-        PseudoClass::LastChild => idx as usize == count,
-        PseudoClass::OnlyChild => count == 1,
-        PseudoClass::NthChild { a, b } => {
-            if *a == 0 {
-                idx == *b
-            } else {
-                let diff = idx - *b;
-                diff % *a == 0 && diff / *a >= 0
+    match p {
+        // Dynamic / unrecognised — never matches: the rule is inert.
+        PseudoClass::Unsupported => false,
+        PseudoClass::Root => parent.is_none(),
+        PseudoClass::Empty => el.children.iter().all(|c| match c {
+            Node::Element(_) => false,
+            Node::Text(t) => t.is_empty(),
+        }),
+        PseudoClass::AnyLink => {
+            matches!(el.tag.as_str(), "a" | "area") && el.attr("href").is_some()
+        }
+        PseudoClass::Not(list) => {
+            // A constraint we can't evaluate inside `:not(…)` must NOT flip
+            // into a match ("not(unknowable) ⇒ true" would over-apply the
+            // rule); the whole selector is inert instead.
+            if list
+                .iter()
+                .any(|c| c.pseudo.contains(&PseudoClass::Unsupported))
+            {
+                return false;
+            }
+            !list
+                .iter()
+                .any(|c| matches(c, el) && pseudo_classes_ok(c, el, parent))
+        }
+        // Positional tests need the sibling list.
+        _ => {
+            let Some(parent) = parent else { return true };
+            let siblings: Vec<&Element> = parent
+                .children
+                .iter()
+                .filter_map(|c| match c {
+                    // Generated `::before`/`::after` children are invisible to
+                    // structural pseudo-classes (they are not real siblings).
+                    Node::Element(e) if e.tag != PSEUDO_ELEMENT_TAG => Some(e),
+                    _ => None,
+                })
+                .collect();
+            let count = siblings.len() as i32;
+            let Some(pos) = siblings.iter().position(|e| std::ptr::eq(*e, el)) else {
+                return true; // `el` not found under `parent` — don't drop the rule
+            };
+            let idx = (pos + 1) as i32; // 1-based
+            match p {
+                PseudoClass::FirstChild => idx == 1,
+                PseudoClass::LastChild => idx == count,
+                PseudoClass::OnlyChild => count == 1,
+                PseudoClass::NthChild { a, b } => nth(*a, *b, idx),
+                PseudoClass::NthLastChild { a, b } => nth(*a, *b, count - idx + 1),
+                PseudoClass::NthOfType { .. }
+                | PseudoClass::FirstOfType
+                | PseudoClass::LastOfType
+                | PseudoClass::OnlyOfType => {
+                    // Position among same-tag siblings only.
+                    let typed: Vec<&&Element> =
+                        siblings.iter().filter(|e| e.tag == el.tag).collect();
+                    let tcount = typed.len() as i32;
+                    let Some(tpos) = typed.iter().position(|e| std::ptr::eq(**e, el)) else {
+                        return true;
+                    };
+                    let tidx = (tpos + 1) as i32;
+                    match p {
+                        PseudoClass::NthOfType { a, b } => nth(*a, *b, tidx),
+                        PseudoClass::FirstOfType => tidx == 1,
+                        PseudoClass::LastOfType => tidx == tcount,
+                        PseudoClass::OnlyOfType => tcount == 1,
+                        _ => unreachable!("outer match narrowed to of-type variants"),
+                    }
+                }
+                // Non-positional variants are fully handled above.
+                _ => unreachable!("non-positional pseudo-classes handled above"),
             }
         }
-    })
+    }
 }
 
 fn parse_selector(s: &str) -> Option<Selector> {
@@ -1262,9 +1606,11 @@ fn parse_rules_into(
         if selectors.is_empty() {
             continue;
         }
+        let (decls, important) = split_important(parse_decls_full(body));
         out.push(Rule {
             selectors,
-            decls: parse_decls(body),
+            decls,
+            important,
             order,
         });
         order += 1;
@@ -1468,6 +1814,98 @@ fn parse_font_face_weight(v: &str) -> u16 {
     }
 }
 
+/// Scan the author CSS for an `@page { … }` rule and reduce it to a
+/// [`PageRule`]. Page-selector variants (`@page :first`, `@page landscape`)
+/// are accepted; the **first** block wins per component (documents in the wild
+/// declare one). Returns `None` when the stylesheet has no `@page` at all, or
+/// none of its declarations resolve.
+pub(crate) fn collect_page_rule(css: &str) -> Option<PageRule> {
+    let css = strip_comments(css);
+    let mut rule = PageRule::default();
+    let mut found = false;
+    let mut rest = css.as_str();
+    while let Some(at) = rest.find("@page") {
+        // Require a word boundary so `@page-break-x` (hypothetical) is skipped.
+        let after_kw = &rest[at + "@page".len()..];
+        if after_kw
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && c != '{' && c != ':')
+        {
+            rest = after_kw;
+            continue;
+        }
+        let Some(open) = after_kw.find('{') else { break };
+        let Some((body, consumed)) = take_balanced_block(&after_kw[open + 1..]) else {
+            break;
+        };
+        for (k, v) in parse_decls(body) {
+            match k.as_str() {
+                "size" if rule.size.is_none() => rule.size = parse_page_size_value(&v),
+                "margin" => {
+                    let e = parse_edges(&v, ROOT_EM_PT);
+                    for (slot, side) in rule
+                        .margins
+                        .iter_mut()
+                        .zip([e.top, e.right, e.bottom, e.left])
+                    {
+                        slot.get_or_insert(side);
+                    }
+                }
+                "margin-top" => {
+                    rule.margins[0] = parse_len_px(&v, ROOT_EM_PT).or(rule.margins[0]);
+                }
+                "margin-right" => {
+                    rule.margins[1] = parse_len_px(&v, ROOT_EM_PT).or(rule.margins[1]);
+                }
+                "margin-bottom" => {
+                    rule.margins[2] = parse_len_px(&v, ROOT_EM_PT).or(rule.margins[2]);
+                }
+                "margin-left" => {
+                    rule.margins[3] = parse_len_px(&v, ROOT_EM_PT).or(rule.margins[3]);
+                }
+                _ => {}
+            }
+        }
+        found = true;
+        rest = &after_kw[open + 1 + consumed..];
+    }
+    (found && (rule.size.is_some() || rule.margins.iter().any(Option::is_some))).then_some(rule)
+}
+
+/// Resolve an `@page` `size:` value to `(width, height)` points. Forms:
+/// a named paper size with an optional `landscape`/`portrait` keyword
+/// (`A4 landscape`, `letter`), two lengths (`210mm 297mm`), or one length (a
+/// square page, per spec). `auto` (or anything unresolvable) yields `None`.
+fn parse_page_size_value(v: &str) -> Option<(f64, f64)> {
+    let toks: Vec<&str> = v.split_whitespace().collect();
+    if toks.is_empty() || v.trim().eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    // `<length> <length>` / a single `<length>` (square).
+    let lens: Vec<f64> = toks
+        .iter()
+        .filter_map(|t| parse_len_px(t, ROOT_EM_PT))
+        .collect();
+    match lens.as_slice() {
+        [w, h] if *w > 0.0 && *h > 0.0 => return Some((*w, *h)),
+        [s] if *s > 0.0 && toks.len() == 1 => return Some((*s, *s)),
+        _ => {}
+    }
+    // Named size, with the orientation keyword in either position.
+    let mut name = None;
+    let mut landscape = false;
+    for t in &toks {
+        match t.to_ascii_lowercase().as_str() {
+            "landscape" => landscape = true,
+            "portrait" => {}
+            other => name = name.or_else(|| super::page::page_size(other)),
+            // (first name token wins; `page_size` rejects unknown names)
+        }
+    }
+    name.map(|(w, h)| if landscape { (h, w) } else { (w, h) })
+}
+
 fn strip_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
     let mut rest = css;
@@ -1484,17 +1922,31 @@ fn strip_comments(css: &str) -> String {
 
 /// Parse `prop: value; …` into pairs. Splits on `;` at paren depth 0, so a
 /// `url(data:image/png;base64,…)` value (whose `;` is *inside* the function) is
-/// not torn in half.
+/// not torn in half. A `!important` suffix is **stripped from the value** (it is
+/// a cascade flag, not part of the value — left in place it made the whole
+/// declaration unparseable, e.g. `parse_color("red !important")` failed and the
+/// property was silently dropped); use [`parse_decls_full`] when the importance
+/// flag itself is needed.
 pub fn parse_decls(body: &str) -> Vec<(String, String)> {
+    parse_decls_full(body)
+        .into_iter()
+        .map(|(k, v, _)| (k, v))
+        .collect()
+}
+
+/// [`parse_decls`] plus the `!important` flag per declaration (the suffix is
+/// stripped from the returned value either way).
+fn parse_decls_full(body: &str) -> Vec<(String, String, bool)> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = 0;
-    let push = |seg: &str, out: &mut Vec<(String, String)>| {
+    let push = |seg: &str, out: &mut Vec<(String, String, bool)>| {
         if let Some((k, v)) = seg.split_once(':') {
             let k = k.trim().to_ascii_lowercase();
+            let (v, important) = strip_important(v.trim());
             let v = v.trim().to_string();
             if !k.is_empty() && !v.is_empty() {
-                out.push((k, v));
+                out.push((k, v, important));
             }
         }
     };
@@ -1511,6 +1963,40 @@ pub fn parse_decls(body: &str) -> Vec<(String, String)> {
     }
     push(&body[start..], &mut out);
     out
+}
+
+/// Split a trailing `!important` off a declaration value: returns the value
+/// without the flag plus whether it was present. Case-insensitive, tolerant of
+/// whitespace around the `!` (`red !important`, `red!important`,
+/// `red ! IMPORTANT` all match). ASCII-only lowering keeps byte offsets valid.
+fn strip_important(v: &str) -> (&str, bool) {
+    let lower = v.to_ascii_lowercase();
+    let Some(before_word) = lower.strip_suffix("important") else {
+        return (v, false);
+    };
+    let trimmed = before_word.trim_end();
+    let Some(before_bang) = trimmed.strip_suffix('!') else {
+        return (v, false);
+    };
+    (v[..before_bang.len()].trim_end(), true)
+}
+
+/// A property→value declaration list (importance already resolved/stripped).
+type DeclList = Vec<(String, String)>;
+
+/// Partition parsed declarations into (normal, important) pairs, preserving
+/// order within each class.
+fn split_important(decls: Vec<(String, String, bool)>) -> (DeclList, DeclList) {
+    let mut normal = Vec::new();
+    let mut important = Vec::new();
+    for (k, v, imp) in decls {
+        if imp {
+            important.push((k, v));
+        } else {
+            normal.push((k, v));
+        }
+    }
+    (normal, important)
 }
 
 // ─── cascade ──────────────────────────────────────────────────────────────
@@ -1573,7 +2059,10 @@ fn preceding_siblings<'a>(el: &Element, parent: &'a Element) -> Vec<&'a Element>
             if std::ptr::eq(e, el) {
                 break;
             }
-            out.push(e);
+            // Generated `::before` children are not real siblings.
+            if e.tag != PSEUDO_ELEMENT_TAG {
+                out.push(e);
+            }
         }
     }
     out
@@ -1590,6 +2079,29 @@ fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -
     if !matches(&parts[0].1, el) || !pseudo_ok(&parts[0].1, el, parent) {
         return false;
     }
+    selector_ancestry_matches(selector, el, ancestors)
+}
+
+/// Does an `x::before` / `x::after` selector target `el`? Like
+/// [`selector_matches`] but the target compound's pseudo-**element** flag is
+/// ignored (its pseudo-classes still apply): the generated-content pass asks
+/// "does this rule generate a pseudo child ON `el`", which is precisely a
+/// match of everything except the pseudo-element itself.
+fn selector_matches_pseudo_target(selector: &Selector, el: &Element, ancestors: &[&Element]) -> bool {
+    let parts = &selector.parts;
+    let parent = ancestors.last().copied();
+    if !matches(&parts[0].1, el) || !pseudo_classes_ok(&parts[0].1, el, parent) {
+        return false;
+    }
+    selector_ancestry_matches(selector, el, ancestors)
+}
+
+/// The combinator walk over `selector.parts[1..]` (descendant / child /
+/// sibling hops), shared by [`selector_matches`] and
+/// [`selector_matches_pseudo_target`] — the target compound is already checked.
+fn selector_ancestry_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -> bool {
+    let parts = &selector.parts;
+    let parent = ancestors.last().copied();
     // `cur` tracks the element currently anchored; `ai` the next ancestor index
     // available for descendant/child hops (ancestors are root-first).
     let mut cur: &Element = el;
@@ -1684,6 +2196,19 @@ fn sibling_parent<'a>(
     }
 }
 
+/// The document's `@page` rule, reduced to what the paged renderer consumes:
+/// an explicit page size and per-side margins. `None`/absent components leave
+/// the caller's [`RenderOptions`](super::page::RenderOptions) untouched.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageRule {
+    /// `size: A4 [landscape] | letter | <w> <h> | <len>` → `(width, height)`
+    /// in points.
+    pub size: Option<(f64, f64)>,
+    /// `margin`/`margin-{top,right,bottom,left}` in points, `[top, right,
+    /// bottom, left]` order; `None` per side keeps the caller's margin.
+    pub margins: [Option<f64>; 4],
+}
+
 /// The full stylesheet context: user-agent defaults + author rules.
 #[derive(Debug)]
 pub struct Stylesheet {
@@ -1694,6 +2219,11 @@ pub struct Stylesheet {
     /// Full `@font-face` rules (family + `src` URLs + weight/style), so the
     /// renderer can decode inline `data:` font sources and register them.
     font_face_rules: Vec<FontFaceRule>,
+    /// The author's `@page { size; margin }` rule, when present.
+    page_rule: Option<PageRule>,
+    /// Whether any rule targets `::before`/`::after` — the fast bail that keeps
+    /// [`apply_pseudo_elements`] a no-op clone for the common document.
+    has_generated_content: bool,
 }
 
 impl Stylesheet {
@@ -1710,16 +2240,61 @@ impl Stylesheet {
     pub fn with_viewport(author_css: &str, viewport_px: Option<f64>) -> Stylesheet {
         let mut rules = parse_rules(UA_CSS, 0, viewport_px);
         rules.extend(parse_rules(author_css, 100_000, viewport_px));
+        let has_generated_content = rules.iter().any(|r| {
+            r.selectors.iter().any(|s| {
+                matches!(
+                    s.parts[0].1.pseudo_element_name.as_deref(),
+                    Some("before") | Some("after")
+                )
+            })
+        });
         Stylesheet {
             rules,
             font_faces: collect_font_faces(author_css),
             font_face_rules: collect_font_face_rules(author_css),
+            page_rule: collect_page_rule(author_css),
+            has_generated_content,
         }
     }
 
     /// Family names registered via `@font-face` (lower-cased).
     pub fn font_faces(&self) -> &[String] {
         &self.font_faces
+    }
+
+    /// The author's `@page { size; margin }` rule, when the document has one.
+    pub fn page_rule(&self) -> Option<&PageRule> {
+        self.page_rule.as_ref()
+    }
+
+    /// The cascade-ordered declarations of every rule targeting
+    /// `el::{which}` (`which` = `"before"` / `"after"`): rule normals in
+    /// (specificity, order), then `!important`s in the same order. Empty when
+    /// no pseudo-element rule matches `el`.
+    fn pseudo_decls(&self, el: &Element, ancestors: &[&Element], which: &str) -> DeclList {
+        let mut hits: Vec<(&Selector, &Rule)> = Vec::new();
+        for rule in &self.rules {
+            for sel in &rule.selectors {
+                if sel.parts[0].1.pseudo_element_name.as_deref() == Some(which)
+                    && selector_matches_pseudo_target(sel, el, ancestors)
+                {
+                    hits.push((sel, rule));
+                    break;
+                }
+            }
+        }
+        if hits.is_empty() {
+            return Vec::new();
+        }
+        hits.sort_by_key(|(s, r)| (s.specificity, r.order));
+        let mut out: DeclList = Vec::new();
+        for (_, rule) in &hits {
+            out.extend(rule.decls.iter().cloned());
+        }
+        for (_, rule) in &hits {
+            out.extend(rule.important.iter().cloned());
+        }
+        out
     }
 
     /// Full `@font-face` rules (family + `src` URLs + weight/style). The renderer
@@ -1758,12 +2333,62 @@ impl Stylesheet {
             }
         }
         hits.sort_by_key(|(s, r)| (s.specificity, r.order));
-        for (_, rule) in hits {
+        let inline = el.attr("style").map(parse_decls_full).map(split_important);
+        // Custom properties (`--name`) are collected FIRST, over the whole
+        // cascade in priority order, so a `var(--x)` reference resolves no
+        // matter where the declaration sits relative to the `--x` definition
+        // (per spec, custom properties are order-independent within an
+        // element's cascade).
+        {
+            let mut collect = |decls: &[(String, String)]| {
+                for (k, v) in decls {
+                    if k.starts_with("--") {
+                        style.custom_props.insert(k.clone(), v.clone());
+                    }
+                }
+            };
+            for (_, rule) in &hits {
+                collect(&rule.decls);
+            }
+            if let Some((normal, _)) = &inline {
+                collect(normal);
+            }
+            for (_, rule) in &hits {
+                collect(&rule.important);
+            }
+            if let Some((_, important)) = &inline {
+                collect(important);
+            }
+        }
+        // Cascade in ascending priority: rule normals (by specificity/order),
+        // inline normals, rule `!important`s (same specificity/order among
+        // themselves), inline `!important`s — the CSS origin order for
+        // author-level styles.
+        for (_, rule) in &hits {
             apply_decls(&mut style, &rule.decls);
         }
-        // Inline `style="…"` wins over everything.
-        if let Some(inline) = el.attr("style") {
-            apply_decls(&mut style, &parse_decls(inline));
+        if let Some((normal, _)) = &inline {
+            apply_decls(&mut style, normal);
+        }
+        for (_, rule) in &hits {
+            apply_decls(&mut style, &rule.important);
+        }
+        if let Some((_, important)) = &inline {
+            apply_decls(&mut style, important);
+        }
+        // `opacity` composes down the tree: the element's own declaration (the
+        // last to cascade, if any) multiplies the inherited effective opacity —
+        // a 0.5 child of a 0.5 parent paints at 0.25, never "back up" to 0.5.
+        if let Some(own) = style.own_opacity {
+            style.opacity = (parent.opacity * own).clamp(0.0, 1.0);
+        }
+        // A closed `<select>` control displays exactly ONE option — the
+        // `selected` one(s), else the first — never the concatenation of every
+        // `<option>`'s text. This is control semantics, not a style choice, so
+        // it is decided here (where the ancestor chain is available) after the
+        // cascade.
+        if el.tag == "option" && !option_is_rendered(el, ancestors) {
+            style.display = Display::None;
         }
         // Resolve the inline super/subscript shift to a top-down point offset.
         // Keyword shifts use the *parent* em so a shrunk `<sup>` glyph still
@@ -1775,8 +2400,398 @@ impl Stylesheet {
             VShift::Super => -parent_em * 0.33,
             VShift::Sub => parent_em * 0.20,
             VShift::Points(p) => -p, // CSS positive = up ⇒ negative top-down
+            // Line-relative alignments resolve at line assembly (the line
+            // height isn't known here); no static shift.
+            VShift::Top | VShift::Middle | VShift::Bottom => 0.0,
         };
         style
+    }
+}
+
+// ─── generated content (`::before` / `::after`) ────────────────────────────
+
+/// CSS counters in scope during the generated-content walk. Each counter name
+/// holds a **stack** of `(scope_depth, value)` entries: `counter-reset` at tree
+/// depth `d` pushes a new innermost counter that lives until its parent (depth
+/// `d - 1`) is exited — i.e. it covers the resetting element, its descendants
+/// and its following siblings, per CSS 2.1 §12.4. Nested resets of the same
+/// name stack, which is what makes `counters(item, ".")` produce `1.2.1`-style
+/// hierarchical numbering on nested lists.
+#[derive(Debug, Default)]
+struct CounterSet {
+    stacks: std::collections::BTreeMap<String, Vec<(usize, i64)>>,
+}
+
+impl CounterSet {
+    /// `counter-reset: name v` at tree depth `depth`.
+    fn reset(&mut self, name: &str, v: i64, depth: usize) {
+        self.stacks
+            .entry(name.to_string())
+            .or_default()
+            .push((depth, v));
+    }
+
+    /// `counter-increment: name by`. With no counter of that name in scope, a
+    /// fresh one is auto-created at `depth` starting from 0 (then incremented),
+    /// per spec.
+    fn increment(&mut self, name: &str, by: i64, depth: usize) {
+        let stack = self.stacks.entry(name.to_string()).or_default();
+        match stack.last_mut() {
+            Some(top) => top.1 += by,
+            None => stack.push((depth, by)),
+        }
+    }
+
+    /// The innermost value of `name` (0 when no counter is in scope).
+    fn value(&self, name: &str) -> i64 {
+        self.stacks
+            .get(name)
+            .and_then(|s| s.last())
+            .map(|(_, v)| *v)
+            .unwrap_or(0)
+    }
+
+    /// All in-scope values of `name`, outermost→innermost, joined with `sep`
+    /// (the `counters(name, sep)` form). `"0"` when none is in scope.
+    fn join(&self, name: &str, sep: &str) -> String {
+        match self.stacks.get(name) {
+            Some(s) if !s.is_empty() => s
+                .iter()
+                .map(|(_, v)| v.to_string())
+                .collect::<Vec<_>>()
+                .join(sep),
+            _ => "0".to_string(),
+        }
+    }
+
+    /// Leaving an element at `depth`: counters scoped deeper die; counters
+    /// reset AT `depth` survive for the element's following siblings.
+    fn exit_depth(&mut self, depth: usize) {
+        for stack in self.stacks.values_mut() {
+            stack.retain(|(d, _)| *d <= depth);
+        }
+    }
+}
+
+/// Resolve a `content:` value to the generated text. Supports the forms real
+/// documents use: quoted strings (concatenated), `attr(name)`,
+/// `counter(name[, style])`, `counters(name, "sep"[, style])` (decimal
+/// rendering), and the `open-quote`/`close-quote` keywords. `none`/`normal` —
+/// or an unparseable value — yields `None` (no pseudo-element is generated).
+/// An empty string is a **valid** result: `content: ""` still generates the
+/// (empty) box, which the clearfix idiom relies on.
+fn resolve_content(value: &str, el: &Element, counters: &CounterSet) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("normal") {
+        return None;
+    }
+    let bytes = v.as_bytes();
+    let mut out = String::new();
+    let mut produced = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' || c == b'\'' {
+            // Quoted string with the usual `\` escapes.
+            let quote = c;
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    if bytes[i] == b'A' || bytes[i] == b'a' {
+                        // `\A` (or `\a`) is the CSS newline escape.
+                        out.push('\n');
+                    } else {
+                        // Any other escape: the character itself, verbatim
+                        // (full UTF-8 scalar — never a mid-char byte slice).
+                        let ch = v[i..].chars().next().unwrap_or('\u{FFFD}');
+                        out.push(ch);
+                        i += ch.len_utf8() - 1;
+                    }
+                } else {
+                    // Copy one UTF-8 scalar.
+                    let ch = v[i..].chars().next().unwrap_or('\u{FFFD}');
+                    out.push(ch);
+                    i += ch.len_utf8() - 1;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(bytes.len()); // consume the closing quote
+            produced = true;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // An identifier / function token.
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'(' {
+            i += 1;
+        }
+        let word = &v[start..i];
+        if i < bytes.len() && bytes[i] == b'(' {
+            // Function: capture the balanced argument.
+            i += 1;
+            let astart = i;
+            let mut depth = 1usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let arg = &v[astart..i.min(bytes.len())];
+            i = (i + 1).min(bytes.len());
+            match word.to_ascii_lowercase().as_str() {
+                "attr" => {
+                    out.push_str(el.attr(arg.trim()).unwrap_or_default());
+                    produced = true;
+                }
+                "counter" => {
+                    // `counter(name[, style])` — style rendered as decimal.
+                    let name = arg.split(',').next().unwrap_or(arg).trim();
+                    out.push_str(&counters.value(name).to_string());
+                    produced = true;
+                }
+                "counters" => {
+                    // `counters(name, "sep"[, style])`.
+                    let mut parts = arg.splitn(3, ',');
+                    let name = parts.next().unwrap_or("").trim();
+                    let sep = parts
+                        .next()
+                        .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
+                        .unwrap_or_default();
+                    out.push_str(&counters.join(name, &sep));
+                    produced = true;
+                }
+                _ => {} // url(...) / unknown function — contributes nothing
+            }
+            continue;
+        }
+        match word.to_ascii_lowercase().as_str() {
+            "open-quote" => {
+                out.push('\u{201C}');
+                produced = true;
+            }
+            "close-quote" => {
+                out.push('\u{201D}');
+                produced = true;
+            }
+            "no-open-quote" | "no-close-quote" => produced = true,
+            _ => {} // unknown keyword — contributes nothing
+        }
+    }
+    produced.then_some(out)
+}
+
+/// Materialise `::before` / `::after` rules as synthetic children.
+///
+/// This is the styled-tree construction point: for every element matched by an
+/// `x::before` / `x::after` rule whose `content` is not `none`, a
+/// [`PSEUDO_ELEMENT_TAG`] child is inserted first / last, carrying the rule's
+/// declarations as an inline `style` attribute (so the normal cascade styles
+/// it, inheriting from the host element exactly like a real pseudo) and the
+/// resolved `content` as its text. `counter-reset` / `counter-increment` are
+/// processed document-order-wide during this walk — on the real elements and
+/// on the pseudos themselves — so `counter()` / `counters()` produce the
+/// standard hierarchical numbering. Documents whose stylesheet has no
+/// `::before`/`::after` rule are returned as an untouched clone.
+pub fn apply_pseudo_elements(nodes: &[Node], sheet: &Stylesheet) -> Vec<Node> {
+    if !sheet.has_generated_content {
+        return nodes.to_vec();
+    }
+    let root = Style::default();
+    let mut counters = CounterSet::default();
+    pseudo_walk_nodes(nodes, sheet, &root, &[], 0, &mut counters)
+}
+
+fn pseudo_walk_nodes(
+    nodes: &[Node],
+    sheet: &Stylesheet,
+    parent_style: &Style,
+    ancestors: &[&Element],
+    depth: usize,
+    counters: &mut CounterSet,
+) -> Vec<Node> {
+    nodes
+        .iter()
+        .map(|n| match n {
+            Node::Text(t) => Node::Text(t.clone()),
+            Node::Element(e) => Node::Element(pseudo_walk_element(
+                e,
+                sheet,
+                parent_style,
+                ancestors,
+                depth,
+                counters,
+            )),
+        })
+        .collect()
+}
+
+fn pseudo_walk_element(
+    el: &Element,
+    sheet: &Stylesheet,
+    parent_style: &Style,
+    ancestors: &[&Element],
+    depth: usize,
+    counters: &mut CounterSet,
+) -> Element {
+    let style = sheet.computed(el, parent_style, ancestors);
+    // A `display: none` subtree generates nothing and doesn't touch counters.
+    if style.display == Display::None {
+        return el.clone();
+    }
+    // The element's own counter properties apply before its `::before`.
+    for (name, v) in &style.counter_reset {
+        counters.reset(name, *v, depth);
+    }
+    for (name, by) in &style.counter_increment {
+        counters.increment(name, *by, depth);
+    }
+
+    let mut rebuilt = Element {
+        tag: el.tag.clone(),
+        attrs: el.attrs.clone(),
+        children: Vec::new(),
+    };
+    if let Some(pseudo) = make_pseudo_child(sheet, el, &style, ancestors, "before", depth, counters)
+    {
+        rebuilt.children.push(Node::Element(pseudo));
+    }
+    let chain: Vec<&Element> = ancestors.iter().copied().chain([el]).collect();
+    rebuilt.children.extend(pseudo_walk_nodes(
+        &el.children,
+        sheet,
+        &style,
+        &chain,
+        depth + 1,
+        counters,
+    ));
+    if let Some(pseudo) = make_pseudo_child(sheet, el, &style, ancestors, "after", depth, counters)
+    {
+        rebuilt.children.push(Node::Element(pseudo));
+    }
+    // Descendant counter scopes die here; scopes opened AT this depth survive
+    // for the following siblings.
+    counters.exit_depth(depth);
+    rebuilt
+}
+
+/// Build the synthetic `el::{which}` child, when a matching rule generates one.
+fn make_pseudo_child(
+    sheet: &Stylesheet,
+    el: &Element,
+    host_style: &Style,
+    ancestors: &[&Element],
+    which: &str,
+    depth: usize,
+    counters: &mut CounterSet,
+) -> Option<Element> {
+    let decls = sheet.pseudo_decls(el, ancestors, which);
+    if decls.is_empty() {
+        return None;
+    }
+    // The last cascaded `content` wins; without one there is no pseudo.
+    let raw_content = decls
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "content")
+        .map(|(_, v)| v.clone())?;
+    // `var()` in the content resolves against the host's custom properties.
+    let raw_content = if raw_content.contains("var(") {
+        substitute_vars(&raw_content, &host_style.custom_props, 0)?
+    } else {
+        raw_content
+    };
+    // The pseudo's own counter properties apply BEFORE its content is
+    // resolved (`li::before { counter-increment: item; content: counter(item) }`
+    // numbers 1, 2, 3 …). The pseudo counts as one level deeper.
+    for (k, v) in &decls {
+        match k.as_str() {
+            "counter-reset" => {
+                for (name, n) in parse_counter_pairs(v, 0) {
+                    counters.reset(&name, n, depth + 1);
+                }
+            }
+            "counter-increment" => {
+                for (name, n) in parse_counter_pairs(v, 1) {
+                    counters.increment(&name, n, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    let text = resolve_content(&raw_content, el, counters)?;
+    // Every other declaration rides on the synthetic element as an inline
+    // style, so the ordinary cascade (inheriting from the host) styles the
+    // generated box — `display`, colours, margins, all of it.
+    let style_attr = decls
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "content" | "counter-reset" | "counter-increment"))
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    let mut children = Vec::new();
+    if !text.is_empty() {
+        children.push(Node::Text(text));
+    }
+    Some(Element {
+        tag: PSEUDO_ELEMENT_TAG.to_string(),
+        attrs: vec![("style".to_string(), style_attr)],
+        children,
+    })
+}
+
+/// Whether this `<option>` is the one a closed `<select>` control displays.
+///
+/// The scope is the nearest ancestor `<select>` (looking through `<optgroup>`
+/// and any other wrapper); an orphaned option falls back to its direct parent.
+/// Within the scope, the option(s) carrying the `selected` attribute render
+/// (covers `<select multiple>` too); with no `selected` anywhere, the **first**
+/// option renders — matching what a browser paints for the closed control.
+/// A frameless/unmatched option (defensive) renders rather than vanishing.
+fn option_is_rendered(el: &Element, ancestors: &[&Element]) -> bool {
+    let scope = ancestors
+        .iter()
+        .rev()
+        .find(|a| a.tag == "select")
+        .copied()
+        .or_else(|| ancestors.last().copied());
+    let Some(scope) = scope else {
+        return true; // no parent at all — keep it visible
+    };
+    let mut options: Vec<&Element> = Vec::new();
+    collect_options(scope, &mut options);
+    if options.is_empty() {
+        return true;
+    }
+    if options.iter().any(|o| o.attr("selected").is_some()) {
+        el.attr("selected").is_some()
+    } else {
+        std::ptr::eq(options[0], el)
+    }
+}
+
+/// Collect the `<option>` elements under `el` in tree order (descending through
+/// `<optgroup>` or any other wrapper, but not *into* an option).
+fn collect_options<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
+    for child in &el.children {
+        if let Node::Element(e) = child {
+            if e.tag == "option" {
+                out.push(e);
+            } else {
+                collect_options(e, out);
+            }
+        }
     }
 }
 
@@ -1862,6 +2877,9 @@ fn inherit(parent: &Style) -> Style {
         position: Position::Static,
         inset: [None; 4],
         z_index: 0,
+        // `writing-mode` is inherited in CSS; kept per-element here (see the
+        // field doc) so only the declaring block rotates.
+        writing_mode: WritingMode::HorizontalTb,
         overflow_clip: false,
         establishes_bfc: false,
         flex_wrap: false,
@@ -1889,6 +2907,29 @@ fn inherit(parent: &Style) -> Style {
         text_shadows: parent.text_shadows.clone(),
         // `transform` is not inherited (each element transforms independently).
         transform: None,
+        // Inherited (like `pre`, which mirrors it):
+        white_space: parent.white_space,
+        // `overflow-wrap`/`word-break` are inherited.
+        break_word: parent.break_word,
+        // `text-overflow` / `object-fit` / `max-height` are box properties.
+        text_overflow_ellipsis: false,
+        object_fit: ObjectFit::Fill,
+        max_height: None,
+        // The `font-family` fallback list travels with `font_family`.
+        font_families: parent.font_families.clone(),
+        // Custom properties inherit; a child's own `--x` overrides on top.
+        custom_props: parent.custom_props.clone(),
+        // `opacity` composes per element: the effective value inherits (above,
+        // in `opacity`), the element's own declaration starts empty.
+        own_opacity: None,
+        // Counter properties apply to the element itself only.
+        counter_reset: Vec::new(),
+        counter_increment: Vec::new(),
+        // `transform-origin` rides with `transform` (not inherited).
+        transform_origin: None,
+        // `caption-side` IS inherited (declared on the table, read on the
+        // caption).
+        caption_side: parent.caption_side,
     }
 }
 
@@ -2174,10 +3215,12 @@ fn parse_radial_gradient(inner: &str, em: f64) -> Option<RadialGradient> {
     } else {
         (0.5, 0.5, 1.0, &parts[..])
     };
-    let stops: Vec<GradientStop> = stop_parts
-        .iter()
-        .filter_map(|p| parse_gradient_stop(p, em))
-        .collect();
+    let stops = finish_gradient_stops(
+        stop_parts
+            .iter()
+            .filter_map(|p| parse_gradient_stop(p, em))
+            .collect(),
+    );
     if stops.len() < 2 {
         return None;
     }
@@ -2204,10 +3247,12 @@ fn parse_conic_gradient(inner: &str, em: f64) -> Option<ConicGradient> {
     } else {
         (0.5, 0.5, 0.0, &parts[..])
     };
-    let stops: Vec<GradientStop> = stop_parts
-        .iter()
-        .filter_map(|p| parse_conic_stop(p, em))
-        .collect();
+    let stops = finish_gradient_stops(
+        stop_parts
+            .iter()
+            .filter_map(|p| parse_conic_stop(p, em))
+            .collect(),
+    );
     if stops.len() < 2 {
         return None;
     }
@@ -2309,15 +3354,23 @@ fn parse_color_in(part: &str) -> Option<[f64; 3]> {
 
 /// Parse one conic `<color> [<angular-pos>]` stop. The position may be a `%` /
 /// bare `0..1` (a fraction of the turn) or an angle (`deg`/`turn`) which is
-/// normalised to a `0..1` fraction. `None` if no colour parses.
-fn parse_conic_stop(p: &str, _em: f64) -> Option<GradientStop> {
+/// normalised to a `0..1` fraction. `None` if no colour parses. The `bool`
+/// flags a `transparent` stop (see [`finish_gradient_stops`]).
+fn parse_conic_stop(p: &str, _em: f64) -> Option<(GradientStop, bool)> {
     let mut color = None;
+    let mut alpha = 1.0;
+    let mut transparent = false;
     let mut pos = None;
     for tok in p.split_whitespace() {
         if let Some(pct) = tok.strip_suffix('%').and_then(|n| n.parse::<f64>().ok()) {
             pos = Some((pct / 100.0).clamp(0.0, 1.0));
-        } else if let Some(c) = parse_color(tok) {
+        } else if tok.eq_ignore_ascii_case("transparent") {
+            color = Some([0.0, 0.0, 0.0]);
+            alpha = 0.0;
+            transparent = true;
+        } else if let Some((c, a)) = parse_color_alpha(tok) {
             color = Some(c);
+            alpha = a;
         } else if let Some(deg) = parse_gradient_angle(tok) {
             // An explicit angle stop → fraction of the full turn.
             pos = Some((deg / 360.0).rem_euclid(1.0));
@@ -2325,7 +3378,7 @@ fn parse_conic_stop(p: &str, _em: f64) -> Option<GradientStop> {
             pos = Some(n.clamp(0.0, 1.0));
         }
     }
-    color.map(|color| GradientStop { color, pos })
+    color.map(|color| (GradientStop { color, pos, alpha }, transparent))
 }
 
 /// Parse the inside of a `linear-gradient(...)` into a [`LinearGradient`].
@@ -2347,10 +3400,12 @@ fn parse_linear_gradient(inner: &str, em: f64) -> Option<LinearGradient> {
         Some(a) => (a, &parts[1..]),
         None => (180.0, &parts[..]),
     };
-    let stops: Vec<GradientStop> = stop_parts
-        .iter()
-        .filter_map(|p| parse_gradient_stop(p, em))
-        .collect();
+    let stops = finish_gradient_stops(
+        stop_parts
+            .iter()
+            .filter_map(|p| parse_gradient_stop(p, em))
+            .collect(),
+    );
     if stops.len() < 2 {
         return None;
     }
@@ -2419,21 +3474,57 @@ fn side_keywords_to_angle(sides: &str) -> f64 {
 
 /// Parse one `<color> [<position>]` gradient stop. `<position>` is a `%` or a
 /// `0..1` number (other length units are ignored — the stop is then auto-placed).
-/// `None` if no colour parses.
-fn parse_gradient_stop(p: &str, _em: f64) -> Option<GradientStop> {
+/// `None` if no colour parses. The `bool` flags a `transparent` stop, whose
+/// colour is later borrowed from its nearest opaque neighbour (see
+/// [`finish_gradient_stops`]) so the ramp fades out in place instead of
+/// towards black.
+fn parse_gradient_stop(p: &str, _em: f64) -> Option<(GradientStop, bool)> {
     let mut color = None;
+    let mut alpha = 1.0;
+    let mut transparent = false;
     let mut pos = None;
     for tok in p.split_whitespace() {
         if let Some(pct) = tok.strip_suffix('%').and_then(|n| n.parse::<f64>().ok()) {
             pos = Some((pct / 100.0).clamp(0.0, 1.0));
-        } else if let Some(c) = parse_color(tok) {
+        } else if tok.eq_ignore_ascii_case("transparent") {
+            // Kept as a stop: black alpha-0 per spec, but we substitute the
+            // neighbour's colour so the fade doesn't muddy towards grey.
+            color = Some([0.0, 0.0, 0.0]);
+            alpha = 0.0;
+            transparent = true;
+        } else if let Some((c, a)) = parse_color_alpha(tok) {
             color = Some(c);
+            alpha = a;
         } else if let Ok(n) = tok.parse::<f64>() {
             // A bare 0..1 number as a position (rare but valid in our subset).
             pos = Some(n.clamp(0.0, 1.0));
         }
     }
-    color.map(|color| GradientStop { color, pos })
+    color.map(|color| (GradientStop { color, pos, alpha }, transparent))
+}
+
+/// Resolve `transparent` stops against their neighbours: each keeps its
+/// position and `alpha = 0`, but takes the colour of the nearest non-
+/// transparent stop (previous first, else next) so interpolation fades the
+/// *neighbour's* colour out rather than blending towards black. An all-
+/// transparent ramp keeps black (nothing better to borrow).
+fn finish_gradient_stops(raw: Vec<(GradientStop, bool)>) -> Vec<GradientStop> {
+    let mut out: Vec<GradientStop> = raw.iter().map(|(s, _)| *s).collect();
+    for i in 0..out.len() {
+        if !raw[i].1 {
+            continue;
+        }
+        let borrowed = raw[..i]
+            .iter()
+            .rev()
+            .chain(raw[i + 1..].iter())
+            .find(|(_, t)| !t)
+            .map(|(s, _)| s.color);
+        if let Some(c) = borrowed {
+            out[i].color = c;
+        }
+    }
+    out
 }
 
 /// Parse the column count from a `columns` shorthand (`column-width ||
@@ -2580,20 +3671,82 @@ fn apply_flex_shorthand(style: &mut Style, v: &str) {
 
 /// Apply `font-family` (a comma-separated stack): adopt the first family name
 /// and infer the serif/mono generic buckets used for fallback metrics.
+/// Parse a `counter-reset` / `counter-increment` value into `(name, value)`
+/// pairs: a whitespace list of counter names, each optionally followed by an
+/// integer. `default` is the per-name value when the integer is absent (`0`
+/// for reset, `1` for increment). `none` (or nothing parseable) yields an
+/// empty list.
+fn parse_counter_pairs(v: &str, default: i64) -> Vec<(String, i64)> {
+    let mut out: Vec<(String, i64)> = Vec::new();
+    if v.trim().eq_ignore_ascii_case("none") {
+        return out;
+    }
+    for tok in v.split_whitespace() {
+        if let Ok(n) = tok.parse::<i64>() {
+            // An integer adjusts the preceding counter name.
+            if let Some(last) = out.last_mut() {
+                last.1 = n;
+            }
+        } else if tok
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+        {
+            out.push((tok.to_string(), default));
+        }
+    }
+    out
+}
+
 fn apply_font_family(style: &mut Style, v: &str) {
-    let first = v
+    // Keep the FULL fallback list (de-quoted, source order): the font resolver
+    // tries each family and uses the first one it has, so `font-family:
+    // "MissingFont", serif` really falls back to a serif face instead of a
+    // sans-serif guess for the unknown first name.
+    let names: Vec<String> = v
         .split(',')
-        .next()
-        .unwrap_or(v)
-        .trim()
-        .trim_matches(['"', '\'']);
-    style.font_family = first.to_string();
-    let lower = first.to_ascii_lowercase();
-    style.generic_serif = lower == "serif" || lower.contains("times") || lower.contains("georgia");
-    style.generic_mono = lower == "monospace"
-        || lower.contains("courier")
-        || lower.contains("mono")
-        || lower.contains("consol");
+        .map(|t| t.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    style.font_family = names[0].clone();
+    // Generic serif/mono flags: the first name in the list that clearly
+    // announces a generic wins — so `"MissingFont", serif` sets serif, while
+    // `Arial, serif` stops at the (sans) Arial and keeps the old flags. The
+    // single-name case is byte-identical to the previous first-name heuristic.
+    let is_serif = |l: &str| l == "serif" || l.contains("times") || l.contains("georgia");
+    let is_mono = |l: &str| {
+        l == "monospace" || l.contains("courier") || l.contains("mono") || l.contains("consol")
+    };
+    let is_sans = |l: &str| {
+        l == "sans-serif"
+            || l.contains("arial")
+            || l.contains("helvetica")
+            || l.contains("verdana")
+            || l.contains("tahoma")
+            || l.contains("segoe")
+    };
+    style.generic_serif = false;
+    style.generic_mono = false;
+    for name in &names {
+        let lower = name.to_ascii_lowercase();
+        if is_serif(&lower) {
+            style.generic_serif = true;
+            break;
+        }
+        if is_mono(&lower) {
+            style.generic_mono = true;
+            break;
+        }
+        if is_sans(&lower) {
+            break; // an explicit sans family: flags stay off
+        }
+        // An unknown concrete family: keep scanning — the next fallback name
+        // may reveal the intended generic.
+    }
+    style.font_families = names;
 }
 
 /// Apply a `font-weight` value: store the numeric weight (named keywords map to
@@ -2719,7 +3872,33 @@ fn parse_align_items(v: &str) -> AlignItems {
 }
 
 fn apply_one(style: &mut Style, prop: &str, value: &str) {
+    // Custom properties (`--name: value`) are collected into
+    // `Style::custom_props` before the cascade applies normal declarations
+    // (see [`Stylesheet::computed`]); they are never properties themselves.
+    if prop.starts_with("--") {
+        style
+            .custom_props
+            .insert(prop.to_string(), value.trim().to_string());
+        return;
+    }
     let v = value.trim();
+    // Substitute `var(--name[, fallback])` references against the custom
+    // properties in scope (inherited + own). A reference that resolves to
+    // nothing — unknown name with no fallback, or a reference cycle — makes the
+    // declaration *invalid at computed-value time*: it is skipped, leaving the
+    // inherited/previous value in place.
+    let substituted;
+    let v = if v.contains("var(") {
+        match substitute_vars(v, &style.custom_props, 0) {
+            Some(s) => {
+                substituted = s;
+                substituted.trim()
+            }
+            None => return,
+        }
+    } else {
+        v
+    };
     // `currentColor` resolves to the element's own (already-cascaded) colour, so
     // a bare `border-color: currentColor` / `background: currentColor` / … picks
     // up `color`. Substitute it as an `rgb(...)` literal before parsing. (The
@@ -2943,6 +4122,13 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         "z-index" => {
             style.z_index = v.parse().unwrap_or(0);
         }
+        "writing-mode" => {
+            style.writing_mode = match v {
+                "vertical-rl" | "sideways-rl" => WritingMode::VerticalRl,
+                "vertical-lr" | "sideways-lr" => WritingMode::VerticalLr,
+                _ => WritingMode::HorizontalTb,
+            };
+        }
         "overflow" | "overflow-x" | "overflow-y" => {
             // Any non-visible overflow clips descendants to the box.
             if matches!(v, "hidden" | "clip" | "scroll" | "auto") {
@@ -3056,8 +4242,17 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         }
         "visibility" => style.hidden = v == "hidden" || v == "collapse",
         "opacity" => {
-            if let Ok(o) = v.parse::<f64>() {
-                style.opacity = o.clamp(0.0, 1.0);
+            // Recorded as the element's OWN opacity; `Stylesheet::computed`
+            // composes it multiplicatively with the inherited (ancestor)
+            // opacity once per element — so nested `opacity: 0.5` boxes
+            // multiply (0.25 effective) instead of the child overwriting the
+            // parent. A `%` value is accepted too (`50%` ⇒ 0.5).
+            let parsed = v
+                .strip_suffix('%')
+                .and_then(|n| n.trim().parse::<f64>().ok().map(|p| p / 100.0))
+                .or_else(|| v.parse::<f64>().ok());
+            if let Some(o) = parsed {
+                style.own_opacity = Some(o.clamp(0.0, 1.0));
             }
         }
         "text-indent" => style.text_indent = parse_len_px(v, style.font_size).unwrap_or(0.0),
@@ -3085,6 +4280,15 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         "min-height" => {
             style.min_height = parse_len_px(v, style.font_size);
         }
+        "max-height" => {
+            // `none` (the initial value) clears the clamp; a length caps the
+            // used box height (content overflows, visible by default).
+            style.max_height = if v == "none" {
+                None
+            } else {
+                parse_len_px(v, style.font_size)
+            };
+        }
         "height" => {
             // Definite height: caps the box (content overflows) rather than just
             // flooring it like `min-height`.
@@ -3107,7 +4311,42 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                 style.line_height = px / style.font_size;
             }
         }
-        "white-space" => style.pre = v.starts_with("pre"),
+        "white-space" => {
+            style.white_space = match v {
+                "nowrap" => WhiteSpace::Nowrap,
+                "pre" => WhiteSpace::Pre,
+                // `break-spaces` preserves whitespace and wraps, like pre-wrap.
+                "pre-wrap" | "break-spaces" => WhiteSpace::PreWrap,
+                "pre-line" => WhiteSpace::PreLine,
+                _ => WhiteSpace::Normal,
+            };
+            // Legacy flag, kept in lock-step: `pre`/`pre-wrap` preserve
+            // whitespace (`pre-line` collapses spaces, so it is NOT `pre`).
+            style.pre = matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
+        }
+        "word-break" => {
+            // `break-all` (and the legacy `break-word`) allow mid-word breaks;
+            // `normal`/`keep-all` do not.
+            style.break_word = matches!(v, "break-all" | "break-word");
+        }
+        // `word-wrap` is the legacy alias of `overflow-wrap`.
+        "overflow-wrap" | "word-wrap" => {
+            style.break_word = matches!(v, "break-word" | "anywhere");
+        }
+        "text-overflow" => {
+            style.text_overflow_ellipsis = v.contains("ellipsis");
+        }
+        "object-fit" => {
+            style.object_fit = match v {
+                "contain" => ObjectFit::Contain,
+                "cover" => ObjectFit::Cover,
+                "none" => ObjectFit::None,
+                "scale-down" => ObjectFit::ScaleDown,
+                _ => ObjectFit::Fill,
+            };
+        }
+        "counter-reset" => style.counter_reset = parse_counter_pairs(v, 0),
+        "counter-increment" => style.counter_increment = parse_counter_pairs(v, 1),
         "page-break-before" | "break-before" => {
             style.page_break_before =
                 matches!(v, "always" | "page" | "left" | "right" | "recto" | "verso");
@@ -3225,12 +4464,16 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             };
             // Inline baseline shift for super/subscript text. Lengths/percentages
             // resolve against the run's own font-size; `%` is positive-up like CSS.
+            // `top`/`middle`/`bottom` (and their `text-*` cousins) shift the run
+            // within its line box — the offset is resolved at line assembly, when
+            // the line height is known.
             style.valign = match v {
                 "super" => VShift::Super,
                 "sub" => VShift::Sub,
-                "baseline" | "top" | "middle" | "bottom" | "text-top" | "text-bottom" => {
-                    VShift::Baseline
-                }
+                "top" | "text-top" => VShift::Top,
+                "middle" => VShift::Middle,
+                "bottom" | "text-bottom" => VShift::Bottom,
+                "baseline" => VShift::Baseline,
                 _ => {
                     if let Some(p) = v
                         .strip_suffix('%')
@@ -3268,6 +4511,15 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         }
         "text-shadow" => style.text_shadows = parse_text_shadows(v, style.font_size, style.color),
         "transform" => style.transform = parse_transform(v, style.font_size),
+        "transform-origin" => {
+            style.transform_origin = parse_transform_origin(v, style.font_size);
+        }
+        "caption-side" => {
+            style.caption_side = match v {
+                "bottom" => CaptionSide::Bottom,
+                _ => CaptionSide::Top,
+            };
+        }
         "width" => style.width = parse_len(v, style.font_size),
         _ => {}
     }
@@ -3625,6 +4877,56 @@ fn transform_function(name: &str, args: &str, em: f64) -> Option<[f64; 6]> {
     }
 }
 
+/// Parse a `transform-origin` value into per-axis lengths: keywords map to
+/// percentages (`left`/`top` → 0%, `center` → 50%, `right`/`bottom` → 100%),
+/// lengths resolve to points from the box's top-left, `%` stays relative to
+/// the border-box dimension. One value sets `x` (y defaults to `center`); the
+/// two-value form accepts the keywords in either order (`top left` ≡ `left
+/// top`), while plain lengths are positional `x y`. `None` (initial value /
+/// unparseable) keeps the box-centre pivot.
+fn parse_transform_origin(v: &str, em: f64) -> Option<(Len, Len)> {
+    // A component along one axis. `swapped` marks a keyword that names the
+    // OTHER axis (`top`/`bottom` in x position), so the pair can be reordered.
+    fn component(tok: &str, em: f64) -> Option<(Len, bool)> {
+        match tok {
+            "left" => Some((Len::Percent(0.0), false)),
+            "right" => Some((Len::Percent(100.0), false)),
+            "top" => Some((Len::Percent(0.0), true)),
+            "bottom" => Some((Len::Percent(100.0), true)),
+            "center" | "centre" => Some((Len::Percent(50.0), false)),
+            t => {
+                if let Some(p) = t.strip_suffix('%').and_then(|n| n.trim().parse::<f64>().ok()) {
+                    Some((Len::Percent(p), false))
+                } else {
+                    parse_len_px(t, em).map(|pt| (Len::Pt(pt), false))
+                }
+            }
+        }
+    }
+    let toks: Vec<&str> = v.split_whitespace().collect();
+    match toks.as_slice() {
+        [x] => {
+            let (cx, vertical) = component(x, em)?;
+            // A lone `top`/`bottom` names the Y axis; X defaults to center.
+            Some(if vertical {
+                (Len::Percent(50.0), cx)
+            } else {
+                (cx, Len::Percent(50.0))
+            })
+        }
+        [a, b, ..] => {
+            let (ca, a_vert) = component(a, em)?;
+            let (cb, _) = component(b, em)?;
+            // Keyword axes may arrive in either order (`top left` ≡ `left
+            // top`): a leading `top`/`bottom` — or a trailing `left`/`right` —
+            // means the pair is (y, x). Positional lengths stay `x y`.
+            let swapped = a_vert || matches!(*b, "left" | "right");
+            Some(if swapped { (cb, ca) } else { (ca, cb) })
+        }
+        _ => None,
+    }
+}
+
 /// Fold a transform-origin `(ox, oy)` into a raw transform matrix:
 /// `T(ox, oy) · raw · T(-ox, -oy)`, so the transform pivots about `(ox, oy)`
 /// (CSS user space). The paint layer then applies the page Y-flip.
@@ -3730,6 +5032,137 @@ const VIEWPORT_H_PT: f64 = 792.0;
 /// Assumed root font size (1rem) in points.
 const ROOT_EM_PT: f64 = 12.0;
 
+std::thread_local! {
+    /// The live viewport (page) size in points that `vw`/`vh` resolve against.
+    /// Layout entry points install the real page geometry for the duration of a
+    /// layout via [`set_viewport_for_layout`]; outside a layout the reference
+    /// US-Letter viewport applies (the historical behaviour). Thread-local so
+    /// concurrent renders on different threads never observe each other.
+    static VIEWPORT_PT: std::cell::Cell<(f64, f64)> =
+        const { std::cell::Cell::new((VIEWPORT_W_PT, VIEWPORT_H_PT)) };
+}
+
+/// Scope guard restoring the previous `vw`/`vh` viewport on drop.
+pub(crate) struct ViewportGuard {
+    prev: (f64, f64),
+}
+
+impl Drop for ViewportGuard {
+    fn drop(&mut self) {
+        VIEWPORT_PT.with(|c| c.set(self.prev));
+    }
+}
+
+/// Install the real page size (points) for `vw`/`vh` resolution during a
+/// layout; the returned guard restores the previous viewport when dropped.
+/// Non-finite, non-positive, or absurdly large dimensions (the synthetic
+/// "endless page" used to measure header/footer bands) are ignored per axis,
+/// keeping the reference viewport for that axis.
+pub(crate) fn set_viewport_for_layout(w: f64, h: f64) -> ViewportGuard {
+    let sane = |v: f64, fallback: f64| {
+        if v.is_finite() && v > 0.0 && v < 1.0e5 {
+            v
+        } else {
+            fallback
+        }
+    };
+    let prev = VIEWPORT_PT.with(|c| c.get());
+    VIEWPORT_PT.with(|c| c.set((sane(w, prev.0), sane(h, prev.1))));
+    ViewportGuard { prev }
+}
+
+/// Maximum `var()` substitution depth. A dependency chain deeper than this — in
+/// practice a reference **cycle** (`--a: var(--b); --b: var(--a)`) — makes the
+/// reference unresolvable, so the `var()` falls back (or invalidates the
+/// declaration), per the spec's cycle handling.
+const MAX_VAR_DEPTH: usize = 8;
+
+/// Substitute every `var(--name[, fallback])` in `v` against the custom
+/// properties in scope. Substituted values are themselves substituted (nested
+/// references), bounded by [`MAX_VAR_DEPTH`] as the cycle guard. Returns `None`
+/// when any reference is unresolvable — unknown custom property with no
+/// fallback, a cycle, or a malformed `var(` — which invalidates the whole
+/// declaration at computed-value time.
+fn substitute_vars(
+    v: &str,
+    props: &std::collections::BTreeMap<String, String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_VAR_DEPTH {
+        return None; // cycle (or absurd nesting) — unresolvable
+    }
+    if !v.contains("var(") {
+        return Some(v.to_string());
+    }
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(at) = rest.find("var(") {
+        // A `var(` must be a function head, not the tail of an identifier
+        // (e.g. `navar(`); require a non-ident char before it.
+        let is_head = at == 0
+            || !rest[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !is_head {
+            out.push_str(&rest[..at + 4]);
+            rest = &rest[at + 4..];
+            continue;
+        }
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 4..];
+        // Find the matching `)` (the fallback may itself contain functions).
+        let mut close = None;
+        let mut par = 1usize;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => par += 1,
+                ')' => {
+                    par -= 1;
+                    if par == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?; // unterminated `var(` — invalid
+        let inner = &after[..close];
+        // Split `--name` from the optional fallback at the first TOP-LEVEL comma.
+        let mut split = None;
+        let mut par2 = 0usize;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '(' => par2 += 1,
+                ')' => par2 = par2.saturating_sub(1),
+                ',' if par2 == 0 => {
+                    split = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (name, fallback) = match split {
+            Some(i) => (inner[..i].trim(), Some(inner[i + 1..].trim())),
+            None => (inner.trim(), None),
+        };
+        let replacement = match props.get(name) {
+            // A known custom property: substitute its (recursively resolved)
+            // value; if ITS references are unresolvable, fall back.
+            Some(val) => match substitute_vars(val, props, depth + 1) {
+                Some(s) => s,
+                None => substitute_vars(fallback?, props, depth + 1)?,
+            },
+            None => substitute_vars(fallback?, props, depth + 1)?,
+        };
+        out.push_str(replacement.trim());
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// Strip a single level of `var(--name[, fallback])`, yielding the fallback (the
 /// declared behaviour when the custom property is unknown — custom properties
 /// are not tracked). Returns the inner text unchanged when there is no `var(`.
@@ -3747,36 +5180,225 @@ fn resolve_var(v: &str) -> String {
     v.to_string()
 }
 
-/// Evaluate a basic `calc(A op B)` with `+ - * /` over two point-resolved
-/// operands; `None` if it is not a `calc(...)` or cannot be reduced to points.
-fn parse_calc_px(v: &str, em: f64) -> Option<f64> {
-    let inner = v.trim().strip_prefix("calc(")?.strip_suffix(')')?.trim();
-    // Find a top-level binary operator (single operation only; no nesting).
-    for op in ['+', '-', '*', '/'] {
-        // Skip a leading sign so `-5px + 1px` still splits on the real `+`.
-        if let Some(pos) = inner[1..].find(op).map(|i| i + 1) {
-            let (a, b) = inner.split_at(pos);
-            let b = &b[1..];
-            let (a, b) = (a.trim(), b.trim());
-            return match op {
-                '+' => Some(parse_len_px(a, em)? + parse_len_px(b, em)?),
-                '-' => Some(parse_len_px(a, em)? - parse_len_px(b, em)?),
-                '*' => {
-                    // One side must be a unitless multiplier.
-                    let an = a.parse::<f64>().ok();
-                    let bn = b.parse::<f64>().ok();
-                    match (an, bn) {
-                        (Some(k), None) => Some(k * parse_len_px(b, em)?),
-                        (None, Some(k)) => Some(parse_len_px(a, em)? * k),
-                        _ => None,
-                    }
-                }
-                '/' => Some(parse_len_px(a, em)? / b.parse::<f64>().ok()?),
-                _ => None,
+/// A `calc()` value mid-evaluation. Lengths reduce to a **linear form**
+/// `pt + pct%·base` (absolute units fold into `pt` immediately; the percent
+/// part stays symbolic until the caller supplies its base), and bare numbers
+/// stay dimensionless so they can multiply/divide a length.
+#[derive(Debug, Clone, Copy)]
+enum CalcV {
+    /// A dimensionless number — only meaningful as a `*`/`/` operand.
+    Num(f64),
+    /// `pt + (pct/100)·base` — a length with an unresolved percent part.
+    Lin { pt: f64, pct: f64 },
+}
+
+/// Recursive-descent `calc()` expression parser: full operator chaining with
+/// `*`/`/` binding tighter than `+`/`-`, parentheses, nested `calc()`, unary
+/// signs, and mixed `%`/absolute operands kept in linear form. Invalid algebra
+/// — `length × length`, division **by** a length, `number + length`, division
+/// by zero — yields `None` so the declaration is ignored (CSS error handling).
+struct CalcParser<'a> {
+    s: &'a [u8],
+    i: usize,
+    em: f64,
+}
+
+impl<'a> CalcParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.i).copied()
+    }
+
+    /// `sum := prod (('+' | '-') prod)*`
+    fn sum(&mut self) -> Option<CalcV> {
+        let mut acc = self.prod()?;
+        loop {
+            self.skip_ws();
+            let sign = match self.peek() {
+                Some(b'+') => 1.0,
+                Some(b'-') => -1.0,
+                _ => return Some(acc),
+            };
+            self.i += 1;
+            let rhs = self.prod()?;
+            acc = match (acc, rhs) {
+                (CalcV::Num(a), CalcV::Num(b)) => CalcV::Num(a + sign * b),
+                (CalcV::Lin { pt: ap, pct: ac }, CalcV::Lin { pt: bp, pct: bc }) => CalcV::Lin {
+                    pt: ap + sign * bp,
+                    pct: ac + sign * bc,
+                },
+                // `number ± length` has no CSS meaning — the whole calc is invalid.
+                _ => return None,
             };
         }
     }
-    None
+
+    /// `prod := atom (('*' | '/') atom)*`
+    fn prod(&mut self) -> Option<CalcV> {
+        let mut acc = self.atom()?;
+        loop {
+            self.skip_ws();
+            let mul = match self.peek() {
+                Some(b'*') => true,
+                Some(b'/') => false,
+                _ => return Some(acc),
+            };
+            self.i += 1;
+            let rhs = self.atom()?;
+            acc = if mul {
+                match (acc, rhs) {
+                    (CalcV::Num(a), CalcV::Num(b)) => CalcV::Num(a * b),
+                    (CalcV::Num(k), CalcV::Lin { pt, pct })
+                    | (CalcV::Lin { pt, pct }, CalcV::Num(k)) => CalcV::Lin {
+                        pt: pt * k,
+                        pct: pct * k,
+                    },
+                    // `length × length` would be an area — invalid in CSS.
+                    _ => return None,
+                }
+            } else {
+                match rhs {
+                    // Division by a length (or by zero) is invalid.
+                    CalcV::Num(k) if k != 0.0 => match acc {
+                        CalcV::Num(a) => CalcV::Num(a / k),
+                        CalcV::Lin { pt, pct } => CalcV::Lin {
+                            pt: pt / k,
+                            pct: pct / k,
+                        },
+                    },
+                    _ => return None,
+                }
+            };
+        }
+    }
+
+    /// `atom := ['+'|'-'] ( '(' sum ')' | 'calc(' sum ')' | value )`
+    fn atom(&mut self) -> Option<CalcV> {
+        self.skip_ws();
+        // Unary sign (covers `-5px`, `2 * -3px`, `-(1px + 2px)`).
+        let mut sign = 1.0;
+        while let Some(c @ (b'+' | b'-')) = self.peek() {
+            if c == b'-' {
+                sign = -sign;
+            }
+            self.i += 1;
+            self.skip_ws();
+        }
+        let v = match self.peek()? {
+            b'(' => self.group()?,
+            b'c' | b'C' => {
+                // Nested `calc( … )` — the inner expression evaluates in place.
+                let rest = &self.s[self.i..];
+                if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"calc(") {
+                    self.i += 4; // leave the '(' for `group`
+                    self.group()?
+                } else {
+                    return None;
+                }
+            }
+            _ => self.value()?,
+        };
+        Some(match v {
+            CalcV::Num(n) => CalcV::Num(sign * n),
+            CalcV::Lin { pt, pct } => CalcV::Lin {
+                pt: sign * pt,
+                pct: sign * pct,
+            },
+        })
+    }
+
+    /// A parenthesised sub-expression: `'(' sum ')'`.
+    fn group(&mut self) -> Option<CalcV> {
+        debug_assert_eq!(self.peek(), Some(b'('));
+        self.i += 1;
+        let v = self.sum()?;
+        self.skip_ws();
+        if self.peek() != Some(b')') {
+            return None;
+        }
+        self.i += 1;
+        Some(v)
+    }
+
+    /// `<number> [unit | '%']` — absolute/font/viewport units resolve to points
+    /// through [`parse_len_px`]; a bare number stays dimensionless.
+    fn value(&mut self) -> Option<CalcV> {
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() || c == b'.' {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if self.i == start {
+            return None;
+        }
+        let num: f64 = std::str::from_utf8(&self.s[start..self.i])
+            .ok()?
+            .parse()
+            .ok()?;
+        if self.peek() == Some(b'%') {
+            self.i += 1;
+            return Some(CalcV::Lin { pt: 0.0, pct: num });
+        }
+        let ustart = self.i;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphabetic() {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if ustart == self.i {
+            return Some(CalcV::Num(num));
+        }
+        let unit = std::str::from_utf8(&self.s[ustart..self.i])
+            .ok()?
+            .to_ascii_lowercase();
+        let pt = parse_len_px(&format!("{num}{unit}"), self.em)?;
+        Some(CalcV::Lin { pt, pct: 0.0 })
+    }
+}
+
+/// Parse a full `calc( … )` expression to its linear form `(pt, pct)` — the
+/// caller resolves the percent part against its own base (container width for
+/// box lengths, `em` for font-relative contexts). `None` when the text is not
+/// a `calc(...)` or the expression is invalid.
+fn parse_calc_lin(v: &str, em: f64) -> Option<(f64, f64)> {
+    let v = v.trim();
+    // Byte-wise prefix test (a `str` slice could panic mid-char on exotic input).
+    if v.len() < 5 || !v.as_bytes()[..5].eq_ignore_ascii_case(b"calc(") {
+        return None;
+    }
+    let mut p = CalcParser {
+        s: v.as_bytes(),
+        i: 4, // at the opening '('
+        em,
+    };
+    let val = p.group()?;
+    p.skip_ws();
+    if p.i != p.s.len() {
+        return None; // trailing garbage after the closing ')'
+    }
+    match val {
+        CalcV::Lin { pt, pct } => Some((pt, pct)),
+        // A pure number is not a length (`calc(2*3)` where a length is due).
+        CalcV::Num(_) => None,
+    }
+}
+
+/// Evaluate a `calc(...)` down to points. The percent part resolves against
+/// `em` — the same base the bare `%` branch of [`parse_len_px`] uses, since
+/// this entry serves font-relative contexts.
+fn parse_calc_px(v: &str, em: f64) -> Option<f64> {
+    let (pt, pct) = parse_calc_lin(v, em)?;
+    Some(pt + em * pct / 100.0)
 }
 
 /// CSS length units [`parse_len_px`] resolves — kept in **lock-step** with the
@@ -3794,7 +5416,7 @@ const LENGTH_UNITS: [&str; 13] = [
 fn parse_len_px(v: &str, em: f64) -> Option<f64> {
     let resolved = resolve_var(v);
     let v = resolved.trim();
-    if v.starts_with("calc(") {
+    if v.len() >= 5 && v.as_bytes()[..5].eq_ignore_ascii_case(b"calc(") {
         return parse_calc_px(v, em);
     }
     if let Some(n) = v.strip_suffix("px") {
@@ -3809,19 +5431,16 @@ fn parse_len_px(v: &str, em: f64) -> Option<f64> {
     if let Some(n) = v.strip_suffix("em") {
         return n.trim().parse::<f64>().ok().map(|p| p * em);
     }
+    // `vw`/`vh` resolve against the LIVE page size when a layout is running
+    // (installed by the layout entry via `set_viewport_for_layout`), falling
+    // back to the reference US-Letter viewport outside one.
     if let Some(n) = v.strip_suffix("vw") {
-        return n
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|p| VIEWPORT_W_PT * p / 100.0);
+        let vp_w = VIEWPORT_PT.with(|c| c.get().0);
+        return n.trim().parse::<f64>().ok().map(|p| vp_w * p / 100.0);
     }
     if let Some(n) = v.strip_suffix("vh") {
-        return n
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|p| VIEWPORT_H_PT * p / 100.0);
+        let vp_h = VIEWPORT_PT.with(|c| c.get().1);
+        return n.trim().parse::<f64>().ok().map(|p| vp_h * p / 100.0);
     }
     // Absolute physical units, anchored at 1in = 72pt (= 96px).
     if let Some(n) = v.strip_suffix("cm") {
@@ -3856,6 +5475,19 @@ fn parse_len_px(v: &str, em: f64) -> Option<f64> {
 fn parse_len(v: &str, em: f64) -> Option<Len> {
     let resolved = resolve_var(v);
     let v = resolved.trim();
+    // `calc()` keeps its percent part symbolic so box lengths resolve it
+    // against the container (not `em`): pure-pt / pure-% forms normalise to
+    // the plain variants, a genuine mix stays `Len::Calc`.
+    if v.len() >= 5 && v.as_bytes()[..5].eq_ignore_ascii_case(b"calc(") {
+        let (pt, pct) = parse_calc_lin(v, em)?;
+        return Some(if pct == 0.0 {
+            Len::Pt(pt)
+        } else if pt == 0.0 {
+            Len::Percent(pct)
+        } else {
+            Len::Calc { pt, pct }
+        });
+    }
     if let Some(n) = v.strip_suffix('%') {
         return n.trim().parse::<f64>().ok().map(Len::Percent);
     }
@@ -4385,6 +6017,148 @@ mod tests {
         let style = sheet.computed(p, &Style::default(), &[]);
         // Inline blue wins over the class-green and tag-red rules.
         assert_eq!(style.color, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn important_suffix_is_stripped_not_corrupting() {
+        // `!important` is a cascade flag, not part of the value: previously the
+        // suffix stayed glued to the value ("red !important"), the colour parse
+        // failed, and the whole declaration was silently dropped.
+        let nodes = parse(r#"<style>p { color: red !important; }</style><p>x</p>"#);
+        let sheet = Stylesheet::new(&collect_style_css(&nodes));
+        let p = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "p" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let style = sheet.computed(p, &Style::default(), &[]);
+        assert_eq!(style.color, [1.0, 0.0, 0.0], "value survives the flag");
+        // Spacing/case variants of the flag are all recognised.
+        assert_eq!(strip_important("red !important"), ("red", true));
+        assert_eq!(strip_important("red!important"), ("red", true));
+        assert_eq!(strip_important("red ! IMPORTANT"), ("red", true));
+        assert_eq!(strip_important("red"), ("red", false));
+        // "important" alone (no `!`) is a legitimate value, not a flag.
+        assert_eq!(strip_important("important"), ("important", false));
+    }
+
+    #[test]
+    fn important_wins_the_cascade() {
+        // A `!important` tag rule beats a later, more specific class rule AND a
+        // normal inline style; an important inline style beats everything.
+        let nodes = parse(
+            r#"<style>p { color: red !important; } p.k { color: green; }</style>
+               <p class="k" style="color: blue">a</p>
+               <p class="k" style="color: blue !important">b</p>"#,
+        );
+        let sheet = Stylesheet::new(&collect_style_css(&nodes));
+        let ps: Vec<&Element> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Element(e) if e.tag == "p" => Some(e),
+                _ => None,
+            })
+            .collect();
+        let a = sheet.computed(ps[0], &Style::default(), &[]);
+        assert_eq!(
+            a.color,
+            [1.0, 0.0, 0.0],
+            "rule !important beats class rule + normal inline"
+        );
+        let b = sheet.computed(ps[1], &Style::default(), &[]);
+        assert_eq!(
+            b.color,
+            [0.0, 0.0, 1.0],
+            "inline !important beats rule !important"
+        );
+    }
+
+    /// Elements (not text) among a node's children.
+    fn child_elements(el: &Element) -> Vec<&Element> {
+        el.children
+            .iter()
+            .filter_map(|n| match n {
+                Node::Element(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_renders_only_the_selected_option() {
+        // A closed <select> shows ONE option; previously every option's text was
+        // concatenated into the output.
+        let nodes = parse(
+            "<select><option>One</option><option selected>Two</option>\
+             <option>Three</option></select>",
+        );
+        let sheet = Stylesheet::new("");
+        let select = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "select" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let options = child_elements(select);
+        assert_eq!(options.len(), 3);
+        let displays: Vec<Display> = options
+            .iter()
+            .map(|o| sheet.computed(o, &Style::default(), &[select]).display)
+            .collect();
+        assert_eq!(displays[0], Display::None, "unselected option hidden");
+        assert_ne!(displays[1], Display::None, "selected option shown");
+        assert_eq!(displays[2], Display::None, "unselected option hidden");
+    }
+
+    #[test]
+    fn select_without_selected_shows_the_first_option() {
+        let nodes = parse("<select><option>First</option><option>Second</option></select>");
+        let sheet = Stylesheet::new("");
+        let select = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "select" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let options = child_elements(select);
+        assert_eq!(options.len(), 2);
+        let first = sheet.computed(options[0], &Style::default(), &[select]);
+        let second = sheet.computed(options[1], &Style::default(), &[select]);
+        assert_ne!(first.display, Display::None, "first option is the default");
+        assert_eq!(second.display, Display::None, "others hidden");
+    }
+
+    #[test]
+    fn optgroup_options_resolve_against_the_whole_select() {
+        // The `selected` option lives in the SECOND optgroup: the first group's
+        // options must still hide (the scope is the select, not the optgroup).
+        let nodes = parse(
+            "<select><optgroup><option>A</option></optgroup>\
+             <optgroup><option selected>B</option></optgroup></select>",
+        );
+        let sheet = Stylesheet::new("");
+        let select = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "select" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let groups = child_elements(select);
+        let a = child_elements(groups[0])[0];
+        let b = child_elements(groups[1])[0];
+        let sa = sheet.computed(a, &Style::default(), &[select, groups[0]]);
+        let sb = sheet.computed(b, &Style::default(), &[select, groups[1]]);
+        assert_eq!(
+            sa.display,
+            Display::None,
+            "unselected group-A option hidden"
+        );
+        assert_ne!(sb.display, Display::None, "selected group-B option shown");
     }
 
     #[test]
@@ -5093,12 +6867,14 @@ mod tests {
             [0.0, 0.0, 0.0],
             "::before leaves <p> unstyled"
         );
-        // A dynamic pseudo-class we don't model still applies (over-match kept).
+        // A dynamic pseudo-class can never fire on static paged output: the
+        // rule is inert (it used to over-match, painting hover styles into
+        // the PDF).
         let hover = "<style>a{color:#000000} a:hover{color:#ff0000}</style><a>x</a>";
         assert_eq!(
             colors_of(hover, "a")[0],
-            [1.0, 0.0, 0.0],
-            ":hover kept as over-match"
+            [0.0, 0.0, 0.0],
+            ":hover rule is inert on paged output"
         );
     }
 
@@ -5878,5 +7654,718 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].family, "embedded");
         assert_eq!(rules[0].srcs, vec!["data:font/ttf;base64,QQ".to_string()]);
+    }
+
+    // ── custom properties (`var()`) ─────────────────────────────────────────
+
+    /// Compute the style of the first `<tag>` element in `html`.
+    fn computed_of(html: &str, tag: &str) -> Style {
+        fn find<'a>(nodes: &'a [Node], tag: &str) -> Option<&'a Element> {
+            for n in nodes {
+                if let Node::Element(e) = n {
+                    if e.tag == tag {
+                        return Some(e);
+                    }
+                    if let Some(f) = find(&e.children, tag) {
+                        return Some(f);
+                    }
+                }
+            }
+            None
+        }
+        fn chain<'a>(nodes: &'a [Node], tag: &str, acc: &mut Vec<&'a Element>) -> bool {
+            for n in nodes {
+                if let Node::Element(e) = n {
+                    if e.tag == tag {
+                        return true;
+                    }
+                    acc.push(e);
+                    if chain(&e.children, tag, acc) {
+                        return true;
+                    }
+                    acc.pop();
+                }
+            }
+            false
+        }
+        let nodes = parse(html);
+        let sheet = Stylesheet::new(&collect_style_css(&nodes));
+        let el = find(&nodes, tag).expect("element present");
+        let mut ancestors = Vec::new();
+        chain(&nodes, tag, &mut ancestors);
+        // Resolve parent styles down the chain so inheritance is realistic.
+        let mut parent = Style::default();
+        let mut walked: Vec<&Element> = Vec::new();
+        for a in &ancestors {
+            parent = sheet.computed(a, &parent, &walked);
+            walked.push(a);
+        }
+        sheet.computed(el, &parent, &walked)
+    }
+
+    #[test]
+    fn var_resolves_from_custom_property() {
+        let s = computed_of(
+            "<style>div { --brand: #ff0000; color: var(--brand); }</style><div>x</div>",
+            "div",
+        );
+        assert_eq!(s.color, [1.0, 0.0, 0.0], "var(--brand) → red");
+    }
+
+    #[test]
+    fn var_falls_back_when_unknown() {
+        let s = computed_of(
+            "<style>div { color: var(--missing, #00ff00); }</style><div>x</div>",
+            "div",
+        );
+        assert_eq!(s.color, [0.0, 1.0, 0.0], "fallback used");
+        // No fallback → the declaration is invalid: inherited/default stands.
+        let s2 = computed_of(
+            "<style>div { color: var(--missing); }</style><div>x</div>",
+            "div",
+        );
+        assert_eq!(s2.color, [0.0, 0.0, 0.0], "invalid declaration skipped");
+    }
+
+    #[test]
+    fn var_inherits_down_the_tree() {
+        let s = computed_of(
+            "<style>div { --pad: 10pt; } p { margin-top: var(--pad); }</style>\
+             <div><p>x</p></div>",
+            "p",
+        );
+        assert!(
+            (s.margin.top - 10.0).abs() < 1e-9,
+            "inherited custom property resolves on the child: {}",
+            s.margin.top
+        );
+    }
+
+    #[test]
+    fn var_in_var_resolves_nested_references() {
+        let s = computed_of(
+            "<style>div { --a: var(--b); --b: 24pt; font-size: var(--a); }</style><div>x</div>",
+            "div",
+        );
+        assert!(
+            (s.font_size - 24.0).abs() < 1e-9,
+            "var(--a) → var(--b) → 24pt: {}",
+            s.font_size
+        );
+    }
+
+    #[test]
+    fn var_cycle_uses_fallback_or_skips() {
+        // `--a` ↔ `--b` is a cycle: the reference is unresolvable, so the
+        // fallback applies…
+        let s = computed_of(
+            "<style>div { --a: var(--b); --b: var(--a); font-size: var(--a, 30pt); }</style>\
+             <div>x</div>",
+            "div",
+        );
+        assert!((s.font_size - 30.0).abs() < 1e-9, "cycle → fallback");
+        // …and with no fallback the declaration is skipped (default stands).
+        let s2 = computed_of(
+            "<style>div { --a: var(--b); --b: var(--a); font-size: var(--a); }</style>\
+             <div>x</div>",
+            "div",
+        );
+        assert!(
+            (s2.font_size - 16.0).abs() < 1e-9,
+            "cycle without fallback → declaration skipped (16pt root default kept), got {}",
+            s2.font_size
+        );
+    }
+
+    #[test]
+    fn var_on_root_pseudo_class_reaches_descendants() {
+        // The classic `:root { --x: … }` pattern must work end-to-end.
+        let s = computed_of(
+            "<style>:root { --c: #0000ff; } p { color: var(--c); }</style>\
+             <html><body><p>x</p></body></html>",
+            "p",
+        );
+        assert_eq!(s.color, [0.0, 0.0, 1.0], ":root custom property inherited");
+    }
+
+    // ── `::before` / `::after` generated content ────────────────────────────
+
+    /// Inject pseudo-elements for `html` and return the transformed forest.
+    fn injected(html: &str) -> Vec<Node> {
+        let nodes = parse(html);
+        let sheet = Stylesheet::new(&collect_style_css(&nodes));
+        apply_pseudo_elements(&nodes, &sheet)
+    }
+
+    /// Collect the visible text of a forest in document order.
+    fn forest_text(nodes: &[Node]) -> String {
+        fn walk(nodes: &[Node], out: &mut String) {
+            for n in nodes {
+                match n {
+                    Node::Text(t) => out.push_str(t),
+                    Node::Element(e) => {
+                        if e.tag != "style" {
+                            walk(&e.children, out);
+                        }
+                    }
+                }
+            }
+        }
+        let mut s = String::new();
+        walk(nodes, &mut s);
+        s
+    }
+
+    #[test]
+    fn before_and_after_content_strings_are_injected() {
+        let out = injected(
+            "<style>p::before { content: \">> \"; } p::after { content: \" <<\"; }</style>\
+             <p>mid</p>",
+        );
+        assert_eq!(forest_text(&out), ">> mid <<");
+        // The pseudo is a synthetic child with the rule's decls as inline style.
+        let p = out
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "p" => Some(e),
+                _ => None,
+            })
+            .expect("p");
+        let first = match &p.children[0] {
+            Node::Element(e) => e,
+            other => panic!("expected pseudo element first, got {other:?}"),
+        };
+        assert_eq!(first.tag, PSEUDO_ELEMENT_TAG);
+    }
+
+    #[test]
+    fn content_attr_reads_the_host_attribute() {
+        let out = injected(
+            "<style>a::after { content: \" (\" attr(href) \")\"; }</style>\
+             <a href=\"https://x.test\">link</a>",
+        );
+        assert_eq!(forest_text(&out), "link (https://x.test)");
+    }
+
+    #[test]
+    fn counters_number_nested_ordered_lists() {
+        // The standard authored pattern: reset on each <ol>, increment per <li>.
+        let out = injected(
+            "<style>ol { counter-reset: item; } \
+             li::before { counter-increment: item; content: counters(item, \".\") \". \"; }\
+             </style>\
+             <ol><li>a</li><li>b<ol><li>b1</li><li>b2</li></ol></li><li>c</li></ol>",
+        );
+        let text = forest_text(&out);
+        for expected in ["1. a", "2. b", "2.1. b1", "2.2. b2", "3. c"] {
+            assert!(
+                text.contains(expected),
+                "hierarchical numbering has {expected:?}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_counter_reset_and_increment_values() {
+        let out = injected(
+            "<style>div { counter-reset: sec 10; } \
+             h2::before { counter-increment: sec 5; content: counter(sec) \" — \"; }</style>\
+             <div><h2>alpha</h2><h2>beta</h2></div>",
+        );
+        let text = forest_text(&out);
+        assert!(text.contains("15 — alpha"), "10 + 5: {text:?}");
+        assert!(text.contains("20 — beta"), "15 + 5: {text:?}");
+    }
+
+    #[test]
+    fn resolve_content_never_panics_on_garbage() {
+        let el = Element {
+            tag: "p".into(),
+            ..Default::default()
+        };
+        let counters = CounterSet::default();
+        for v in [
+            "\"unterminated",
+            "\"esc \\é end\"",  // escaped multibyte char
+            "\"line\\Abreak\"", // \A newline escape
+            "counter(",
+            "counters(a",
+            "attr()",
+            "url(x.png) \"y\"",
+            "open-quote close-quote",
+            "🎉 \"emoji\"",
+        ] {
+            let _ = resolve_content(v, &el, &counters); // must not panic
+        }
+        assert_eq!(
+            resolve_content("\"a\\Ab\"", &el, &counters).as_deref(),
+            Some("a\nb"),
+            "\\A is the CSS newline escape"
+        );
+        assert_eq!(
+            resolve_content("\"e \\é\"", &el, &counters).as_deref(),
+            Some("e é"),
+            "escaped multibyte char copied verbatim"
+        );
+    }
+
+    #[test]
+    fn content_none_and_no_rule_generate_nothing() {
+        let out = injected("<style>p::before { content: none; }</style><p>x</p>");
+        assert_eq!(forest_text(&out), "x");
+        // Empty-string content still generates the (empty) box — the clearfix.
+        let out2 = injected("<style>p::after { content: \"\"; display: block; }</style><p>x</p>");
+        let p = out2
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "p" => Some(e),
+                _ => None,
+            })
+            .expect("p");
+        assert!(
+            matches!(p.children.last(), Some(Node::Element(e)) if e.tag == PSEUDO_ELEMENT_TAG),
+            "content:\"\" still injects the box"
+        );
+    }
+
+    #[test]
+    fn injected_pseudo_does_not_shift_first_child() {
+        // A `::before` on the parent must not steal the first real child's
+        // `:first-child` match.
+        let out = injected(
+            "<style>ul::before { content: \"L: \"; } li:first-child { color: #ff0000; }</style>\
+             <ul><li>one</li><li>two</li></ul>",
+        );
+        let sheet = Stylesheet::new(
+            "ul::before { content: \"L: \"; } li:first-child { color: #ff0000; }",
+        );
+        let ul = out
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "ul" => Some(e),
+                _ => None,
+            })
+            .expect("ul");
+        let lis: Vec<&Element> = ul
+            .children
+            .iter()
+            .filter_map(|n| match n {
+                Node::Element(e) if e.tag == "li" => Some(e),
+                _ => None,
+            })
+            .collect();
+        let first = sheet.computed(lis[0], &Style::default(), &[ul]);
+        let second = sheet.computed(lis[1], &Style::default(), &[ul]);
+        assert_eq!(first.color, [1.0, 0.0, 0.0], "real first li still matches");
+        assert_eq!(second.color, [0.0, 0.0, 0.0], "second li does not");
+    }
+
+    // ── `@page` ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn page_rule_named_size_and_orientation() {
+        let rule = collect_page_rule("@page { size: A4 landscape; }").expect("rule");
+        let (w, h) = rule.size.expect("size");
+        assert!(w > h, "landscape is wider than tall");
+        assert!((h - 595.276).abs() < 0.1 && (w - 841.890).abs() < 0.1, "A4 swapped");
+        let portrait = collect_page_rule("@page { size: letter; }").unwrap();
+        assert_eq!(portrait.size, Some((612.0, 792.0)));
+    }
+
+    #[test]
+    fn page_rule_custom_size_lengths() {
+        let rule = collect_page_rule("@page { size: 400pt 500pt; }").unwrap();
+        assert_eq!(rule.size, Some((400.0, 500.0)));
+        // A single length is a square page, per spec.
+        let sq = collect_page_rule("@page { size: 10cm; }").unwrap();
+        let (w, h) = sq.size.unwrap();
+        assert!((w - h).abs() < 1e-9 && (w - 10.0 * 72.0 / 2.54).abs() < 0.01);
+    }
+
+    #[test]
+    fn page_rule_margins_shorthand_and_longhands() {
+        let rule = collect_page_rule("@page { margin: 1in 2in; }").unwrap();
+        assert_eq!(rule.margins, [Some(72.0), Some(144.0), Some(72.0), Some(144.0)]);
+        let long = collect_page_rule("@page { margin-top: 10pt; margin-left: 20pt; }").unwrap();
+        assert_eq!(long.margins, [Some(10.0), None, None, Some(20.0)]);
+        // No @page at all → None.
+        assert!(collect_page_rule("p { color: red }").is_none());
+    }
+
+    // ── gradient `transparent` stops ────────────────────────────────────────
+
+    #[test]
+    fn transparent_gradient_stop_is_kept_with_alpha_zero() {
+        let s = inline_style("background: linear-gradient(red, transparent)");
+        let g = as_linear(&s);
+        assert_eq!(g.stops.len(), 2, "transparent stop is NOT dropped");
+        assert!((g.stops[0].alpha - 1.0).abs() < 1e-9, "red is opaque");
+        assert!(g.stops[1].alpha.abs() < 1e-9, "transparent stop alpha 0");
+        // The transparent stop borrows its neighbour's colour so the ramp
+        // fades red out in place instead of towards black.
+        assert_eq!(g.stops[1].color, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn rgba_gradient_stop_carries_its_alpha() {
+        let s = inline_style("background: linear-gradient(rgba(0,0,255,0.5), yellow)");
+        let g = as_linear(&s);
+        assert!((g.stops[0].alpha - 0.5).abs() < 1e-9, "rgba alpha kept");
+        assert!((g.stops[1].alpha - 1.0).abs() < 1e-9);
+    }
+
+    // ── `white-space` / overflow properties / `object-fit` / `max-height` ──
+
+    #[test]
+    fn white_space_values_parse_and_track_the_pre_flag() {
+        for (v, ws, pre) in [
+            ("normal", WhiteSpace::Normal, false),
+            ("nowrap", WhiteSpace::Nowrap, false),
+            ("pre", WhiteSpace::Pre, true),
+            ("pre-wrap", WhiteSpace::PreWrap, true),
+            ("pre-line", WhiteSpace::PreLine, false),
+        ] {
+            let s = inline_style(&format!("white-space: {v}"));
+            assert_eq!(s.white_space, ws, "white-space: {v}");
+            assert_eq!(s.pre, pre, "legacy pre flag for {v}");
+        }
+    }
+
+    #[test]
+    fn word_break_overflow_wrap_and_text_overflow_parse() {
+        assert!(inline_style("word-break: break-all").break_word);
+        assert!(inline_style("overflow-wrap: break-word").break_word);
+        assert!(inline_style("word-wrap: break-word").break_word, "legacy alias");
+        assert!(!inline_style("word-break: keep-all").break_word);
+        assert!(inline_style("text-overflow: ellipsis").text_overflow_ellipsis);
+        assert!(!inline_style("text-overflow: clip").text_overflow_ellipsis);
+    }
+
+    #[test]
+    fn object_fit_parses_every_mode() {
+        for (v, want) in [
+            ("fill", ObjectFit::Fill),
+            ("contain", ObjectFit::Contain),
+            ("cover", ObjectFit::Cover),
+            ("none", ObjectFit::None),
+            ("scale-down", ObjectFit::ScaleDown),
+        ] {
+            assert_eq!(inline_style(&format!("object-fit: {v}")).object_fit, want);
+        }
+    }
+
+    #[test]
+    fn max_height_parses_and_none_clears() {
+        let s = inline_style("max-height: 100pt");
+        assert_eq!(s.max_height, Some(100.0));
+        assert_eq!(inline_style("max-height: none").max_height, None);
+    }
+
+    #[test]
+    fn vertical_align_line_relative_values_parse() {
+        assert_eq!(inline_style("vertical-align: middle").valign, VShift::Middle);
+        assert_eq!(inline_style("vertical-align: top").valign, VShift::Top);
+        assert_eq!(inline_style("vertical-align: bottom").valign, VShift::Bottom);
+        // Lengths keep resolving to points (positive = raise).
+        assert_eq!(
+            inline_style("vertical-align: 3pt").valign,
+            VShift::Points(3.0)
+        );
+    }
+
+    // ── `:not()` / `:nth-of-type` / unknown pseudo-classes ─────────────────
+
+    #[test]
+    fn not_pseudo_class_excludes_matching_elements() {
+        let html = "<style>p:not(.a) { color: #ff0000 }</style>\
+                    <div><p class=\"a\">skip</p><p>hit</p></div>";
+        let nodes = parse(html);
+        let sheet = Stylesheet::new(&collect_style_css(&nodes));
+        let div = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "div" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let ps: Vec<&Element> = div
+            .children
+            .iter()
+            .filter_map(|n| match n {
+                Node::Element(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        let skip = sheet.computed(ps[0], &Style::default(), &[div]);
+        let hit = sheet.computed(ps[1], &Style::default(), &[div]);
+        assert_eq!(skip.color, [0.0, 0.0, 0.0], ":not(.a) excludes .a");
+        assert_eq!(hit.color, [1.0, 0.0, 0.0], ":not(.a) matches the other");
+    }
+
+    #[test]
+    fn nth_of_type_counts_same_tag_siblings_only() {
+        // <h1> then three <p>: `p:nth-of-type(2n)` must hit ONLY the 2nd <p>
+        // (with nth-child semantics the h1 would shift every index by one).
+        let html = "<style>p:nth-of-type(2n) { color: #ff0000 }</style>\
+                    <div><h1>t</h1><p>p1</p><p>p2</p><p>p3</p></div>";
+        let nodes = parse(html);
+        let sheet = Stylesheet::new(&collect_style_css(&nodes));
+        let div = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "div" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let ps: Vec<&Element> = div
+            .children
+            .iter()
+            .filter_map(|n| match n {
+                Node::Element(e) if e.tag == "p" => Some(e),
+                _ => None,
+            })
+            .collect();
+        let colors: Vec<[f64; 3]> = ps
+            .iter()
+            .map(|p| sheet.computed(p, &Style::default(), &[div]).color)
+            .collect();
+        assert_eq!(colors[0], [0.0, 0.0, 0.0], "p1 is 1st of type");
+        assert_eq!(colors[1], [1.0, 0.0, 0.0], "p2 is 2nd of type → match");
+        assert_eq!(colors[2], [0.0, 0.0, 0.0], "p3 is 3rd of type");
+    }
+
+    #[test]
+    fn unknown_pseudo_class_makes_the_rule_inert() {
+        // Standalone unknown pseudo: never matches.
+        let s = computed_of(
+            "<style>p:figment-of-css { color: #ff0000 }</style><p>x</p>",
+            "p",
+        );
+        assert_eq!(s.color, [0.0, 0.0, 0.0], "unknown pseudo → inert rule");
+        // Unknown pseudo INSIDE :not(…) must not flip into an over-match.
+        let s2 = computed_of(
+            "<style>p:not(:figment-of-css) { color: #ff0000 }</style><p>x</p>",
+            "p",
+        );
+        assert_eq!(s2.color, [0.0, 0.0, 0.0], ":not(unknown) → inert, not true");
+    }
+
+    // ── `font-family` fallback list ─────────────────────────────────────────
+
+    #[test]
+    fn font_family_keeps_the_full_fallback_list() {
+        let s = inline_style("font-family: \"PoliceInexistante\", serif");
+        assert_eq!(s.font_family, "PoliceInexistante", "first name kept");
+        assert_eq!(
+            s.font_families,
+            vec!["PoliceInexistante".to_string(), "serif".to_string()]
+        );
+        // The unknown first name doesn't hide the generic fallback intent.
+        assert!(s.generic_serif, "serif fallback drives the generic flag");
+        // A recognised sans first name stops the scan (flags stay off).
+        let s2 = inline_style("font-family: Arial, serif");
+        assert!(!s2.generic_serif && !s2.generic_mono);
+        // Single-name behaviour is unchanged.
+        let s3 = inline_style("font-family: Courier");
+        assert!(s3.generic_mono);
+    }
+
+    // ── `vw`/`vh` against the live page size ────────────────────────────────
+
+    #[test]
+    fn vw_vh_resolve_against_installed_viewport() {
+        // Reference viewport (no layout running): the historical values.
+        assert_eq!(parse_len_px("50vw", 12.0), Some(VIEWPORT_W_PT / 2.0));
+        assert_eq!(parse_len_px("50vh", 12.0), Some(VIEWPORT_H_PT / 2.0));
+        {
+            let _vp = set_viewport_for_layout(400.0, 1000.0);
+            assert_eq!(parse_len_px("50vw", 12.0), Some(200.0), "live width");
+            assert_eq!(parse_len_px("10vh", 12.0), Some(100.0), "live height");
+        }
+        // The guard restored the reference viewport.
+        assert_eq!(parse_len_px("50vw", 12.0), Some(VIEWPORT_W_PT / 2.0));
+        // An absurd (synthetic band) height is ignored, keeping the fallback.
+        {
+            let _vp = set_viewport_for_layout(500.0, 1.0e6);
+            assert_eq!(parse_len_px("100vw", 12.0), Some(500.0));
+            assert_eq!(parse_len_px("100vh", 12.0), Some(VIEWPORT_H_PT));
+        }
+    }
+
+    // ── `transform-origin` / `caption-side` ────────────────────────────────
+
+    #[test]
+    fn transform_origin_parses_keywords_lengths_and_percentages() {
+        let get = |v: &str| inline_style(&format!("transform-origin: {v}")).transform_origin;
+        // Keywords, both orders.
+        let (x, y) = get("top left").expect("parsed");
+        assert!(matches!(x, Len::Percent(p) if p == 0.0), "left → 0% x");
+        assert!(matches!(y, Len::Percent(p) if p == 0.0), "top → 0% y");
+        let (x2, y2) = get("left top").expect("parsed");
+        assert!(matches!(x2, Len::Percent(p) if p == 0.0));
+        assert!(matches!(y2, Len::Percent(p) if p == 0.0));
+        // One value: x set, y defaults to center; a lone vertical keyword is y.
+        let (x3, y3) = get("right").unwrap();
+        assert!(matches!(x3, Len::Percent(p) if p == 100.0));
+        assert!(matches!(y3, Len::Percent(p) if p == 50.0));
+        let (x4, y4) = get("bottom").unwrap();
+        assert!(matches!(x4, Len::Percent(p) if p == 50.0));
+        assert!(matches!(y4, Len::Percent(p) if p == 100.0));
+        // Lengths and percentages stay positional (x then y).
+        let (x5, y5) = get("10pt 25%").unwrap();
+        assert!(matches!(x5, Len::Pt(p) if (p - 10.0).abs() < 1e-9));
+        assert!(matches!(y5, Len::Percent(p) if p == 25.0));
+        // Initial value: no declaration → None (centre pivot).
+        assert!(inline_style("color:red").transform_origin.is_none());
+    }
+
+    #[test]
+    fn caption_side_parses_and_inherits() {
+        assert_eq!(
+            inline_style("caption-side: bottom").caption_side,
+            CaptionSide::Bottom
+        );
+        assert_eq!(
+            inline_style("caption-side: top").caption_side,
+            CaptionSide::Top
+        );
+        // Inherited: declared on the table, visible on the caption.
+        let s = computed_of(
+            "<style>table { caption-side: bottom }</style>\
+             <table><caption>c</caption></table>",
+            "caption",
+        );
+        assert_eq!(s.caption_side, CaptionSide::Bottom);
+    }
+
+    // ── nested opacity composition ──────────────────────────────────────────
+
+    #[test]
+    fn nested_opacity_composes_multiplicatively() {
+        let s = computed_of(
+            "<style>div { opacity: 0.5 } p { opacity: 0.5 }</style><div><p>x</p></div>",
+            "p",
+        );
+        assert!(
+            (s.opacity - 0.25).abs() < 1e-9,
+            "0.5 × 0.5 = 0.25 effective, got {}",
+            s.opacity
+        );
+        // A child WITHOUT its own opacity inherits the parent's effective value.
+        let s2 = computed_of(
+            "<style>div { opacity: 0.5 }</style><div><p>x</p></div>",
+            "p",
+        );
+        assert!((s2.opacity - 0.5).abs() < 1e-9);
+        // Within one element the LAST declaration wins (no double-compose).
+        let s3 = computed_of(
+            "<style>p { opacity: 0.8 } p { opacity: 0.5 }</style><p>x</p>",
+            "p",
+        );
+        assert!(
+            (s3.opacity - 0.5).abs() < 1e-9,
+            "last declaration wins, not 0.4: {}",
+            s3.opacity
+        );
+    }
+
+    // ── calc() expression parser (chained ops, parentheses, mixed units) ──
+
+    #[test]
+    fn calc_chained_operations_with_precedence() {
+        // `*` binds tighter than `+`: 10 + 2·20 + 5 = 55pt.
+        let s = inline_style("margin-top: calc(10pt + 2*20pt + 5pt)");
+        assert!(
+            (s.margin.top - 55.0).abs() < 1e-6,
+            "chained +/* with precedence: {}",
+            s.margin.top
+        );
+    }
+
+    #[test]
+    fn calc_parentheses_and_division() {
+        // (10 + 20) / 3 = 10pt — the parens beat the natural precedence.
+        let s = inline_style("margin-top: calc((10pt + 20pt)/3)");
+        assert!((s.margin.top - 10.0).abs() < 1e-6, "{}", s.margin.top);
+    }
+
+    #[test]
+    fn calc_mixed_percent_and_points_stays_symbolic() {
+        // width: calc(100% - 2*20pt + 5pt) → Len::Calc { pct: 100, pt: -35 },
+        // resolved against the CONTAINER at layout time (not em).
+        let s = inline_style("width: calc(100% - 2*20pt + 5pt)");
+        match s.width {
+            Some(Len::Calc { pt, pct }) => {
+                assert!((pt + 35.0).abs() < 1e-6, "pt part: {pt}");
+                assert!((pct - 100.0).abs() < 1e-6, "pct part: {pct}");
+            }
+            other => panic!("expected a mixed calc, got {other:?}"),
+        }
+        // Resolution against a 200pt base: 200 − 35 = 165.
+        assert!((s.width.unwrap().resolve(200.0) - 165.0).abs() < 1e-6);
+        // The (100% − 40pt)/3 form divides BOTH components.
+        let thirds = inline_style("width: calc((100% - 40pt)/3)");
+        match thirds.width {
+            Some(Len::Calc { pt, pct }) => {
+                assert!((pct - 100.0 / 3.0).abs() < 1e-6, "pct third: {pct}");
+                assert!((pt + 40.0 / 3.0).abs() < 1e-6, "pt third: {pt}");
+            }
+            other => panic!("expected thirds calc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calc_nested_calc_and_pure_forms_normalise() {
+        // Nested calc() evaluates in place; a pure-% result is a plain Percent.
+        let s = inline_style("width: calc(calc(50% + 25%))");
+        assert!(
+            matches!(s.width, Some(Len::Percent(p)) if (p - 75.0).abs() < 1e-6),
+            "nested pure-percent normalises to Len::Percent: {:?}",
+            s.width
+        );
+        // A pure-pt result is a plain Pt.
+        let s2 = inline_style("width: calc(2*(10pt + 5pt))");
+        assert!(
+            matches!(s2.width, Some(Len::Pt(p)) if (p - 30.0).abs() < 1e-6),
+            "pure-pt normalises to Len::Pt: {:?}",
+            s2.width
+        );
+    }
+
+    #[test]
+    fn calc_invalid_expressions_are_ignored() {
+        // Division BY a length is invalid.
+        assert!(inline_style("width: calc(100pt / 2pt)").width.is_none());
+        // length × length would be an area — invalid.
+        assert!(inline_style("width: calc(10pt * 2pt)").width.is_none());
+        // Unbalanced parenthesis.
+        assert!(inline_style("width: calc((10pt + 5pt)").width.is_none());
+        // number + length has no meaning.
+        assert!(inline_style("width: calc(5 + 10pt)").width.is_none());
+        // Division by zero.
+        assert!(inline_style("width: calc(10pt / 0)").width.is_none());
+    }
+
+    // ── writing-mode ──
+
+    #[test]
+    fn writing_mode_parses_vertical_variants() {
+        assert_eq!(
+            inline_style("writing-mode: vertical-rl").writing_mode,
+            WritingMode::VerticalRl
+        );
+        assert_eq!(
+            inline_style("writing-mode: vertical-lr").writing_mode,
+            WritingMode::VerticalLr
+        );
+        assert_eq!(
+            inline_style("writing-mode: horizontal-tb").writing_mode,
+            WritingMode::HorizontalTb
+        );
+        // Unknown values keep the default.
+        assert_eq!(
+            inline_style("writing-mode: bogus").writing_mode,
+            WritingMode::HorizontalTb
+        );
     }
 }

@@ -59,7 +59,10 @@ hr{border:0;border-top:1px solid #999}\
 sup.cmt-ref{font-size:.7em;line-height:0}\
 aside.comments{margin-top:2em;border-top:1px solid #999;font-size:.9em;color:#333}\
 aside.comments h2{font-size:1em}\
-aside.comments .cmt-meta{color:#777;font-size:.85em}</style></head><body>",
+aside.comments .cmt-meta{color:#777;font-size:.85em}\
+sup.fn-ref{font-size:.7em;line-height:0}\
+aside.footnotes{margin-top:2em;border-top:1px solid #999;font-size:.9em;color:#333}\
+aside.footnotes h2{font-size:1em}</style></head><body>",
     );
     for section in &doc.sections {
         if let Some(header) = &section.header {
@@ -67,8 +70,20 @@ aside.comments .cmt-meta{color:#777;font-size:.85em}</style></head><body>",
             html_blocks(header, doc, &mut html);
             html.push_str("</header>");
         }
+        // Multi-column body: when the section geometry declares more than one
+        // text column, wrap the flow in a `column-count`/`column-gap` container.
+        // The HTML engine lays multi-column blocks out natively (equal-width
+        // columns), so the body text really flows into columns rather than one
+        // wide measure. Header/footer stay single-column.
+        let multicol = section.geometry.column_count > 1;
+        if multicol {
+            html.push_str(&multicol_open(&section.geometry));
+        }
         for page in &section.pages {
             html_blocks(&page.blocks, doc, &mut html);
+        }
+        if multicol {
+            html.push_str("</div>");
         }
         if let Some(footer) = &section.footer {
             html.push_str("<footer>");
@@ -76,9 +91,66 @@ aside.comments .cmt-meta{color:#777;font-size:.85em}</style></head><body>",
             html.push_str("</footer>");
         }
     }
+    html_footnotes(doc, &mut html);
     html_comments(doc, &mut html);
     html.push_str("</body></html>");
     html
+}
+
+/// Open the multi-column flow container for a section whose [`PageGeometry`]
+/// declares more than one text column. Emits `column-count` (the column count —
+/// the number of explicit [`column_widths_pt`] when given, else
+/// [`column_count`]) and `column-gap` (the gutter, [`column_gap_pt`], default
+/// 36pt / Word's 720 twips). The engine renders equal-width columns, so a
+/// non-uniform `column_widths_pt` is approximated by the column count; the
+/// caller closes the `</div>`.
+///
+/// [`PageGeometry`]: crate::model::PageGeometry
+/// [`column_widths_pt`]: crate::model::PageGeometry::column_widths_pt
+/// [`column_count`]: crate::model::PageGeometry::column_count
+/// [`column_gap_pt`]: crate::model::PageGeometry::column_gap_pt
+fn multicol_open(geom: &crate::model::PageGeometry) -> String {
+    let count = geom
+        .column_widths_pt
+        .as_ref()
+        .map(|w| w.len())
+        .filter(|&n| n > 1)
+        .unwrap_or(geom.column_count as usize)
+        .max(2);
+    let gap = geom.column_gap_pt.unwrap_or(36.0).max(0.0);
+    format!("<div style=\"column-count:{count};column-gap:{}pt\">", n(gap))
+}
+
+/// Append the document's foot-/endnotes as a bottom `<aside>`: each note's
+/// block content renders under an anchor (`id="fnt-<id>"`) that the inline
+/// [`Inline::FootnoteRef`] markers link to, with a back-link to the in-flow
+/// call marker. Emits nothing when the document has no notes.
+fn html_footnotes(doc: &Document, out: &mut String) {
+    if doc.footnotes.is_empty() {
+        return;
+    }
+    out.push_str("<aside class=\"footnotes\"><h2>Notes</h2><ol>");
+    for f in &doc.footnotes {
+        let anchor = footnote_anchor(&f.id);
+        out.push_str(&format!("<li id=\"{anchor}\">"));
+        html_blocks(&f.blocks, doc, out);
+        // Back-link to the in-flow call marker, when one exists.
+        out.push_str(&format!(" <a href=\"#{anchor}-ref\">\u{21a9}</a>"));
+        out.push_str("</li>");
+    }
+    out.push_str("</ol></aside>");
+}
+
+/// The HTML element id for a footnote: `fnt-<id>` with the id attribute-escaped.
+/// Used by both the inline call marker and the notes section so they link up.
+fn footnote_anchor(id: &str) -> String {
+    format!("fnt-{}", attr_esc(id))
+}
+
+/// The 1-based display ordinal of the footnote with `id` (its position in
+/// `doc.footnotes`), or `None` if no note carries that id.
+fn footnote_number(doc: &Document, id: &str) -> Option<usize> {
+    doc.footnotes.iter().position(|f| f.id == id).map(|p| p + 1)
 }
 
 /// Append the document's review comments as an endnote-style `<aside>`: each
@@ -252,6 +324,14 @@ fn html_inlines(runs: &[Inline], doc: &Document, out: &mut String) {
                 let target = match href {
                     LinkTarget::Url(u) => attr_esc(u),
                     LinkTarget::Page(p) => format!("#page{p}"),
+                    // A named in-document anchor: the HTML fragment form.
+                    LinkTarget::Anchor(a) => format!("#{}", attr_esc(a)),
+                    // A raw action summary (GoToR/Named/Launch…): HTML has no
+                    // equivalent target — render the children un-linked.
+                    LinkTarget::Other(_) => {
+                        html_inlines(children, doc, out);
+                        continue;
+                    }
                 };
                 out.push_str(&format!("<a href=\"{target}\">"));
                 html_inlines(children, doc, out);
@@ -266,6 +346,18 @@ fn html_inlines(runs: &[Inline], doc: &Document, out: &mut String) {
                     let anchor = comment_anchor(id);
                     out.push_str(&format!(
                         "<sup class=\"cmt-ref\" id=\"{anchor}-ref\"><a href=\"#{anchor}\">[{n}]</a></sup>"
+                    ));
+                }
+            }
+            // A foot-/endnote anchor → the synthesized superscript call marker
+            // (the note's 1-based ordinal in `doc.footnotes`) linking to the
+            // note body in the bottom notes section. A dangling id (degenerate
+            // input) emits nothing, mirroring `CommentRef`.
+            Inline::FootnoteRef { id } => {
+                if let Some(n) = footnote_number(doc, id) {
+                    let anchor = footnote_anchor(id);
+                    out.push_str(&format!(
+                        "<sup class=\"fn-ref\" id=\"{anchor}-ref\"><a href=\"#{anchor}\">{n}</a></sup>"
                     ));
                 }
             }
@@ -323,6 +415,17 @@ fn char_style_css(style: &CharStyle) -> String {
     }
     if style.letter_spacing_pt != 0.0 {
         css.push_str(&format!(";letter-spacing:{}pt", n(style.letter_spacing_pt)));
+    }
+    // Display transforms: `caps` renders through `text-transform:uppercase`
+    // (the run text keeps its original casing — the internal HTML→PDF engine
+    // applies the transform natively); `small_caps` emits the standard
+    // `font-variant` (honoured by browsers; a no-op for the internal engine,
+    // which keeps the original text — never a fake uppercase).
+    if style.caps {
+        css.push_str(";text-transform:uppercase");
+    }
+    if style.small_caps {
+        css.push_str(";font-variant:small-caps");
     }
     css.trim_start_matches(';').to_string()
 }
@@ -478,17 +581,107 @@ fn html_image_inline(img: &ImageRef, doc: &Document, out: &mut String) {
     let Some(res) = doc.resources.images.get(&img.resource) else {
         return;
     };
+    let alt = attr_esc(img.alt.as_deref().unwrap_or(""));
+
+    // A source-rectangle crop (`ImageRef::crop`, DrawingML `a:srcRect`) is baked
+    // into the emitted pixels: decode → keep only the visible sub-rectangle →
+    // re-encode PNG. CSS can't express an arbitrary sub-rect crop this HTML
+    // engine will actually realise — it honours neither negative-margin/absolute
+    // offsets on `<img>` nor overflow-clipping of an oversized image, and there
+    // is no SVG `<image>` element to viewBox-crop through — so cropping the
+    // bitmap is the faithful, renderer-agnostic way to make "only the cropped
+    // region shows" (a browser consuming this same HTML export shows it too).
+    // Degenerate crops or undecodable bytes fall through to the whole image.
+    if let Some(crop) = img.crop {
+        if let Some((png, cw_px, ch_px)) = crop_image_bytes(&res.bytes, &res.format, crop) {
+            // Display at the authored (cropped) footprint when the extent is
+            // known; otherwise the cropped pixel size at 1px→1pt. The engine
+            // reads `<img>` width/height as points.
+            let (dw, dh) = img
+                .size_pt
+                .unwrap_or((f64::from(cw_px), f64::from(ch_px)));
+            out.push_str(&format!(
+                "<img alt=\"{alt}\" width=\"{}\" height=\"{}\" src=\"data:image/png;base64,{}\"/>",
+                n(dw),
+                n(dh),
+                base64(&png)
+            ));
+            return;
+        }
+    }
+
     let mime = match res.format.as_str() {
         "jpeg" | "jpg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
         _ => "image/png",
     };
-    let alt = attr_esc(img.alt.as_deref().unwrap_or(""));
     out.push_str(&format!(
         "<img alt=\"{alt}\" src=\"data:{mime};base64,{}\"/>",
         base64(&res.bytes)
     ));
+}
+
+/// Bake a source-rectangle crop into the image pixels: decode `bytes`, keep only
+/// the visible sub-rectangle (`crop` = `[left, top, right, bottom]` inset
+/// fractions, each `0.0..=1.0`), and re-encode as PNG. Returns the PNG bytes and
+/// the cropped pixel dimensions, or `None` for a degenerate crop (a no-op, or one
+/// that removes a whole axis) or bytes that don't decode — the caller then emits
+/// the whole image unchanged.
+fn crop_image_bytes(bytes: &[u8], format: &str, crop: [f64; 4]) -> Option<(Vec<u8>, u32, u32)> {
+    let [l, t, r, b] = [
+        crop[0].clamp(0.0, 1.0),
+        crop[1].clamp(0.0, 1.0),
+        crop[2].clamp(0.0, 1.0),
+        crop[3].clamp(0.0, 1.0),
+    ];
+    // A no-op crop, or one that collapses an axis, leaves the image untouched.
+    if (l + t + r + b) == 0.0 || l + r >= 1.0 || t + b >= 1.0 {
+        return None;
+    }
+    let (w, h, rgba) = decode_rgba(bytes, format)?;
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return None;
+    }
+    let x0 = ((l * w as f64).round() as usize).min(w - 1);
+    let y0 = ((t * h as f64).round() as usize).min(h - 1);
+    let x1 = (((1.0 - r) * w as f64).round() as usize).clamp(x0 + 1, w);
+    let y1 = (((1.0 - b) * h as f64).round() as usize).clamp(y0 + 1, h);
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    let mut cropped = Vec::with_capacity(cw * ch * 4);
+    for y in y0..y1 {
+        let start = (y * w + x0) * 4;
+        cropped.extend_from_slice(&rgba[start..start + cw * 4]);
+    }
+    Some((
+        crate::raster::png::encode_png(cw as u32, ch as u32, &cropped),
+        cw as u32,
+        ch as u32,
+    ))
+}
+
+/// Decode any supported raster (`png`/`jpeg`/`gif`/`webp`/`avif`) to
+/// `(width, height, RGBA)`. The `format` tag routes to the right decoder first;
+/// if that fails (mislabelled bytes) every decoder is tried in turn. `None` when
+/// nothing decodes.
+fn decode_rgba(bytes: &[u8], format: &str) -> Option<(u32, u32, Vec<u8>)> {
+    use crate::raster::{avif, gif, jpeg, png_decode, webp};
+    let png = |b: &[u8]| png_decode::decode_png(b).map(|d| (d.width, d.height, d.rgba));
+    let by_tag = match format {
+        "png" => png(bytes),
+        "jpeg" | "jpg" => jpeg::decode_jpeg(bytes),
+        "gif" => gif::decode_gif(bytes),
+        "webp" => webp::decode_webp(bytes),
+        "avif" => avif::decode_avif(bytes),
+        _ => None,
+    };
+    by_tag
+        .or_else(|| png(bytes))
+        .or_else(|| jpeg::decode_jpeg(bytes))
+        .or_else(|| gif::decode_gif(bytes))
+        .or_else(|| webp::decode_webp(bytes))
+        .or_else(|| avif::decode_avif(bytes))
 }
 
 fn html_shape(shape: &Shape, out: &mut String) {
@@ -526,7 +719,16 @@ fn html_shape(shape: &Shape, out: &mut String) {
     }
     let d = d.trim_end();
 
-    let mut paint = format!(" fill=\"{}\"", svg_fill(shape.fill));
+    // Fill: a real gradient when the shape carries one (PPTX/ODP `a:gradFill`),
+    // emitted as an SVG `<linearGradient>` in `<defs>` referenced by
+    // `fill="url(#g)"`. The HTML engine's inline-SVG path resolves gradient fills
+    // natively, so every stop renders instead of the flat first-stop fallback.
+    // Ids are scoped per inline `<svg>`, so a fixed `g` is collision-free.
+    let (defs, fill) = match shape.fill_gradient.as_ref().filter(|g| g.stops.len() >= 2) {
+        Some(g) => (svg_gradient_defs(g), " fill=\"url(#g)\"".to_string()),
+        None => (String::new(), format!(" fill=\"{}\"", svg_fill(shape.fill))),
+    };
+    let mut paint = fill;
     if let Some(stroke) = shape.stroke {
         paint.push_str(&format!(" stroke=\"{}\"", rgb_hex(stroke)));
         if shape.stroke_width > 0.0 {
@@ -541,7 +743,7 @@ fn html_shape(shape: &Shape, out: &mut String) {
     out.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" \
 viewBox=\"0 0 {vw} {vh}\" width=\"{vw}pt\" height=\"{vh}pt\" \
-style=\"display:inline-block\"><path d=\"{d}\"{paint}/></svg>",
+style=\"display:inline-block\">{defs}<path d=\"{d}\"{paint}/></svg>",
         vw = n(width.max(0.0)),
         vh = n(height.max(0.0)),
     ));
@@ -596,6 +798,72 @@ fn rgb_hex([r, g, b]: [f64; 3]) -> String {
     format!("#{:02X}{:02X}{:02X}", q(r), q(g), q(b))
 }
 
+/// A model [`Gradient`](crate::model::Gradient) as a CSS `linear-gradient(…)`.
+/// The model angle is DrawingML's (degrees clockwise from +X, `0` =
+/// left→right, +Y down); CSS measures clockwise from *to-top*, so
+/// `css = model + 90`. Stops keep their positions as percentages; a stop
+/// alpha < 1 emits an `rgba()` colour.
+fn css_linear_gradient(g: &crate::model::Gradient) -> String {
+    let css_deg = (g.angle_deg + 90.0).rem_euclid(360.0);
+    let mut stops = String::new();
+    for s in &g.stops {
+        if !stops.is_empty() {
+            stops.push(',');
+        }
+        let color = if s.alpha < 1.0 {
+            let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+            format!(
+                "rgba({},{},{},{})",
+                q(s.color[0]),
+                q(s.color[1]),
+                q(s.color[2]),
+                n(s.alpha.clamp(0.0, 1.0))
+            )
+        } else {
+            rgb_hex(s.color)
+        };
+        stops.push_str(&format!(
+            "{color} {}%",
+            n((s.pos.clamp(0.0, 1.0) * 100.0 * 100.0).round() / 100.0)
+        ));
+    }
+    format!("linear-gradient({}deg,{stops})", n(css_deg))
+}
+
+/// A model [`Gradient`](crate::model::Gradient) as an SVG
+/// `<defs><linearGradient id="g">…</linearGradient></defs>` block for an inline
+/// shape `<svg>`. The gradient axis uses objectBoundingBox units (the SVG
+/// default), so it needs no box size: the direction comes from the model angle —
+/// DrawingML degrees clockwise from +X (`0` = left→right, `90` = top→bottom),
+/// which matches the shape SVG's own Y-down orientation, so the unit direction is
+/// `(cos θ, sin θ)` and the line is centred and spans the box. Each stop keeps
+/// its position (as a fraction) and colour, with `stop-opacity` for alpha < 1.
+fn svg_gradient_defs(g: &crate::model::Gradient) -> String {
+    let theta = g.angle_deg.to_radians();
+    let (dx, dy) = (theta.cos(), theta.sin());
+    let (x1, y1) = (0.5 - 0.5 * dx, 0.5 - 0.5 * dy);
+    let (x2, y2) = (0.5 + 0.5 * dx, 0.5 + 0.5 * dy);
+    let mut stops = String::new();
+    for s in &g.stops {
+        stops.push_str(&format!(
+            "<stop offset=\"{}\" stop-color=\"{}\"",
+            n(s.pos.clamp(0.0, 1.0)),
+            rgb_hex(s.color)
+        ));
+        if s.alpha < 1.0 {
+            stops.push_str(&format!(" stop-opacity=\"{}\"", n(s.alpha.clamp(0.0, 1.0))));
+        }
+        stops.push_str("/>");
+    }
+    format!(
+        "<defs><linearGradient id=\"g\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\">{stops}</linearGradient></defs>",
+        n(x1),
+        n(y1),
+        n(x2),
+        n(y2),
+    )
+}
+
 /// Fallback for a shape with no drawable geometry: a tiny bordered box carrying
 /// the fill colour, so the shape is acknowledged rather than silently dropped.
 fn shape_placeholder(shape: &Shape) -> String {
@@ -617,16 +885,23 @@ fn html_sheet_table(sheet: &Sheet, out: &mut String) {
     for row in &sheet.rows {
         out.push_str("<tr>");
         for cell in &row.cells {
-            let mut style = String::new();
-            if let Some([r, g, b]) = cell.fill {
-                let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-                style = format!(
-                    " style=\"background-color:#{:02X}{:02X}{:02X}\"",
-                    q(r),
-                    q(g),
-                    q(b)
-                );
+            let mut decls: Vec<String> = Vec::new();
+            if let Some(rgb) = cell.fill {
+                decls.push(format!("background-color:{}", rgb_hex(rgb)));
             }
+            // A diagonal cell border (XLSX `border/diagonal`) as a best-effort
+            // background gradient slash (see `cell_diagonal_background`). Paints
+            // over the fill (its transparent parts let the fill show).
+            if let Some(diag) = &cell.diagonal {
+                if let Some(bg) = cell_diagonal_background(diag) {
+                    decls.push(bg);
+                }
+            }
+            let style = if decls.is_empty() {
+                String::new()
+            } else {
+                format!(" style=\"{}\"", decls.join(";"))
+            };
             out.push_str(&format!("<td{style}>"));
             let text = match &cell.value {
                 CellValue::Empty => String::new(),
@@ -642,6 +917,30 @@ fn html_sheet_table(sheet: &Sheet, out: &mut String) {
     out.push_str("</table>");
 }
 
+/// A cell diagonal border (XLSX `border/diagonal`) as a best-effort
+/// `background-image` declaration: a thin opaque band along the corner-to-corner
+/// diagonal, drawn with a `linear-gradient` (no cell dimensions are available
+/// here to place a real vector line). A stripe is perpendicular to the gradient
+/// axis, so the `down` slash (↘, top-left→bottom-right) uses the `to top right`
+/// axis and `up` (↗, bottom-left→top-right) the `to bottom right` axis; when both
+/// are set only the `down` slash is drawn (one linear gradient can't be an ✕).
+/// `None` when neither diagonal is set. Aspect-approximate: exactly
+/// corner-to-corner only for a square cell.
+///
+/// This is standards-correct CSS a browser consuming the HTML export paints; the
+/// in-engine PDF renderer does not currently paint gradient backgrounds on table
+/// cells, so the slash is deferred there — no regression, the fill still shows.
+fn cell_diagonal_background(diag: &crate::model::DiagonalBorder) -> Option<String> {
+    if !diag.up && !diag.down {
+        return None;
+    }
+    let color = rgb_hex(diag.border.color);
+    let dir = if diag.down { "to top right" } else { "to bottom right" };
+    Some(format!(
+        "background-image:linear-gradient({dir},transparent 49.3%,{color} 49.3%,{color} 50.7%,transparent 50.7%)"
+    ))
+}
+
 fn html_slides(slides: &SlideBlock, doc: &Document, out: &mut String) {
     for slide in &slides.slides {
         html_slide(slide, doc, out);
@@ -650,18 +949,22 @@ fn html_slides(slides: &SlideBlock, doc: &Document, out: &mut String) {
 
 fn html_slide(slide: &Slide, doc: &Document, out: &mut String) {
     out.push_str("<section>");
-    // Slide background fill (`Slide::background`): a full-coverage,
-    // absolutely-positioned backdrop `<div>` emitted first so it paints behind the
-    // slide content. Sized to the slide geometry; the engine clips any overflow.
-    if let Some([r, g, b]) = slide.background {
-        let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    // Slide background fill: a full-coverage, absolutely-positioned backdrop
+    // `<div>` emitted first so it paints behind the slide content. A gradient
+    // background (`Slide::background_gradient`) renders as a CSS
+    // `linear-gradient` (the layout engine paints those natively); the flat
+    // `Slide::background` stays the solid path. Sized to the slide geometry;
+    // the engine clips any overflow.
+    let backdrop = match (&slide.background_gradient, slide.background) {
+        (Some(g), _) if g.stops.len() >= 2 => Some(css_linear_gradient(g)),
+        (_, Some(rgb)) => Some(rgb_hex(rgb)),
+        _ => None,
+    };
+    if let Some(background) = backdrop {
         out.push_str(&format!(
-            "<div style=\"position:absolute;left:0;top:0;width:{:.0}pt;height:{:.0}pt;background:#{:02X}{:02X}{:02X}\"></div>",
+            "<div style=\"position:absolute;left:0;top:0;width:{:.0}pt;height:{:.0}pt;background:{background}\"></div>",
             slide.geometry.width,
             slide.geometry.height,
-            q(r),
-            q(g),
-            q(b)
         ));
     }
     for ph in &slide.placeholders {
@@ -903,6 +1206,7 @@ mod tests {
             stroke: Some([0.0, 0.0, 1.0]),
             stroke_width: 2.0,
             dash: Vec::new(),
+            ..Default::default()
         };
         let html = html_for_shape(shape);
         assert!(html.contains("<svg "), "inline svg emitted: {html}");
@@ -939,6 +1243,7 @@ mod tests {
             stroke: Some([0.0, 0.0, 0.0]),
             stroke_width: 1.0,
             dash: Vec::new(),
+            ..Default::default()
         };
         let html = html_for_shape(shape);
         assert!(html.contains("<svg "), "inline svg emitted: {html}");
@@ -958,6 +1263,7 @@ mod tests {
             stroke: Some([0.2, 0.2, 0.2]),
             stroke_width: 1.0,
             dash: vec![3.0, 2.0],
+            ..Default::default()
         };
         let html = html_for_shape(shape);
         assert!(
@@ -979,6 +1285,7 @@ mod tests {
             stroke: None,
             stroke_width: 0.0,
             dash: Vec::new(),
+            ..Default::default()
         };
         let html = html_for_shape(shape);
         assert!(
@@ -1078,6 +1385,112 @@ mod tests {
         }
     }
 
+    /// The display bridge for typed footnotes: an `Inline::FootnoteRef` renders
+    /// as a superscript call marker (the note's 1-based ordinal) linking to the
+    /// note body rendered in a bottom `<aside class="footnotes">` — so the note
+    /// still reads at the bottom of the page after the importers stopped
+    /// inlining it. A dangling id emits nothing.
+    #[test]
+    fn html_from_model_renders_footnote_ref_and_notes_aside() {
+        let mut anchor = para("The claim");
+        if let BlockKind::Paragraph(p) = &mut anchor.kind {
+            p.runs.push(Inline::FootnoteRef {
+                id: "fn1".to_string(),
+            });
+            p.runs.push(Inline::FootnoteRef {
+                id: "ghost".to_string(),
+            });
+        }
+        let mut doc = doc_with_blocks(vec![anchor]);
+        doc.footnotes = vec![crate::model::Footnote {
+            id: "fn1".to_string(),
+            blocks: vec![para("The note body.")],
+        }];
+        let html = html_from_model(&doc);
+        assert!(
+            html.contains("<sup class=\"fn-ref\" id=\"fnt-fn1-ref\"><a href=\"#fnt-fn1\">1</a></sup>"),
+            "superscript ordinal call marker: {html}"
+        );
+        assert!(
+            html.contains("<aside class=\"footnotes\">") && html.contains("The note body."),
+            "notes aside renders the body blocks: {html}"
+        );
+        assert!(
+            html.contains("<li id=\"fnt-fn1\">"),
+            "note anchored for the marker link: {html}"
+        );
+        assert!(!html.contains("ghost"), "dangling id emits nothing: {html}");
+    }
+
+    /// `caps` renders through `text-transform:uppercase` (the internal engine
+    /// applies it natively; the run text stays untouched) and `small_caps`
+    /// through `font-variant:small-caps`.
+    #[test]
+    fn char_style_css_emits_caps_and_small_caps() {
+        let caps = CharStyle {
+            caps: true,
+            ..CharStyle::default()
+        };
+        assert_eq!(char_style_css(&caps), "text-transform:uppercase");
+        let small = CharStyle {
+            small_caps: true,
+            ..CharStyle::default()
+        };
+        assert_eq!(char_style_css(&small), "font-variant:small-caps");
+        // The transform never rewrites the emitted text itself.
+        let doc = doc_with_blocks(vec![Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: "Mixed Case".to_string(),
+                    style: CharStyle {
+                        caps: true,
+                        ..CharStyle::default()
+                    },
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        let html = html_from_model(&doc);
+        assert!(
+            html.contains("Mixed Case") && html.contains("text-transform:uppercase"),
+            "original casing + CSS transform: {html}"
+        );
+    }
+
+    /// The typed link targets render: `Anchor` as an HTML fragment href, and
+    /// `Other` (a raw PDF action summary) as un-linked children.
+    #[test]
+    fn html_from_model_renders_anchor_and_other_links() {
+        let mut block = para("intro ");
+        if let BlockKind::Paragraph(p) = &mut block.kind {
+            p.runs.push(Inline::Link {
+                href: LinkTarget::Anchor("sec-2".to_string()),
+                children: vec![Inline::Run(InlineRun {
+                    text: "see §2".to_string(),
+                    ..Default::default()
+                })],
+            });
+            p.runs.push(Inline::Link {
+                href: LinkTarget::Other("GoToR:annexe.pdf".to_string()),
+                children: vec![Inline::Run(InlineRun {
+                    text: "annexe".to_string(),
+                    ..Default::default()
+                })],
+            });
+        }
+        let html = html_from_model(&doc_with_blocks(vec![block]));
+        assert!(
+            html.contains("<a href=\"#sec-2\">see §2</a>"),
+            "anchor renders as a fragment link: {html}"
+        );
+        assert!(
+            html.contains("annexe") && !html.contains("GoToR"),
+            "an action summary renders its children un-linked: {html}"
+        );
+    }
+
     #[test]
     fn meta_title_and_lang_appear_in_head() {
         let mut doc = doc_with_blocks(vec![para("body")]);
@@ -1171,6 +1584,8 @@ mod tests {
         };
         let list = List {
             marker_suffix: None,
+            levels: Vec::new(),
+            marker_prefix: None,
             ordered: true,
             marker: ListMarker::LowerRoman,
             items: vec![li("one"), li("two")],
@@ -1187,6 +1602,8 @@ mod tests {
         // An unordered list is a plain <ul> with no type/start.
         let ul = List {
             marker_suffix: None,
+            levels: Vec::new(),
+            marker_prefix: None,
             ordered: false,
             marker: ListMarker::Bullet('•'),
             items: vec![li("x")],
@@ -1245,6 +1662,7 @@ mod tests {
                 kind: BlockKind::Image(ImageRef {
                     resource: 42,
                     alt: Some("a \"photo\"".into()),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }])
@@ -1263,12 +1681,222 @@ mod tests {
             kind: BlockKind::Image(ImageRef {
                 resource: 999,
                 alt: None,
+                ..Default::default()
             }),
             ..Default::default()
         }]);
         assert!(
             !html_from_model(&doc2).contains("<img"),
             "missing resource → no <img>"
+        );
+    }
+
+    // ── deferred display renders: crop / gradient / diagonal / multicol ──
+
+    /// Re-open a rendered PDF's page-1 content stream as text (the paint-test
+    /// idiom): renders `html` through the same engine `html_from_model` feeds.
+    fn rendered_page1(html: &str) -> String {
+        let pdf = crate::html::render(html, &[], 612.0, 792.0, 36.0);
+        let doc = crate::document::Document::open(&pdf).expect("re-open rendered PDF");
+        String::from_utf8_lossy(&doc.page_content(1).expect("page content")).into_owned()
+    }
+
+    /// A `w×h` test PNG whose pixel (x, y) red channel is `x * step` (a horizontal
+    /// colour ramp, green/blue 0, opaque) — used to prove a crop keeps the right
+    /// pixels.
+    fn ramp_png(w: u32, h: u32, step: u8) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x as u8).wrapping_mul(step), 0, 0, 255]);
+            }
+        }
+        crate::raster::png::encode_png(w, h, &rgba)
+    }
+
+    #[test]
+    fn crop_image_bytes_keeps_only_the_visible_rectangle() {
+        // 4×2 horizontal ramp (reds 0,60,120,180). Cut 50% off the left → the two
+        // right columns (reds 120,180) survive, at 2×2.
+        let png = ramp_png(4, 2, 60);
+        let (cropped, cw, ch) =
+            crop_image_bytes(&png, "png", [0.5, 0.0, 0.0, 0.0]).expect("crop applies");
+        assert_eq!((cw, ch), (2, 2), "left half removed");
+        let dec = crate::raster::png_decode::decode_png(&cropped).expect("decode cropped");
+        assert_eq!((dec.width, dec.height), (2, 2));
+        assert_eq!(dec.rgba[0], 120, "kept the right half's first column");
+        assert_eq!(dec.rgba[4], 180, "…then the last column");
+        // A no-op crop, and one collapsing an axis, are refused (whole image kept).
+        assert!(crop_image_bytes(&png, "png", [0.0, 0.0, 0.0, 0.0]).is_none());
+        assert!(crop_image_bytes(&png, "png", [0.6, 0.0, 0.6, 0.0]).is_none());
+    }
+
+    #[test]
+    fn html_image_bakes_the_crop_into_a_resized_png() {
+        use crate::model::{ImageResource, ResourceTable};
+        let whole = ramp_png(4, 2, 60);
+        let mut images = std::collections::BTreeMap::new();
+        images.insert(
+            7u64,
+            ImageResource {
+                bytes: whole.clone(),
+                format: "png".into(),
+            },
+        );
+        let doc = Document {
+            resources: ResourceTable { images },
+            ..doc_with_blocks(vec![Block {
+                kind: BlockKind::Image(ImageRef {
+                    resource: 7,
+                    size_pt: Some((72.0, 36.0)),
+                    crop: Some([0.5, 0.0, 0.0, 0.0]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }])
+        };
+        let html = html_from_model(&doc);
+        assert!(html.contains("data:image/png;base64,"), "png data uri: {html}");
+        assert!(
+            html.contains("width=\"72\"") && html.contains("height=\"36\""),
+            "authored footprint: {html}"
+        );
+        // The emitted bytes are the CROPPED image, not the whole one.
+        assert!(
+            !html.contains(&base64(&whole)),
+            "crop re-encoded, not the original bytes"
+        );
+    }
+
+    #[test]
+    fn shape_gradient_emits_svg_lineargradient_and_renders_multiple_colours() {
+        use crate::model::{Gradient, GradientStop, Shape};
+        let rect = vec![
+            PathSeg::Move(0.0, 0.0),
+            PathSeg::Line(100.0, 0.0),
+            PathSeg::Line(100.0, 40.0),
+            PathSeg::Line(0.0, 40.0),
+            PathSeg::Close,
+        ];
+        let shape = Shape {
+            segments: rect,
+            fill: Some([1.0, 0.0, 0.0]), // the flat first-stop fallback
+            fill_gradient: Some(Gradient {
+                angle_deg: 0.0,
+                stops: vec![
+                    GradientStop {
+                        pos: 0.0,
+                        color: [1.0, 0.0, 0.0],
+                        alpha: 1.0,
+                    },
+                    GradientStop {
+                        pos: 1.0,
+                        color: [0.0, 0.0, 1.0],
+                        alpha: 1.0,
+                    },
+                ],
+            }),
+            ..Shape::default()
+        };
+        let doc = doc_with_blocks(vec![Block {
+            kind: BlockKind::Shape(shape),
+            ..Default::default()
+        }]);
+        let html = html_from_model(&doc);
+        assert!(html.contains("<linearGradient id=\"g\""), "gradient def: {html}");
+        assert!(html.contains("fill=\"url(#g)\""), "path uses the gradient: {html}");
+        assert!(
+            html.contains("#FF0000") && html.contains("#0000FF"),
+            "both stop colours: {html}"
+        );
+        // Rendered: a real gradient paints as a pattern fill (`scn`), not a flat
+        // `rg`, so more than the first stop's colour appears.
+        let content = rendered_page1(&html);
+        assert!(
+            content.contains("scn"),
+            "gradient renders as a pattern fill (multiple colours):\n{content}"
+        );
+    }
+
+    #[test]
+    fn sheet_cell_diagonal_emits_gradient_slash() {
+        use crate::model::{BorderStyle, DiagonalBorder, Sheet, SheetBlock, SheetCell, SheetRow};
+        let mk = |up: bool, down: bool| SheetCell {
+            value: CellValue::Text("x".into()),
+            diagonal: Some(DiagonalBorder {
+                up,
+                down,
+                border: BorderStyle {
+                    width: 1.0,
+                    color: [0.0, 0.0, 0.0],
+                },
+            }),
+            ..SheetCell::default()
+        };
+        let sheet = Sheet {
+            name: "S".into(),
+            rows: vec![SheetRow {
+                cells: vec![mk(false, true), mk(true, false)],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+            ..Default::default()
+        };
+        let doc = doc_with_blocks(vec![Block {
+            kind: BlockKind::Sheet(SheetBlock {
+                sheets: vec![sheet],
+            }),
+            ..Default::default()
+        }]);
+        let html = html_from_model(&doc);
+        // `down` → the stripe is perpendicular to the `to top right` axis.
+        assert!(
+            html.contains("background-image:linear-gradient(to top right"),
+            "down slash: {html}"
+        );
+        // `up` → `to bottom right` axis.
+        assert!(
+            html.contains("background-image:linear-gradient(to bottom right"),
+            "up slash: {html}"
+        );
+    }
+
+    #[test]
+    fn multi_column_section_emits_and_renders_two_columns() {
+        use crate::model::{PageGeometry, Section};
+        let blocks: Vec<Block> = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+            .iter()
+            .map(|t| para(t))
+            .collect();
+        let doc = Document {
+            sections: vec![Section {
+                geometry: PageGeometry {
+                    column_count: 2,
+                    column_gap_pt: Some(18.0),
+                    ..PageGeometry::default()
+                },
+                pages: vec![Page {
+                    blocks,
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let html = html_from_model(&doc);
+        assert!(html.contains("column-count:2"), "two-column container: {html}");
+        assert!(html.contains("column-gap:18pt"), "column gutter: {html}");
+        // Rendered: text lands at two distinct column x-origins.
+        let content = rendered_page1(&html);
+        let xs: std::collections::BTreeSet<String> = content
+            .lines()
+            .filter(|l| l.trim_end().ends_with(" Tm"))
+            .filter_map(|l| l.split_whitespace().nth(4).map(|s| s.to_string()))
+            .collect();
+        assert!(
+            xs.len() >= 2,
+            "text flows into ≥2 column x-origins ({xs:?}):\n{content}"
         );
     }
 
@@ -1293,6 +1921,7 @@ mod tests {
             }],
             merges: Vec::new(),
             col_widths: Vec::new(),
+            ..Default::default()
         };
         let mut out = String::new();
         html_sheet(
@@ -1325,6 +1954,7 @@ mod tests {
             shapes: vec![para("Shape text")],
             notes: None,
             background: None,
+            ..Default::default()
         };
         let mut out = String::new();
         html_slide(&slide, &Document::default(), &mut out);

@@ -245,8 +245,7 @@ fn model_lists_render_markers_to_pdf() {
             ],
             ..Default::default()
         }],
-        header: None,
-        footer: None,
+        ..Default::default()
     });
 
     let pdf = gigapdf_core::convert::project::pdf_from_model(&model);

@@ -16,7 +16,7 @@
 
 use super::zip::read_zip;
 use crate::html::{FontRequest, Margins, ProvidedFont, RenderOptions};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ─────────────────────────────── page geometry ────────────────────────────────
 //
@@ -45,7 +45,8 @@ const TWIP_PER_PT: f64 = 20.0;
 const EMU_PER_PT: f64 = 12700.0;
 
 /// Resolved page size + margins for an Office document, in PDF points.
-#[derive(Debug, Clone, Copy)]
+/// Not `Copy` (the column widths are heap-allocated); `.clone()` where needed.
+#[derive(Debug, Clone)]
 struct PageGeom {
     w: f64,
     h: f64,
@@ -60,6 +61,16 @@ struct PageGeom {
     /// `w:sectPr/w:cols@w:num`. `1` for every other format / no `w:cols`.
     /// Surfaced as the model's [`PageGeometry::column_count`].
     column_count: u8,
+    /// Column gutter (DOCX `w:cols@w:space`, twips → points). `None` ⇒ the
+    /// suite default. Surfaced as [`PageGeometry::column_gap_pt`].
+    column_gap_pt: Option<f64>,
+    /// Individual column widths (DOCX `w:cols/w:col@w:w`, twips → points), for
+    /// a non-uniform (`w:equalWidth="0"`) layout. Surfaced as
+    /// [`PageGeometry::column_widths_pt`].
+    column_widths_pt: Option<Vec<f64>>,
+    /// Separator rule between columns (DOCX `w:cols@w:sep`). Surfaced as
+    /// [`PageGeometry::column_separator`].
+    column_separator: bool,
 }
 
 impl PageGeom {
@@ -72,6 +83,9 @@ impl PageGeom {
             header_off: None,
             footer_off: None,
             column_count: 1,
+            column_gap_pt: None,
+            column_widths_pt: None,
+            column_separator: false,
         }
     }
 
@@ -81,9 +95,7 @@ impl PageGeom {
             w: A4_H,
             h: A4_W,
             margins: Margins::uniform(TABULAR_MARGIN),
-            header_off: None,
-            footer_off: None,
-            column_count: 1,
+            ..PageGeom::prose_default()
         }
     }
 
@@ -93,9 +105,7 @@ impl PageGeom {
             w: SLIDE_W,
             h: SLIDE_H,
             margins: Margins::uniform(TABULAR_MARGIN),
-            header_off: None,
-            footer_off: None,
-            column_count: 1,
+            ..PageGeom::prose_default()
         }
     }
 
@@ -154,39 +164,7 @@ fn render_geom_with_fonts(
 /// XLSX, else the ODF `mimetype` marker → ODT/ODS/ODP, else the OLE2 magic →
 /// legacy text extraction.
 pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
-    // Legacy OLE2 Compound File (.doc/.xls/.ppt) — not a ZIP.
-    if bytes.len() >= 8 && bytes[..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
-        return ole2_to_pdf(bytes);
-    }
-
-    let zip = read_zip(bytes);
-    if zip.contains_key("word/document.xml") {
-        Some(docx_to_pdf(&zip))
-    } else if zip.contains_key("ppt/presentation.xml") {
-        Some(pptx_to_pdf(&zip))
-    } else if zip.contains_key("xl/workbook.xml") {
-        Some(xlsx_to_pdf(&zip))
-    } else if let Some(kind) = zip
-        .get("mimetype")
-        .and_then(|m| odf_kind(&String::from_utf8_lossy(m)))
-    {
-        Some(match kind {
-            OdfKind::Text => odt_to_pdf(&zip),
-            OdfKind::Spreadsheet => ods_to_pdf(&zip),
-            // `.odg` drawing pages render through the `.odp` slide path.
-            OdfKind::Presentation | OdfKind::Drawing => odp_to_pdf(&zip),
-        })
-    } else if let Some((kind, parts)) = flat_odf_parts(bytes) {
-        // Flat single-file ODF (`.fodt`/`.fods`/`.fodp`/`.fodg`): part map aliases
-        // the one document, then the existing exporters run unchanged.
-        Some(match kind {
-            OdfKind::Text => odt_to_pdf(&parts),
-            OdfKind::Spreadsheet => ods_to_pdf(&parts),
-            OdfKind::Presentation | OdfKind::Drawing => odp_to_pdf(&parts),
-        })
-    } else {
-        None
-    }
+    office_to_pdf_opts(bytes, &[], false)
 }
 
 /// Phase 2 of the two-phase font flow for [`office_to_pdf`]: render the container
@@ -202,7 +180,42 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
 /// is identical to [`office_to_pdf`] regardless of `host`. `None` for an
 /// unrecognized archive.
 pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<Vec<u8>> {
-    // Legacy OLE2 Compound File (.doc/.xls/.ppt) — no resolvable font references.
+    office_to_pdf_opts(bytes, host, false)
+}
+
+/// The shared core of the [`office_to_pdf`] family, with explicit control over
+/// both the host font set (as [`office_to_pdf_with_fonts`]) and whether the output
+/// is a **Tagged PDF** — a logical `/StructTreeRoot` + marked content laid over the
+/// rendered baseline. This is the SDK-facing knob (`officeToPdf({ tagged })`).
+///
+/// When `tagged` is set, the rendered PDF is re-opened and run through
+/// [`Document::to_tagged`](crate::Document::to_tagged): the very same
+/// geometrically-inferred logical structure the editor already reconstructs
+/// (paragraphs, headings, tables, lists, figures) is emitted as a `/StructTreeRoot`
+/// with `/MarkInfo <</Marked true>>` and per-run `/MCID` marked content, so a
+/// gigapdf→gigapdf round-trip takes the **faithful tagged reconstruction path**
+/// (real declared roles) instead of re-deriving them heuristically. The rewrite is
+/// rendering-neutral (only balanced `BDC`/`EMC` are inserted); a document with no
+/// reconstructable structure ships the untagged baseline (never a regression).
+///
+/// **Default is `false` (untagged).** Tagging changes what [`Document::to_text`]
+/// (and any struct-tree-aware consumer) reads — it flattens the tag tree instead
+/// of the raw text layer — so it is opt-in to keep the untagged text-layer contract
+/// the existing o2p callers rely on (e.g. numbered list markers surface from the
+/// painted layer, not the tag-tree list reconstruction). Enable it per call for the
+/// accessible / faithful-round-trip output.
+pub fn office_to_pdf_opts(bytes: &[u8], host: &[ProvidedFont], tagged: bool) -> Option<Vec<u8>> {
+    let pdf = office_render(bytes, host)?;
+    Some(if tagged { tag_office_pdf(pdf) } else { pdf })
+}
+
+/// Render an Office container to an **untagged** styled PDF (the raw baseline the
+/// [`office_to_pdf`] family tags on top of). Dispatch mirrors [`office_to_pdf`];
+/// `host` faces are merged into every OOXML/ODF exporter (the container's own
+/// embedded faces win on conflict). Legacy OLE2 has no resolvable font references,
+/// so its output is `host`-independent. `None` for an unrecognized archive.
+fn office_render(bytes: &[u8], host: &[ProvidedFont]) -> Option<Vec<u8>> {
+    // Legacy OLE2 Compound File (.doc/.xls/.ppt) — not a ZIP, no font references.
     if bytes.len() >= 8 && bytes[..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
         return ole2_to_pdf(bytes);
     }
@@ -221,9 +234,12 @@ pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<V
         Some(match kind {
             OdfKind::Text => odt_to_pdf_with(&zip, host),
             OdfKind::Spreadsheet => ods_to_pdf_with(&zip, host),
+            // `.odg` drawing pages render through the `.odp` slide path.
             OdfKind::Presentation | OdfKind::Drawing => odp_to_pdf_with(&zip, host),
         })
     } else if let Some((kind, parts)) = flat_odf_parts(bytes) {
+        // Flat single-file ODF (`.fodt`/`.fods`/`.fodp`/`.fodg`): part map aliases
+        // the one document, then the existing exporters run unchanged.
         Some(match kind {
             OdfKind::Text => odt_to_pdf_with(&parts, host),
             OdfKind::Spreadsheet => ods_to_pdf_with(&parts, host),
@@ -231,6 +247,21 @@ pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<V
         })
     } else {
         None
+    }
+}
+
+/// Re-open a freshly rendered Office PDF and lift it to a **Tagged PDF** via
+/// [`Document::to_tagged`](crate::Document::to_tagged) (the o2p pipeline's
+/// StructTree post-pass). The engine reconstructs the page's logical structure
+/// (`Document → {H1..H6, P, Table → TR → TH/TD, L → LI → LBody, Figure}`) from the
+/// clean render it just produced and re-emits each page's content stream with
+/// marked content binding every run to its `/StructElem`. Robust by construction:
+/// a parse failure (never expected on our own output) or a document with no
+/// reconstructable structure yields the input bytes unchanged.
+fn tag_office_pdf(pdf: Vec<u8>) -> Vec<u8> {
+    match crate::Document::open(&pdf) {
+        Ok(doc) => doc.to_tagged(false),
+        Err(_) => pdf,
     }
 }
 
@@ -266,6 +297,9 @@ fn page_geometry(g: PageGeom) -> PageGeometry {
             left: g.margins.left,
         },
         column_count: g.column_count.max(1),
+        column_gap_pt: g.column_gap_pt,
+        column_widths_pt: g.column_widths_pt,
+        column_separator: g.column_separator,
     }
 }
 
@@ -343,6 +377,7 @@ fn apply_color_mods(
 /// `a:srgbClr`/`a:hslClr`/`a:sysClr`) or a theme scheme slot name (`a:schemeClr@val`,
 /// resolved against a [`PptxTheme`] only at [`finish`](PptxFillColor::finish_with)
 /// time, where the theme is in scope).
+#[derive(Clone)]
 enum PptxColorBase {
     Hex(String),
     Scheme(String),
@@ -353,7 +388,7 @@ enum PptxColorBase {
 /// `a:lumMod`/`a:lumOff`/`a:shade`/`a:tint` child modifiers, folded together on
 /// [`finish_with`](PptxFillColor::finish_with). The *first* base colour seen wins,
 /// so a gradient's first stop is captured as a solid fallback.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PptxFillColor {
     base: Option<PptxColorBase>,
     lum_mod: Option<f64>,
@@ -511,6 +546,12 @@ fn run_char_style(run: &RunStyle) -> CharStyle {
         vertical_align: run.vertical_align,
         letter_spacing_pt: run.letter_spacing.unwrap_or(0.0),
         hidden: run.hidden,
+        caps: run.caps,
+        small_caps: run.small_caps,
+        dstrike: run.dstrike,
+        baseline_shift_pt: run.baseline_shift_pt,
+        char_scale_pct: run.char_scale_pct,
+        kern_min_pt: run.kern_min_pt,
     }
 }
 
@@ -834,12 +875,11 @@ fn flow_document(blocks: Vec<Block>, geom: PageGeometry) -> Document {
     Document {
         sections: vec![Section {
             geometry: geom,
-            header: None,
-            footer: None,
             pages: vec![model::Page {
                 blocks,
                 absolute: false,
             }],
+            ..Default::default()
         }],
         ..Document::default()
     }
@@ -888,6 +928,12 @@ struct OutlineBuilder {
     /// `Document.comments` once the walk finishes. Unused by the DOCX path (whose
     /// comment bodies come from a separate `word/comments.xml` part).
     comments: Vec<model::Comment>,
+    /// Foot-/endnote bodies collected during the DOCX body walk: each
+    /// `w:footnoteReference`/`w:endnoteReference` lowers its note body to
+    /// blocks **once** (keyed by [`model::Footnote::id`]) and anchors it with
+    /// an [`Inline::FootnoteRef`]. Rides this already-threaded builder for the
+    /// same reason as `comments`; drained into `Document.footnotes`.
+    footnotes: Vec<model::Footnote>,
 }
 
 impl OutlineBuilder {
@@ -987,19 +1033,22 @@ fn resolve_links_in_blocks(blocks: &mut [Block], bookmarks: &BTreeMap<String, us
     }
 }
 
-/// Resolve the `#name` placeholders of every [`Inline::Link`] in `inlines`
+/// Resolve the deferred internal anchors of every [`Inline::Link`] in `inlines`
 /// (recursing into link children, which the walker never nests but the model
-/// permits). A placeholder whose anchor matches `bookmarks` becomes
-/// `LinkTarget::Page`; one that does not is left as-is.
+/// permits) — both the typed [`LinkTarget::Anchor`] the DOCX path now defers
+/// and the legacy `Url("#name")` placeholder the ODT path still emits. An
+/// anchor that matches `bookmarks` becomes `LinkTarget::Page`; one that does
+/// not is left as-is (typed `Anchor`s stay typed — never a false page-0 jump).
 fn resolve_links_in_inlines(inlines: &mut [Inline], bookmarks: &BTreeMap<String, usize>) {
     for inline in inlines {
         if let Inline::Link { href, children } = inline {
-            if let model::LinkTarget::Url(u) = href {
-                if let Some(anchor) = u.strip_prefix('#') {
-                    if let Some(&page) = bookmarks.get(anchor) {
-                        *href = model::LinkTarget::Page(page);
-                    }
-                }
+            let anchor = match href {
+                model::LinkTarget::Anchor(a) => Some(a.as_str()),
+                model::LinkTarget::Url(u) => u.strip_prefix('#'),
+                _ => None,
+            };
+            if let Some(&page) = anchor.and_then(|a| bookmarks.get(a)) {
+                *href = model::LinkTarget::Page(page);
             }
             resolve_links_in_inlines(children, bookmarks);
         }
@@ -1032,6 +1081,9 @@ fn inlines_plain_text(inlines: &[Inline]) -> String {
             }
             Inline::Image(_) => {}
             Inline::CommentRef { .. } => {}
+            // A note anchor carries no text of its own (the body lives in
+            // `Document.footnotes`), so it contributes nothing to a title.
+            Inline::FootnoteRef { .. } => {}
         }
     }
     s.trim().to_string()
@@ -1065,7 +1117,7 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         .get("word/_rels/document.xml.rels")
         .map(|b| parse_rels(&String::from_utf8_lossy(b)))
         .unwrap_or_default();
-    let styles = parse_docx_styles(&part(zip, "word/styles.xml"));
+    let styles = parse_docx_styles(&part(zip, "word/styles.xml"), docx_theme(zip));
     let numbering = parse_docx_numbering(&part(zip, "word/numbering.xml"));
     let mut footnotes = parse_docx_footnotes(&part(zip, "word/footnotes.xml"));
     // Endnotes (`word/endnotes.xml`) are lowered inline at their references too;
@@ -1102,17 +1154,36 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     // `document.resources.images` is moved out of `resources`.
     let header = docx_header_footer_model(zip, &doc, &rels, &ctx, "header", &mut resources);
     let footer = docx_header_footer_model(zip, &doc, &rels, &ctx, "footer", &mut resources);
+    // First-/even-page variants, gated on their governing flags: `w:titlePg`
+    // (body-level sectPr) and `w:evenAndOddHeaders` (settings.xml). A flag set
+    // with no distinct part lowers to `Some(vec![])` — a *blank* variant.
+    let title_pg = docx_title_pg(&doc);
+    let even_odd = docx_even_and_odd_headers(zip);
+    let header_first =
+        docx_hf_variant_model(zip, &doc, &rels, &ctx, "header", "first", title_pg, &mut resources);
+    let footer_first =
+        docx_hf_variant_model(zip, &doc, &rels, &ctx, "footer", "first", title_pg, &mut resources);
+    let header_even =
+        docx_hf_variant_model(zip, &doc, &rels, &ctx, "header", "even", even_odd, &mut resources);
+    let footer_even =
+        docx_hf_variant_model(zip, &doc, &rels, &ctx, "footer", "even", even_odd, &mut resources);
     let mut document = flow_document_pages(pages.finish(), page_geometry(geom));
     document.resources.images = resources;
     if let Some(section) = document.sections.first_mut() {
         section.header = header;
         section.footer = footer;
+        section.header_first = header_first;
+        section.footer_first = footer_first;
+        section.header_even = header_even;
+        section.footer_even = footer_even;
     }
     // Resolve internal hyperlink anchors (`w:hyperlink@w:anchor` / `HYPERLINK \l`)
     // to their bookmark's page now that every bookmark has been seen (a link may
     // reference a bookmark defined later). Take the map before the builder is
     // consumed by `finish`.
     let bookmark_pages = std::mem::take(&mut outline.bookmark_pages);
+    // Foot-/endnote bodies collected at their references during the walk.
+    document.footnotes = std::mem::take(&mut outline.footnotes);
     document.outline = outline.finish();
     resolve_internal_links(&mut document, &bookmark_pages);
     // Lower `word/styles.xml`'s named paragraph styles into the model's style
@@ -1141,9 +1212,8 @@ fn flow_document_pages(pages: Vec<model::Page>, geom: PageGeometry) -> Document 
     Document {
         sections: vec![Section {
             geometry: geom,
-            header: None,
-            footer: None,
             pages,
+            ..Default::default()
         }],
         ..Document::default()
     }
@@ -1371,6 +1441,11 @@ fn para_style_model(para: &ParaStyle) -> ParagraphStyle {
         keep_with_next: para.keep_with_next,
         keep_together: para.keep_together,
         tab_stops: para.tab_stops.clone(),
+        // `w:pPr/w:bidi` (direct or inherited from the named style).
+        direction: (para.direction_rtl == Some(true)).then_some(model::Direction::Rtl),
+        // Future additive fields (`soft_breaks`, …) default here — a flowing
+        // import has no line-break analysis (breaks are explicit `w:br`s).
+        ..Default::default()
     }
 }
 
@@ -1766,6 +1841,12 @@ fn docx_paragraph_model(
                         para.keep_together =
                             !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
                     }
+                    // `w:pPr/w:bidi`: right-to-left paragraph flow (Hebrew/Arabic).
+                    // `w:val="0"`/`"false"` cancels an inherited setting.
+                    "bidi" if in_ppr => {
+                        para.direction_rtl =
+                            Some(!matches!(attr(&attrs, "val"), Some("0") | Some("false")));
+                    }
                     // `w:pPr/w:pBdr` opens the per-side paragraph border group;
                     // its `w:top`/`w:left`/`w:bottom`/`w:right` children carry the
                     // width/style/colour of each side (the "encadré" frame).
@@ -1786,11 +1867,22 @@ fn docx_paragraph_model(
                         depth += 1;
                         run = RunStyle::default();
                     }
+                    // `w:rPr/w:rStyle`: a referenced **character style** (Strong,
+                    // Emphasis, custom…). Resolved through the basedOn-flattened
+                    // style table and seeded onto the run; schema order puts
+                    // `w:rStyle` first in `w:rPr`, so the direct properties
+                    // parsed below override it (see [`DocxStyle::seed_run`]).
+                    "rStyle" if in_rpr => {
+                        if let Some(s) = attr(&attrs, "val").and_then(|v| ctx.styles.by_id.get(v)) {
+                            s.seed_run(&mut run);
+                        }
+                    }
                     "rFonts" if in_rpr => {
-                        run.font_family = attr(&attrs, "ascii")
-                            .or_else(|| attr(&attrs, "hAnsi"))
-                            .filter(|v| !v.trim().is_empty())
-                            .map(|v| v.to_string());
+                        // Direct `ascii`/`hAnsi` faces or `asciiTheme`/`hAnsiTheme`
+                        // theme placeholders (Calibri/Cambria in stock Word docs).
+                        if let Some(f) = docx_rfonts_family(&attrs, &ctx.styles.theme) {
+                            run.font_family = Some(f);
+                        }
                     }
                     "b" if in_rpr => {
                         run.bold = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
@@ -1803,8 +1895,44 @@ fn docx_paragraph_model(
                             run.underline = true;
                         }
                     }
-                    "strike" | "dstrike" if in_rpr => {
+                    "strike" if in_rpr => {
                         run.strike = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
+                    }
+                    // `w:dstrike` (double strike): keep the single-strike flag set
+                    // alongside so a consumer unaware of `dstrike` still draws a
+                    // line through the run.
+                    "dstrike" if in_rpr => {
+                        let on = !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                        run.strike = on;
+                        run.dstrike = on;
+                    }
+                    // `w:caps` / `w:smallCaps`: display transforms, carried on the
+                    // style (the run text keeps its original casing).
+                    "caps" if in_rpr => {
+                        run.caps = !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                    }
+                    "smallCaps" if in_rpr => {
+                        run.small_caps = !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                    }
+                    // `w:position@w:val`: baseline shift in half-points (signed).
+                    "position" if in_rpr => {
+                        run.baseline_shift_pt = attr(&attrs, "val")
+                            .and_then(|v| v.trim().parse::<f64>().ok())
+                            .map(|half| half / 2.0)
+                            .filter(|v| *v != 0.0);
+                    }
+                    // `w:w@w:val`: horizontal character scaling in percent.
+                    "w" if in_rpr => {
+                        run.char_scale_pct = attr(&attrs, "val")
+                            .and_then(|v| v.trim().parse::<f64>().ok())
+                            .filter(|v| *v > 0.0 && *v != 100.0);
+                    }
+                    // `w:kern@w:val`: kerning threshold in half-points (0 = off).
+                    "kern" if in_rpr => {
+                        run.kern_min_pt = attr(&attrs, "val")
+                            .and_then(|v| v.trim().parse::<f64>().ok())
+                            .map(|half| half / 2.0)
+                            .filter(|v| *v > 0.0);
                     }
                     "vertAlign" if in_rpr => {
                         // `w:vertAlign@val`: superscript / subscript / baseline.
@@ -1842,10 +1970,10 @@ fn docx_paragraph_model(
                         run.hidden = true;
                     }
                     "color" if in_rpr => {
-                        if let Some(v) = attr(&attrs, "val") {
-                            if v != "auto" && is_hex6(v) {
-                                run.color = Some(v.to_ascii_uppercase());
-                            }
+                        // A direct 6-hex `w:val` wins; else a `w:themeColor`
+                        // slot (+ tint/shade) resolves against the theme.
+                        if let Some(v) = docx_color_hex(&attrs, &ctx.styles.theme) {
+                            run.color = Some(v);
                         }
                     }
                     "tab" => push_run(docx_sink(&mut runs, &mut link, &mut fields), &run, "\t"),
@@ -1907,28 +2035,34 @@ fn docx_paragraph_model(
                     // field while `in_instr` is set (see the `Text` arm).
                     "instrText" => in_instr = true,
                     // A footnote/endnote reference marker (`<w:footnoteReference
-                    // w:id="N"/>` / `<w:endnoteReference w:id="N"/>`): lower the
-                    // referenced note's body inline at this point — a superscript
-                    // citation marker followed by the note body text — so neither is
-                    // lost. Mirrors the ODT `text:note` lowering. The body XML lives
-                    // in a separate part (`footnotes.xml`/`endnotes.xml`), so it is
-                    // re-walked through the body grammar here (styling survives).
-                    "footnoteReference" => {
-                        if let Some(n) =
-                            attr(&attrs, "id").and_then(|id| ctx.footnotes.footnote_bodies.get(id))
+                    // w:id="N"/>` / `<w:endnoteReference w:id="N"/>`): anchor a
+                    // typed [`Inline::FootnoteRef`] at this point and lower the
+                    // referenced note's body ONCE into `Document.footnotes` (via
+                    // the threaded outline builder) — the renderer synthesizes
+                    // the superscript call marker and the bottom-of-page note.
+                    // The body XML lives in a separate part
+                    // (`footnotes.xml`/`endnotes.xml`), so it is re-walked
+                    // through the body grammar (styling survives); ids are
+                    // prefixed (`fn`/`en`) so the two parts can't collide.
+                    "footnoteReference" | "endnoteReference" => {
+                        let (bodies, prefix) = if ln == "footnoteReference" {
+                            (&ctx.footnotes.footnote_bodies, "fn")
+                        } else {
+                            (&ctx.footnotes.endnote_bodies, "en")
+                        };
+                        if let Some((id, n)) =
+                            attr(&attrs, "id").and_then(|id| Some((id, bodies.get(id)?)))
                         {
-                            for inline in docx_note_inline(ctx, n, resources) {
-                                docx_sink(&mut runs, &mut link, &mut fields).push(inline);
+                            let fid = format!("{prefix}{id}");
+                            if !outline.footnotes.iter().any(|f| f.id == fid) {
+                                let blocks = docx_note_blocks(ctx, n, resources);
+                                outline.footnotes.push(model::Footnote {
+                                    id: fid.clone(),
+                                    blocks,
+                                });
                             }
-                        }
-                    }
-                    "endnoteReference" => {
-                        if let Some(n) =
-                            attr(&attrs, "id").and_then(|id| ctx.footnotes.endnote_bodies.get(id))
-                        {
-                            for inline in docx_note_inline(ctx, n, resources) {
-                                docx_sink(&mut runs, &mut link, &mut fields).push(inline);
-                            }
+                            docx_sink(&mut runs, &mut link, &mut fields)
+                                .push(Inline::FootnoteRef { id: fid });
                         }
                     }
                     "br" if matches!(attr(&attrs, "type"), Some("page")) => {
@@ -2115,7 +2249,11 @@ fn docx_paragraph_model(
 
     let resolved = ctx.styles.effective(style_id.as_deref());
     para.apply_style_defaults(&resolved);
-    let style = para_style_model(&para);
+    let mut style = para_style_model(&para);
+    // Keep the authored `w:pageBreakBefore` intent on the paragraph style (the
+    // structural page split below still happens, so rendering is unchanged —
+    // this is what lets a DOCX round-trip re-emit the property).
+    style.page_break_before = page_break_before;
 
     let mut paragraph = Paragraph {
         style,
@@ -2161,6 +2299,13 @@ fn docx_paragraph_model(
                 }],
                 start: if ordered { ordinal } else { 1 },
                 marker_suffix,
+                // The numbering definition's full per-depth marker table, so a
+                // nested list keeps its real `1. / a) / i.` scheme per level.
+                levels: num_ref
+                    .num_id
+                    .map(|nid| ctx.numbering.model_levels(nid))
+                    .unwrap_or_default(),
+                ..List::default()
             }),
             ..Block::default()
         }
@@ -2298,18 +2443,19 @@ fn docx_field_hyperlink(instr: &str) -> Option<model::LinkTarget> {
     {
         return None;
     }
-    // A `\l "name"` switch makes this an in-document jump. Its operand is the next
-    // token (quoted or bare) after `\l`; defer it as a `#name` placeholder.
+    // A `\l "name"` switch makes this an in-document jump. Its operand is the
+    // next token (quoted or bare) after `\l`; defer it as a **typed**
+    // `LinkTarget::Anchor` (resolved to a page by `resolve_internal_links`).
     let tokens: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
     if let Some(pos) = tokens.iter().position(|t| *t == "\\l") {
         if let Some(anchor) = tokens.get(pos + 1).map(|t| t.trim_matches('"').trim()) {
             if !anchor.is_empty() {
-                return Some(model::LinkTarget::Url(format!("#{anchor}")));
+                return Some(model::LinkTarget::Anchor(anchor.to_string()));
             }
         }
-        // `\l` with no operand: an in-document jump to an unknown anchor; keep an
-        // empty `#` placeholder (resolves to nothing → stays linked but unmoved).
-        return Some(model::LinkTarget::Url("#".to_string()));
+        // `\l` with no operand: an in-document jump to an unknown anchor; keep
+        // an empty anchor (resolves to nothing → stays linked but unmoved).
+        return Some(model::LinkTarget::Anchor(String::new()));
     }
     // No `\l`: an external link. First quoted string is the URL; otherwise the
     // first non-switch token.
@@ -2333,9 +2479,11 @@ fn docx_field_hyperlink(instr: &str) -> Option<model::LinkTarget> {
 /// Resolve a `<w:hyperlink>` to a model [`LinkTarget`]: an external URL via the
 /// relationship `r:id` (the same `word/_rels` table the HTML/image path uses), or
 /// an in-document jump for `w:anchor`. The anchor names a bookmark that may be
-/// defined *after* this link, so it is deferred as a `LinkTarget::Url("#name")`
-/// placeholder and rewritten to the bookmark's page by [`resolve_internal_links`]
-/// once the whole document has been walked. Missing/blank ⇒ an empty URL.
+/// defined *after* this link, so it is deferred as a **typed**
+/// [`LinkTarget::Anchor`] and rewritten to the bookmark's page by
+/// [`resolve_internal_links`] once the whole document has been walked (an
+/// anchor matching no bookmark stays a typed `Anchor`, never a false page-0
+/// jump). Missing/blank ⇒ an empty URL.
 fn docx_link_target(ctx: &DocxCtx, attrs: &[(String, String)]) -> model::LinkTarget {
     if let Some(rid) = attr(attrs, "id").filter(|v| !v.trim().is_empty()) {
         if let Some(target) = ctx.rels.get(rid) {
@@ -2347,7 +2495,7 @@ fn docx_link_target(ctx: &DocxCtx, attrs: &[(String, String)]) -> model::LinkTar
         .filter(|a| !a.is_empty())
     {
         // In-document anchor: defer until the bookmark→page map is complete.
-        return model::LinkTarget::Url(format!("#{anchor}"));
+        return model::LinkTarget::Anchor(anchor.to_string());
     }
     model::LinkTarget::Url(String::new())
 }
@@ -2523,7 +2671,7 @@ fn image_ref(
 ) -> Option<model::ImageRef> {
     Some(model::ImageRef {
         resource: intern_media(zip, key, resources)?,
-        alt: None,
+        ..Default::default()
     })
 }
 
@@ -2590,6 +2738,8 @@ fn docx_drawing_model(
     let mut alt: Option<String> = None;
     let mut size_w: Option<f64> = None;
     let mut size_h: Option<f64> = None;
+    // `a:srcRect` crop insets (fractions), applied to the interned image.
+    let mut crop: Option<[f64; 4]> = None;
     // Which axis a following `wp:posOffset` text node belongs to (set by the
     // enclosing `wp:positionH`/`wp:positionV`). `wp:align` has no offset value.
     let mut cur_axis: Option<bool> = None; // Some(true)=H, Some(false)=V
@@ -2602,6 +2752,9 @@ fn docx_drawing_model(
                     size_w = attr(&attrs, "cx").and_then(emu_to_pt).or(size_w);
                     size_h = attr(&attrs, "cy").and_then(emu_to_pt).or(size_h);
                 }
+                // `a:srcRect@l/t/r/b` — the picture's source-rectangle crop
+                // (thousandths of a percent → fractions).
+                "srcRect" if crop.is_none() => crop = parse_src_rect(&attrs),
                 // `wp:docPr@descr` is the accessibility alt text; `@title` is the
                 // fallback. Mirrors the ODP/PPTX `ImageRef.alt` precedence.
                 "docPr" => {
@@ -2655,8 +2808,29 @@ fn docx_drawing_model(
     };
     if let Some(img) = out.image.as_mut() {
         img.alt = alt;
+        // The drawing's authored footprint (`wp:extent`) — what the inline
+        // exporter re-emits so a flow image keeps its real size instead of
+        // the 1″×1″ default. Anchored images carry it too (harmless; their
+        // `Block::frame` still wins for placement).
+        img.size_pt = out.size;
+        img.crop = crop;
     }
     out
+}
+
+/// Parse a DrawingML `a:srcRect` (source-rectangle crop) into the model's
+/// `[left, top, right, bottom]` inset fractions. Attribute values are
+/// thousandths of a percent (`50000` = 50 %), clamped to `0..=1`. Returns
+/// `None` when every inset is zero/absent (no crop).
+fn parse_src_rect(attrs: &[(String, String)]) -> Option<[f64; 4]> {
+    let side = |k: &str| {
+        attr(attrs, k)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|v| (v / 100_000.0).clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    };
+    let rect = [side("l"), side("t"), side("r"), side("b")];
+    rect.iter().any(|v| *v != 0.0).then_some(rect)
 }
 
 /// Trim an attribute value, returning `None` when absent or blank. Used to pick
@@ -2715,6 +2889,25 @@ fn apply_named_run_defaults(runs: &mut [Inline], style: &DocxStyle) {
             if r.style.color.is_none() {
                 r.style.color = style.color.as_deref().and_then(hex_to_rgb_f64);
             }
+            if !r.style.strike {
+                r.style.strike = style.strike == Some(true);
+            }
+            if r.style.background.is_none() {
+                r.style.background = style.highlight.as_deref().and_then(hex_to_rgb_f64);
+            }
+            if r.style.vertical_align == model::VAlign::Baseline {
+                if let Some(v) = style.vert_align {
+                    r.style.vertical_align = v;
+                }
+            }
+            if r.style.letter_spacing_pt == 0.0 {
+                if let Some(ls) = style.letter_spacing_pt {
+                    r.style.letter_spacing_pt = ls;
+                }
+            }
+            if !r.style.hidden {
+                r.style.hidden = style.hidden == Some(true);
+            }
             if r.style.family.is_empty() {
                 if let Some(fam) = &style.font_family {
                     r.style.family = fam.clone();
@@ -2749,6 +2942,10 @@ fn push_run(runs: &mut Vec<Inline>, run: &RunStyle, text: &str) {
 /// [`push_run`]. Used by the PPTX slide/table paths where `a:hlinkClick` lives on
 /// the run (`a:rPr`), not a wrapping element.
 fn push_run_maybe_linked(runs: &mut Vec<Inline>, run: &RunStyle, text: &str) {
+    // `a:rPr@cap="all"` rides the style ([`CharStyle::caps`], via
+    // [`run_char_style`]) — the model keeps the original casing and renderers
+    // apply the transform (`text-transform:uppercase`), so a host can edit the
+    // real text. The HTML string path (`push_run_text`) still folds it.
     let Some(url) = run.hyperlink.as_deref() else {
         push_run(runs, run, text);
         return;
@@ -2814,10 +3011,24 @@ fn docx_table_model(
     // Whether the row currently being read is a header row (`w:trPr/w:tblHeader`,
     // a CT_OnOff). Reset at every `w:tr`.
     let mut cur_header = false;
-    // The model carries one table-wide border. A `w:tblBorders` side seeds it
-    // first; failing that, the first cell `w:tcBorders` edge does (mirrors the
-    // PPTX path). The first declared width wins.
+    // The model carries one table-wide border. An inline `w:tblBorders` side
+    // seeds it first; failing that, the referenced table style's
+    // (`w:tblPr/w:tblStyle`) own `w:tblBorders`; failing that, the first cell
+    // `w:tcBorders` edge (mirrors the PPTX path). The first declared width wins.
     let mut border: Option<model::BorderStyle> = None;
+    // First cell-edge fallback, kept apart from the inline table border so the
+    // style resolution can slot between the two.
+    let mut cell_border: Option<model::BorderStyle> = None;
+    // `w:tblPr/w:tblStyle@w:val` — the referenced named table style.
+    let mut tbl_style_id: Option<String> = None;
+    // An inline `w:tblBorders` element was present (even all-`nil`): the table
+    // declares its own border regime, so the style's borders must NOT apply
+    // (an explicit `nil` side means "no line here", not "inherit").
+    let mut inline_borders_declared = false;
+    // `w:tblPr/w:tblLook` firstRow toggle: `None` = no `w:tblLook` at all
+    // (treated as enabled — Word's stock `04A0` look enables it, and minimal
+    // writers omit the element), `Some(b)` = the explicit setting.
+    let mut tbl_look_first_row: Option<bool> = None;
     // Track the relevant `w:tblPr` subtrees so a `w:tblBorders` side is not
     // confused with an identically-named child elsewhere (e.g. `w:tcBorders`).
     let mut in_tblpr = false;
@@ -2830,7 +3041,25 @@ fn docx_table_model(
                 let ln = local(&name);
                 match ln {
                     "tblPr" if !sc => in_tblpr = true,
-                    "tblBorders" if in_tblpr && !sc => in_tblborders = true,
+                    "tblStyle" if in_tblpr => {
+                        tbl_style_id = attr(&attrs, "val").map(|v| v.to_string());
+                    }
+                    // Which conditional-format regions the table opts into:
+                    // `@firstRow` attribute, or bit `0x0020` of the legacy hex
+                    // `@val` bitmask (Word 2007-style `w:tblLook w:val="04A0"`).
+                    "tblLook" if in_tblpr => {
+                        tbl_look_first_row = match attr(&attrs, "firstRow") {
+                            Some("1") | Some("true") => Some(true),
+                            Some(_) => Some(false),
+                            None => attr(&attrs, "val")
+                                .and_then(|v| u32::from_str_radix(v.trim(), 16).ok())
+                                .map(|mask| mask & 0x0020 != 0),
+                        };
+                    }
+                    "tblBorders" if in_tblpr => {
+                        inline_borders_declared = true;
+                        in_tblborders = !sc;
+                    }
                     // Table border sides (`w:top/left/bottom/right/insideH/
                     // insideV`). The first side that declares a real width seeds
                     // the model's single table-wide border.
@@ -2869,8 +3098,8 @@ fn docx_table_model(
                     }
                     "tc" if !sc => {
                         let out = docx_cell_model(x, ctx, resources);
-                        if border.is_none() {
-                            border = out.border;
+                        if cell_border.is_none() {
+                            cell_border = out.border;
                         }
                         if let Some(row) = cur_row.as_mut() {
                             row.push(DocxRawCell {
@@ -2913,8 +3142,33 @@ fn docx_table_model(
         }
     }
 
+    // Resolve the table-wide border. Inline `w:tblBorders` wins outright (its
+    // very presence overrides the style — a `nil` side is an explicit "no
+    // line"); otherwise the referenced table style's borders (basedOn-flattened)
+    // apply; the first cell edge remains the last resort either way.
+    let border = if inline_borders_declared {
+        border.or(cell_border)
+    } else {
+        ctx.styles
+            .table_borders(tbl_style_id.as_deref())
+            .and_then(|b| b.first_side())
+            .map(border_side_to_model)
+            .or(cell_border)
+    };
+
+    let mut rows = resolve_docx_vmerges(raw_rows);
+    // A table style with a `firstRow` conditional block formats its first row
+    // as a header; honour it when the table's `w:tblLook` enables the region
+    // (or is absent — see `tbl_look_first_row`). A per-row `w:tblHeader` flag
+    // keeps working independently.
+    if tbl_look_first_row.unwrap_or(true) && ctx.styles.table_first_row(tbl_style_id.as_deref()) {
+        if let Some(first) = rows.first_mut() {
+            first.is_header = true;
+        }
+    }
+
     Table {
-        rows: resolve_docx_vmerges(raw_rows),
+        rows,
         col_widths,
         border: border.unwrap_or_default(),
     }
@@ -3078,6 +3332,12 @@ fn docx_cell_model(
     let mut border: Option<model::BorderStyle> = None;
     // Cell vertical alignment `w:tcPr/w:vAlign@w:val` (top/center/bottom).
     let mut vertical_align: Option<model::CellVAlign> = None;
+    // Per-cell borders `[top, right, bottom, left]` from `w:tcBorders` →
+    // [`Cell::borders`]. A `nil`/`none` side parses to `None` (an explicit "no
+    // line here" under the declared regime); per-cell diagonals (`tl2br`/
+    // `tr2bl`) have no model slot and are ignored (the XLSX diagonal is
+    // modelled instead — see [`model::SheetCell::diagonal`]).
+    let mut cell_borders: [Option<model::ParaBorder>; 4] = [None, None, None, None];
 
     while let Some(tok) = x.next() {
         match tok {
@@ -3086,13 +3346,25 @@ fn docx_cell_model(
                 match ln {
                     "tcPr" if !sc => in_tcpr = true,
                     "tcBorders" if in_tcpr && !sc => in_tcborders = true,
-                    // Cell border sides — the first real width seeds the surfaced
-                    // border (the model has no per-cell border slot).
+                    // Cell border sides — each outer side lands in its
+                    // `Cell::borders` slot; the first real width also still
+                    // seeds the surfaced table-wide fallback (unchanged).
                     "top" | "left" | "bottom" | "right" | "insideH" | "insideV" if in_tcborders => {
+                        let side = parse_border_side(&attrs);
                         if border.is_none() {
-                            if let Some(side) = parse_border_side(&attrs) {
-                                border = Some(border_side_to_model(&side));
+                            if let Some(s) = &side {
+                                border = Some(border_side_to_model(s));
                             }
+                        }
+                        let slot = match ln {
+                            "top" => Some(0),
+                            "right" => Some(1),
+                            "bottom" => Some(2),
+                            "left" => Some(3),
+                            _ => None, // insideH/insideV: no per-cell slot
+                        };
+                        if let Some(i) = slot {
+                            cell_borders[i] = side.as_ref().map(border_side_to_para_border);
                         }
                     }
                     "gridSpan" if in_tcpr => {
@@ -3174,6 +3446,7 @@ fn docx_cell_model(
             row_span: 1,
             shading,
             vertical_align,
+            borders: cell_borders,
         },
         span,
         border,
@@ -3199,6 +3472,12 @@ pub fn xlsx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         .get("xl/workbook.xml")
         .map(|b| parse_sheet_names(&String::from_utf8_lossy(b)))
         .unwrap_or_default();
+    // `_xlnm.Print_Area` defined names (workbook sheet index → ranges): each
+    // sheet's import is restricted to its print area when one is defined.
+    let print_areas = zip
+        .get("xl/workbook.xml")
+        .map(|b| parse_print_areas(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
 
     let mut sheet_parts: Vec<(usize, String)> = zip
         .iter()
@@ -3221,7 +3500,14 @@ pub fn xlsx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
             .get(&format!("xl/worksheets/_rels/sheet{n}.xml.rels"))
             .map(|b| parse_rels(&String::from_utf8_lossy(b)))
             .unwrap_or_default();
-        sheets.push(xlsx_sheet_model(name, xml, &shared, &styles, &rels));
+        sheets.push(xlsx_sheet_model(
+            name,
+            xml,
+            &shared,
+            &styles,
+            &rels,
+            print_areas.get(&idx),
+        ));
     }
 
     let block = Block {
@@ -3233,22 +3519,365 @@ pub fn xlsx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     doc
 }
 
+/// An inclusive rectangle of sheet cells (0-based row/column corners), with
+/// `usize::MAX` bounds for the unbounded axis of a whole-column (`$A:$G`) or
+/// whole-row (`$1:$40`) reference. Used by the `_xlnm.Print_Area` restriction
+/// and by conditional-formatting `@sqref` targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SheetRange {
+    r0: usize,
+    c0: usize,
+    r1: usize,
+    c1: usize,
+}
+
+impl SheetRange {
+    fn contains(&self, r: usize, c: usize) -> bool {
+        r >= self.r0 && r <= self.r1 && c >= self.c0 && c <= self.c1
+    }
+}
+
+/// Parse one A1 endpoint (`"B7"`, `"$B$7"`, `"B"`, `"7"` — `$` anchors are
+/// ignored) into its `(column, row)` pair, each `None` when that axis is
+/// unbounded in the endpoint. `None` overall for an empty/garbled token.
+fn parse_a1_endpoint(s: &str) -> Option<(Option<usize>, Option<usize>)> {
+    let s: String = s
+        .chars()
+        .filter(|c| *c != '$' && !c.is_whitespace())
+        .collect();
+    if s.is_empty() {
+        return None;
+    }
+    let letters_len = s.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+    let (letters, digits) = s.split_at(letters_len);
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let col = (!letters.is_empty()).then(|| col_of_ref(letters));
+    let row = if digits.is_empty() {
+        None
+    } else {
+        Some(digits.parse::<usize>().ok()?.checked_sub(1)?)
+    };
+    if col.is_none() && row.is_none() {
+        return None;
+    }
+    Some((col, row))
+}
+
+/// Parse an A1 range (`"A1:G40"`, `"$A$1:$G$40"`, `"B3"`, `"A:C"`, `"2:9"`)
+/// into a [`SheetRange`]. A missing axis on either endpoint leaves that axis
+/// unbounded (`0..=usize::MAX`); reversed corners are normalised.
+fn parse_a1_range(s: &str) -> Option<SheetRange> {
+    let (a, b) = match s.split_once(':') {
+        Some((a, b)) => (parse_a1_endpoint(a)?, parse_a1_endpoint(b)?),
+        None => {
+            let e = parse_a1_endpoint(s)?;
+            (e, e)
+        }
+    };
+    let (c0, c1) = match (a.0, b.0) {
+        (Some(x), Some(y)) => (x.min(y), x.max(y)),
+        _ => (0, usize::MAX),
+    };
+    let (r0, r1) = match (a.1, b.1) {
+        (Some(x), Some(y)) => (x.min(y), x.max(y)),
+        _ => (0, usize::MAX),
+    };
+    Some(SheetRange { r0, c0, r1, c1 })
+}
+
+/// Split a defined-name reference list on top-level commas — a quoted sheet
+/// name (`'P&L, FY24'!$A$1:$B$2`) keeps its embedded comma.
+fn split_name_refs(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for ch in s.chars() {
+        match ch {
+            '\'' => {
+                in_quote = !in_quote;
+                cur.push(ch);
+            }
+            ',' if !in_quote => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    out.push(cur);
+    out.retain(|p| !p.trim().is_empty());
+    out
+}
+
+/// Read the workbook's `_xlnm.Print_Area` defined names: workbook sheet index
+/// (`definedName@localSheetId`) → its print range(s). Each value is a
+/// comma-separated list of `Sheet!$A$1:$G$40` references (sheet names may be
+/// quoted); the sheet qualifier is dropped — `localSheetId` already scopes the
+/// name. Sheets without a print area are simply absent from the map (import
+/// everything), as are names whose references don't parse.
+fn parse_print_areas(workbook_xml: &str) -> BTreeMap<usize, Vec<SheetRange>> {
+    let mut out: BTreeMap<usize, Vec<SheetRange>> = BTreeMap::new();
+    let mut x = Xml::new(workbook_xml);
+    // The `localSheetId` of the `_xlnm.Print_Area` definedName being read.
+    let mut cur: Option<usize> = None;
+    let mut buf = String::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) if local(&name) == "definedName" => {
+                let is_print_area = attr(&attrs, "name") == Some("_xlnm.Print_Area");
+                cur = (is_print_area && !sc)
+                    .then(|| {
+                        attr(&attrs, "localSheetId").and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .flatten();
+                buf.clear();
+            }
+            Tok::Text(t) if cur.is_some() => buf.push_str(&t),
+            Tok::Close(name) if local(&name) == "definedName" => {
+                if let Some(idx) = cur.take() {
+                    let ranges: Vec<SheetRange> = split_name_refs(&buf)
+                        .iter()
+                        .filter_map(|part| {
+                            // `Sheet1!$A$1:$B$2` → the part after the last `!`
+                            // (sheet names cannot contain `!`, quoted or not).
+                            let r = part.rsplit_once('!').map(|(_, r)| r).unwrap_or(part);
+                            parse_a1_range(r)
+                        })
+                        .collect();
+                    if !ranges.is_empty() {
+                        out.insert(idx, ranges);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One `<cfRule>` of a worksheet `<conditionalFormatting>` block, scoped to the
+/// block's `@sqref` ranges. Only the simple, literal-operand kinds are
+/// evaluated ([`xlsx_cf_rule_matches`]); everything else (formula rules, colour
+/// scales, data bars, icon sets) is carried but never matches — ignored
+/// gracefully rather than mis-rendered.
+struct XlsxCfRule {
+    ranges: Vec<SheetRange>,
+    /// `cfRule@type` (`cellIs`, `containsText`, …).
+    kind: String,
+    /// `cfRule@operator` (`greaterThan`, `between`, …) — `cellIs` only.
+    operator: String,
+    /// `cfRule@text` — the `containsText` needle.
+    text: Option<String>,
+    /// `cfRule@dxfId` → [`XlsxStyles::dxf_fill`].
+    dxf_id: Option<usize>,
+    /// `cfRule@priority` — LOWER wins in Excel; `u32::MAX` when absent.
+    priority: u32,
+    /// `<formula>` operand bodies, in document order.
+    formulas: Vec<String>,
+}
+
+/// Whether a conditional-formatting rule matches one cell. `cellIs` compares
+/// the cell's **numeric** value against literal `<formula>` operands
+/// (non-literal operands — real formulas — never match, so the rule is
+/// effectively skipped); `containsText` searches the cell text
+/// case-insensitively for `@text`. Unsupported rule kinds match nothing.
+fn xlsx_cf_rule_matches(rule: &XlsxCfRule, cell: &SheetCell) -> bool {
+    match rule.kind.as_str() {
+        "cellIs" => {
+            let model::CellValue::Number(n) = cell.value else {
+                return false;
+            };
+            let lit = |i: usize| {
+                rule.formulas
+                    .get(i)
+                    .and_then(|f| f.trim().parse::<f64>().ok())
+            };
+            let Some(a) = lit(0) else {
+                return false;
+            };
+            match rule.operator.as_str() {
+                "greaterThan" => n > a,
+                "greaterThanOrEqual" => n >= a,
+                "lessThan" => n < a,
+                "lessThanOrEqual" => n <= a,
+                "equal" => n == a,
+                "notEqual" => n != a,
+                "between" => {
+                    let Some(b) = lit(1) else {
+                        return false;
+                    };
+                    n >= a.min(b) && n <= a.max(b)
+                }
+                _ => false,
+            }
+        }
+        "containsText" => {
+            let Some(needle) = rule.text.as_deref().filter(|t| !t.is_empty()) else {
+                return false;
+            };
+            let model::CellValue::Text(t) = &cell.value else {
+                return false;
+            };
+            t.to_lowercase().contains(&needle.to_lowercase())
+        }
+        _ => false,
+    }
+}
+
+/// Materialise conditional-formatting fills onto the grid: rules are applied in
+/// Excel's precedence order (ascending `@priority`), and the first matching
+/// rule claims the cell — later rules cannot repaint it. The conditional fill
+/// **overwrites** any direct cell fill, exactly as Excel paints it (the
+/// conditional format sits on top of the cell's own format).
+fn xlsx_apply_conditional_fills(
+    rows: &mut [SheetRow],
+    mut rules: Vec<XlsxCfRule>,
+    styles: &XlsxStyles,
+) {
+    if rules.is_empty() {
+        return;
+    }
+    rules.sort_by_key(|r| r.priority);
+    let mut claimed: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for rule in &rules {
+        let Some(rgb) = rule
+            .dxf_id
+            .and_then(|i| styles.dxf_fill(i))
+            .and_then(hex_to_rgb_f64)
+        else {
+            continue;
+        };
+        for (r, row) in rows.iter_mut().enumerate() {
+            for (c, cell) in row.cells.iter_mut().enumerate() {
+                if claimed.contains(&(r, c)) || !rule.ranges.iter().any(|g| g.contains(r, c)) {
+                    continue;
+                }
+                if xlsx_cf_rule_matches(rule, cell) {
+                    cell.fill = Some(rgb);
+                    claimed.insert((r, c));
+                }
+            }
+        }
+    }
+}
+
+/// Restrict an imported sheet to its `_xlnm.Print_Area`: cells outside the
+/// union of `ranges` are blanked (grid coordinates are preserved — column
+/// widths and row placement inside the area stay intact), trailing empties are
+/// trimmed, and merges anchored outside the area are dropped.
+fn xlsx_apply_print_area(
+    rows: &mut Vec<SheetRow>,
+    merges: &mut Vec<model::MergeRange>,
+    ranges: &[SheetRange],
+) {
+    let blank = SheetCell::default();
+    for (r, row) in rows.iter_mut().enumerate() {
+        for (c, cell) in row.cells.iter_mut().enumerate() {
+            if !ranges.iter().any(|g| g.contains(r, c)) {
+                *cell = SheetCell::default();
+            }
+        }
+        while matches!(row.cells.last(), Some(c) if *c == blank) {
+            row.cells.pop();
+        }
+    }
+    while matches!(rows.last(), Some(r) if r.cells.is_empty()) {
+        rows.pop();
+    }
+    merges.retain(|m| ranges.iter().any(|g| g.contains(m.r0, m.c0)));
+}
+
+/// Remap an inclusive index span `[a, b]` after the `hidden` indices are
+/// removed from the axis: ends sitting on hidden slots shrink inward, then both
+/// ends shift down by the number of hidden indices before them. `None` when the
+/// whole span is hidden.
+fn remap_span(a: usize, b: usize, hidden: &BTreeSet<usize>) -> Option<(usize, usize)> {
+    let mut lo = a;
+    while lo <= b && hidden.contains(&lo) {
+        lo += 1;
+    }
+    if lo > b {
+        return None;
+    }
+    let mut hi = b;
+    while hi > lo && hidden.contains(&hi) {
+        hi -= 1;
+    }
+    let shift = |i: usize| i - hidden.range(..i).count();
+    Some((shift(lo), shift(hi)))
+}
+
+/// Drop hidden rows and columns from an imported sheet, the way Excel displays
+/// it: the hidden slots take no space, so subsequent rows/columns (and their
+/// widths, and the merge ranges) shift up/left. Merges that lose part of their
+/// span shrink; fully-hidden ones disappear.
+fn xlsx_remove_hidden(
+    rows: &mut Vec<SheetRow>,
+    merges: &mut Vec<model::MergeRange>,
+    col_w: &mut BTreeMap<usize, f64>,
+    hidden_rows: &BTreeSet<usize>,
+    hidden_cols: &BTreeSet<usize>,
+) {
+    if hidden_rows.is_empty() && hidden_cols.is_empty() {
+        return;
+    }
+    if !hidden_rows.is_empty() {
+        let mut i = 0usize;
+        rows.retain(|_| {
+            let keep = !hidden_rows.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+    if !hidden_cols.is_empty() {
+        for row in rows.iter_mut() {
+            let mut c = 0usize;
+            row.cells.retain(|_| {
+                let keep = !hidden_cols.contains(&c);
+                c += 1;
+                keep
+            });
+        }
+        let shifted: BTreeMap<usize, f64> = col_w
+            .iter()
+            .filter(|(c, _)| !hidden_cols.contains(c))
+            .map(|(c, w)| (c - hidden_cols.range(..c).count(), *w))
+            .collect();
+        *col_w = shifted;
+    }
+    merges.retain_mut(|m| {
+        match (
+            remap_span(m.r0, m.r1, hidden_rows),
+            remap_span(m.c0, m.c1, hidden_cols),
+        ) {
+            (Some((r0, r1)), Some((c0, c1))) => {
+                *m = model::MergeRange { r0, c0, r1, c1 };
+                true
+            }
+            _ => false,
+        }
+    });
+}
+
 /// Build one model [`Sheet`] from a worksheet XML, reusing [`parse_merges`] and
 /// the cell type/format/fill resolution from [`xlsx_sheet_table`] — but storing
 /// typed [`CellValue`]s (`Number`/`Text`/`Bool`/`Empty`), per-cell
 /// `number_format`, fill, font/border/alignment (from `styles`), expanded
 /// shared formulas, cell hyperlinks (resolved via `rels`), the merge ranges, and
 /// per-column widths from `<cols><col>` (Excel character units → points).
+/// Display fidelity passes then run in order: conditional-formatting fills are
+/// materialised, the sheet is restricted to `print_area` (when one is defined),
+/// and hidden rows/columns are removed.
 fn xlsx_sheet_model(
     name: String,
     xml: &str,
     shared: &[String],
     styles: &XlsxStyles,
     rels: &BTreeMap<String, String>,
+    print_area: Option<&Vec<SheetRange>>,
 ) -> Sheet {
     // Reuse the worksheet merge parser; map the engine's tuple form to the
     // model's `MergeRange` struct (0-based inclusive corners).
-    let merges: Vec<model::MergeRange> = parse_merges(xml)
+    let mut merges: Vec<model::MergeRange> = parse_merges(xml)
         .into_iter()
         .map(|(r0, c0, r1, c1)| model::MergeRange { r0, c0, r1, c1 })
         .collect();
@@ -3290,10 +3919,43 @@ fn xlsx_sheet_model(
     let mut shared_masters: BTreeMap<u32, (String, usize, usize)> = BTreeMap::new();
     // Cell hyperlinks (`<hyperlinks>` after `<sheetData>`): (row, col) → target.
     let mut hyperlinks: BTreeMap<(usize, usize), String> = BTreeMap::new();
+    // Hidden rows (`<row hidden="1">`) and columns (`<col hidden="1">`, over
+    // the col's `min..=max` span) — removed after the grid is built, the way
+    // Excel displays them (they take no space).
+    let mut hidden_rows: BTreeSet<usize> = BTreeSet::new();
+    let mut hidden_cols: BTreeSet<usize> = BTreeSet::new();
+    // Conditional formatting: each `<conditionalFormatting sqref=…>` block's
+    // ranges apply to its `<cfRule>` children; `<formula>` operand text bodies
+    // stream into the last-opened rule.
+    let mut cf_rules: Vec<XlsxCfRule> = Vec::new();
+    let mut cf_sqref: Vec<SheetRange> = Vec::new();
+    let mut in_cf_rule = false;
+    let mut in_cf_formula = false;
+    let mut cf_formula_buf = String::new();
+
+    // Frozen panes: `<sheetView><pane ySplit xSplit state="frozen"/>` (the
+    // first frozen pane wins; `<pane>` also appears under `customSheetViews`,
+    // which restates the same freeze).
+    let mut freeze: Option<(u32, u32)> = None;
 
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => match local(&name) {
+                "pane" if !in_sheet_data && freeze.is_none() => {
+                    if matches!(attr(&attrs, "state"), Some("frozen") | Some("frozenSplit")) {
+                        let split = |k: &str| {
+                            attr(&attrs, k)
+                                .and_then(|v| v.trim().parse::<f64>().ok())
+                                .filter(|v| *v > 0.0 && v.fract() == 0.0)
+                                .map(|v| v as u32)
+                                .unwrap_or(0)
+                        };
+                        let (rows_f, cols_f) = (split("ySplit"), split("xSplit"));
+                        if rows_f > 0 || cols_f > 0 {
+                            freeze = Some((rows_f, cols_f));
+                        }
+                    }
+                }
                 "cols" if !in_sheet_data => in_cols = true,
                 // `<col>` spans columns `min..=max` (1-based). Expand the range to
                 // per-column points so a single `<col min=1 max=3 width=20/>` fills
@@ -3302,15 +3964,24 @@ fn xlsx_sheet_model(
                     let min = attr(&attrs, "min").and_then(|v| v.trim().parse::<usize>().ok());
                     let max = attr(&attrs, "max").and_then(|v| v.trim().parse::<usize>().ok());
                     let width = attr(&attrs, "width").and_then(|v| v.trim().parse::<f64>().ok());
-                    if let (Some(min), Some(max), Some(w)) = (min, max, width) {
-                        if min >= 1 && max >= min && w > 0.0 {
-                            let pts = w * 7.0;
+                    let hidden = matches!(attr(&attrs, "hidden"), Some("1") | Some("true"));
+                    if let (Some(min), Some(max)) = (min, max) {
+                        if min >= 1 && max >= min {
                             // Cap the span so a stray `max` (Excel may emit a huge
                             // `max` for a trailing default `<col>`) cannot allocate
                             // an unbounded number of slots.
                             let last = max.min(min + 16_383);
-                            for c in min..=last {
-                                col_w.insert(c - 1, pts);
+                            if hidden {
+                                for c in min..=last {
+                                    hidden_cols.insert(c - 1);
+                                }
+                            }
+                            // Ignore non-positive/absent widths.
+                            if let Some(w) = width.filter(|w| *w > 0.0) {
+                                let pts = w * 7.0;
+                                for c in min..=last {
+                                    col_w.insert(c - 1, pts);
+                                }
                             }
                         }
                     }
@@ -3319,14 +3990,24 @@ fn xlsx_sheet_model(
                     in_cols = false;
                     in_sheet_data = true;
                 }
-                "row" if in_sheet_data && !sc => {
-                    row_open = true;
-                    row_cells.clear();
-                    row_idx = attr(&attrs, "r")
+                "row" if in_sheet_data => {
+                    let r = attr(&attrs, "r")
                         .and_then(|v| v.trim().parse::<usize>().ok())
-                        .map(|n| n.saturating_sub(1))
-                        .unwrap_or(next_auto_row);
-                    next_auto_row = row_idx + 1;
+                        .map(|n| n.saturating_sub(1));
+                    if !sc {
+                        row_open = true;
+                        row_cells.clear();
+                        row_idx = r.unwrap_or(next_auto_row);
+                        next_auto_row = row_idx + 1;
+                    }
+                    // `<row hidden="1">` — removed from the grid after the walk
+                    // (a self-closing hidden row is recorded too so a padded
+                    // empty slot at its index still collapses).
+                    if matches!(attr(&attrs, "hidden"), Some("1") | Some("true")) {
+                        if let Some(hr) = r.or((!sc).then_some(row_idx)) {
+                            hidden_rows.insert(hr);
+                        }
+                    }
                 }
                 "c" if in_sheet_data => {
                     in_cell = true;
@@ -3373,6 +4054,33 @@ fn xlsx_sheet_model(
                         }
                     }
                 }
+                // A `<conditionalFormatting sqref="A1:A9 C3">` block: its
+                // space-separated ranges scope the `<cfRule>` children.
+                "conditionalFormatting" => {
+                    cf_sqref = attr(&attrs, "sqref")
+                        .map(|s| s.split_whitespace().filter_map(parse_a1_range).collect())
+                        .unwrap_or_default();
+                }
+                "cfRule" => {
+                    cf_rules.push(XlsxCfRule {
+                        ranges: cf_sqref.clone(),
+                        kind: attr(&attrs, "type").unwrap_or("").to_string(),
+                        operator: attr(&attrs, "operator").unwrap_or("").to_string(),
+                        text: attr(&attrs, "text").map(|t| t.to_string()),
+                        dxf_id: attr(&attrs, "dxfId").and_then(|v| v.trim().parse().ok()),
+                        priority: attr(&attrs, "priority")
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(u32::MAX),
+                        formulas: Vec::new(),
+                    });
+                    in_cf_rule = !sc;
+                }
+                // A rule's literal operand (`<formula>5</formula>`): its text
+                // body streams into the last-opened rule.
+                "formula" if in_cf_rule => {
+                    in_cf_formula = !sc;
+                    cf_formula_buf.clear();
+                }
                 _ => {}
             },
             Tok::Text(t) => {
@@ -3380,6 +4088,8 @@ fn xlsx_sheet_model(
                     cell_formula.push_str(&t);
                 } else if in_cell && in_value {
                     cell_text.push_str(&t);
+                } else if in_cf_formula {
+                    cf_formula_buf.push_str(&t);
                 }
             }
             Tok::Close(name) => match local(&name) {
@@ -3408,6 +4118,8 @@ fn xlsx_sheet_model(
                                 align: cell_style.align,
                                 vertical_align: cell_style.valign,
                                 wrap: cell_style.wrap,
+                                rotation_deg: cell_style.rotation_deg,
+                                diagonal: cell_style.diagonal,
                                 ..Default::default()
                             },
                         );
@@ -3444,6 +4156,13 @@ fn xlsx_sheet_model(
                     }
                 }
                 "sheetData" => in_sheet_data = false,
+                "formula" if in_cf_rule => {
+                    in_cf_formula = false;
+                    if let Some(rule) = cf_rules.last_mut() {
+                        rule.formulas.push(std::mem::take(&mut cf_formula_buf));
+                    }
+                }
+                "cfRule" => in_cf_rule = false,
                 _ => {}
             },
         }
@@ -3461,6 +4180,21 @@ fn xlsx_sheet_model(
         }
         cells[c].hyperlink = Some(target);
     }
+
+    // Display-fidelity passes — the first two in the **authored** grid
+    // coordinates (rule ranges and the print area reference them), then the
+    // structural hidden-row/column removal that shifts the surviving grid.
+    xlsx_apply_conditional_fills(&mut rows, cf_rules, styles);
+    if let Some(ranges) = print_area.filter(|r| !r.is_empty()) {
+        xlsx_apply_print_area(&mut rows, &mut merges, ranges);
+    }
+    xlsx_remove_hidden(
+        &mut rows,
+        &mut merges,
+        &mut col_w,
+        &hidden_rows,
+        &hidden_cols,
+    );
 
     // Materialise per-column widths (points) from the `<cols>` ranges: dense
     // `0..=highest` with gaps left at the default `0.0`, then trailing defaults
@@ -3485,6 +4219,7 @@ fn xlsx_sheet_model(
         rows,
         merges,
         col_widths,
+        freeze,
     }
 }
 
@@ -3724,7 +4459,7 @@ pub fn pptx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
             zip,
             &rels,
             &theme,
-            geom,
+            geom.clone(),
             &mut resources,
             *n,
         ));
@@ -3760,6 +4495,7 @@ fn pptx_slide_model(
     let inherit = PptxPlaceholderGeom::resolve(zip, rels, n);
     let mut acc = PptxSlideAcc::default();
     let mut background: Option<[f64; 3]> = None;
+    let mut background_gradient: Option<crate::model::Gradient> = None;
     let mut x = Xml::new(xml);
     // Read the slide background fill (`p:bg`, in the `p:cSld` preamble) then enter
     // the shape tree; the recursive walker consumes `p:spTree`'s children and any
@@ -3767,14 +4503,14 @@ fn pptx_slide_model(
     while let Some(tok) = x.next() {
         if let Tok::Open(name, _, sc) = &tok {
             match local(name) {
-                "bg" if !sc => background = pptx_bg_color(&mut x, theme),
+                "bg" if !sc => (background, background_gradient) = pptx_bg_color(&mut x, theme),
                 "spTree" if !sc => {
                     pptx_walk_sptree(
                         &mut x,
                         zip,
                         rels,
                         theme,
-                        geom,
+                        geom.clone(),
                         resources,
                         &inherit,
                         IDENTITY_XFRM,
@@ -3793,6 +4529,7 @@ fn pptx_slide_model(
         placeholders: acc.placeholders,
         notes: pptx_slide_notes(zip, n),
         background,
+        background_gradient,
     }
 }
 
@@ -3921,29 +4658,99 @@ fn pptx_notes_body_blocks(xml: &str) -> Vec<Block> {
 /// first `a:srgbClr`/`a:schemeClr` found inside the `p:bg` wins (which is the
 /// first gradient stop, or the sole solid colour). Picture/tile/blip fills are
 /// out of scope (→ `None`). Consumes up to `</p:bg>`.
-fn pptx_bg_color(x: &mut Xml, theme: &PptxTheme) -> Option<[f64; 3]> {
+fn pptx_bg_color(
+    x: &mut Xml,
+    theme: &PptxTheme,
+) -> (Option<[f64; 3]>, Option<crate::model::Gradient>) {
     let mut color: Option<[f64; 3]> = None;
+    // Full-gradient capture (`p:bgPr/a:gradFill`): every stop + `a:lin@ang`.
+    // The flat `color` above keeps the first resolvable colour so
+    // gradient-unaware consumers keep the previous solid approximation.
+    let mut in_grad = false;
+    let mut grad_angle = 0.0_f64;
+    let mut grad_stops: Vec<crate::model::GradientStop> = Vec::new();
+    let mut cur_stop: Option<(f64, PptxFillColor, f64)> = None;
     while let Some(tok) = x.next() {
         match tok {
-            Tok::Open(name, attrs, _) => match local(&name) {
-                "srgbClr" if color.is_none() => {
-                    color = attr(&attrs, "val")
-                        .filter(|v| is_hex6(v))
-                        .and_then(hex_to_rgb_f64);
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "gradFill" if !sc && grad_stops.is_empty() => in_grad = true,
+                "gs" if in_grad => {
+                    let pos = attr(&attrs, "pos")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .map(|p| (p / 100_000.0).clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
+                    cur_stop = Some((pos, PptxFillColor::default(), 1.0));
                 }
-                "schemeClr" if color.is_none() => {
-                    color = attr(&attrs, "val")
-                        .and_then(|v| theme.resolve_scheme(v))
-                        .as_deref()
-                        .and_then(hex_to_rgb_f64);
+                "lin" if in_grad => {
+                    grad_angle = attr(&attrs, "ang")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .map(|a| a / 60_000.0)
+                        .unwrap_or(grad_angle);
+                }
+                "alpha" => {
+                    if let Some((_, _, a)) = cur_stop.as_mut() {
+                        if let Some(v) = attr(&attrs, "val")
+                            .and_then(|v| v.trim().parse::<f64>().ok())
+                            .map(|v| (v / 100_000.0).clamp(0.0, 1.0))
+                        {
+                            *a = v;
+                        }
+                    }
+                }
+                "srgbClr" => {
+                    if let Some((_, c, _)) = cur_stop.as_mut() {
+                        c.set_base("srgbClr", &attrs);
+                    }
+                    if color.is_none() {
+                        color = attr(&attrs, "val")
+                            .filter(|v| is_hex6(v))
+                            .and_then(hex_to_rgb_f64);
+                    }
+                }
+                "schemeClr" => {
+                    if let Some((_, c, _)) = cur_stop.as_mut() {
+                        c.set_base("schemeClr", &attrs);
+                    }
+                    if color.is_none() {
+                        color = attr(&attrs, "val")
+                            .and_then(|v| theme.resolve_scheme(v))
+                            .as_deref()
+                            .and_then(hex_to_rgb_f64);
+                    }
+                }
+                "lumMod" | "lumOff" | "shade" | "tint" => {
+                    if let Some((_, c, _)) = cur_stop.as_mut() {
+                        c.set_mod(local(&name), &attrs);
+                    }
                 }
                 _ => {}
             },
-            Tok::Close(name) if local(&name) == "bg" => break,
+            Tok::Close(name) => match local(&name) {
+                "gs" if in_grad => {
+                    if let Some((pos, c, alpha)) = cur_stop.take() {
+                        grad_stops.push(crate::model::GradientStop {
+                            pos,
+                            color: c
+                                .finish_with(theme)
+                                .as_deref()
+                                .and_then(hex_to_rgb_f64)
+                                .unwrap_or([0.0, 0.0, 0.0]),
+                            alpha,
+                        });
+                    }
+                }
+                "gradFill" => in_grad = false,
+                "bg" => break,
+                _ => {}
+            },
             _ => {}
         }
     }
-    color
+    let gradient = (grad_stops.len() >= 2).then_some(crate::model::Gradient {
+        stops: grad_stops,
+        angle_deg: grad_angle,
+    });
+    (color, gradient)
 }
 
 /// Accumulated slide content: semantic placeholders vs free-floating shapes.
@@ -4094,13 +4901,23 @@ fn pptx_walk_sptree(
     while let Some(tok) = x.next() {
         match &tok {
             Tok::Open(name, attrs, sc) if !sc => match local(name) {
-                "sp" => pptx_sp_model(x, rels, theme, geom, inherit, &g, acc),
-                "cxnSp" => pptx_cxn_sp_model(x, rels, theme, geom, inherit, &g, acc),
-                "pic" => pptx_pic_model(x, zip, rels, geom, resources, &g, acc),
-                "graphicFrame" => pptx_graphic_frame_model(x, zip, rels, theme, geom, &g, acc),
-                "grpSp" => {
-                    pptx_grp_sp_model(x, zip, rels, theme, geom, resources, inherit, &g, acc)
+                "sp" => pptx_sp_model(x, rels, theme, geom.clone(), inherit, &g, acc),
+                "cxnSp" => pptx_cxn_sp_model(x, rels, theme, geom.clone(), inherit, &g, acc),
+                "pic" => pptx_pic_model(x, zip, rels, geom.clone(), resources, &g, acc),
+                "graphicFrame" => {
+                    pptx_graphic_frame_model(x, zip, rels, theme, geom.clone(), &g, acc)
                 }
+                "grpSp" => pptx_grp_sp_model(
+                    x,
+                    zip,
+                    rels,
+                    theme,
+                    geom.clone(),
+                    resources,
+                    inherit,
+                    &g,
+                    acc,
+                ),
                 _ => {}
             },
             Tok::Close(name) if matches!(local(name), "spTree" | "grpSp") => break,
@@ -4136,14 +4953,26 @@ fn pptx_grp_sp_model(
                     composed = g.compose(&b, ch_off, ch_ext);
                 }
                 // Child shapes — same dispatch as the top-level tree.
-                "sp" if !sc => pptx_sp_model(x, rels, theme, geom, inherit, &composed, acc),
-                "cxnSp" if !sc => pptx_cxn_sp_model(x, rels, theme, geom, inherit, &composed, acc),
-                "pic" if !sc => pptx_pic_model(x, zip, rels, geom, resources, &composed, acc),
+                "sp" if !sc => pptx_sp_model(x, rels, theme, geom.clone(), inherit, &composed, acc),
+                "cxnSp" if !sc => {
+                    pptx_cxn_sp_model(x, rels, theme, geom.clone(), inherit, &composed, acc)
+                }
+                "pic" if !sc => {
+                    pptx_pic_model(x, zip, rels, geom.clone(), resources, &composed, acc)
+                }
                 "graphicFrame" if !sc => {
-                    pptx_graphic_frame_model(x, zip, rels, theme, geom, &composed, acc)
+                    pptx_graphic_frame_model(x, zip, rels, theme, geom.clone(), &composed, acc)
                 }
                 "grpSp" if !sc => pptx_grp_sp_model(
-                    x, zip, rels, theme, geom, resources, inherit, &composed, acc,
+                    x,
+                    zip,
+                    rels,
+                    theme,
+                    geom.clone(),
+                    resources,
+                    inherit,
+                    &composed,
+                    acc,
                 ),
                 _ => {}
             },
@@ -4258,6 +5087,12 @@ struct PptxShapeStyle {
     /// Dash pattern in points (`a:ln/a:custDash` stops scaled by the line width);
     /// empty for a solid line or a `a:prstDash`.
     dash: Vec<f64>,
+    /// Full gradient fill (`a:gradFill`: every stop + `a:lin@ang`), when the
+    /// shape declares one with ≥ 2 stops. [`fill`](Self::fill) stays the first
+    /// stop's colour (the flat fallback). See [`model::Gradient`].
+    fill_gradient: Option<crate::model::Gradient>,
+    /// Outer drop shadow (`a:effectLst/a:outerShdw`). See [`model::Shadow`].
+    shadow: Option<crate::model::Shadow>,
 }
 
 /// True when a `p:sp`/`p:cxnSp` actually carries any drawable paint — a fill, a
@@ -4290,6 +5125,20 @@ fn pptx_parse_sp_pr(
     let mut fill = PptxFillColor::default();
     let mut in_fill = false;
     let mut fill_grad_done = false;
+    // Full-gradient capture (shape-level `a:gradFill` only): every `a:gs` stop
+    // (position + colour + alpha) and the linear angle. The flat `fill` above
+    // still receives the first stop (unchanged fallback behaviour).
+    let mut in_shape_grad = false;
+    let mut grad_angle: f64 = 0.0;
+    let mut grad_stops: Vec<(f64, PptxFillColor, f64)> = Vec::new();
+    // The `a:gs` stop currently open (its colour accumulates separately from
+    // the flat `fill` so stops past the first are still captured).
+    let mut cur_stop: Option<(f64, PptxFillColor, f64)> = None;
+    // Drop-shadow capture (`a:effectLst/a:outerShdw`).
+    let mut in_shdw = false;
+    let mut shdw: Option<(f64, f64, f64, f64)> = None; // (dx, dy, blur, alpha)
+    let mut shdw_color = PptxFillColor::default();
+    let mut shdw_alpha: f64 = 1.0;
     // Line state.
     let mut in_ln = false;
     let mut ln_fill = PptxFillColor::default();
@@ -4369,26 +5218,90 @@ fn pptx_parse_sp_pr(
                         in_fill = true;
                     }
                 }
+                // The shape-level gradient container: capture the FULL stop list
+                // (the flat `fill` still receives only the first stop below).
+                "gradFill" if !sc && !in_ln && !in_cust && grad_stops.is_empty() => {
+                    in_shape_grad = true;
+                }
+                // Linear gradient axis (`a:lin@ang`, 60000ths of a degree).
+                "lin" if in_shape_grad => {
+                    grad_angle = attr(&attrs, "ang")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .map(|a| a / 60_000.0)
+                        .unwrap_or(grad_angle);
+                }
                 "gs" => {
-                    if in_ln && !ln_grad_done {
-                        ln_in_fill = true;
-                    } else if !in_cust && !fill_grad_done {
-                        in_fill = true;
+                    if in_ln {
+                        if !ln_grad_done {
+                            ln_in_fill = true;
+                        }
+                    } else if !in_cust {
+                        if !fill_grad_done {
+                            in_fill = true;
+                        }
+                        if in_shape_grad {
+                            let pos = attr(&attrs, "pos")
+                                .and_then(|v| v.trim().parse::<f64>().ok())
+                                .map(|p| (p / 100_000.0).clamp(0.0, 1.0))
+                                .unwrap_or(0.0);
+                            cur_stop = Some((pos, PptxFillColor::default(), 1.0));
+                        }
+                    }
+                }
+                // Outer drop shadow: `a:effectLst/a:outerShdw@blurRad/@dist/@dir`
+                // (EMU / EMU / 60000ths-degree clockwise, +Y down — the same
+                // screen convention as the model's `Shadow`).
+                "outerShdw" if !in_ln && !in_cust && shdw.is_none() => {
+                    let blur = attr(&attrs, "blurRad").and_then(emu_to_pt).unwrap_or(0.0);
+                    let dist = attr(&attrs, "dist").and_then(emu_to_pt).unwrap_or(0.0);
+                    let dir = attr(&attrs, "dir")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                        / 60_000.0;
+                    let rad = dir.to_radians();
+                    shdw = Some((dist * rad.cos(), dist * rad.sin(), blur, 1.0));
+                    in_shdw = !sc;
+                }
+                // Per-stop / shadow opacity (`a:alpha@val`, thousandths of %).
+                "alpha" => {
+                    let v = attr(&attrs, "val")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .map(|v| (v / 100_000.0).clamp(0.0, 1.0));
+                    if let Some(v) = v {
+                        if in_shdw {
+                            shdw_alpha = v;
+                        } else if let Some((_, _, a)) = cur_stop.as_mut() {
+                            *a = v;
+                        }
                     }
                 }
                 // Colour bases / modifiers, routed to the active fill accumulator.
                 "srgbClr" | "schemeClr" | "hslClr" | "sysClr" => {
-                    if ln_in_fill {
+                    if in_shdw {
+                        shdw_color.set_base(local(&name), &attrs);
+                    } else if ln_in_fill {
                         ln_fill.set_base(local(&name), &attrs);
-                    } else if in_fill {
-                        fill.set_base(local(&name), &attrs);
+                    } else {
+                        if in_fill {
+                            fill.set_base(local(&name), &attrs);
+                        }
+                        if let Some((_, c, _)) = cur_stop.as_mut() {
+                            c.set_base(local(&name), &attrs);
+                        }
                     }
                 }
                 "lumMod" | "lumOff" | "shade" | "tint" => {
-                    if ln_in_fill {
+                    if in_shdw {
+                        shdw_color.set_mod(local(&name), &attrs);
+                    } else if ln_in_fill {
                         ln_fill.set_mod(local(&name), &attrs);
-                    } else if in_fill {
-                        fill.set_mod(local(&name), &attrs);
+                    } else {
+                        if in_fill {
+                            fill.set_mod(local(&name), &attrs);
+                        }
+                        if let Some((_, c, _)) = cur_stop.as_mut() {
+                            c.set_mod(local(&name), &attrs);
+                        }
                     }
                 }
                 _ => {}
@@ -4420,6 +5333,9 @@ fn pptx_parse_sp_pr(
                         }
                     }
                     "gs" => {
+                        if let Some(stop) = cur_stop.take() {
+                            grad_stops.push(stop);
+                        }
                         if ln_in_fill {
                             ln_grad_done = true;
                             ln_in_fill = false;
@@ -4428,6 +5344,8 @@ fn pptx_parse_sp_pr(
                             in_fill = false;
                         }
                     }
+                    "gradFill" => in_shape_grad = false,
+                    "outerShdw" => in_shdw = false,
                     "ln" => in_ln = false,
                     "custGeom" => {
                         in_cust = false;
@@ -4457,6 +5375,39 @@ fn pptx_parse_sp_pr(
     // Custom dash stops are per-mille of the line width → absolute points.
     if !dash_perm.is_empty() && style.stroke_width > 0.0 {
         style.dash = dash_perm.iter().map(|f| f * style.stroke_width).collect();
+    }
+    // A real gradient (≥ 2 stops) survives in full; a single-stop `a:gradFill`
+    // stays the flat-fill approximation only (statu quo).
+    if grad_stops.len() >= 2 {
+        let stops = grad_stops
+            .into_iter()
+            .map(|(pos, c, alpha)| crate::model::GradientStop {
+                pos,
+                color: c
+                    .finish_with(theme)
+                    .as_deref()
+                    .and_then(hex_to_rgb_f64)
+                    .unwrap_or([0.0, 0.0, 0.0]),
+                alpha,
+            })
+            .collect();
+        style.fill_gradient = Some(crate::model::Gradient {
+            stops,
+            angle_deg: grad_angle,
+        });
+    }
+    if let Some((dx, dy, blur, _)) = shdw {
+        style.shadow = Some(crate::model::Shadow {
+            dx_pt: dx,
+            dy_pt: dy,
+            blur_pt: blur,
+            color: shdw_color
+                .finish_with(theme)
+                .as_deref()
+                .and_then(hex_to_rgb_f64)
+                .unwrap_or([0.0, 0.0, 0.0]),
+            alpha: shdw_alpha,
+        });
     }
     (xfrm, have_xfrm, style)
 }
@@ -4618,6 +5569,8 @@ struct PptxParaPr {
     first_line: Option<f64>,
     /// `a:pPr@lvl` (0-based nesting level; default 0).
     level: u8,
+    /// `a:pPr@rtl="1"`: right-to-left paragraph flow.
+    rtl: bool,
     /// Space before, from `a:spcBef/a:spcPts@val` (points). `a:spcPct` (relative)
     /// has no absolute value without the font size, so it is not lowered.
     space_before: Option<f64>,
@@ -4644,6 +5597,7 @@ impl PptxParaPr {
             level: attr(attrs, "lvl")
                 .and_then(|v| v.trim().parse::<u8>().ok())
                 .unwrap_or(0),
+            rtl: matches!(attr(attrs, "rtl"), Some("1") | Some("true")),
             ..PptxParaPr::default()
         }
     }
@@ -4709,6 +5663,7 @@ impl PptxParaPr {
             indent_right_pt: 0.0,
             first_line_pt: self.first_line.unwrap_or(0.0),
             line_height: self.line_height.unwrap_or_default(),
+            direction: self.rtl.then_some(model::Direction::Rtl),
             ..Default::default()
         }
     }
@@ -4890,6 +5845,9 @@ fn pptx_shape_or_textbox(
     // collected while `in_ppr`. Reset at every `a:p`.
     let mut ppr = PptxParaPr::default();
     let mut in_ppr = false;
+    // `a:bodyPr/a:normAutofit@fontScale` — the shape's shrink-to-fit factor,
+    // applied to every following run's explicit size.
+    let mut font_scale: Option<f64> = None;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -4898,6 +5856,7 @@ fn pptx_shape_or_textbox(
                     have_ph = true;
                     ph = Some(PhKey::from_attrs(&attrs));
                 }
+                "normAutofit" => font_scale = pptx_font_scale(&attrs),
                 // The `p:spPr` carries the transform, geometry and fill/line; a
                 // dedicated parser consumes its whole subtree (incl. `a:xfrm`).
                 "spPr" if !sc => {
@@ -4924,6 +5883,7 @@ fn pptx_shape_or_textbox(
                 "br" => para_runs.push(Inline::LineBreak),
                 "rPr" => {
                     run = pptx_run_props(&attrs);
+                    pptx_scale_run_size(&mut run, font_scale);
                     rpr = PptxRunPr::open();
                     // A self-closing `<a:rPr/>` carries no colour/link children.
                     if sc {
@@ -5004,6 +5964,8 @@ fn pptx_shape_or_textbox(
                         stroke: style.stroke,
                         stroke_width: style.stroke_width,
                         dash: style.dash,
+                        fill_gradient: style.fill_gradient,
+                        shadow: style.shadow,
                     }),
                     ..Block::default()
                 });
@@ -5044,6 +6006,8 @@ fn pptx_pic_model(
     let mut xfrm = XfrmBox::default();
     let mut have_xfrm = false;
     let mut img: Option<Block> = None;
+    // `p:blipFill/a:srcRect` — the picture crop, applied to the image ref.
+    let mut crop: Option<[f64; 4]> = None;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -5060,6 +6024,7 @@ fn pptx_pic_model(
                             .and_then(|k| image_block(zip, &k, resources));
                     }
                 }
+                "srcRect" if crop.is_none() => crop = parse_src_rect(&attrs),
                 _ => {}
             },
             Tok::Close(name) if local(&name) == "pic" => break,
@@ -5071,6 +6036,9 @@ fn pptx_pic_model(
         let (frame, rotation) = xfrm_to_frame(&xfrm, g, geom.h);
         block.frame = frame;
         block.rotation = rotation;
+        if let BlockKind::Image(image) = &mut block.kind {
+            image.crop = crop;
+        }
         acc.shapes.push(block);
     }
 }
@@ -5111,7 +6079,7 @@ fn pptx_graphic_frame_model(
                 }
                 "tbl" if !sc && single.is_none() && placed.is_none() => {
                     single = Some(Block {
-                        kind: BlockKind::Table(pptx_table_model(x, rels, theme)),
+                        kind: BlockKind::Table(pptx_table_model(x, zip, rels, theme)),
                         ..Block::default()
                     });
                 }
@@ -5407,23 +6375,195 @@ fn part_rels_key(part: &str) -> String {
     }
 }
 
+/// One resolved entry of `ppt/tableStyles.xml`: the `wholeTbl` region's first
+/// border edge and fill, plus the `band1H` (odd body band) and `firstRow`
+/// (header) region fills. Colours are resolved against the deck theme at parse
+/// time. The model's table is coarser than the style grammar (one table-wide
+/// border, per-cell shading), so this is deliberately the table-wide
+/// approximation — no per-edge/per-cell borders.
+#[derive(Default, Clone)]
+struct PptxTableStyle {
+    /// `wholeTbl/tcStyle/tcBdr` — the first edge with a real width.
+    border: Option<model::BorderStyle>,
+    /// `wholeTbl/tcStyle/fill` — the base cell fill.
+    whole_fill: Option<[f64; 3]>,
+    /// `band1H/tcStyle/fill` — the first banded-row fill (`a:tblPr@bandRow`).
+    band1_fill: Option<[f64; 3]>,
+    /// `firstRow/tcStyle/fill` — the header-row fill (`a:tblPr@firstRow`).
+    first_row_fill: Option<[f64; 3]>,
+}
+
+/// Parse the deck's `ppt/tableStyles.xml` into styleId → [`PptxTableStyle`].
+/// Region grammar per `a:tblStyle`: `wholeTbl`/`band1H`/`firstRow` (other
+/// regions are skipped) each carry a `tcStyle` whose `tcBdr` edges hold
+/// `a:ln@w` (EMU) + a solid fill colour, and whose `fill` is the region's cell
+/// background. Colour children route to the open border line when inside one,
+/// else to the region fill — mirroring [`PptxCellPr`]'s discrimination. Empty
+/// when the part is absent.
+fn pptx_table_styles(
+    zip: &BTreeMap<String, Vec<u8>>,
+    theme: &PptxTheme,
+) -> BTreeMap<String, PptxTableStyle> {
+    let Some(bytes) = zip.get("ppt/tableStyles.xml") else {
+        return BTreeMap::new();
+    };
+    let xml = String::from_utf8_lossy(bytes);
+    let mut out: BTreeMap<String, PptxTableStyle> = BTreeMap::new();
+
+    let mut x = Xml::new(&xml);
+    let mut cur_id: Option<String> = None;
+    let mut cur = PptxTableStyle::default();
+    // The conditional region being read (`wholeTbl` / `band1H` / `firstRow`).
+    let mut region: Option<&'static str> = None;
+    let mut in_tcbdr = false;
+    // Border line under an edge of the region's `tcBdr`.
+    let mut in_ln = false;
+    let mut ln_w: Option<f64> = None;
+    let mut ln_color = PptxFillColor::default();
+    // The region's own `a:fill` (outside any border line).
+    let mut in_fill = false;
+    let mut fill_color = PptxFillColor::default();
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "tblStyle" if !sc => {
+                        cur_id = attr(&attrs, "styleId").map(|v| v.to_string());
+                        cur = PptxTableStyle::default();
+                    }
+                    "wholeTbl" if !sc => region = Some("wholeTbl"),
+                    "band1H" if !sc => region = Some("band1H"),
+                    "firstRow" if !sc => region = Some("firstRow"),
+                    "tcBdr" if region.is_some() && !sc => in_tcbdr = true,
+                    "ln" if in_tcbdr => {
+                        in_ln = !sc;
+                        ln_w = attr(&attrs, "w").and_then(emu_to_pt);
+                        ln_color = PptxFillColor::default();
+                        if sc {
+                            pptx_table_style_edge(
+                                &mut cur,
+                                region,
+                                ln_w.take(),
+                                &mut ln_color,
+                                theme,
+                            );
+                        }
+                    }
+                    "fill" if region.is_some() && !in_tcbdr && !sc => {
+                        in_fill = true;
+                        fill_color = PptxFillColor::default();
+                    }
+                    "srgbClr" | "schemeClr" | "hslClr" | "sysClr" if in_ln => {
+                        ln_color.set_base(ln, &attrs);
+                    }
+                    "srgbClr" | "schemeClr" | "hslClr" | "sysClr" if in_fill => {
+                        fill_color.set_base(ln, &attrs);
+                    }
+                    "lumMod" | "lumOff" | "shade" | "tint" if in_ln => {
+                        ln_color.set_mod(ln, &attrs);
+                    }
+                    "lumMod" | "lumOff" | "shade" | "tint" if in_fill => {
+                        fill_color.set_mod(ln, &attrs);
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Close(name) => {
+                let ln = local(&name);
+                match ln {
+                    "ln" if in_ln => {
+                        in_ln = false;
+                        pptx_table_style_edge(&mut cur, region, ln_w.take(), &mut ln_color, theme);
+                    }
+                    "fill" if in_fill => {
+                        in_fill = false;
+                        let rgb = std::mem::take(&mut fill_color)
+                            .finish_with(theme)
+                            .as_deref()
+                            .and_then(hex_to_rgb_f64);
+                        let slot = match region {
+                            Some("wholeTbl") => &mut cur.whole_fill,
+                            Some("band1H") => &mut cur.band1_fill,
+                            Some("firstRow") => &mut cur.first_row_fill,
+                            _ => continue,
+                        };
+                        if slot.is_none() {
+                            *slot = rgb;
+                        }
+                    }
+                    "tcBdr" => in_tcbdr = false,
+                    "wholeTbl" | "band1H" | "firstRow" => region = None,
+                    "tblStyle" => {
+                        if let Some(id) = cur_id.take() {
+                            out.insert(id, std::mem::take(&mut cur));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    out
+}
+
+/// Fold one closed `wholeTbl` border edge (`a:ln`) into the style's table-wide
+/// border slot: the first edge with a real width wins; its solid-fill colour
+/// (theme-resolved) defaults to black when the line declares none.
+fn pptx_table_style_edge(
+    style: &mut PptxTableStyle,
+    region: Option<&'static str>,
+    width: Option<f64>,
+    color: &mut PptxFillColor,
+    theme: &PptxTheme,
+) {
+    let color = std::mem::take(color);
+    if region != Some("wholeTbl") || style.border.is_some() {
+        return;
+    }
+    let Some(width) = width.filter(|w| *w > 0.0) else {
+        return;
+    };
+    let rgb = color
+        .finish_with(theme)
+        .as_deref()
+        .and_then(hex_to_rgb_f64)
+        .unwrap_or([0.0, 0.0, 0.0]);
+    style.border = Some(model::BorderStyle { width, color: rgb });
+}
+
 /// Lower a PPTX `a:tbl` (open consumed) to a model [`Table`]: `a:tblGrid/a:gridCol@w`
 /// seeds `col_widths` (points); each `a:tr`→[`Row`], each `a:tc`→[`Cell`] with
 /// `@gridSpan`/`@rowSpan`→spans and `@hMerge`/`@vMerge` continuation cells folded
 /// into empty placeholders. Cell `a:tcPr/a:solidFill` → [`Cell::shading`] and
 /// `a:hlinkClick` runs → [`Inline::Link`]. The model carries one table-wide
 /// [`BorderStyle`], so the first cell edge (`a:lnL/R/T/B`) that declares a width
-/// seeds it. Cell text reuses the slide paragraph grammar.
-fn pptx_table_model(x: &mut Xml, rels: &BTreeMap<String, String>, theme: &PptxTheme) -> Table {
+/// seeds it — else the referenced deck table style's (`a:tblPr/a:tableStyleId`
+/// → `ppt/tableStyles.xml`) `wholeTbl` border does. The style's region fills
+/// (`wholeTbl`/`band1H`/`firstRow`) paint cells that declare no own shading.
+/// Cell text reuses the slide paragraph grammar.
+fn pptx_table_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+) -> Table {
     let mut col_widths: Vec<f64> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut cur: Option<Vec<Cell>> = None;
     // The model has a single table-wide border; the first declared cell edge wins.
     let mut border: Option<model::BorderStyle> = None;
     // `a:tblPr@firstRow="1"` marks the first row as a styled header row; honour it
-    // so the first emitted [`Row`] carries `is_header` (mirrors the exporter,
-    // which always writes `firstRow="1"`).
+    // so the first emitted [`Row`] carries `is_header` (the exporter writes
+    // `firstRow="1"` exactly when the model's first row is a header).
     let mut first_row_header = false;
+    // `a:tblPr@bandRow="1"` — alternate body rows take the style's `band1H` fill.
+    let mut band_rows = false;
+    // `a:tblPr/a:tableStyleId` text content (a `{GUID}`).
+    let mut style_id = String::new();
+    let mut in_style_id = false;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -5431,6 +6571,9 @@ fn pptx_table_model(x: &mut Xml, rels: &BTreeMap<String, String>, theme: &PptxTh
                 let ln = local(&name);
                 if ln == "tblPr" {
                     first_row_header = matches!(attr(&attrs, "firstRow"), Some("1") | Some("true"));
+                    band_rows = matches!(attr(&attrs, "bandRow"), Some("1") | Some("true"));
+                } else if ln == "tableStyleId" && !sc {
+                    in_style_id = true;
                 } else if ln == "gridCol" {
                     if let Some(w) = attr(&attrs, "w").and_then(emu_to_pt) {
                         if w > 0.0 {
@@ -5453,7 +6596,9 @@ fn pptx_table_model(x: &mut Xml, rels: &BTreeMap<String, String>, theme: &PptxTh
             }
             Tok::Close(name) => {
                 let ln = local(&name);
-                if ln == "tr" {
+                if ln == "tableStyleId" {
+                    in_style_id = false;
+                } else if ln == "tr" {
                     if let Some(cells) = cur.take() {
                         // Only the first row is the header (PPTX `firstRow`).
                         let is_header = first_row_header && rows.is_empty();
@@ -5467,7 +6612,42 @@ fn pptx_table_model(x: &mut Xml, rels: &BTreeMap<String, String>, theme: &PptxTh
                     break;
                 }
             }
-            Tok::Text(_) => {}
+            Tok::Text(t) => {
+                if in_style_id {
+                    style_id.push_str(&t);
+                }
+            }
+        }
+    }
+
+    // Resolve the referenced deck table style: its `wholeTbl` border seeds the
+    // table-wide border when no cell edge declared one, and its region fills
+    // paint the cells that carry no own `a:tcPr` shading. Unknown id / absent
+    // `ppt/tableStyles.xml` → unchanged.
+    let style_id = style_id.trim();
+    if !style_id.is_empty() {
+        let styles = pptx_table_styles(zip, theme);
+        if let Some(ts) = styles.get(style_id) {
+            if border.is_none() {
+                border = ts.border;
+            }
+            // Banding starts after the header row when one is enabled.
+            let body_start = usize::from(first_row_header);
+            for (ri, row) in rows.iter_mut().enumerate() {
+                let fill = if first_row_header && ri == 0 {
+                    ts.first_row_fill.or(ts.whole_fill)
+                } else if band_rows && (ri - body_start) % 2 == 0 {
+                    ts.band1_fill.or(ts.whole_fill)
+                } else {
+                    ts.whole_fill
+                };
+                let Some(fill) = fill else { continue };
+                for cell in &mut row.cells {
+                    if cell.shading.is_none() {
+                        cell.shading = Some(fill);
+                    }
+                }
+            }
         }
     }
 
@@ -5575,7 +6755,7 @@ fn pptx_table_cell_model(
         }
     }
 
-    let (fill, border, vertical_align) = tc_pr.finish(theme);
+    let (fill, border, vertical_align, cell_borders) = tc_pr.finish(theme);
 
     // Horizontal-merge continuation: covered by the cell spanning it — drop.
     if h_merge {
@@ -5598,6 +6778,7 @@ fn pptx_table_cell_model(
         row_span,
         shading: fill,
         vertical_align,
+        borders: cell_borders,
     }];
     // Pad to `grid_span` physical columns (empty continuation cells).
     for _ in 1..grid_span {
@@ -5621,8 +6802,15 @@ struct PptxCellPr {
     line_w: Option<f64>,
     /// The current border line's colour accumulator.
     line_color: PptxFillColor,
+    /// The current border line's dash keyword from `a:prstDash@val`, mapped to
+    /// the model's CSS-ish line-style word (`solid` when absent).
+    line_dash: Option<&'static str>,
     /// The first border edge's `(width, colour)` once a line closes.
     border: Option<(f64, PptxFillColor)>,
+    /// Per-side edges `[top, right, bottom, left]` (model order) — each side's
+    /// `(width, colour, style)` from its own `a:lnT/R/B/L`, surfaced as the
+    /// cell's [`Cell::borders`](model::Cell::borders).
+    sides: [Option<(f64, PptxFillColor, &'static str)>; 4],
     /// True while inside the cell's own `a:solidFill` (a direct `a:tcPr` child).
     in_cell_fill: bool,
     /// The cell fill colour accumulator.
@@ -5653,6 +6841,15 @@ impl PptxCellPr {
                 self.in_line = true;
                 self.line_w = attr(attrs, "w").and_then(emu_to_pt);
                 self.line_color = PptxFillColor::default();
+                self.line_dash = None;
+            }
+            // Border line dash preset → the model's line-style keyword.
+            "prstDash" if self.in_line => {
+                self.line_dash = attr(attrs, "val").map(|v| match v {
+                    "dash" | "lgDash" | "dashDot" | "lgDashDot" | "lgDashDotDot" => "dashed",
+                    "dot" | "sysDot" | "sysDash" | "sysDashDot" | "sysDashDotDot" => "dotted",
+                    _ => "solid",
+                });
             }
             "solidFill" if self.in_line => {} // colours below land in line_color
             "solidFill" => self.in_cell_fill = true,
@@ -5680,9 +6877,23 @@ impl PptxCellPr {
     fn on_close(&mut self, ln: &str) {
         match ln {
             "lnL" | "lnR" | "lnT" | "lnB" => {
-                if self.border.is_none() {
-                    if let Some(w) = self.line_w.filter(|w| *w > 0.0) {
-                        self.border = Some((w, std::mem::take(&mut self.line_color)));
+                if let Some(w) = self.line_w.filter(|w| *w > 0.0) {
+                    let color = std::mem::take(&mut self.line_color);
+                    // Per-side slot (model order [top, right, bottom, left]).
+                    let slot = match ln {
+                        "lnT" => 0,
+                        "lnR" => 1,
+                        "lnB" => 2,
+                        _ => 3, // lnL
+                    };
+                    if self.sides[slot].is_none() {
+                        self.sides[slot] =
+                            Some((w, color.clone(), self.line_dash.unwrap_or("solid")));
+                    }
+                    // Legacy: the first edge in document order still seeds the
+                    // table-wide border (unchanged behaviour).
+                    if self.border.is_none() {
+                        self.border = Some((w, color));
                     }
                 }
                 self.in_line = false;
@@ -5693,8 +6904,9 @@ impl PptxCellPr {
     }
 
     /// Resolve the cell fill and border colours through `theme`, returning
-    /// `(cell fill RGB, table border, vertical anchor)`. A border with no
-    /// resolvable colour falls back to black.
+    /// `(cell fill RGB, table border, vertical anchor, per-side borders)`. A
+    /// border with no resolvable colour falls back to black.
+    #[allow(clippy::type_complexity)] // one-shot destructured tuple at the sole call site
     fn finish(
         self,
         theme: &PptxTheme,
@@ -5702,6 +6914,7 @@ impl PptxCellPr {
         Option<[f64; 3]>,
         Option<model::BorderStyle>,
         Option<model::CellVAlign>,
+        [Option<model::ParaBorder>; 4],
     ) {
         let fill = self
             .cell_fill
@@ -5716,7 +6929,21 @@ impl PptxCellPr {
                 .unwrap_or([0.0, 0.0, 0.0]);
             model::BorderStyle { width, color }
         });
-        (fill, border, self.anchor)
+        let sides = self.sides.map(|s| {
+            s.map(|(width_pt, color, style)| {
+                let color = color
+                    .finish_with(theme)
+                    .as_deref()
+                    .and_then(hex_to_rgb_f64)
+                    .unwrap_or([0.0, 0.0, 0.0]);
+                model::ParaBorder {
+                    width_pt,
+                    style: style.to_string(),
+                    color,
+                }
+            })
+        });
+        (fill, border, self.anchor, sides)
     }
 }
 
@@ -5739,6 +6966,9 @@ struct OdfModelCtx<'a> {
     /// Cell style name → `style:vertical-align`, for table-cell vertical
     /// alignment.
     cell_valign: &'a BTreeMap<String, model::CellVAlign>,
+    /// Cell style name → per-side borders `[top, right, bottom, left]` from the
+    /// style's `fo:border`/`fo:border-*`, for [`Cell::borders`](model::Cell::borders).
+    cell_borders: &'a BTreeMap<String, [Option<model::ParaBorder>; 4]>,
     /// `text:list-style` name → per-level [`ListMarker`] (`Some` ⇒ ordered level,
     /// `None`/gap ⇒ unordered bullet). Indexed by `text:level - 1`.
     list_styles: &'a BTreeMap<String, Vec<Option<OdfListLevel>>>,
@@ -5791,6 +7021,9 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     // Table-cell vertical alignment, same name-keyed precedence as `cell_bg`.
     let mut cell_valign = odf_cell_valigns(&styles_xml);
     cell_valign.extend(odf_cell_valigns(&content));
+    // Per-cell borders (`fo:border`/`fo:border-*`), same precedence.
+    let mut cell_borders = odf_cell_borders_map(&styles_xml);
+    cell_borders.extend(odf_cell_borders_map(&content));
     // `text:list-style` per-level number/bullet definitions, so a `text:list`'s
     // `text:style-name` resolves ordered-vs-unordered (and the number format) at
     // each nesting level. Automatic styles (content.xml) win on a name clash.
@@ -5804,6 +7037,7 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         cols: &cols,
         cell_bg: &cell_bg,
         cell_valign: &cell_valign,
+        cell_borders: &cell_borders,
         list_styles: &list_styles,
     };
     let mut blocks = Vec::new();
@@ -5838,6 +7072,9 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     // (anchored by the `Inline::CommentRef`s emitted alongside). Taken before the
     // builder is consumed by `finish`.
     doc.comments = std::mem::take(&mut outline.comments);
+    // Foot-/endnote bodies collected at their `text:note` references (anchored
+    // by the `Inline::FootnoteRef`s emitted alongside — the DOCX shape).
+    doc.footnotes = std::mem::take(&mut outline.footnotes);
     doc.outline = outline.finish();
     resolve_internal_links(&mut doc, &bookmark_pages);
     // Lower `styles.xml`'s `office:styles` paragraph styles into the model's
@@ -5964,6 +7201,7 @@ fn odf_walk_model(
                                         }],
                                         start,
                                         marker_suffix,
+                                        ..List::default()
                                     }),
                                     ..Block::default()
                                 });
@@ -5999,8 +7237,20 @@ fn odf_walk_model(
                         match list {
                             // Nested list: share the tree's ordinal counters.
                             Some(outer) => {
-                                let inner = Some(OdfListCtx { level, style, ..outer });
-                                odf_walk_model(x, ctx, out, Some("list"), inner, resources, outline);
+                                let inner = Some(OdfListCtx {
+                                    level,
+                                    style,
+                                    ..outer
+                                });
+                                odf_walk_model(
+                                    x,
+                                    ctx,
+                                    out,
+                                    Some("list"),
+                                    inner,
+                                    resources,
+                                    outline,
+                                );
                             }
                             // Outermost list: fresh counters for this tree.
                             None => {
@@ -6010,7 +7260,15 @@ fn odf_walk_model(
                                     style,
                                     counters: &counters,
                                 });
-                                odf_walk_model(x, ctx, out, Some("list"), inner, resources, outline);
+                                odf_walk_model(
+                                    x,
+                                    ctx,
+                                    out,
+                                    Some("list"),
+                                    inner,
+                                    resources,
+                                    outline,
+                                );
                             }
                         }
                     }
@@ -6166,14 +7424,27 @@ fn odf_inline_model(
                             children: Vec::new(),
                         });
                     }
-                    // A footnote/endnote: inline its citation marker followed by
-                    // the note body text so neither is lost (the body lives inside
-                    // the note element, right at the reference point).
+                    // A footnote/endnote: a structured [`model::Footnote`] (body
+                    // blocks kept whole, collected on the outline builder like
+                    // the DOCX path) anchored by an `Inline::FootnoteRef` at the
+                    // reference point — so ODT notes round-trip through the
+                    // model instead of flattening into the host paragraph.
                     "note" if !sc => {
-                        let note = odf_note_inline(x, ctx);
-                        for inline in note {
-                            active_inlines(&mut runs, &mut link).push(inline);
+                        let ordinal = outline.footnotes.len() + 1;
+                        let (id, blocks) = odf_note_structured(
+                            x,
+                            ctx,
+                            attr(&attrs, "id"),
+                            ordinal,
+                            resources,
+                        );
+                        if !outline.footnotes.iter().any(|f| f.id == id) {
+                            outline.footnotes.push(model::Footnote {
+                                id: id.clone(),
+                                blocks,
+                            });
                         }
+                        active_inlines(&mut runs, &mut link).push(Inline::FootnoteRef { id });
                     }
                     // A review comment: `office:annotation` holds its own body
                     // (`dc:creator`/`dc:date` + `text:p`). Parse it into a
@@ -6272,26 +7543,40 @@ fn odf_inline_model(
     runs
 }
 
-/// Collect a `text:note` (open already consumed) as inline runs: the
-/// `text:note-citation` text rendered as a superscript marker, then the
-/// `text:note-body` paragraphs' text (paragraphs joined by a space). Consumes up
-/// to the matching `</text:note>`. Span styling inside the body is flattened to
-/// plain text (the note is surfaced as a parenthetical, not a styled subtree).
-fn odf_note_inline(x: &mut Xml, ctx: &OdfModelCtx) -> Vec<Inline> {
-    let mut citation = String::new();
-    let mut body = String::new();
+/// Collect a `text:note` (open already consumed) as a **structured** footnote:
+/// its id (`text:id`, else a synthesized `fn{ordinal}`) and the
+/// `text:note-body` lowered to whole model blocks (paragraph/run structure
+/// kept; images intern into the shared `resources`). The `text:note-citation`
+/// text is NOT re-emitted inline — the anchoring [`Inline::FootnoteRef`]
+/// suffices, and renderers derive the superscript ordinal from the note's
+/// position in `Document::footnotes` (the same shape as the DOCX path).
+/// Consumes up to the matching `</text:note>`.
+fn odf_note_structured(
+    x: &mut Xml,
+    ctx: &OdfModelCtx,
+    id_attr: Option<&str>,
+    ordinal: usize,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> (String, Vec<Block>) {
+    let id = id_attr
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        // The ODT exporter writes `text:id="ftn{model id}"` — strip its prefix
+        // so an export→import round trip keeps the original model id.
+        .map(|s| s.strip_prefix("ftn").unwrap_or(s).to_string())
+        .unwrap_or_else(|| format!("fn{ordinal}"));
+    let mut blocks: Vec<Block> = Vec::new();
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, _, sc) => {
                 let ln = local(&name);
                 if ln == "note-citation" && !sc {
-                    citation = odf_text_only(x, "note-citation");
+                    // The citation text is the display ordinal; recomputed at
+                    // render time, so only consumed (not kept).
+                    let _ = odf_text_only(x, "note-citation");
                 } else if ln == "note-body" && !sc {
-                    // Walk the body into throwaway blocks, then flatten to text.
                     // The note body is not part of the document outline, so its
                     // headings/bookmarks go to a discarded builder.
-                    let mut blocks: Vec<Block> = Vec::new();
-                    let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
                     let mut no_outline = OutlineBuilder::default();
                     odf_walk_model(
                         x,
@@ -6299,52 +7584,33 @@ fn odf_note_inline(x: &mut Xml, ctx: &OdfModelCtx) -> Vec<Inline> {
                         &mut blocks,
                         Some("note-body"),
                         None,
-                        &mut resources,
+                        resources,
                         &mut no_outline,
                     );
-                    body = inline_blocks_text(&blocks);
                 }
             }
             Tok::Close(name) if local(&name) == "note" => break,
             _ => {}
         }
     }
-    let mut out: Vec<Inline> = Vec::new();
-    let citation = citation.trim();
-    if !citation.is_empty() {
-        out.push(Inline::Run(InlineRun {
-            text: citation.to_string(),
-            style: CharStyle {
-                vertical_align: model::style::VAlign::Super,
-                ..CharStyle::default()
-            },
-            source_index: None,
-        }));
-    }
-    let body = body.trim();
-    if !body.is_empty() {
-        // A leading space separates the note body from the citation marker / the
-        // surrounding text so the inlined note reads cleanly.
-        out.push(Inline::Run(InlineRun {
-            text: format!(" {body}"),
-            ..InlineRun::default()
-        }));
-    }
-    out
+    (id, blocks)
 }
 
-/// Lower a DOCX foot-/endnote ([`DocxNote`]) to inline runs at its reference
-/// point, mirroring the ODT [`odf_note_inline`] lowering: a superscript citation
-/// marker (the note's display ordinal) followed by the note body text. The body
-/// lives in a separate part as raw `w:p`/`w:r` XML, so it is re-walked here with
-/// the body model walker ([`docx_walk_model`]) — through a throwaway page/outline
-/// accumulator (a note body is not part of the document outline) — then flattened
-/// to text. Any images in the body intern into the shared `resources` table.
-fn docx_note_inline(
+/// Lower a DOCX foot-/endnote ([`DocxNote`]) body to model **blocks** for
+/// [`Document::footnotes`](model::Document::footnotes). The body lives in a
+/// separate part as raw `w:p`/`w:r` XML, so it is re-walked here with the body
+/// model walker ([`docx_walk_model`]) — through a throwaway page/outline
+/// accumulator (a note body is not part of the document outline) — keeping its
+/// paragraph/run structure instead of the historical flattened-inline
+/// degradation. Any images in the body intern into the shared `resources`
+/// table. The citation marker is NOT synthesized here: the anchoring
+/// [`Inline::FootnoteRef`] suffices, and renderers derive the superscript
+/// ordinal from the note's position in `Document.footnotes`.
+fn docx_note_blocks(
     ctx: &DocxCtx,
     note: &DocxNote,
     resources: &mut BTreeMap<u64, model::ImageResource>,
-) -> Vec<Inline> {
+) -> Vec<Block> {
     let mut pages = DocxPages::new();
     let mut counters = ListCounters::default();
     let mut no_outline = OutlineBuilder::default();
@@ -6357,57 +7623,7 @@ fn docx_note_inline(
         &mut no_outline,
         None,
     );
-    let blocks: Vec<Block> = pages.finish().into_iter().flat_map(|p| p.blocks).collect();
-    let body = inline_blocks_text(&blocks);
-
-    let mut out: Vec<Inline> = Vec::new();
-    // The citation marker is surfaced as a superscript run (same shape as ODT).
-    out.push(Inline::Run(InlineRun {
-        text: note.number.to_string(),
-        style: CharStyle {
-            vertical_align: model::style::VAlign::Super,
-            ..CharStyle::default()
-        },
-        source_index: None,
-    }));
-    if !body.is_empty() {
-        // A leading space separates the body from the citation marker / host text.
-        out.push(Inline::Run(InlineRun {
-            text: format!(" {body}"),
-            ..InlineRun::default()
-        }));
-    }
-    out
-}
-
-/// The concatenated plain text of a block list (paragraph/heading runs joined,
-/// paragraphs separated by a single space), trimmed. Used to flatten a footnote
-/// body to inline text.
-fn inline_blocks_text(blocks: &[Block]) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        match &b.kind {
-            BlockKind::Paragraph(p) | BlockKind::Heading(Heading { para: p, .. }) => {
-                for r in &p.runs {
-                    if let Inline::Run(run) = r {
-                        out.push_str(&run.text);
-                    }
-                }
-                out.push(' ');
-            }
-            BlockKind::List(l) => {
-                for it in &l.items {
-                    let inner = inline_blocks_text(&it.blocks);
-                    if !inner.is_empty() {
-                        out.push_str(&inner);
-                        out.push(' ');
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out.trim().to_string()
+    pages.finish().into_iter().flat_map(|p| p.blocks).collect()
 }
 
 /// Collect only the text content of an element (open already consumed) until its
@@ -6549,6 +7765,10 @@ fn odf_table_model(
                     let style_name = attr(&attrs, "style-name");
                     let shading = style_name.and_then(|n| ctx.cell_bg.get(n)).copied();
                     let vertical_align = style_name.and_then(|n| ctx.cell_valign.get(n)).copied();
+                    let borders = style_name
+                        .and_then(|n| ctx.cell_borders.get(n))
+                        .cloned()
+                        .unwrap_or_default();
                     // `table:number-{columns,rows}-spanned` define a merge anchor;
                     // lower them onto `Cell::col_span`/`row_span` (the covered
                     // slots that follow are dropped below). Clamp to `u16`.
@@ -6581,6 +7801,7 @@ fn odf_table_model(
                                 row_span,
                                 shading,
                                 vertical_align,
+                                borders: borders.clone(),
                             });
                         }
                     }
@@ -6752,6 +7973,7 @@ fn ods_sheet_model(x: &mut Xml, name: String, props: &OdsStyleTables) -> Sheet {
         rows,
         merges,
         col_widths,
+        ..Default::default()
     }
 }
 
@@ -6820,7 +8042,7 @@ fn ods_row_model(
                     if cspan.is_some() || rspan.is_some() {
                         spans.push((cells.len(), cspan.unwrap_or(1), rspan.unwrap_or(1)));
                     }
-                    let text = ods_cell_text(x, ln);
+                    let (text, hyperlink) = ods_cell_text_link(x, ln);
                     let trimmed = text.trim();
                     cell.value = if let Some(n) = typed_num {
                         model::CellValue::Number(n)
@@ -6831,6 +8053,7 @@ fn ods_row_model(
                     } else {
                         model::CellValue::Text(trimmed.to_string())
                     };
+                    cell.hyperlink = hyperlink;
                     cell.formula = formula;
                     // A formula or styled cell is meaningful even when blank, so
                     // emit each repeat (don't collapse a styled run to one).
@@ -6888,6 +8111,18 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     // ones in `styles.xml`.
     let mut gstyles = odf_graphic_styles(&styles_xml);
     gstyles.extend(odf_graphic_styles(&content));
+    // `<draw:gradient>` definitions (styles.xml primarily; content.xml wins on
+    // a name clash) → resolve each graphic style's `draw:fill-gradient-name`,
+    // and each drawing-page style's gradient background.
+    let mut grad_defs = odf_gradient_defs(&styles_xml);
+    grad_defs.extend(odf_gradient_defs(&content));
+    odf_resolve_gradients(&mut gstyles, &grad_defs);
+    let mut page_grad_names = odf_drawing_page_gradient_names(&styles_xml);
+    page_grad_names.extend(odf_drawing_page_gradient_names(&content));
+    let page_grads: BTreeMap<String, model::Gradient> = page_grad_names
+        .into_iter()
+        .filter_map(|(style, grad)| grad_defs.get(&grad).map(|g| (style, g.clone())))
+        .collect();
 
     // Only the run-style and paragraph/list maps matter for the slide text bodies;
     // the table/cell maps stay empty (slide text frames carry the formatting that
@@ -6896,6 +8131,9 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     static EMPTY_BG: std::sync::OnceLock<BTreeMap<String, [f64; 3]>> = std::sync::OnceLock::new();
     static EMPTY_VA: std::sync::OnceLock<BTreeMap<String, model::CellVAlign>> =
         std::sync::OnceLock::new();
+    static EMPTY_BORDERS: std::sync::OnceLock<
+        BTreeMap<String, [Option<model::ParaBorder>; 4]>,
+    > = std::sync::OnceLock::new();
     let ctx = OdfModelCtx {
         zip,
         styles: &styles,
@@ -6903,6 +8141,7 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         cols: EMPTY_COLS.get_or_init(BTreeMap::new),
         cell_bg: EMPTY_BG.get_or_init(BTreeMap::new),
         cell_valign: EMPTY_VA.get_or_init(BTreeMap::new),
+        cell_borders: EMPTY_BORDERS.get_or_init(BTreeMap::new),
         list_styles: &list_styles,
     };
 
@@ -6912,13 +8151,24 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     while let Some(tok) = x.next() {
         if let Tok::Open(name, attrs, sc) = &tok {
             if local(name) == "page" && !sc {
-                let background = odp_page_background(attrs, &page_fills, &master_styles);
+                let background_gradient =
+                    odp_page_background_gradient(attrs, &page_grads, &master_styles);
+                // The gradient's first stop doubles as the flat background so
+                // gradient-unaware consumers keep a solid approximation.
+                let background = odp_page_background(attrs, &page_fills, &master_styles)
+                    .or_else(|| {
+                        background_gradient
+                            .as_ref()
+                            .and_then(|g| g.stops.first())
+                            .map(|s| s.color)
+                    });
                 slides.push(odp_page_model(
                     &mut x,
                     &ctx,
                     &gstyles,
-                    geom,
+                    geom.clone(),
                     background,
+                    background_gradient,
                     &mut resources,
                 ));
             }
@@ -6951,6 +8201,7 @@ fn odp_page_model(
     gstyles: &BTreeMap<String, OdfGraphicStyle>,
     geom: PageGeom,
     background: Option<[f64; 3]>,
+    background_gradient: Option<model::Gradient>,
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Slide {
     let mut placeholders: Vec<model::Placeholder> = Vec::new();
@@ -6981,7 +8232,7 @@ fn odp_page_model(
                         odp_frame_model(
                             x,
                             ctx,
-                            geom,
+                            geom.clone(),
                             (0.0, 0.0),
                             bx,
                             &attrs,
@@ -6997,7 +8248,7 @@ fn odp_page_model(
                             x,
                             ctx,
                             gstyles,
-                            geom,
+                            geom.clone(),
                             (0.0, 0.0),
                             ln,
                             sc,
@@ -7014,7 +8265,7 @@ fn odp_page_model(
                             x,
                             ctx,
                             gstyles,
-                            geom,
+                            geom.clone(),
                             (gx, gy),
                             resources,
                             &mut shapes,
@@ -7087,6 +8338,7 @@ fn odp_page_model(
         placeholders,
         notes,
         background,
+        background_gradient,
     }
 }
 
@@ -7182,7 +8434,7 @@ fn odp_group_model(
                         odp_frame_model(
                             x,
                             ctx,
-                            geom,
+                            geom.clone(),
                             off,
                             bx,
                             &attrs,
@@ -7198,7 +8450,7 @@ fn odp_group_model(
                             x,
                             ctx,
                             gstyles,
-                            geom,
+                            geom.clone(),
                             off,
                             ln,
                             sc,
@@ -7214,7 +8466,7 @@ fn odp_group_model(
                             x,
                             ctx,
                             gstyles,
-                            geom,
+                            geom.clone(),
                             (off.0 + gx, off.1 + gy),
                             resources,
                             shapes,
@@ -7508,7 +8760,7 @@ fn image_block(
     Some(Block {
         kind: BlockKind::Image(model::ImageRef {
             resource: intern_media(zip, key, resources)?,
-            alt: None,
+            ..Default::default()
         }),
         ..Block::default()
     })
@@ -8402,7 +9654,7 @@ fn docx_html_parts(zip: &BTreeMap<String, Vec<u8>>) -> DocxHtmlParts {
         .get("word/_rels/document.xml.rels")
         .map(|b| parse_rels(&String::from_utf8_lossy(b)))
         .unwrap_or_default();
-    let styles = parse_docx_styles(&part(zip, "word/styles.xml"));
+    let styles = parse_docx_styles(&part(zip, "word/styles.xml"), docx_theme(zip));
     let numbering = parse_docx_numbering(&part(zip, "word/numbering.xml"));
     let footnotes = parse_docx_footnotes(&part(zip, "word/footnotes.xml"));
 
@@ -8540,6 +9792,98 @@ fn docx_section_ref_id(document_xml: &str, kind: &str) -> Option<String> {
     default_id.or(any_id)
 }
 
+/// Resolve the relationship id of the **last** `w:headerReference`/
+/// `w:footerReference` whose `@w:type` matches `ty` (`"first"`/`"even"`),
+/// for the first-/even-page header/footer variants. `None` when the document
+/// declares none of that type.
+fn docx_section_ref_id_of_type(document_xml: &str, kind: &str, ty: &str) -> Option<String> {
+    let want = format!("{kind}Reference");
+    let mut id_out: Option<String> = None;
+    let mut x = Xml::new(document_xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == want && attr(&attrs, "type") == Some(ty) {
+                if let Some(id) = attr(&attrs, "id") {
+                    id_out = Some(id.to_string());
+                }
+            }
+        }
+    }
+    id_out
+}
+
+/// Whether the body-level (**last**) `w:sectPr` sets `w:titlePg` — a distinct
+/// first-page header/footer. `w:titlePg w:val="0"/"false"` cancels it.
+fn docx_title_pg(document_xml: &str) -> bool {
+    let mut in_sect = false;
+    let mut cur = false;
+    let mut last = false;
+    let mut x = Xml::new(document_xml);
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "sectPr" if !sc => {
+                    in_sect = true;
+                    cur = false;
+                }
+                "titlePg" if in_sect => {
+                    cur = !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "sectPr" {
+                    in_sect = false;
+                    last = cur;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    last
+}
+
+/// Whether `word/settings.xml` sets `w:evenAndOddHeaders` — distinct even-page
+/// headers/footers (a document-wide setting in OOXML, unlike `w:titlePg`).
+fn docx_even_and_odd_headers(zip: &BTreeMap<String, Vec<u8>>) -> bool {
+    let settings = part(zip, "word/settings.xml");
+    let mut x = Xml::new(&settings);
+    let mut on = false;
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == "evenAndOddHeaders" {
+                on = !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+            }
+        }
+    }
+    on
+}
+
+/// Lower a first-/even-page header/footer variant. Returns `None` when the
+/// governing flag is off (no distinct variant); `Some(blocks)` when it is on —
+/// `Some(vec![])` when the flag is set but no part of that type resolves or the
+/// part is empty (Word's *blank* first-page header), which is exactly the
+/// distinction [`model::Section`]'s `Option<Vec<Block>>` encodes.
+#[allow(clippy::too_many_arguments)]
+fn docx_hf_variant_model(
+    zip: &BTreeMap<String, Vec<u8>>,
+    document_xml: &str,
+    rels: &BTreeMap<String, String>,
+    ctx: &DocxCtx,
+    kind: &str,
+    ty: &str,
+    flag: bool,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<Vec<Block>> {
+    if !flag {
+        return None;
+    }
+    let blocks = docx_section_ref_id_of_type(document_xml, kind, ty)
+        .and_then(|id| docx_hf_part_blocks(zip, rels, ctx, &id, resources))
+        .unwrap_or_default();
+    Some(blocks)
+}
+
 /// Lower the section's default header (`kind="header"`) or footer
 /// (`kind="footer"`) into a flat list of model [`Block`]s, reusing the body
 /// model walker ([`docx_walk_model`]) so the header/footer paragraphs, tables,
@@ -8564,9 +9908,23 @@ fn docx_header_footer_model(
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Option<Vec<Block>> {
     let id = docx_section_ref_id(document_xml, kind)?;
+    docx_hf_part_blocks(zip, rels, ctx, &id, resources)
+}
+
+/// Load the header/footer part behind relationship `id` and lower its body to
+/// model blocks (shared by the default and the first-/even-page variants).
+/// `None` when the relationship is unresolvable, the part is missing/blank, or
+/// it lowers to no blocks.
+fn docx_hf_part_blocks(
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    ctx: &DocxCtx,
+    id: &str,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<Vec<Block>> {
     // Relationship targets are relative to `word/` (the rels part is
     // `word/_rels/document.xml.rels`).
-    let target = rels.get(&id)?;
+    let target = rels.get(id)?;
     let part_key = format!("word/{target}");
     let xml = part(zip, &part_key);
     if xml.trim().is_empty() {
@@ -8671,10 +10029,25 @@ fn docx_page_geom(document_xml: &str) -> PageGeom {
                 }
                 // `w:cols@w:num` — the section's text-column count. Every
                 // section is scanned; the last (body-level, main flow) wins.
+                // `@w:space` (twips) is the gutter, `@w:sep` the separator
+                // rule; nested `<w:col w:w>` children (a `w:equalWidth="0"`
+                // layout) collect as the individual column widths.
                 "cols" if in_sect => {
                     if let Some(n) = attr(&attrs, "num").and_then(|v| v.trim().parse::<u32>().ok())
                     {
                         geom.column_count = n.clamp(1, 8) as u8;
+                    }
+                    geom.column_gap_pt = attr(&attrs, "space").and_then(twips_to_pt);
+                    geom.column_separator =
+                        matches!(attr(&attrs, "sep"), Some("1") | Some("true") | Some("on"));
+                    geom.column_widths_pt = None; // reset; `w:col` children refill
+                }
+                // `<w:col w:w>` — one explicit column width (twips). Only
+                // meaningful inside `w:cols`; a `w:col` never appears elsewhere
+                // in a `w:sectPr`, so the `in_sect` guard suffices.
+                "col" if in_sect => {
+                    if let Some(w) = attr(&attrs, "w").and_then(twips_to_pt) {
+                        geom.column_widths_pt.get_or_insert_with(Vec::new).push(w);
                     }
                 }
                 _ => {}
@@ -8725,10 +10098,34 @@ struct RunStyle {
     /// [`CharStyle::vertical_align`] so footnote refs / `x²` / formulae keep
     /// their position. Defaults to [`model::VAlign::Baseline`].
     vertical_align: model::VAlign,
-    /// Letter spacing in points from DOCX `w:rPr/w:spacing w:val` (twips ÷ 20).
+    /// Letter spacing in points from DOCX `w:rPr/w:spacing w:val` (twips ÷ 20)
+    /// or PPTX `a:rPr@spc` (hundredths of a point).
     letter_spacing: Option<f64>,
     /// Hidden text from DOCX `w:vanish`. Surfaced as `CharStyle::hidden`.
     hidden: bool,
+    /// All-capitals transform: DOCX `w:caps`, PPTX `a:rPr@cap="all"`. The
+    /// **model** path carries it as [`CharStyle::caps`] (the run text keeps its
+    /// original casing; renderers apply the transform). The **HTML** path
+    /// (`push_run_text`) still folds it into the emitted text (uppercase), as
+    /// the string pipeline has no styled carrier for it.
+    caps: bool,
+    /// Small capitals: DOCX `w:smallCaps`, PPTX `a:rPr@cap="small"`. Surfaced
+    /// as [`CharStyle::small_caps`]; never a text transform (small caps keep
+    /// the original characters).
+    small_caps: bool,
+    /// Double strike-through (`w:dstrike`), distinct from the single `strike`
+    /// (which importers keep set alongside as the display fallback). Surfaced
+    /// as [`CharStyle::dstrike`].
+    dstrike: bool,
+    /// Baseline shift in points from `w:position` (half-points ÷ 2; positive
+    /// raises). Surfaced as [`CharStyle::baseline_shift_pt`].
+    baseline_shift_pt: Option<f64>,
+    /// Horizontal character scaling in percent from `w:w` (`100` = normal).
+    /// Surfaced as [`CharStyle::char_scale_pct`].
+    char_scale_pct: Option<f64>,
+    /// Kerning threshold in points from `w:kern` (half-points ÷ 2). Surfaced
+    /// as [`CharStyle::kern_min_pt`].
+    kern_min_pt: Option<f64>,
 }
 
 impl RunStyle {
@@ -8824,6 +10221,11 @@ struct ParaStyle {
     /// `w:pPr/w:keepLines`: keep all lines of this paragraph together (no
     /// page-split mid-paragraph).
     keep_together: bool,
+    /// `w:pPr/w:bidi`: right-to-left paragraph flow. `Option` so a named
+    /// style's setting can fill in when the paragraph doesn't say
+    /// ([`apply_style_defaults`](Self::apply_style_defaults)); `Some(true)` ⇒
+    /// the model's [`Direction::Rtl`](model::Direction::Rtl).
+    direction_rtl: Option<bool>,
 }
 
 /// One side of a paragraph border (`w:pBdr/w:{top,left,bottom,right}`), reduced
@@ -8941,6 +10343,7 @@ impl ParaStyle {
         self.indent_right_pt = self.indent_right_pt.or(style.indent_right_pt);
         self.first_line_pt = self.first_line_pt.or(style.first_line_pt);
         self.line_height = self.line_height.or(style.line_height);
+        self.direction_rtl = self.direction_rtl.or(style.bidi);
     }
 
     /// A ` style="…"` attribute (with leading space) for the block element, or
@@ -9230,7 +10633,10 @@ impl ListCounters {
     /// value is `start` (its `w:start`, 1 by default).
     fn next(&mut self, num_id: u32, level: u32, start: u32) -> u32 {
         self.counts.retain(|&(n, l), _| !(n == num_id && l > level));
-        let c = self.counts.entry((num_id, level)).or_insert(start.max(1) - 1);
+        let c = self
+            .counts
+            .entry((num_id, level))
+            .or_insert(start.max(1) - 1);
         *c += 1;
         *c
     }
@@ -9461,6 +10867,27 @@ fn finish_html_field(f: HtmlField, inner: &mut String, tokens: bool) {
     inner.push_str(rep);
 }
 
+/// The width (points) the inline-block spacer for the `index`-th run-level tab
+/// should span so the following segment lands on its stop. With explicit stops
+/// (sorted, from `w:pPr/w:tabs`), a left tab stop is modelled by the **inter-stop
+/// distance** (`stops[index] - stops[index-1]`, or `stops[0]` for the first),
+/// clamped to a small floor so the tab always makes visible progress. Beyond the
+/// last explicit stop — or with none at all — Word's default half-inch (36pt) tab
+/// grid applies.
+fn docx_tab_advance_pt(stops: &[f64], index: usize) -> f64 {
+    /// Word's default tab interval (half an inch).
+    const DEFAULT_TAB_PT: f64 = 36.0;
+    /// Minimum visible advance so a tab is never a zero-width no-op.
+    const MIN_ADVANCE_PT: f64 = 12.0;
+    match stops.get(index) {
+        Some(&pos) => {
+            let prev = if index == 0 { 0.0 } else { stops[index - 1] };
+            (pos - prev).max(MIN_ADVANCE_PT)
+        }
+        None => DEFAULT_TAB_PT,
+    }
+}
+
 /// Emit one `w:p` (already consumed its open tag) until `</w:p>`. Returns
 /// `true` when the paragraph carried a `w:pPr/w:sectPr` (a section break): the
 /// caller ([`docx_body`]) then closes the current section's column wrapper.
@@ -9497,6 +10924,17 @@ fn docx_paragraph(
     let mut page_break_before = false;
     // A run-level `<w:br w:type="page"/>` → force a new page after this paragraph.
     let mut page_break_after = false;
+    // Explicit tab stops (`w:pPr/w:tabs/w:tab@w:pos`, points) collected while
+    // `in_tabs`; empty ⇒ Word's default 36pt grid. Consumed to size the
+    // inline-block spacer each run-level `<w:tab/>` expands to.
+    let mut in_tabs = false;
+    let mut tab_positions: Vec<f64> = Vec::new();
+    // The next tab's ordinal (which stop it advances to) and the byte offset in
+    // `inner` where the current inter-tab segment began — a `<w:tab/>` wraps
+    // `inner[seg_start..]` in an inline-block sized to reach the stop, so the
+    // following segment starts at that horizontal position (a real left tab stop).
+    let mut tab_index = 0usize;
+    let mut seg_start = 0usize;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -9606,11 +11044,19 @@ fn docx_paragraph(
                         depth += 1;
                         run = RunStyle::default();
                     }
+                    // `w:rPr/w:rStyle`: seed the run from the referenced
+                    // character style (schema puts it first in `w:rPr`, so the
+                    // direct properties below override — mirrors the model path).
+                    "rStyle" if in_rpr => {
+                        if let Some(s) = attr(&attrs, "val").and_then(|v| ctx.styles.by_id.get(v)) {
+                            s.seed_run(&mut run);
+                        }
+                    }
                     "rFonts" if in_rpr => {
-                        run.font_family = attr(&attrs, "ascii")
-                            .or_else(|| attr(&attrs, "hAnsi"))
-                            .filter(|v| !v.trim().is_empty())
-                            .map(|v| v.to_string());
+                        // Direct faces or theme placeholders (asciiTheme/hAnsiTheme).
+                        if let Some(f) = docx_rfonts_family(&attrs, &ctx.styles.theme) {
+                            run.font_family = Some(f);
+                        }
                     }
                     "b" if in_rpr => {
                         run.bold = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
@@ -9658,10 +11104,10 @@ fn docx_paragraph(
                         run.size_half_pt = attr(&attrs, "val").and_then(|v| v.parse().ok());
                     }
                     "color" if in_rpr => {
-                        if let Some(v) = attr(&attrs, "val") {
-                            if v != "auto" && is_hex6(v) {
-                                run.color = Some(v.to_ascii_uppercase());
-                            }
+                        // A direct 6-hex `w:val` wins; else a `w:themeColor`
+                        // slot (+ tint/shade) resolves against the theme.
+                        if let Some(v) = docx_color_hex(&attrs, &ctx.styles.theme) {
+                            run.color = Some(v);
                         }
                     }
                     "instrText" => {
@@ -9695,7 +11141,33 @@ fn docx_paragraph(
                         }
                         _ => {}
                     },
-                    "tab" => inner.push(' '),
+                    // `w:pPr/w:tabs/w:tab@w:pos` — an explicit tab stop (twips).
+                    // Every alignment kind lowers to a left stop for flow layout;
+                    // `clear`/`bar`/`num` are structural and skipped.
+                    "tabs" if in_ppr => in_tabs = true,
+                    "tab" if in_tabs => {
+                        if !matches!(attr(&attrs, "val"), Some("clear" | "bar" | "num")) {
+                            if let Some(pos) = attr(&attrs, "pos").and_then(twips_to_pt) {
+                                tab_positions.push(pos);
+                            }
+                        }
+                    }
+                    // A run-level `<w:tab/>`: advance to the next tab stop by
+                    // wrapping the current inter-tab segment in an inline-block
+                    // whose min-width reaches the stop, so the text after it starts
+                    // at that horizontal position — a real (left) tab stop instead
+                    // of a collapsed single space.
+                    "tab" => {
+                        let advance = docx_tab_advance_pt(&tab_positions, tab_index);
+                        let seg = inner.split_off(seg_start);
+                        inner.push_str("<span style=\"display:inline-block;min-width:");
+                        inner.push_str(&fmt_pt(advance));
+                        inner.push_str("pt\">");
+                        inner.push_str(&seg);
+                        inner.push_str("</span>");
+                        seg_start = inner.len();
+                        tab_index += 1;
+                    }
                     "br" if matches!(attr(&attrs, "type"), Some("page")) => {
                         // An explicit run-level page break (`<w:br w:type="page"/>`)
                         // ends the current line and forces a new page after this
@@ -9703,8 +11175,16 @@ fn docx_paragraph(
                         // block boundary, not nested in `<p>`).
                         inner.push_str("<br>");
                         page_break_after = true;
+                        // Tab stops restart on a new line.
+                        seg_start = inner.len();
+                        tab_index = 0;
                     }
-                    "br" | "cr" => inner.push_str("<br>"),
+                    "br" | "cr" => {
+                        inner.push_str("<br>");
+                        // Tab stops restart on a new line.
+                        seg_start = inner.len();
+                        tab_index = 0;
+                    }
                     // A drawing: inline images stay in the run; anchored
                     // (floating) objects are lifted into absolute siblings.
                     "drawing" if !sc => match docx_drawing(x, ctx) {
@@ -9726,7 +11206,16 @@ fn docx_paragraph(
                 let ln = local(&name);
                 match ln {
                     "p" => break,
-                    "pPr" => in_ppr = false,
+                    "pPr" => {
+                        in_ppr = false;
+                        // Order the collected stops so the cumulative inter-stop
+                        // advances (used by `docx_tab_advance_pt`) stay monotonic
+                        // regardless of the source order, and drop duplicates.
+                        tab_positions
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        tab_positions.dedup();
+                    }
+                    "tabs" => in_tabs = false,
                     "pBdr" => in_pbdr = false,
                     "rPr" => in_rpr = false,
                     "sectPr" => in_psect = false,
@@ -9875,8 +11364,11 @@ struct CellSpan {
 
 /// Per-table border defaults from `w:tblPr/w:tblBorders`: the four outer sides
 /// plus the inner-edge defaults (`w:insideH`/`w:insideV`) every cell inherits
-/// where its own `w:tcBorders` says nothing.
-#[derive(Default)]
+/// where its own `w:tcBorders` says nothing. Also carried by a **table style**
+/// (`w:style[@type="table"]`'s `w:tblPr/w:tblBorders`, see [`DocxStyle`]) so a
+/// `w:tblStyle`-referenced named style contributes borders where the table
+/// declares none inline.
+#[derive(Default, Clone)]
 struct TblBorders {
     top: Option<BorderSide>,
     right: Option<BorderSide>,
@@ -9888,6 +11380,39 @@ struct TblBorders {
     /// regime, so every cell side is emitted — a side resolving to nothing
     /// becomes `border-…:none` instead of the stylesheet's default gray grid.
     declared: bool,
+}
+
+impl TblBorders {
+    /// The first declared side, scanning outer edges before inner grid lines —
+    /// used to seed the model's single table-wide [`model::BorderStyle`] from a
+    /// table style's `w:tblBorders` (mirrors the inline seeding order of
+    /// [`docx_table_model`], which takes the first side in document order).
+    fn first_side(&self) -> Option<&BorderSide> {
+        self.top
+            .as_ref()
+            .or(self.left.as_ref())
+            .or(self.bottom.as_ref())
+            .or(self.right.as_ref())
+            .or(self.inside_h.as_ref())
+            .or(self.inside_v.as_ref())
+    }
+
+    /// Route one `w:tblBorders` child (`w:top`/`w:left`/…) into its slot,
+    /// marking the border regime declared. Shared by the styles.xml table-style
+    /// capture; a `nil`/`none` side stays `None` but still declares the regime.
+    fn set_side(&mut self, ln: &str, attrs: &[(String, String)]) {
+        self.declared = true;
+        let side = parse_border_side(attrs);
+        match ln {
+            "top" => self.top = side,
+            "right" => self.right = side,
+            "bottom" => self.bottom = side,
+            "left" => self.left = side,
+            "insideH" => self.inside_h = side,
+            "insideV" => self.inside_v = side,
+            _ => {}
+        }
+    }
 }
 
 /// One parsed `w:tc` of a buffered DOCX table row: merge metadata, the
@@ -9922,6 +11447,9 @@ struct DocxHtmlCell {
 fn docx_table(x: &mut Xml, ctx: &DocxCtx, out: &mut String) {
     let mut col_pts: Vec<f64> = Vec::new();
     let mut borders = TblBorders::default();
+    // `w:tblPr/w:tblStyle@w:val` — resolved after the walk when the table
+    // declares no inline `w:tblBorders` of its own.
+    let mut tbl_style_id: Option<String> = None;
     let mut in_tblpr = false;
     let mut in_tblborders = false;
     let mut rows: Vec<Vec<DocxHtmlCell>> = Vec::new();
@@ -9931,6 +11459,9 @@ fn docx_table(x: &mut Xml, ctx: &DocxCtx, out: &mut String) {
                 let ln = local(&name);
                 match ln {
                     "tblPr" if !sc => in_tblpr = true,
+                    "tblStyle" if in_tblpr => {
+                        tbl_style_id = attr(&attrs, "val").map(|v| v.to_string());
+                    }
                     "tblBorders" if in_tblpr => {
                         borders.declared = true;
                         in_tblborders = !sc;
@@ -9970,6 +11501,15 @@ fn docx_table(x: &mut Xml, ctx: &DocxCtx, out: &mut String) {
                 }
             }
             Tok::Text(_) => {}
+        }
+    }
+    // No inline `w:tblBorders` → the referenced table style's own borders
+    // (basedOn-flattened) supply the border regime, so a Word table styled by
+    // name alone ("Table Grid", …) still renders its grid. Inline borders —
+    // even all-`nil` — keep priority (`declared` short-circuits the style).
+    if !borders.declared {
+        if let Some(sb) = ctx.styles.table_borders(tbl_style_id.as_deref()) {
+            borders = sb.clone();
         }
     }
     emit_docx_table(&col_pts, &borders, &rows, out);
@@ -10256,6 +11796,96 @@ fn heading_level(style: &str) -> Option<u8> {
 
 // ───────────────────────── DOCX named styles (styles.xml) ──────────────────────
 
+/// Read the DOCX document theme (`word/theme/theme*.xml` — first part in key
+/// order) into a [`PptxTheme`]. A DOCX theme part is the same DrawingML grammar
+/// as a deck theme (`a:fontScheme` + `a:clrScheme`), so the PPTX parser is
+/// reused verbatim; only the package location differs. Default (empty) when the
+/// document embeds no theme.
+fn docx_theme(zip: &BTreeMap<String, Vec<u8>>) -> PptxTheme {
+    let key = zip
+        .keys()
+        .filter(|k| k.starts_with("word/theme/theme") && k.ends_with(".xml"))
+        .min();
+    match key {
+        Some(key) => parse_pptx_theme(&String::from_utf8_lossy(&zip[key])),
+        None => PptxTheme::default(),
+    }
+}
+
+/// Resolve a `w:rFonts` element to a concrete family name: a direct
+/// `w:ascii`/`w:hAnsi` face wins; otherwise a `w:asciiTheme`/`w:hAnsiTheme`
+/// placeholder (`minorHAnsi`/`majorAscii`/…) resolves to the theme's
+/// minor (body) or major (heading) latin face — Word's default styles reference
+/// Calibri/Cambria exclusively through these. `None` when neither is present
+/// (or the theme is empty), so callers keep their previous family.
+fn docx_rfonts_family(attrs: &[(String, String)], theme: &PptxTheme) -> Option<String> {
+    if let Some(v) = attr(attrs, "ascii")
+        .or_else(|| attr(attrs, "hAnsi"))
+        .filter(|v| !v.trim().is_empty())
+    {
+        return Some(v.to_string());
+    }
+    let slot = attr(attrs, "asciiTheme").or_else(|| attr(attrs, "hAnsiTheme"))?;
+    if slot.starts_with("major") {
+        theme.major_latin.clone()
+    } else if slot.starts_with("minor") {
+        theme.minor_latin.clone()
+    } else {
+        None
+    }
+}
+
+/// Map a DOCX `w:themeColor` token (ECMA-376 `ST_ThemeColor`) to its
+/// `a:clrScheme` slot name. The `background1`/`text1` aliases fold onto their
+/// default clrMap targets (`lt1`/`dk1`), mirroring
+/// [`PptxTheme::resolve_scheme`]'s `bg1`/`tx1` handling. `none` (and unknown
+/// tokens) ⇒ `None`.
+fn docx_theme_color_slot(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "dark1" | "text1" => "dk1",
+        "light1" | "background1" => "lt1",
+        "dark2" | "text2" => "dk2",
+        "light2" | "background2" => "lt2",
+        "accent1" => "accent1",
+        "accent2" => "accent2",
+        "accent3" => "accent3",
+        "accent4" => "accent4",
+        "accent5" => "accent5",
+        "accent6" => "accent6",
+        "hyperlink" => "hlink",
+        "followedHyperlink" => "folHlink",
+        _ => return None,
+    })
+}
+
+/// Resolve a `w:color`-shaped element (also `w:u@w:color`-style attribute sets)
+/// to a 6-hex colour: a direct 6-hex `w:val` wins; with `w:val="auto"`/absent, a
+/// `w:themeColor` slot resolves against the document theme, modulated by
+/// `w:themeTint`/`w:themeShade` (hex bytes `00`–`FF`; tint `T` blends toward
+/// white with weight `1−T/255`, shade multiplies by `S/255` — the OOXML
+/// straight-RGB approximation shared with [`apply_color_mods`]). `None` when
+/// neither yields a colour (the run keeps its inherited/default colour).
+fn docx_color_hex(attrs: &[(String, String)], theme: &PptxTheme) -> Option<String> {
+    if let Some(v) = attr(attrs, "val") {
+        if v != "auto" && is_hex6(v) {
+            return Some(v.to_ascii_uppercase());
+        }
+    }
+    let slot = docx_theme_color_slot(attr(attrs, "themeColor")?)?;
+    let base = theme.resolve_scheme(slot)?;
+    let byte = |name: &str| -> Option<f64> {
+        attr(attrs, name)
+            .and_then(|v| u8::from_str_radix(v.trim(), 16).ok())
+            .map(|b| b as f64 / 255.0)
+    };
+    let shade = byte("themeShade");
+    // `apply_color_mods`'s tint lightens by `t` (`c + (1−c)·t`); the DOCX
+    // attribute keeps `T` of the base colour (`c·T + (1−T)`) — same blend with
+    // `t = 1 − T`.
+    let tint = byte("themeTint").map(|t| 1.0 - t);
+    apply_color_mods(&base, None, None, shade, tint).or(Some(base))
+}
+
 /// The subset of run/paragraph formatting a `w:style` (or `w:docDefaults`) can
 /// carry. Every field is optional so a child style / direct property can be
 /// *merged on top* of an inherited one (`merge_under`): the more specific value
@@ -10266,9 +11896,30 @@ struct DocxStyle {
     bold: Option<bool>,
     italic: Option<bool>,
     underline: Option<bool>,
+    strike: Option<bool>,
     size_half_pt: Option<f64>,
     color: Option<String>,
     font_family: Option<String>,
+    /// Run highlight/shading as 6-hex (`w:highlight` named colour or `w:shd@fill`).
+    highlight: Option<String>,
+    /// `w:vertAlign` (superscript/subscript/baseline).
+    vert_align: Option<model::VAlign>,
+    /// Letter spacing in points (`w:rPr/w:spacing@w:val`, twips ÷ 20).
+    letter_spacing_pt: Option<f64>,
+    /// Hidden text (`w:vanish`).
+    hidden: Option<bool>,
+    /// All-capitals transform (`w:caps`).
+    caps: Option<bool>,
+    /// Small capitals (`w:smallCaps`).
+    small_caps: Option<bool>,
+    /// Double strike-through (`w:dstrike`).
+    dstrike: Option<bool>,
+    /// Baseline shift in points (`w:position`, half-points ÷ 2).
+    baseline_shift_pt: Option<f64>,
+    /// Horizontal character scaling in percent (`w:w`).
+    char_scale_pct: Option<f64>,
+    /// Kerning threshold in points (`w:kern`, half-points ÷ 2).
+    kern_min_pt: Option<f64>,
     // Paragraph properties (`w:pPr`).
     align: Option<&'static str>,
     space_before_pt: Option<f64>,
@@ -10277,6 +11928,15 @@ struct DocxStyle {
     indent_right_pt: Option<f64>,
     first_line_pt: Option<f64>,
     line_height: Option<LineHeight>,
+    /// Right-to-left paragraph flow (`w:pPr/w:bidi`).
+    bidi: Option<bool>,
+    // Table properties (`w:style[@type="table"]`'s own `w:tblPr/w:tblBorders`).
+    /// The table style's border set; `None` when the style declares none.
+    table_borders: Option<TblBorders>,
+    /// The style declares a `w:tblStylePr w:type="firstRow"` conditional block
+    /// (header-row formatting) — surfaced as [`Row::is_header`](model::Row) on
+    /// the table's first row when the table's `w:tblLook` enables it.
+    table_first_row: Option<bool>,
 }
 
 impl DocxStyle {
@@ -10292,9 +11952,20 @@ impl DocxStyle {
             bold,
             italic,
             underline,
+            strike,
             size_half_pt,
             color,
             font_family,
+            highlight,
+            vert_align,
+            letter_spacing_pt,
+            hidden,
+            caps,
+            small_caps,
+            dstrike,
+            baseline_shift_pt,
+            char_scale_pct,
+            kern_min_pt,
             align,
             space_before_pt,
             space_after_pt,
@@ -10302,7 +11973,72 @@ impl DocxStyle {
             indent_right_pt,
             first_line_pt,
             line_height,
+            bidi,
+            table_borders,
+            table_first_row,
         );
+    }
+
+    /// Seed a [`RunStyle`] from this style's **character** formatting — the
+    /// `w:rStyle` resolution step. Called when the run's `w:rPr/w:rStyle` opens;
+    /// per the `CT_RPr` schema `w:rStyle` is the *first* `w:rPr` child, so the
+    /// run's direct properties are parsed **after** this and simply overwrite
+    /// (an explicit `w:b w:val="0"` beats the style's bold, exactly like Word).
+    fn seed_run(&self, run: &mut RunStyle) {
+        if let Some(b) = self.bold {
+            run.bold = b;
+        }
+        if let Some(i) = self.italic {
+            run.italic = i;
+        }
+        if let Some(u) = self.underline {
+            run.underline = u;
+        }
+        if let Some(s) = self.strike {
+            run.strike = s;
+        }
+        if self.size_half_pt.is_some() {
+            run.size_half_pt = self.size_half_pt;
+        }
+        if self.color.is_some() {
+            run.color = self.color.clone();
+        }
+        if self.font_family.is_some() {
+            run.font_family = self.font_family.clone();
+        }
+        if self.highlight.is_some() {
+            run.highlight = self.highlight.clone();
+        }
+        if let Some(v) = self.vert_align {
+            run.vertical_align = v;
+        }
+        if self.letter_spacing_pt.is_some() {
+            run.letter_spacing = self.letter_spacing_pt;
+        }
+        if let Some(h) = self.hidden {
+            run.hidden = h;
+        }
+        if let Some(c) = self.caps {
+            run.caps = c;
+        }
+        if let Some(c) = self.small_caps {
+            run.small_caps = c;
+        }
+        if let Some(d) = self.dstrike {
+            run.dstrike = d;
+            if d {
+                run.strike = true;
+            }
+        }
+        if self.baseline_shift_pt.is_some() {
+            run.baseline_shift_pt = self.baseline_shift_pt;
+        }
+        if self.char_scale_pct.is_some() {
+            run.char_scale_pct = self.char_scale_pct;
+        }
+        if self.kern_min_pt.is_some() {
+            run.kern_min_pt = self.kern_min_pt;
+        }
     }
 }
 
@@ -10336,9 +12072,31 @@ struct DocxStyles {
     /// edges intact. Distinct from [`by_id`](DocxStyles::by_id), which is
     /// flattened for inline paragraph resolution.
     raw: BTreeMap<String, DocxRawStyle>,
+    /// The document's DrawingML theme (`word/theme/theme1.xml`): the
+    /// minor/major latin faces that `w:rFonts@asciiTheme`/`@hAnsiTheme`
+    /// reference and the `a:clrScheme` palette that `w:color@themeColor`
+    /// resolves against. Same part grammar as a deck theme, so the
+    /// [`PptxTheme`] parser is reused. Default (empty) when the part is absent.
+    theme: PptxTheme,
 }
 
 impl DocxStyles {
+    /// The resolved (basedOn-flattened) table borders of the
+    /// `w:style[@type="table"]` referenced by a table's `w:tblStyle`, or `None`
+    /// when the id is unknown or the style chain declares no `w:tblBorders`.
+    fn table_borders(&self, style_id: Option<&str>) -> Option<&TblBorders> {
+        self.by_id.get(style_id?)?.table_borders.as_ref()
+    }
+
+    /// Whether the referenced table style declares a `firstRow` conditional
+    /// block (`w:tblStylePr w:type="firstRow"`), anywhere along its `basedOn`
+    /// chain — i.e. the style formats a header row.
+    fn table_first_row(&self, style_id: Option<&str>) -> bool {
+        style_id
+            .and_then(|id| self.by_id.get(id))
+            .and_then(|s| s.table_first_row)
+            == Some(true)
+    }
     /// The effective formatting for a paragraph whose `w:pStyle` is `style_id`:
     /// the named style merged over the document defaults. With no style id (or an
     /// unknown one) just the defaults.
@@ -10426,8 +12184,19 @@ fn docx_style_to_char(s: &DocxStyle) -> CharStyle {
         bold: s.bold == Some(true),
         italic: s.italic == Some(true),
         underline: s.underline == Some(true),
+        strike: s.strike == Some(true) || s.dstrike == Some(true),
         size_pt: s.size_half_pt.map(|h| h / 2.0).unwrap_or(0.0),
         color: s.color.as_deref().and_then(hex_to_rgb_f64),
+        background: s.highlight.as_deref().and_then(hex_to_rgb_f64),
+        vertical_align: s.vert_align.unwrap_or_default(),
+        letter_spacing_pt: s.letter_spacing_pt.unwrap_or(0.0),
+        hidden: s.hidden == Some(true),
+        caps: s.caps == Some(true),
+        small_caps: s.small_caps == Some(true),
+        dstrike: s.dstrike == Some(true),
+        baseline_shift_pt: s.baseline_shift_pt,
+        char_scale_pct: s.char_scale_pct,
+        kern_min_pt: s.kern_min_pt,
         ..CharStyle::default()
     };
     if let Some(fam) = &s.font_family {
@@ -10440,7 +12209,16 @@ fn docx_style_to_char(s: &DocxStyle) -> CharStyle {
 /// Parse `word/styles.xml` into a [`DocxStyles`]: read each `w:style`'s direct
 /// `w:rPr`/`w:pPr` and `w:basedOn`, then flatten the inheritance chains so each
 /// id maps to its fully-resolved formatting. `w:docDefaults` seeds the baseline.
-fn parse_docx_styles(xml: &str) -> DocxStyles {
+///
+/// `theme` (the document's `word/theme` part) resolves `w:rFonts` theme-font
+/// placeholders and `w:color@themeColor` slots at capture time, and is kept on
+/// the returned [`DocxStyles`] so the body walkers resolve direct run
+/// formatting against the same palette. Table styles additionally capture their
+/// `w:tblPr/w:tblBorders` and whether a `firstRow` conditional block exists
+/// (`w:tblStylePr`), for `w:tblStyle` resolution; formatting *inside* a
+/// `w:tblStylePr` (conditional, e.g. the header row's bold) is not folded into
+/// the style's own run/paragraph props.
+fn parse_docx_styles(xml: &str, theme: PptxTheme) -> DocxStyles {
     // Raw, pre-resolution data per style id: (basedOn, own props). Used to
     // flatten the inline-resolution table `by_id`.
     let mut raw: BTreeMap<String, (Option<String>, DocxStyle)> = BTreeMap::new();
@@ -10459,16 +12237,25 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
     let mut in_defaults = false; // inside <w:docDefaults>
     let mut in_rpr = false;
     let mut in_ppr = false;
+    // Table-style capture state: a table style's own <w:tblPr>/<w:tblBorders>,
+    // and the <w:tblStylePr> conditional blocks whose rPr/pPr must NOT bleed
+    // into the style's own formatting (they are per-region: firstRow, band1…).
+    let mut in_tblpr = false;
+    let mut in_tblborders = false;
+    let mut in_tblstylepr = false;
 
     // Apply one run/paragraph property element to a `DocxStyle` target.
-    fn apply_prop(t: &mut DocxStyle, ln: &str, attrs: &[(String, String)], in_rpr: bool) {
+    fn apply_prop(
+        t: &mut DocxStyle,
+        ln: &str,
+        attrs: &[(String, String)],
+        in_rpr: bool,
+        theme: &PptxTheme,
+    ) {
         match ln {
             "rFonts" if in_rpr => {
-                if let Some(v) = attr(attrs, "ascii")
-                    .or_else(|| attr(attrs, "hAnsi"))
-                    .filter(|v| !v.trim().is_empty())
-                {
-                    t.font_family = Some(v.to_string());
+                if let Some(v) = docx_rfonts_family(attrs, theme) {
+                    t.font_family = Some(v);
                 }
             }
             "b" if in_rpr => {
@@ -10478,22 +12265,82 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
                 t.italic = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false")))
             }
             "u" if in_rpr => t.underline = Some(!matches!(attr(attrs, "val"), Some("none"))),
+            "strike" if in_rpr => {
+                t.strike = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false")))
+            }
+            "dstrike" if in_rpr => {
+                let on = !matches!(attr(attrs, "val"), Some("0") | Some("false"));
+                t.strike = Some(on);
+                t.dstrike = Some(on);
+            }
+            "caps" if in_rpr => {
+                t.caps = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false")));
+            }
+            "smallCaps" if in_rpr => {
+                t.small_caps = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false")));
+            }
+            "position" if in_rpr => {
+                t.baseline_shift_pt = attr(attrs, "val")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .map(|half| half / 2.0)
+                    .filter(|v| *v != 0.0);
+            }
+            "w" if in_rpr => {
+                t.char_scale_pct = attr(attrs, "val")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .filter(|v| *v > 0.0 && *v != 100.0);
+            }
+            "kern" if in_rpr => {
+                t.kern_min_pt = attr(attrs, "val")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .map(|half| half / 2.0)
+                    .filter(|v| *v > 0.0);
+            }
+            "vertAlign" if in_rpr => {
+                t.vert_align = Some(ooxml_vert_align(attr(attrs, "val")));
+            }
+            "highlight" if in_rpr => {
+                if let Some(h) = attr(attrs, "val").and_then(highlight_color) {
+                    t.highlight = Some(h.to_string());
+                }
+            }
+            "shd" if in_rpr => {
+                if t.highlight.is_none() {
+                    if let Some(v) = attr(attrs, "fill") {
+                        if v != "auto" && is_hex6(v) {
+                            t.highlight = Some(v.to_ascii_uppercase());
+                        }
+                    }
+                }
+            }
+            // Run-level `w:spacing@w:val` is letter spacing (twips) — distinct
+            // from the paragraph `w:spacing` (before/after/line) handled below.
+            "spacing" if in_rpr => {
+                if let Some(tw) = attr(attrs, "val").and_then(|v| v.trim().parse::<f64>().ok()) {
+                    t.letter_spacing_pt = Some(tw / TWIP_PER_PT);
+                }
+            }
+            "vanish" if in_rpr => {
+                t.hidden = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false")));
+            }
             "sz" if in_rpr => {
                 if let Some(v) = attr(attrs, "val").and_then(|v| v.parse().ok()) {
                     t.size_half_pt = Some(v);
                 }
             }
             "color" if in_rpr => {
-                if let Some(v) = attr(attrs, "val") {
-                    if v != "auto" && is_hex6(v) {
-                        t.color = Some(v.to_ascii_uppercase());
-                    }
+                if let Some(v) = docx_color_hex(attrs, theme) {
+                    t.color = Some(v);
                 }
             }
             "jc" => {
                 if let Some(a) = attr(attrs, "val").and_then(jc_to_align) {
                     t.align = Some(a);
                 }
+            }
+            // `w:pPr/w:bidi` (paragraph-level: `in_rpr` is false there).
+            "bidi" if !in_rpr => {
+                t.bidi = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false")));
             }
             "spacing" => {
                 if let Some(v) = attr(attrs, "before").and_then(twips_to_pt) {
@@ -10539,16 +12386,41 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
                     "basedOn" if in_style => {
                         cur_based = attr(&attrs, "val").map(|s| s.to_string());
                     }
+                    // A conditional-formatting block (`firstRow`, `band1Horz`, …):
+                    // record that the style formats a header row, and gate the
+                    // property capture so its region-scoped rPr/pPr stays out of
+                    // the style's own formatting.
+                    "tblStylePr" if in_style => {
+                        if attr(&attrs, "type") == Some("firstRow") {
+                            cur.table_first_row = Some(true);
+                        }
+                        in_tblstylepr = !sc;
+                    }
+                    // The table style's own table properties → its `w:tblBorders`.
+                    "tblPr" if in_style && !in_tblstylepr => in_tblpr = !sc,
+                    "tblBorders" if in_tblpr => {
+                        cur.table_borders
+                            .get_or_insert_with(TblBorders::default)
+                            .declared = true;
+                        in_tblborders = !sc;
+                    }
+                    "top" | "left" | "bottom" | "right" | "insideH" | "insideV"
+                        if in_tblborders =>
+                    {
+                        if let Some(b) = cur.table_borders.as_mut() {
+                            b.set_side(ln, &attrs);
+                        }
+                    }
                     "rPr" if !sc => in_rpr = true,
                     "pPr" if !sc => in_ppr = true,
                     _ => {
-                        if in_rpr || in_ppr {
+                        if (in_rpr || in_ppr) && !in_tblstylepr {
                             let target = if in_defaults && !in_style {
                                 &mut defaults
                             } else {
                                 &mut cur
                             };
-                            apply_prop(target, ln, &attrs, in_rpr);
+                            apply_prop(target, ln, &attrs, in_rpr, &theme);
                         }
                     }
                 }
@@ -10556,6 +12428,9 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
             Tok::Close(name) => match local(&name) {
                 "rPr" => in_rpr = false,
                 "pPr" => in_ppr = false,
+                "tblStylePr" => in_tblstylepr = false,
+                "tblBorders" => in_tblborders = false,
+                "tblPr" => in_tblpr = false,
                 "docDefaults" => in_defaults = false,
                 "style" if in_style => {
                     if let Some(id) = cur_id.take() {
@@ -10610,6 +12485,7 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
         defaults,
         by_id,
         raw: raw_styles,
+        theme,
     }
 }
 
@@ -10722,16 +12598,16 @@ fn resolve_bullet_char(lvl_text: Option<&str>, font: Option<&str>, level: u32) -
 /// RTF reader resolves Wingdings-charset `\'xx` bytes through it too.
 pub(crate) fn wingdings_to_char(low: u8) -> Option<char> {
     match low {
-        0x6C => Some('\u{25CF}'), // l — black circle ●
-        0x6D => Some('\u{25CB}'), // m — white circle ○
-        0x6E => Some('\u{25A0}'), // n — black square ■
+        0x6C => Some('\u{25CF}'),        // l — black circle ●
+        0x6D => Some('\u{25CB}'),        // m — white circle ○
+        0x6E => Some('\u{25A0}'),        // n — black square ■
         0x6F..=0x71 => Some('\u{25A1}'), // o/p/q — white squares □
-        0x75 => Some('\u{25C6}'), // u — black diamond ◆
-        0x76 => Some('\u{2756}'), // v — ornamental diamond ❖
-        0xA7 => Some('\u{25AA}'), // § slot — black small square ▪ (Word level-3)
-        0xA8 => Some('\u{25A1}'), // ¨ slot — white small square □
-        0xD8 => Some('\u{27A2}'), // Ø slot — 3-D arrowhead ➢
-        0xFC => Some('\u{2713}'), // ü slot — check mark ✓
+        0x75 => Some('\u{25C6}'),        // u — black diamond ◆
+        0x76 => Some('\u{2756}'),        // v — ornamental diamond ❖
+        0xA7 => Some('\u{25AA}'),        // § slot — black small square ▪ (Word level-3)
+        0xA8 => Some('\u{25A1}'),        // ¨ slot — white small square □
+        0xD8 => Some('\u{27A2}'),        // Ø slot — 3-D arrowhead ➢
+        0xFC => Some('\u{2713}'),        // ü slot — check mark ✓
         _ => None,
     }
 }
@@ -10826,6 +12702,41 @@ impl DocxNumbering {
     fn level(&self, num_id: u32, level: u32) -> Option<NumLevel> {
         self.by_num.get(&num_id)?.get(&level).copied()
     }
+
+    /// The list's full per-depth marker table for the model
+    /// ([`model::List::levels`]): entry `i` describes depth `i`, from depth 0 up
+    /// to the deepest level `numbering.xml` defines for this `numId`. A gap in
+    /// the definitions (sparse levels) falls back to the depth's conventional
+    /// bullet ([`default_level_bullet`]). Empty when the `numId` is unknown.
+    fn model_levels(&self, num_id: u32) -> Vec<model::ListLevelStyle> {
+        let Some(levels) = self.by_num.get(&num_id) else {
+            return Vec::new();
+        };
+        let Some(&max) = levels.keys().max() else {
+            return Vec::new();
+        };
+        (0..=max)
+            .map(|lvl| match levels.get(&lvl) {
+                Some(nl) => match nl.fmt.ordered_marker() {
+                    Some(marker) => model::ListLevelStyle {
+                        marker,
+                        suffix: (nl.suffix != '.').then_some(nl.suffix),
+                        start: nl.start,
+                    },
+                    None => model::ListLevelStyle {
+                        marker: ListMarker::Bullet(nl.bullet),
+                        suffix: None,
+                        start: 1,
+                    },
+                },
+                None => model::ListLevelStyle {
+                    marker: ListMarker::Bullet(default_level_bullet(lvl)),
+                    suffix: None,
+                    start: 1,
+                },
+            })
+            .collect()
+    }
 }
 
 /// A `w:lvl` while being parsed: its pieces arrive as separate child elements.
@@ -10905,8 +12816,12 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
                         if in_num {
                             // Inside `w:lvlOverride/w:lvl`: a per-instance override.
                             if let (Some(n), Some(l)) = (cur_num, cur_override_level) {
-                                num_overrides.entry(n).or_default().entry(l).or_default().fmt =
-                                    Some(fmt);
+                                num_overrides
+                                    .entry(n)
+                                    .or_default()
+                                    .entry(l)
+                                    .or_default()
+                                    .fmt = Some(fmt);
                             }
                         } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
                             abstracts.entry(a).or_default().entry(l).or_default().fmt = Some(fmt);
@@ -10928,8 +12843,12 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
                                     .lvl_text = Some(v.to_string());
                             }
                         } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
-                            abstracts.entry(a).or_default().entry(l).or_default().lvl_text =
-                                Some(v.to_string());
+                            abstracts
+                                .entry(a)
+                                .or_default()
+                                .entry(l)
+                                .or_default()
+                                .lvl_text = Some(v.to_string());
                         }
                     }
                 }
@@ -10940,8 +12859,12 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
                     {
                         if in_num {
                             if let (Some(n), Some(l)) = (cur_num, cur_override_level) {
-                                num_overrides.entry(n).or_default().entry(l).or_default().start =
-                                    Some(v);
+                                num_overrides
+                                    .entry(n)
+                                    .or_default()
+                                    .entry(l)
+                                    .or_default()
+                                    .start = Some(v);
                             }
                         } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
                             abstracts.entry(a).or_default().entry(l).or_default().start = Some(v);
@@ -10960,8 +12883,12 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
                     if let Some(f) = font {
                         if in_num {
                             if let (Some(n), Some(l)) = (cur_num, cur_override_level) {
-                                num_overrides.entry(n).or_default().entry(l).or_default().font =
-                                    Some(f);
+                                num_overrides
+                                    .entry(n)
+                                    .or_default()
+                                    .entry(l)
+                                    .or_default()
+                                    .font = Some(f);
                             }
                         } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
                             abstracts.entry(a).or_default().entry(l).or_default().font = Some(f);
@@ -11039,9 +12966,10 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
 /// their styling, mirroring how the ODT path lowers `text:note-body`.
 #[derive(Clone, Default)]
 struct DocxNote {
-    /// 1-based display number used as the inlined citation marker.
-    number: usize,
-    /// Inner XML of the `w:footnote`/`w:endnote` element (its `w:p`/`w:r` grammar).
+    /// Inner XML of the `w:footnote`/`w:endnote` element (its `w:p`/`w:r`
+    /// grammar). The display ordinal is no longer carried here: the model path
+    /// anchors a typed [`Inline::FootnoteRef`] and renderers derive the marker
+    /// from the note's position in [`model::Document::footnotes`].
     body_xml: String,
 }
 
@@ -11223,7 +13151,6 @@ fn parse_docx_notes(
     mut ordered: Option<&mut Vec<String>>,
 ) -> BTreeMap<String, DocxNote> {
     let mut bodies: BTreeMap<String, DocxNote> = BTreeMap::new();
-    let mut next_number = 1usize;
     let mut x = Xml::new(xml);
     // State for the note currently being scanned.
     let mut depth = 0i32; // nesting depth inside the open note (0 = its direct children)
@@ -11273,10 +13200,8 @@ fn parse_docx_notes(
                         // Close the note: `start` is the byte offset of its `</…>`.
                         let key = id.take().unwrap_or_default();
                         if !skip {
-                            let number = next_number;
-                            next_number += 1;
                             let body_xml = xml.get(body_start..start).unwrap_or("").to_string();
-                            bodies.insert(key, DocxNote { number, body_xml });
+                            bodies.insert(key, DocxNote { body_xml });
                             if let Some(list) = ordered.as_deref_mut() {
                                 if !cur.trim().is_empty() {
                                     list.push(cur.trim().to_string());
@@ -11590,6 +13515,11 @@ struct XlsxStyles {
     /// cellXfs index → structured per-cell formatting (font/border/alignment),
     /// for the typed editable-model path ([`xlsx_sheet_model`]).
     fmts: Vec<CellFmt>,
+    /// `<dxfs>` index → the differential format's fill colour (`"#RRGGBB"`),
+    /// referenced by conditional-formatting rules via `cfRule@dxfId`. A dxf
+    /// solid fill conventionally rides `patternFill/bgColor` (unlike a plain
+    /// fill's `fgColor`); both are read, `bgColor` preferred.
+    dxf_fills: Vec<Option<String>>,
 }
 
 /// Structured (non-fill, non-numFmt) formatting resolved for one `cellXfs`
@@ -11604,6 +13534,12 @@ struct CellFmt {
     align: Option<MAlign>,
     valign: Option<model::CellVAlign>,
     wrap: bool,
+    /// `<alignment @textRotation>` → signed degrees CCW (see
+    /// [`model::SheetCell::rotation_deg`]).
+    rotation_deg: Option<i32>,
+    /// The referenced `<border>`'s diagonal line(s) (`@diagonalUp`/`@diagonalDown`
+    /// + the `<diagonal>` edge), for [`model::SheetCell::diagonal`].
+    diagonal: Option<model::DiagonalBorder>,
 }
 
 impl XlsxStyles {
@@ -11620,6 +13556,11 @@ impl XlsxStyles {
     /// Structured font/border/alignment for a cellXfs index (`None` out of range).
     fn fmt(&self, idx: usize) -> Option<&CellFmt> {
         self.fmts.get(idx)
+    }
+    /// The fill colour (`"#RRGGBB"`) of a `<dxfs>` entry (`None` when the dxf
+    /// declares no fill or the index is out of range).
+    fn dxf_fill(&self, idx: usize) -> Option<&str> {
+        self.dxf_fills.get(idx).and_then(|c| c.as_deref())
     }
 }
 
@@ -11687,12 +13628,59 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
         }
     }
 
+    // Pass 1a-bis: `<dxfs>` (differential formats, referenced by conditional
+    // formatting via `cfRule@dxfId`) → per-dxf fill colour. A dxf's solid fill
+    // conventionally carries the colour on `patternFill/bgColor` (no
+    // `patternType` needed, unlike a plain `<fill>`); `fgColor` is the
+    // fallback. Gated on `<dxfs>` so the main `<fills>` list stays untouched,
+    // and on `<fill>` so a dxf's `<font><color>` is never mistaken for a fill.
+    let mut dxf_fills: Vec<Option<String>> = Vec::new();
+    {
+        let mut x = Xml::new(xml);
+        let mut in_dxfs = false;
+        let mut in_dxf = false;
+        let mut in_dxf_fill = false;
+        let mut bg: Option<String> = None;
+        let mut fg: Option<String> = None;
+        while let Some(tok) = x.next() {
+            match tok {
+                Tok::Open(name, attrs, sc) => match local(&name) {
+                    "dxfs" if !sc => in_dxfs = true,
+                    "dxf" if in_dxfs => {
+                        bg = None;
+                        fg = None;
+                        if sc {
+                            dxf_fills.push(None);
+                        } else {
+                            in_dxf = true;
+                        }
+                    }
+                    "fill" if in_dxf => in_dxf_fill = !sc,
+                    "bgColor" if in_dxf_fill => bg = xlsx_color(&attrs, theme).or(bg.take()),
+                    "fgColor" if in_dxf_fill => fg = xlsx_color(&attrs, theme).or(fg.take()),
+                    _ => {}
+                },
+                Tok::Close(name) => match local(&name) {
+                    "fill" if in_dxf => in_dxf_fill = false,
+                    "dxf" if in_dxf => {
+                        dxf_fills.push(bg.take().or(fg.take()));
+                        in_dxf = false;
+                    }
+                    "dxfs" => in_dxfs = false,
+                    _ => {}
+                },
+                Tok::Text(_) => {}
+            }
+        }
+    }
+
     // Pass 1b: fontId → CSS, borderId → CSS (ordered lists of `<font>`/`<border>`),
     // plus their typed counterparts for the editable-model path.
     let font_css = parse_xlsx_fonts(xml, theme);
     let border_css = parse_xlsx_borders(xml, theme);
     let font_struct = parse_xlsx_fonts_struct(xml, theme);
     let border_struct = parse_xlsx_borders_struct(xml, theme);
+    let diagonal_struct = parse_xlsx_diagonals_struct(xml, theme);
 
     // Pass 2: cellXfs order → (fillId → colour, numFmtId → format code, combined
     // non-fill CSS from fontId + borderId + the xf's own `<alignment>`, and the
@@ -11761,6 +13749,10 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                             .and_then(|v| v.trim().parse::<usize>().ok())
                             .and_then(|i| border_struct.get(i))
                             .and_then(|b| *b);
+                        cf.diagonal = attr(&attrs, "borderId")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .and_then(|i| diagonal_struct.get(i))
+                            .and_then(|d| *d);
                         if sc {
                             // Self-closing xf: no `<alignment>` child possible.
                             css.push(c);
@@ -11779,6 +13771,7 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                             cf.align = align;
                             cf.valign = valign;
                             cf.wrap = wrap;
+                            cf.rotation_deg = xlsx_text_rotation(&attrs);
                         }
                     }
                     _ => {}
@@ -11804,6 +13797,7 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
         num_fmts,
         css,
         fmts,
+        dxf_fills,
     }
 }
 
@@ -12035,12 +14029,99 @@ fn parse_xlsx_borders_struct(xml: &str, theme: &XlsxTheme) -> Vec<Option<model::
     out
 }
 
+/// Map `xl/styles.xml`'s `<borders>` list to per-`borderId` diagonal lines:
+/// `<border @diagonalUp @diagonalDown>` with a styled `<diagonal>` edge →
+/// [`model::DiagonalBorder`] (which diagonal(s) + the line width/colour).
+/// `None` when the border declares no diagonal (or no direction flag — a
+/// styled `<diagonal>` without `diagonalUp`/`Down` draws nothing in Excel).
+/// Index-aligned with `borderId`.
+fn parse_xlsx_diagonals_struct(
+    xml: &str,
+    theme: &XlsxTheme,
+) -> Vec<Option<model::DiagonalBorder>> {
+    let mut out: Vec<Option<model::DiagonalBorder>> = Vec::new();
+    let mut x = Xml::new(xml);
+    let mut in_borders = false;
+    let (mut up, mut down) = (false, false);
+    let mut width = 0.0f64;
+    let mut color: Option<[f64; 3]> = None;
+    let mut in_diag = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "borders" => in_borders = true,
+                "border" if in_borders => {
+                    up = matches!(attr(&attrs, "diagonalUp"), Some("1") | Some("true"));
+                    down = matches!(attr(&attrs, "diagonalDown"), Some("1") | Some("true"));
+                    if sc {
+                        out.push(None);
+                    }
+                }
+                "diagonal" if in_borders => {
+                    in_diag = !sc;
+                    if let Some(w) = border_style_width(attr(&attrs, "style")) {
+                        width = width.max(w);
+                    }
+                }
+                "color" if in_borders && in_diag => {
+                    if color.is_none() {
+                        color = xlsx_color(&attrs, theme)
+                            .as_deref()
+                            .and_then(hex_to_rgb_f64);
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => match local(&name) {
+                "diagonal" if in_borders => in_diag = false,
+                "border" if in_borders => {
+                    out.push((width > 0.0 && (up || down)).then(|| model::DiagonalBorder {
+                        up,
+                        down,
+                        border: model::BorderStyle {
+                            width,
+                            color: color.unwrap_or([0.0, 0.0, 0.0]),
+                        },
+                    }));
+                    (up, down, width, color, in_diag) = (false, false, 0.0, None, false);
+                }
+                "borders" => in_borders = false,
+                _ => {}
+            },
+            Tok::Text(_) => {}
+        }
+    }
+    out
+}
+
+/// Parse `<alignment @textRotation>` into the model's signed degrees CCW:
+/// XLSX `0..=90` maps to `+0..=+90` (slanting up) and `91..=180` to
+/// `-1..=-90` (`v - 90` below the baseline, slanting down); the vertical-text
+/// marker `255` and out-of-range values are not modelled (`None`). A plain
+/// `0` (horizontal, the default) also reads as `None` so unrotated cells
+/// stay additive-clean.
+fn xlsx_text_rotation(attrs: &[(String, String)]) -> Option<i32> {
+    let v = attr(attrs, "textRotation")?.trim().parse::<i32>().ok()?;
+    match v {
+        1..=90 => Some(v),
+        91..=180 => Some(-(v - 90)),
+        _ => None,
+    }
+}
+
 /// Resolve an `xf`'s `<alignment>` to `(Option<Align>, Option<CellVAlign>, wrap)`
 /// for the typed model path: `@horizontal` → [`MAlign`]
 /// (`center`/`centerContinuous`→Center, `right`→Right,
 /// `justify`/`distributed`/`fill`→Justify, `left`→Left; unknown ⇒ `None`),
 /// `@vertical` → [`CellVAlign`](model::CellVAlign) via [`xlsx_cell_valign`]
 /// (`top`/`center`/`bottom`; unknown ⇒ `None`), and `@wrapText` → bool.
+///
+/// `@readingOrder="2"` (right-to-left cell text) is **not lowered**: the sheet
+/// model's cell ([`model::SheetCell`]) carries a flat [`CharStyle`] + value,
+/// not styled paragraphs, so there is no [`ParagraphStyle::direction`] slot to
+/// land it on. When the cell model grows paragraph-level content, map
+/// `readingOrder=2` → [`model::Direction::Rtl`] here (same for the ODS cell
+/// styles' `style:writing-mode`).
 fn xlsx_alignment_struct(
     attrs: &[(String, String)],
 ) -> (Option<MAlign>, Option<model::CellVAlign>, bool) {
@@ -13138,6 +15219,14 @@ fn pptx_shape(
     // sized to the shape extent (without a size the engine's default ~64pt box
     // shrank every full-bleed slide picture to a thumbnail).
     let mut pics: Vec<String> = Vec::new();
+    // `a:bodyPr/a:normAutofit@fontScale` — shrink-to-fit factor for the
+    // shape's runs (the bodyPr precedes the paragraphs in a `p:txBody`).
+    let mut font_scale: Option<f64> = None;
+    // A `p:graphicFrame` whose `a:graphicData` payload is a chart
+    // (`<c:chart r:id="…"/>`): the relationship id of the chart part. Resolved
+    // after the walk to the chart's own vector figure + labels (previously this
+    // whole shape rendered nothing — charts were dropped from the slide).
+    let mut chart_rid: Option<String> = None;
 
     while let Some(tok) = x.next() {
         match &tok {
@@ -13148,10 +15237,11 @@ fn pptx_shape(
                     xfrm = parse_xfrm(x, attrs);
                     have_xfrm = true;
                 }
+                "normAutofit" => font_scale = pptx_font_scale(attrs),
                 // Body grammar — delegate each content subtree to pptx_content,
                 // which stops at the element's own close tag.
                 "p" if !sc => {
-                    pptx_content_paragraph(x, theme, &mut body);
+                    pptx_content_paragraph(x, theme, font_scale, &mut body);
                 }
                 "tbl" if !sc => {
                     pptx_table(x, theme, &mut body);
@@ -13167,10 +15257,27 @@ fn pptx_shape(
                         }
                     }
                 }
+                // `a:graphic/a:graphicData/c:chart@r:id` — a chart graphic frame.
+                // Record the rel id; the chart is lowered after the walk.
+                "chart" if chart_rid.is_none() => {
+                    chart_rid = attr(attrs, "id").map(str::to_string);
+                }
                 _ => {}
             },
             Tok::Close(name) if local(name) == tag => break,
             _ => {}
+        }
+    }
+
+    // A chart graphic frame: lower the chart part to its native vector figure
+    // (bars/wedges/axes/legend) plus value/axis/legend labels, rendered as HTML
+    // positioned in the frame. This becomes the shape's body (a chart carries no
+    // `p`/`tbl` text body of its own). Emitted at this shape's position in the
+    // spTree walk, so it keeps the correct paint (z) order among the slide's shapes.
+    if let Some(rid) = &chart_rid {
+        let blocks = pptx_chart_blocks(zip, rels, rid);
+        if !blocks.is_empty() {
+            body = chart_blocks_to_html(&blocks);
         }
     }
 
@@ -13199,6 +15306,179 @@ fn pptx_shape(
     }
 }
 
+/// Render a chart's lowered model blocks (from
+/// [`chart::parse_chart`](crate::convert::chart::parse_chart), resolved by
+/// [`pptx_chart_blocks`]) as HTML for the slide's graphic frame. The chart authors
+/// its vector shapes (bars, wedges, axes, legend) on one shared canvas frame in
+/// **Y-up** space, plus text labels as absolutely-framed paragraphs (top-left,
+/// **Y-down**).
+///
+/// Shapes become a single inline `<svg>` spanning that canvas (each path Y-flipped
+/// into the SVG's Y-down space), wrapped in a `position:absolute` box at the canvas
+/// origin. Labels become `position:absolute` `<div>`s at their frame — kept as real
+/// HTML text so they extract as **selectable PDF text** (an SVG `<text>` would be
+/// traced to glyph outlines, defeating extraction). The chart's data `Table` block
+/// is its numbers, not part of the picture, so it is not drawn (a slide shows the
+/// figure, matching PowerPoint). Every box is positioned relative to the graphic
+/// frame's absolute wrapper added by [`pptx_shape`]. Returns `""` for an empty chart.
+fn chart_blocks_to_html(blocks: &[Block]) -> String {
+    // Canvas extent from the blocks themselves (shapes span the whole canvas
+    // frame; labels sit within it) — no chart-internal constant needed.
+    let canvas_w = blocks
+        .iter()
+        .filter_map(|b| b.frame.map(|r| r.x + r.w))
+        .fold(0.0_f64, f64::max);
+    let canvas_h = blocks
+        .iter()
+        .filter_map(|b| b.frame.map(|r| r.y + r.h))
+        .fold(0.0_f64, f64::max);
+    if !(canvas_w > 0.0 && canvas_h > 0.0) {
+        return String::new();
+    }
+
+    let mut paths = String::new();
+    let mut labels = String::new();
+    for block in blocks {
+        let Some(frame) = block.frame else { continue };
+        match &block.kind {
+            BlockKind::Shape(shape) => {
+                let d = chart_shape_path_d(&shape.segments, frame);
+                if d.is_empty() {
+                    continue;
+                }
+                paths.push_str("<path d=\"");
+                paths.push_str(&d);
+                paths.push('"');
+                match shape.fill {
+                    Some(rgb) => {
+                        paths.push_str(" fill=\"#");
+                        paths.push_str(&rgb_to_hex6(rgb));
+                        paths.push('"');
+                    }
+                    None => paths.push_str(" fill=\"none\""),
+                }
+                if let Some(rgb) = shape.stroke {
+                    paths.push_str(" stroke=\"#");
+                    paths.push_str(&rgb_to_hex6(rgb));
+                    paths.push_str("\" stroke-width=\"");
+                    paths.push_str(&fmt_pt(shape.stroke_width.max(0.25)));
+                    paths.push('"');
+                }
+                paths.push_str("/>");
+            }
+            BlockKind::Paragraph(p) => {
+                let text = inlines_plain_text(&p.runs);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let size = p
+                    .runs
+                    .iter()
+                    .find_map(|i| match i {
+                        Inline::Run(r) if r.style.size_pt > 0.0 => Some(r.style.size_pt),
+                        _ => None,
+                    })
+                    .unwrap_or(8.0);
+                let color = p
+                    .runs
+                    .iter()
+                    .find_map(|i| match i {
+                        Inline::Run(r) => r.style.color,
+                        _ => None,
+                    })
+                    .unwrap_or([0.2, 0.2, 0.2]);
+                let align = match p.style.align {
+                    MAlign::Center => "center",
+                    MAlign::Right => "right",
+                    _ => "left",
+                };
+                labels.push_str("<div style=\"position:absolute;left:");
+                labels.push_str(&fmt_pt(frame.x));
+                labels.push_str("pt;top:");
+                labels.push_str(&fmt_pt(frame.y));
+                labels.push_str("pt;width:");
+                labels.push_str(&fmt_pt(frame.w.max(1.0)));
+                labels.push_str("pt;font-size:");
+                labels.push_str(&fmt_pt(size));
+                labels.push_str("pt;line-height:1;text-align:");
+                labels.push_str(align);
+                labels.push_str(";color:#");
+                labels.push_str(&rgb_to_hex6(color));
+                labels.push_str("\">");
+                esc(&text, &mut labels);
+                labels.push_str("</div>");
+            }
+            _ => {}
+        }
+    }
+
+    if paths.is_empty() && labels.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    if !paths.is_empty() {
+        // The vector figure: an absolutely-positioned box at the canvas origin
+        // holding one 1:1 `<svg>` (bare numeric width/height/viewBox so the engine
+        // parses them). `line-height:0` removes inline leading so it sits flush.
+        out.push_str("<div style=\"position:absolute;left:0pt;top:0pt;line-height:0;width:");
+        out.push_str(&fmt_pt(canvas_w));
+        out.push_str("pt;height:");
+        out.push_str(&fmt_pt(canvas_h));
+        out.push_str("pt\"><svg width=\"");
+        out.push_str(&fmt_pt(canvas_w));
+        out.push_str("\" height=\"");
+        out.push_str(&fmt_pt(canvas_h));
+        out.push_str("\" viewBox=\"0 0 ");
+        out.push_str(&fmt_pt(canvas_w));
+        out.push(' ');
+        out.push_str(&fmt_pt(canvas_h));
+        out.push_str("\">");
+        out.push_str(&paths);
+        out.push_str("</svg></div>");
+    }
+    out.push_str(&labels);
+    out
+}
+
+/// Build the SVG path `d` for a chart shape. Its `segments` are box-local **Y-up**
+/// within `frame` (origin at the frame's bottom-left); this maps each point to the
+/// canvas's **Y-down** SVG space: `x' = frame.x + sx`, `y' = frame.y + frame.h - sy`.
+fn chart_shape_path_d(segments: &[PathSeg], frame: model::Rect) -> String {
+    let mx = |sx: f64| frame.x + sx;
+    let my = |sy: f64| frame.y + (frame.h - sy);
+    let mut d = String::new();
+    for seg in segments {
+        match *seg {
+            PathSeg::Move(x, y) => {
+                d.push('M');
+                d.push_str(&fmt_pt(mx(x)));
+                d.push(' ');
+                d.push_str(&fmt_pt(my(y)));
+                d.push(' ');
+            }
+            PathSeg::Line(x, y) => {
+                d.push('L');
+                d.push_str(&fmt_pt(mx(x)));
+                d.push(' ');
+                d.push_str(&fmt_pt(my(y)));
+                d.push(' ');
+            }
+            PathSeg::Cubic(c1x, c1y, c2x, c2y, ex, ey) => {
+                d.push('C');
+                for (px, py) in [(c1x, c1y), (c2x, c2y), (ex, ey)] {
+                    d.push_str(&fmt_pt(mx(px)));
+                    d.push(' ');
+                    d.push_str(&fmt_pt(my(py)));
+                    d.push(' ');
+                }
+            }
+            PathSeg::Close => d.push_str("Z "),
+        }
+    }
+    d.trim_end().to_string()
+}
+
 /// Parse a flowing run of slide content (paragraphs, tables, images) until
 /// `stop_tag`'s close (or EOF when `None`), emitting into `out`. Shared by the
 /// orphan-content fallback. Paragraph runs honour `a:srgbClr`/`a:schemeClr`
@@ -13215,7 +15495,9 @@ fn pptx_content(
         match &tok {
             Tok::Open(name, attrs, sc) => match local(name) {
                 "tbl" if !sc => pptx_table(x, theme, out),
-                "p" if !sc => pptx_content_paragraph(x, theme, out),
+                // Orphan-content fallback: no enclosing `a:bodyPr` is tracked
+                // here, so no `normAutofit` scale applies.
+                "p" if !sc => pptx_content_paragraph(x, theme, None, out),
                 "blip" => {
                     if let Some(rid) = attr(attrs, "embed").or_else(|| attr(attrs, "link")) {
                         // Slide-part rels: resolve from `ppt/slides/` (see
@@ -13239,8 +15521,15 @@ fn pptx_content(
 
 /// Emit one PPTX `a:p` paragraph (open consumed) as `<p>…</p>` into `out`,
 /// applying each run's `a:rPr` (`b`/`i`/`sz`), `a:srgbClr`/`a:schemeClr` colour
-/// and `a:latin` typeface. Consumes up to `</a:p>`.
-fn pptx_content_paragraph(x: &mut Xml, theme: &PptxTheme, out: &mut String) {
+/// and `a:latin` typeface. `font_scale` is the enclosing text body's
+/// `a:normAutofit@fontScale` shrink factor (applied to explicit run sizes).
+/// Consumes up to `</a:p>`.
+fn pptx_content_paragraph(
+    x: &mut Xml,
+    theme: &PptxTheme,
+    font_scale: Option<f64>,
+    out: &mut String,
+) {
     let mut para = String::new();
     let mut run = RunStyle::default();
     let mut in_rpr = false;
@@ -13249,11 +15538,11 @@ fn pptx_content_paragraph(x: &mut Xml, theme: &PptxTheme, out: &mut String) {
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => match local(&name) {
-                "rPr" if !sc => {
-                    in_rpr = true;
+                "rPr" => {
+                    in_rpr = !sc;
                     run = pptx_run_props(&attrs);
+                    pptx_scale_run_size(&mut run, font_scale);
                 }
-                "rPr" if sc => run = pptx_run_props(&attrs),
                 "srgbClr" if in_rpr => {
                     if let Some(v) = attr(&attrs, "val") {
                         if is_hex6(v) {
@@ -13425,7 +15714,41 @@ fn pptx_run_props(attrs: &[(String, String)]) -> RunStyle {
             .and_then(|v| v.parse::<f64>().ok())
             .map(|sz| sz / 50.0), // hundredths-pt → half-pt
         vertical_align: pptx_vert_align(attr(attrs, "baseline")),
+        // `a:rPr@spc` is letter spacing in hundredths of a point.
+        letter_spacing: attr(attrs, "spc")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|c| c / 100.0),
+        // `a:rPr@cap`: `all` → the CharStyle `caps` display transform (the
+        // model run keeps its original casing; the HTML string path still
+        // uppercases at push, see `push_run_text`); `small` → `small_caps`.
+        caps: matches!(attr(attrs, "cap"), Some("all")),
+        small_caps: matches!(attr(attrs, "cap"), Some("small")),
         ..RunStyle::default()
+    }
+}
+
+/// Parse an `a:normAutofit@fontScale` value — the shrink-to-fit factor
+/// PowerPoint records on a text body (`a:bodyPr`) when its text overflows the
+/// shape. The unit is `ST_TextFontScalePercentOrPercentString`: an integer in
+/// **thousandths of a percent** (`62500` = 62.5%) or, in the newer transitional
+/// form, a percent string (`"62.5%"`). `None` when absent, unparsable, or a
+/// no-op (≤0 / 100%).
+fn pptx_font_scale(attrs: &[(String, String)]) -> Option<f64> {
+    let v = attr(attrs, "fontScale")?.trim();
+    let scale = match v.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f64>().ok()? / 100.0,
+        None => v.parse::<f64>().ok()? / 100_000.0,
+    };
+    (scale > 0.0 && scale != 1.0).then_some(scale)
+}
+
+/// Apply a text body's `normAutofit` font scale to one run's explicit size
+/// (PowerPoint renders every run of the shape at `size × scale`). A run with
+/// no explicit `@sz` keeps the inherited/default size unscaled — a lean
+/// approximation, since the walkers don't resolve placeholder-inherited sizes.
+fn pptx_scale_run_size(run: &mut RunStyle, scale: Option<f64>) {
+    if let (Some(s), Some(sz)) = (scale, run.size_half_pt.as_mut()) {
+        *sz *= s;
     }
 }
 
@@ -13443,6 +15766,14 @@ fn pptx_vert_align(val: Option<&str>) -> model::VAlign {
 /// Append a text run to `out`, wrapped in the run's `<span style>` when it
 /// carries any formatting (shared by the slide body and table cells).
 fn push_run_text(run: &RunStyle, text: &str, out: &mut String) {
+    // `a:rPr@cap="all"` folds into the emitted text (see [`RunStyle::caps`]).
+    let upper;
+    let text = if run.caps {
+        upper = text.to_uppercase();
+        upper.as_str()
+    } else {
+        text
+    };
     let span = run.open_span();
     if span.is_empty() {
         esc(text, out);
@@ -13790,6 +16121,44 @@ fn odf_drawing_page_fills(xml: &str) -> BTreeMap<String, [f64; 3]> {
     map
 }
 
+/// Build a `drawing-page-style-name → gradient-name` map from an ODF part:
+/// each `style:style[@family=drawing-page]` whose properties declare
+/// `draw:fill="gradient"` + `draw:fill-gradient-name`. Resolved against
+/// [`odf_gradient_defs`] to lower a gradient slide background
+/// ([`Slide::background_gradient`]). Mirrors [`odf_drawing_page_fills`].
+fn odf_drawing_page_gradient_names(xml: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    let mut is_page_family = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => {
+                    cur_name = attr(&attrs, "name").map(str::to_string);
+                    is_page_family = attr(&attrs, "family") == Some("drawing-page");
+                }
+                "drawing-page-properties" => {
+                    if let (Some(nm), true) = (cur_name.clone(), is_page_family) {
+                        if attr(&attrs, "fill") == Some("gradient") {
+                            if let Some(g) = attr(&attrs, "fill-gradient-name") {
+                                map.insert(nm, g.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "style" => {
+                cur_name = None;
+                is_page_family = false;
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
 /// Resolve a `style:drawing-page-properties`' solid fill to an RGB colour: the
 /// `draw:fill-color` (6-hex) when `draw:fill` is `solid` (or absent — LibreOffice
 /// often omits it while still setting a colour). Any other `draw:fill`
@@ -13814,13 +16183,22 @@ fn odf_solid_fill_rgb(attrs: &[(String, String)]) -> Option<[f64; 3]> {
 #[derive(Default, Clone)]
 struct OdfGraphicStyle {
     /// RGB solid fill (`draw:fill="solid"` + `draw:fill-color`); `None` for
-    /// `draw:fill="none"`/gradient/bitmap/hatch or an absent colour.
+    /// `draw:fill="none"`/bitmap/hatch or an absent colour. A gradient fill
+    /// resolves to its first stop here (the flat fallback) once
+    /// [`odf_resolve_gradients`] runs.
     fill: Option<[f64; 3]>,
     /// RGB stroke (`draw:stroke="solid"`/`"dash"` + `svg:stroke-color`); `None`
     /// for `draw:stroke="none"`.
     stroke: Option<[f64; 3]>,
     /// Stroke width in points (`svg:stroke-width`); `0.0` when absent.
     stroke_width: f64,
+    /// `draw:fill="gradient"` + `draw:fill-gradient-name` — the referenced
+    /// gradient's name, resolved against the document's `<draw:gradient>`
+    /// definitions by [`odf_resolve_gradients`].
+    gradient_name: Option<String>,
+    /// The resolved gradient (2 stops from the definition's start/end colours
+    /// + the converted angle). See [`model::Gradient`].
+    fill_gradient: Option<model::Gradient>,
 }
 
 /// Build a `graphic-style-name → resolved paint` map from an ODF part
@@ -13880,10 +16258,99 @@ fn odf_graphic_props(attrs: &[(String, String)]) -> OdfGraphicStyle {
         }
         _ => (None, 0.0),
     };
+    let gradient_name = (attr(attrs, "fill") == Some("gradient"))
+        .then(|| attr(attrs, "fill-gradient-name").map(str::to_string))
+        .flatten();
     OdfGraphicStyle {
         fill,
         stroke,
         stroke_width,
+        gradient_name,
+        fill_gradient: None,
+    }
+}
+
+/// Parse an ODF part's `<draw:gradient>` definitions into
+/// `name → `[`model::Gradient`]. ODF models a linear/axial gradient as a
+/// two-colour axis (`draw:start-color`/`draw:end-color` + `draw:angle` in
+/// decidegrees CCW, `0` = bottom→top); the model stores DrawingML's convention
+/// (degrees clockwise from +X, `0` = left→right): `deg = (270 − odf) mod 360`
+/// (the same involution the exporter applies). Non-linear styles (`radial`,
+/// `square`, …) still yield their two colours with a top-down axis.
+fn odf_gradient_defs(xml: &str) -> BTreeMap<String, model::Gradient> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) != "gradient" {
+                continue;
+            }
+            let Some(nm) = attr(&attrs, "name") else {
+                continue;
+            };
+            let color = |k: &str| {
+                attr(&attrs, k)
+                    .map(|v| v.trim().trim_start_matches('#'))
+                    .filter(|v| is_hex6(v))
+                    .and_then(hex_to_rgb_f64)
+            };
+            let (Some(start), Some(end)) = (color("start-color"), color("end-color")) else {
+                continue;
+            };
+            // `draw:angle` is decidegrees when bare (OOo legacy), or a
+            // `deg`-suffixed value in ODF 1.2+.
+            let odf_deg = attr(&attrs, "angle")
+                .map(str::trim)
+                .and_then(|v| {
+                    if let Some(d) = v.strip_suffix("deg") {
+                        d.trim().parse::<f64>().ok()
+                    } else {
+                        v.parse::<f64>().ok().map(|d| d / 10.0)
+                    }
+                })
+                .unwrap_or(0.0);
+            let angle_deg = (270.0 - odf_deg).rem_euclid(360.0);
+            map.insert(
+                nm.to_string(),
+                model::Gradient {
+                    stops: vec![
+                        model::GradientStop {
+                            pos: 0.0,
+                            color: start,
+                            alpha: 1.0,
+                        },
+                        model::GradientStop {
+                            pos: 1.0,
+                            color: end,
+                            alpha: 1.0,
+                        },
+                    ],
+                    angle_deg,
+                },
+            );
+        }
+    }
+    map
+}
+
+/// Resolve every graphic style's `gradient_name` against the document's
+/// gradient definitions: the style gains its full [`model::Gradient`] and — when
+/// it had no solid fill — the first stop as the flat fallback (a gradient shape
+/// used to import unfilled).
+fn odf_resolve_gradients(
+    styles: &mut BTreeMap<String, OdfGraphicStyle>,
+    defs: &BTreeMap<String, model::Gradient>,
+) {
+    for gs in styles.values_mut() {
+        let Some(name) = &gs.gradient_name else {
+            continue;
+        };
+        if let Some(g) = defs.get(name) {
+            if gs.fill.is_none() {
+                gs.fill = g.stops.first().map(|s| s.color);
+            }
+            gs.fill_gradient = Some(g.clone());
+        }
     }
 }
 
@@ -14025,7 +16492,8 @@ fn odp_shape_model(
             fill: gs.fill,
             stroke: gs.stroke,
             stroke_width: gs.stroke_width,
-            dash: Vec::new(),
+            fill_gradient: gs.fill_gradient.clone(),
+            ..Default::default()
         }),
         ..Block::default()
     });
@@ -14234,6 +16702,24 @@ fn odp_page_background(
         .copied()
 }
 
+/// Resolve a `draw:page`'s **gradient** background: its own drawing-page style
+/// first, then its master page's — the gradient analogue of
+/// [`odp_page_background`]. `page_grads` maps drawing-page style names to the
+/// already-resolved [`model::Gradient`]s.
+fn odp_page_background_gradient(
+    page_attrs: &[(String, String)],
+    page_grads: &BTreeMap<String, model::Gradient>,
+    master_styles: &BTreeMap<String, String>,
+) -> Option<model::Gradient> {
+    if let Some(g) = attr(page_attrs, "style-name").and_then(|s| page_grads.get(s)) {
+        return Some(g.clone());
+    }
+    attr(page_attrs, "master-page-name")
+        .and_then(|m| master_styles.get(m))
+        .and_then(|s| page_grads.get(s))
+        .cloned()
+}
+
 /// True when an ODF text style declares an active strikethrough:
 /// `style:text-line-through-style` (the primary property) ≠ `none`, or, when that
 /// is absent, `style:text-line-through-type` ≠ `none`. Either being present and
@@ -14268,6 +16754,12 @@ struct OdfParaProps {
     /// `fo:line-height`: a `%` value → a unitless multiple, a length → fixed
     /// points (a bare number is treated as a length, per ODF).
     line_height: Option<MLineHeight>,
+    /// `style:writing-mode`: `rl-tb`/`rl` → right-to-left paragraph flow.
+    direction: Option<model::Direction>,
+    /// `fo:break-before="page"` → force a page break before the paragraph
+    /// (surfaced as [`ParagraphStyle::page_break_before`]). `column` breaks
+    /// have no model slot and stay `None`.
+    page_break_before: Option<bool>,
 }
 
 impl OdfParaProps {
@@ -14282,6 +16774,49 @@ impl OdfParaProps {
         self.indent_right_pt = self.indent_right_pt.or(base.indent_right_pt);
         self.first_line_pt = self.first_line_pt.or(base.first_line_pt);
         self.line_height = self.line_height.or(base.line_height);
+        self.direction = self.direction.or(base.direction);
+        self.page_break_before = self.page_break_before.or(base.page_break_before);
+    }
+
+    /// Read one `style:paragraph-properties` open-tag's attributes into the
+    /// accumulator — the shared body of every `paragraph-properties` capture
+    /// site (automatic styles, named styles). A field already set (a re-opened
+    /// element) is overwritten by the later declaration, matching ODF cascade.
+    fn read_attrs(&mut self, attrs: &[(String, String)]) {
+        if let Some(a) = attr(attrs, "text-align").and_then(odf_text_align) {
+            self.align = Some(a);
+        }
+        if let Some(v) = attr(attrs, "margin-top").and_then(parse_odf_pt) {
+            self.space_before_pt = Some(v.max(0.0));
+        }
+        if let Some(v) = attr(attrs, "margin-bottom").and_then(parse_odf_pt) {
+            self.space_after_pt = Some(v.max(0.0));
+        }
+        if let Some(v) = attr(attrs, "margin-left").and_then(parse_odf_pt) {
+            self.indent_left_pt = Some(v);
+        }
+        if let Some(v) = attr(attrs, "margin-right").and_then(parse_odf_pt) {
+            self.indent_right_pt = Some(v);
+        }
+        if let Some(v) = attr(attrs, "text-indent").and_then(parse_odf_pt) {
+            self.first_line_pt = Some(v);
+        }
+        if let Some(lh) = attr(attrs, "line-height").and_then(odf_line_height) {
+            self.line_height = Some(lh);
+        }
+        if let Some(d) = attr(attrs, "writing-mode").and_then(odf_writing_mode) {
+            self.direction = Some(d);
+        }
+        // `fo:break-before="page"` forces a page break before the paragraph
+        // (`auto` explicitly cancels an inherited one). `fo:break-after="page"`
+        // is normalized onto the FOLLOWING content by the writers we care
+        // about; the properties-level capture keeps only the `before` form
+        // (the model field is `page_break_before`).
+        match attr(attrs, "break-before").map(str::trim) {
+            Some("page") => self.page_break_before = Some(true),
+            Some("auto") => self.page_break_before = Some(false),
+            _ => {}
+        }
     }
 
     /// Lower to a model [`ParagraphStyle`], stacking a list indent (each level
@@ -14299,8 +16834,23 @@ impl OdfParaProps {
             indent_right_pt: self.indent_right_pt.unwrap_or(0.0),
             first_line_pt: self.first_line_pt.unwrap_or(0.0),
             line_height: self.line_height.unwrap_or(MLineHeight::Normal),
+            direction: self.direction,
+            page_break_before: self.page_break_before.unwrap_or(false),
             ..Default::default()
         }
+    }
+}
+
+/// Map an ODF `style:writing-mode` token to a model [`Direction`](model::Direction):
+/// the right-to-left horizontal modes (`rl-tb`, its `rl` shorthand) → `Rtl`,
+/// the left-to-right ones (`lr-tb`/`lr`) → `Ltr` (an explicit override of an
+/// inherited RTL). Vertical modes (`tb-rl`, …) and `page` have no model slot
+/// ⇒ `None`.
+fn odf_writing_mode(v: &str) -> Option<model::Direction> {
+    match v.trim() {
+        "rl-tb" | "rl" => Some(model::Direction::Rtl),
+        "lr-tb" | "lr" => Some(model::Direction::Ltr),
+        _ => None,
     }
 }
 
@@ -14366,27 +16916,7 @@ fn odf_para_styles(xml: &str) -> BTreeMap<String, OdfParaProps> {
                 "paragraph-properties" => {
                     if cur_name.is_some() {
                         seen = true;
-                        if let Some(a) = attr(&attrs, "text-align").and_then(odf_text_align) {
-                            cur.align = Some(a);
-                        }
-                        if let Some(v) = attr(&attrs, "margin-top").and_then(parse_odf_pt) {
-                            cur.space_before_pt = Some(v.max(0.0));
-                        }
-                        if let Some(v) = attr(&attrs, "margin-bottom").and_then(parse_odf_pt) {
-                            cur.space_after_pt = Some(v.max(0.0));
-                        }
-                        if let Some(v) = attr(&attrs, "margin-left").and_then(parse_odf_pt) {
-                            cur.indent_left_pt = Some(v);
-                        }
-                        if let Some(v) = attr(&attrs, "margin-right").and_then(parse_odf_pt) {
-                            cur.indent_right_pt = Some(v);
-                        }
-                        if let Some(v) = attr(&attrs, "text-indent").and_then(parse_odf_pt) {
-                            cur.first_line_pt = Some(v);
-                        }
-                        if let Some(lh) = attr(&attrs, "line-height").and_then(odf_line_height) {
-                            cur.line_height = Some(lh);
-                        }
+                        cur.read_attrs(&attrs);
                     }
                 }
                 _ => {}
@@ -14460,27 +16990,7 @@ fn odf_named_styles(xml: &str) -> model::StyleTable {
                 }
                 // Paragraph formatting (`fo:*`) — same fields as `odf_para_styles`.
                 "paragraph-properties" if is_para_family && cur_name.is_some() => {
-                    if let Some(a) = attr(&attrs, "text-align").and_then(odf_text_align) {
-                        para.align = Some(a);
-                    }
-                    if let Some(v) = attr(&attrs, "margin-top").and_then(parse_odf_pt) {
-                        para.space_before_pt = Some(v.max(0.0));
-                    }
-                    if let Some(v) = attr(&attrs, "margin-bottom").and_then(parse_odf_pt) {
-                        para.space_after_pt = Some(v.max(0.0));
-                    }
-                    if let Some(v) = attr(&attrs, "margin-left").and_then(parse_odf_pt) {
-                        para.indent_left_pt = Some(v);
-                    }
-                    if let Some(v) = attr(&attrs, "margin-right").and_then(parse_odf_pt) {
-                        para.indent_right_pt = Some(v);
-                    }
-                    if let Some(v) = attr(&attrs, "text-indent").and_then(parse_odf_pt) {
-                        para.first_line_pt = Some(v);
-                    }
-                    if let Some(lh) = attr(&attrs, "line-height").and_then(odf_line_height) {
-                        para.line_height = Some(lh);
-                    }
+                    para.read_attrs(&attrs);
                 }
                 // Run defaults (`fo:*`/`style:*`) — same fields as run styling.
                 "text-properties" if is_para_family && cur_name.is_some() => {
@@ -14547,6 +17057,93 @@ fn odf_cell_backgrounds(xml: &str) -> BTreeMap<String, [f64; 3]> {
         }
     }
     map
+}
+
+/// Build a `cell-style-name → [top, right, bottom, left]` per-side border map
+/// from an ODF part: each `style:style` whose `style:table-cell-properties`
+/// carries `fo:border` (all four sides) and/or per-side `fo:border-top`/
+/// `-right`/`-bottom`/`-left` overrides. A side spec is the CSS-ish
+/// `width style #color` triple (`"0.5pt solid #000000"`); `none`/`hidden` ⇒
+/// that side stays `None`. Mirrors [`odf_cell_backgrounds`]. Feeds
+/// [`Cell::borders`](model::Cell::borders).
+fn odf_cell_borders_map(xml: &str) -> BTreeMap<String, [Option<model::ParaBorder>; 4]> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => cur_name = attr(&attrs, "name").map(|s| s.to_string()),
+                "table-cell-properties" => {
+                    if let Some(nm) = &cur_name {
+                        let all = attr(&attrs, "border").and_then(odf_border_side_spec);
+                        let mut sides = [all.clone(), all.clone(), all.clone(), all];
+                        for (i, key) in ["border-top", "border-right", "border-bottom", "border-left"]
+                            .iter()
+                            .enumerate()
+                        {
+                            if let Some(spec) = attr(&attrs, key) {
+                                // An explicit per-side value overrides the
+                                // shorthand — including `none` (clears the side).
+                                sides[i] = odf_border_side_spec(spec);
+                            }
+                        }
+                        if sides.iter().any(Option::is_some) {
+                            map.insert(nm.clone(), sides);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    cur_name = None;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
+/// Parse one ODF border side spec (`"0.5pt solid #ff0000"`) into a
+/// [`model::ParaBorder`]. `none`/`hidden`/empty ⇒ `None`. A spec with a style
+/// keyword but no positive length still renders as a 0.75pt hairline (matching
+/// the DOCX side parser's clamp).
+fn odf_border_side_spec(spec: &str) -> Option<model::ParaBorder> {
+    let spec = spec.trim();
+    if spec.is_empty()
+        || spec.eq_ignore_ascii_case("none")
+        || spec.eq_ignore_ascii_case("hidden")
+    {
+        return None;
+    }
+    let mut width = 0.0_f64;
+    let mut style = "solid";
+    let mut color = [0.0_f64; 3];
+    for tok in spec.split_whitespace() {
+        if let Some(c) = tok.strip_prefix('#').filter(|h| is_hex6(h)) {
+            if let Some(rgb) = hex_to_rgb_f64(c) {
+                color = rgb;
+            }
+        } else if let Some(w) = parse_odf_pt(tok) {
+            if w > 0.0 {
+                width = w;
+            }
+        } else {
+            style = match tok {
+                "dashed" | "dash-largegap" | "dot-dash" | "dot-dot-dash" => "dashed",
+                "dotted" => "dotted",
+                "double" | "double-thin" => "double",
+                _ => "solid",
+            };
+        }
+    }
+    Some(model::ParaBorder {
+        width_pt: if width > 0.0 { width } else { 0.75 },
+        style: style.to_string(),
+        color,
+    })
 }
 
 /// Build a `cell-style-name → `[`CellVAlign`](model::CellVAlign) map from an ODF
@@ -14636,7 +17233,7 @@ fn apply_page_layout_props(attrs: &[(String, String)], geom: &mut PageGeom) {
 /// deck imported as portrait A4 and cropped nearly half of every slide. Any
 /// missing link falls back to [`odf_geom`]'s heuristic.
 fn odp_geom(styles_xml: &str, content_xml: &str, fallback: PageGeom) -> PageGeom {
-    odp_master_geom(styles_xml, content_xml, fallback)
+    odp_master_geom(styles_xml, content_xml, fallback.clone())
         .unwrap_or_else(|| odf_geom(styles_xml, content_xml, fallback))
 }
 
@@ -15995,18 +18592,32 @@ fn ods_row(
 
 /// Read the joined text of one ODS cell (open consumed) until `</…cell>`.
 fn ods_cell_text(x: &mut Xml, cell_tag: &str) -> String {
+    ods_cell_text_link(x, cell_tag).0
+}
+
+/// [`ods_cell_text`] plus the cell's hyperlink: the first `text:a`'s
+/// `xlink:href` found inside the cell (→ [`SheetCell::hyperlink`]), `None` when
+/// the cell carries no link. The exporter writes the inverse shape
+/// (`<text:a xlink:href="…">` wrapping the display text).
+fn ods_cell_text_link(x: &mut Xml, cell_tag: &str) -> (String, Option<String>) {
     let mut out = String::new();
+    let mut link: Option<String> = None;
     let mut depth = 0i32; // <text:p> nesting
     let mut started = false;
     while let Some(tok) = x.next() {
         match tok {
-            Tok::Open(name, _, sc) => {
-                if local(&name) == "p" && !sc {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if ln == "p" && !sc {
                     if started {
                         out.push(' ');
                     }
                     started = true;
                     depth += 1;
+                } else if ln == "a" && link.is_none() {
+                    link = attr(&attrs, "href")
+                        .map(str::to_string)
+                        .filter(|h| !h.is_empty());
                 }
             }
             Tok::Text(t) => {
@@ -16024,7 +18635,7 @@ fn ods_cell_text(x: &mut Xml, cell_tag: &str) -> String {
             }
         }
     }
-    out
+    (out, link)
 }
 
 /// ODP → one page per `draw:page`; text from `text:p` (with `text:span`
@@ -16392,14 +19003,16 @@ fn odp_shape(
 /// → [`ole_doc`](crate::convert::ole_doc), `Workbook`/`Book` →
 /// [`ole_xls`](crate::convert::ole_xls), `PowerPoint Document` →
 /// [`ole_ppt`](crate::convert::ole_ppt)) and lowers the resulting rich
-/// [`Document`] to PDF via [`pdf_from_model`](crate::convert::project::pdf_from_model)
-/// — the same model→PDF path every reverse converter uses, so styling, tables and
-/// sheet/slide pagination survive. When no structural reader applies, falls back
-/// to the heuristic text-scrape, rendered as plain `<p>` paragraphs. Returns
-/// `None` if nothing legible is found.
+/// [`Document`] to PDF via
+/// [`pdf_from_model_rich`](crate::convert::project::pdf_from_model_rich) — the
+/// same HTML→PDF engine every Office→PDF path renders through (embedded fonts,
+/// full Unicode, images), so styling, tables and sheet/slide pagination
+/// survive. When no structural reader applies, falls back to the heuristic
+/// text-scrape, rendered as plain `<p>` paragraphs. Returns `None` if nothing
+/// legible is found.
 fn ole2_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
     if let Some(doc) = ole2_reader_model(bytes) {
-        return Some(crate::convert::project::pdf_from_model(&doc));
+        return Some(crate::convert::project::pdf_from_model_rich(&doc));
     }
     ole2_scrape_pdf(bytes)
 }
@@ -18291,7 +20904,7 @@ mod tests {
     fn docx_html_with(document_xml: &str, styles_xml: &str, numbering_xml: &str) -> String {
         let zip = BTreeMap::new();
         let rels = BTreeMap::new();
-        let styles = parse_docx_styles(styles_xml);
+        let styles = parse_docx_styles(styles_xml, PptxTheme::default());
         let numbering = parse_docx_numbering(numbering_xml);
         let footnotes = DocxFootnotes::default();
         let ctx = DocxCtx {
@@ -18589,9 +21202,7 @@ mod tests {
             "the host-supplied Calibri face is embedded in the output: {fonts:?}"
         );
         assert!(
-            !fonts
-                .iter()
-                .any(|f| f.base_font.contains("Fallback Sans")),
+            !fonts.iter().any(|f| f.base_font.contains("Fallback Sans")),
             "the bundled fallback is NOT used for the Calibri run when the host face is supplied: {fonts:?}"
         );
 
@@ -21299,11 +23910,12 @@ mod tests {
 
     #[test]
     fn docx_model_footnote_lowered_at_reference_with_styled_body() {
-        // A `<w:footnoteReference w:id="1"/>` lowers the matching `footnotes.xml`
-        // body inline at the reference point: a superscript citation marker (the
-        // note's display ordinal) followed by the note body text — even when the
-        // body run is styled (bold), the text survives via the body walker, just
-        // like the ODT `text:note` lowering.
+        // A `<w:footnoteReference w:id="1"/>` lowers to a **typed** anchor at
+        // the reference point (`Inline::FootnoteRef`) plus the note body as
+        // blocks in `Document.footnotes` — the body is no longer inlined and
+        // no citation-marker run is synthesized (renderers derive the
+        // superscript ordinal from the note's position). The styled (bold)
+        // body run survives via the body walker, structure intact.
         let doc = r#"<w:document xmlns:w="x"><w:body>
   <w:p>
     <w:r><w:t>Claim</w:t></w:r>
@@ -21330,32 +23942,50 @@ mod tests {
             })
             .collect();
         assert!(text.contains("Claim"), "host text kept: {text:?}");
-        assert!(text.contains('1'), "citation marker kept: {text:?}");
-        assert!(text.contains("The source."), "note body kept: {text:?}");
         assert!(
             text.contains("stands."),
             "trailing host text kept: {text:?}"
         );
-        // The citation marker is surfaced as a superscript run (ODT-consistent).
-        let super_run = inlines.iter().any(|i| {
-            matches!(i, Inline::Run(r)
-                if r.text == "1" && r.style.vertical_align == model::style::VAlign::Super)
-        });
+        // The typed anchor sits at the reference point…
         assert!(
-            super_run,
-            "citation rendered as a superscript run: {inlines:?}"
+            inlines
+                .iter()
+                .any(|i| matches!(i, Inline::FootnoteRef { id } if id == "fn1")),
+            "typed FootnoteRef anchored: {inlines:?}"
         );
-        // The synthetic separator note is never emitted.
+        // …and the body is NOT inlined any more (it lives in `footnotes`).
         assert!(
-            !text.contains("SEP"),
-            "separator placeholder dropped: {text:?}"
+            !text.contains("The source."),
+            "note body no longer inlined: {text:?}"
+        );
+        assert_eq!(model.footnotes.len(), 1, "one recovered note");
+        let note = &model.footnotes[0];
+        assert_eq!(note.id, "fn1");
+        let body_run = note
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => p.runs.iter().find_map(|i| match i {
+                    Inline::Run(r) => Some(r),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("note body paragraph run");
+        assert_eq!(body_run.text, "The source.");
+        assert!(body_run.style.bold, "the body run keeps its bold styling");
+        // The synthetic separator note is never referenced ⇒ never recovered.
+        assert!(
+            !format!("{:?}", model.footnotes).contains("SEP"),
+            "separator placeholder dropped"
         );
     }
 
     #[test]
     fn docx_model_endnote_lowered_at_reference() {
-        // `<w:endnoteReference w:id="2"/>` lowers the matching `endnotes.xml` body
-        // inline the same way as a footnote.
+        // `<w:endnoteReference w:id="2"/>` lowers to the same typed shape as a
+        // footnote — an `Inline::FootnoteRef` anchor (id prefixed `en` so the
+        // two parts can't collide) plus the body in `Document.footnotes`.
         let doc = r#"<w:document xmlns:w="x"><w:body>
   <w:p>
     <w:r><w:t>See</w:t></w:r>
@@ -21383,25 +24013,37 @@ mod tests {
             .collect();
         assert!(text.contains("See"), "host text kept: {text:?}");
         assert!(
-            text.contains("An endnote body."),
-            "endnote body kept: {text:?}"
-        );
-        assert!(
             text.contains("appendix."),
             "trailing host text kept: {text:?}"
         );
-        // The first real endnote is numbered 1 and surfaced as a superscript run.
-        let super_run = inlines.iter().any(|i| {
-            matches!(i, Inline::Run(r)
-                if r.text == "1" && r.style.vertical_align == model::style::VAlign::Super)
-        });
         assert!(
-            super_run,
-            "endnote citation is a superscript run: {inlines:?}"
+            inlines
+                .iter()
+                .any(|i| matches!(i, Inline::FootnoteRef { id } if id == "en2")),
+            "typed endnote anchor (en-prefixed id): {inlines:?}"
         );
         assert!(
-            !text.contains("SEP"),
-            "separator placeholder dropped: {text:?}"
+            !text.contains("An endnote body."),
+            "endnote body no longer inlined: {text:?}"
+        );
+        assert_eq!(model.footnotes.len(), 1, "one recovered note");
+        assert_eq!(model.footnotes[0].id, "en2");
+        let body: String = model
+            .footnotes
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .filter_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(inlines_plain_text(&p.runs)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            body.contains("An endnote body."),
+            "endnote body recovered as blocks: {body:?}"
+        );
+        assert!(
+            !format!("{:?}", model.footnotes).contains("SEP"),
+            "separator placeholder dropped"
         );
     }
 
@@ -22247,7 +24889,8 @@ mod tests {
     #[test]
     fn docx_model_internal_anchor_unmatched_is_not_page_zero() {
         // A `w:anchor` naming a bookmark that does not exist must NOT become a
-        // false page-0 jump — it keeps its `#name` placeholder.
+        // false page-0 jump — it stays a **typed** `LinkTarget::Anchor` (the
+        // former `Url("#name")` placeholder, now first-class).
         let doc = r#"<w:document xmlns:w="x"><w:body>
           <w:p>
             <w:hyperlink w:anchor="Missing"><w:r><w:t>dangling</w:t></w:r></w:hyperlink>
@@ -22256,9 +24899,181 @@ mod tests {
         let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
         assert_eq!(
             model_all_link_targets(&model),
-            vec![model::LinkTarget::Url("#Missing".to_string())],
-            "an unmatched anchor stays as-is, never page 0",
+            vec![model::LinkTarget::Anchor("Missing".to_string())],
+            "an unmatched anchor stays typed, never page 0",
         );
+    }
+
+    /// The first body paragraph's [`ParagraphStyle`] (unwrapping a heading).
+    fn model_first_para_style(doc: &Document) -> ParagraphStyle {
+        doc.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(p.style.clone()),
+                BlockKind::Heading(h) => Some(h.para.style.clone()),
+                _ => None,
+            })
+            .expect("a body paragraph")
+    }
+
+    #[test]
+    fn docx_model_bidi_sets_rtl_direction() {
+        // `w:pPr/w:bidi` → `ParagraphStyle::direction = Some(Rtl)`; an explicit
+        // `w:val="0"` cancels; an unmarked paragraph stays `None` (LTR).
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t>שלום</w:t></w:r></w:p>
+          <w:p><w:pPr><w:bidi w:val="0"/></w:pPr><w:r><w:t>latin</w:t></w:r></w:p>
+          <w:p><w:r><w:t>plain</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        let styles: Vec<Option<model::Direction>> = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(p.style.direction),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            styles,
+            vec![Some(model::Direction::Rtl), None, None],
+            "w:bidi → Rtl; w:val=0 and absence → unspecified"
+        );
+    }
+
+    #[test]
+    fn docx_model_bidi_inherited_from_named_style() {
+        // A named paragraph style carrying `w:bidi` seeds the paragraph that
+        // references it (`w:pStyle`), like every other paragraph default.
+        let styles = r#"<w:styles xmlns:w="x">
+          <w:style w:type="paragraph" w:styleId="Rtl"><w:pPr><w:bidi/></w:pPr></w:style>
+        </w:styles>"#;
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:pStyle w:val="Rtl"/></w:pPr><w:r><w:t>מוסתר</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model =
+            office_to_model(&build_docx_with_styles(doc, styles)).expect("docx → model");
+        assert_eq!(
+            model_first_para_style(&model).direction,
+            Some(model::Direction::Rtl),
+            "the style's w:bidi flows into the paragraph"
+        );
+    }
+
+    #[test]
+    fn docx_model_rpr_extended_char_fields() {
+        // `w:caps` / `w:smallCaps` / `w:dstrike` / `w:position` (half-points) /
+        // `w:w` (percent) / `w:kern` (half-points) all reach the CharStyle; the
+        // run text keeps its original casing (caps is a display transform) and
+        // dstrike keeps `strike` set as the single-line fallback.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:r><w:rPr><w:caps/><w:smallCaps/><w:dstrike/><w:position w:val="7"/><w:w w:val="150"/><w:kern w:val="16"/></w:rPr><w:t>Mixed Case</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        let run = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text.contains("Mixed Case") => Some(r),
+                _ => None,
+            })
+            .expect("the styled run");
+        assert_eq!(run.text, "Mixed Case", "caps never rewrites the text");
+        assert!(run.style.caps, "w:caps");
+        assert!(run.style.small_caps, "w:smallCaps");
+        assert!(run.style.dstrike, "w:dstrike");
+        assert!(run.style.strike, "dstrike keeps the single-strike fallback");
+        assert_eq!(run.style.baseline_shift_pt, Some(3.5), "w:position 7 half-pt");
+        assert_eq!(run.style.char_scale_pct, Some(150.0), "w:w percent");
+        assert_eq!(run.style.kern_min_pt, Some(8.0), "w:kern 16 half-pt");
+    }
+
+    #[test]
+    fn docx_model_numbering_levels_lowered_per_depth() {
+        // The numbering definition's FULL per-depth marker table lands on
+        // `List::levels`: depth 0 decimal "." (start 3), depth 1 lowerLetter ")".
+        let numbering = r#"<w:numbering xmlns:w="x">
+          <w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:start w:val="3"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+            <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2)"/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num>
+        </w:numbering>"#;
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="5"/></w:numPr></w:pPr><w:r><w:t>One</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let bytes = build_docx(
+            doc,
+            None,
+            &[("word/numbering.xml", numbering.as_bytes().to_vec())],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+        let list = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::List(l) => Some(l.clone()),
+                _ => None,
+            })
+            .expect("the list block");
+        assert_eq!(list.levels.len(), 2, "both defined depths: {list:?}");
+        assert_eq!(list.levels[0].marker, ListMarker::Decimal);
+        assert_eq!(list.levels[0].suffix, None, "'%1.' → the conventional '.'");
+        assert_eq!(list.levels[0].start, 3, "w:start carried per depth");
+        assert!(list.levels[0].is_ordered());
+        assert_eq!(list.levels[1].marker, ListMarker::LowerAlpha);
+        assert_eq!(list.levels[1].suffix, Some(')'), "'%2)' → ')' suffix");
+        assert_eq!(list.levels[1].start, 1);
+    }
+
+    #[test]
+    fn pptx_model_ppr_rtl_direction() {
+        // `a:pPr@rtl="1"` → `ParagraphStyle::direction = Some(Rtl)`.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></a:xfrm></p:spPr>
+                <p:txBody><a:bodyPr/>
+                  <a:p><a:pPr rtl="1"/><a:r><a:t>مرحبا</a:t></a:r></a:p>
+                  <a:p><a:r><a:t>plain</a:t></a:r></a:p>
+                </p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let BlockKind::TextBox(tb) = &slide.shapes[0].kind else {
+            panic!("expected a TextBox, got {:?}", slide.shapes[0].kind);
+        };
+        let dir = |b: &Block| match &b.kind {
+            BlockKind::Paragraph(p) => p.style.direction,
+            other => panic!("expected a Paragraph, got {other:?}"),
+        };
+        assert_eq!(dir(&tb.blocks[0]), Some(model::Direction::Rtl));
+        assert_eq!(dir(&tb.blocks[1]), None, "unmarked stays unspecified");
+    }
+
+    #[test]
+    fn odt_model_writing_mode_rtl_direction() {
+        // `style:paragraph-properties@style:writing-mode="rl-tb"` on the
+        // paragraph's (automatic) style → `direction = Some(Rtl)`.
+        let content = r#"<office:document-content>
+          <office:automatic-styles>
+            <style:style style:name="P1" style:family="paragraph">
+              <style:paragraph-properties style:writing-mode="rl-tb"/>
+            </style:style>
+          </office:automatic-styles>
+          <office:body><office:text>
+            <text:p text:style-name="P1">עברית</text:p>
+            <text:p>latin</text:p>
+          </office:text></office:body>
+        </office:document-content>"#;
+        let model = odt_model(content, &[]);
+        let dirs: Vec<Option<model::Direction>> = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(p.style.direction),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dirs, vec![Some(model::Direction::Rtl), None]);
     }
 
     #[test]
@@ -22903,31 +25718,60 @@ mod tests {
     }
 
     #[test]
-    fn odt_model_footnote_text_and_citation_inlined() {
-        // A `text:note` (footnote) inlines its citation marker and body text at
-        // the reference point so neither is dropped.
+    fn odt_model_footnote_is_structured_with_anchor() {
+        // A `text:note` (footnote) lowers to a structured `Document::footnotes`
+        // entry anchored by an `Inline::FootnoteRef` at the reference point —
+        // the DOCX shape, so ODT notes round-trip instead of flattening into
+        // the host paragraph (the pre-M2 behaviour).
         let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
   <office:body><office:text>
-    <text:p>Claim<text:note text:note-class="footnote"><text:note-citation>1</text:note-citation><text:note-body><text:p>The source.</text:p></text:note-body></text:note> stands.</text:p>
+    <text:p>Claim<text:note text:id="ftn9" text:note-class="footnote"><text:note-citation>1</text:note-citation><text:note-body><text:p>The source.</text:p></text:note-body></text:note> stands.</text:p>
   </office:text></office:body>
 </office:document-content>"#;
         let model = odt_model(content, &[]);
-        let text: String = model_first_section_inlines(&model)
+        // The body keeps host text + a typed anchor; the note body is NOT
+        // inlined at the reference point any more.
+        let inlines = model_first_section_inlines(&model);
+        let text: String = inlines
             .iter()
             .filter_map(|i| match i {
                 Inline::Run(r) => Some(r.text.as_str()),
                 _ => None,
             })
             .collect();
-        assert!(text.contains('1'), "citation marker kept: {text:?}");
-        assert!(text.contains("The source."), "note body kept: {text:?}");
         assert!(text.contains("Claim"), "host text kept: {text:?}");
-        // The citation marker is surfaced as a superscript run.
-        let super_run = model_first_section_inlines(&model).into_iter().any(|i| {
-            matches!(i, Inline::Run(r)
-                if r.text == "1" && r.style.vertical_align == model::style::VAlign::Super)
-        });
-        assert!(super_run, "citation rendered as a superscript run");
+        assert!(text.contains("stands."), "host tail kept: {text:?}");
+        assert!(
+            !text.contains("The source."),
+            "note body no longer inlined: {text:?}"
+        );
+        let anchor = inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::FootnoteRef { id } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("a FootnoteRef anchors the note");
+        assert_eq!(anchor, "9", "text:id round-trips (ftn prefix stripped)");
+        assert_eq!(model.footnotes.len(), 1, "one structured footnote");
+        assert_eq!(model.footnotes[0].id, "9");
+        let body: String = model.footnotes[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(
+                    p.runs
+                        .iter()
+                        .filter_map(|r| match r {
+                            Inline::Run(ir) => Some(ir.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(body.contains("The source."), "body kept whole: {body:?}");
     }
 
     #[test]
@@ -26369,6 +29213,7 @@ mod tests {
                 margins: Margins::uniform(0.0),
 
                 column_count: 1,
+                ..Default::default()
             },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
@@ -26377,6 +29222,7 @@ mod tests {
             }],
             notes: Some(vec![para("Carry me through the round-trip")]),
             background: None,
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![Section {
@@ -26831,6 +29677,157 @@ mod tests {
         assert!(text.contains("Direct DOCX body"), "body in: {text}");
     }
 
+    // ─── Fix 1: opt-in tagged o2p so round-trips take the faithful tagged path ───
+
+    #[test]
+    fn office_to_pdf_opts_tagged_emits_struct_tree_for_faithful_roundtrip() {
+        let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+            <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Tagged Heading</w:t></w:r></w:p>
+            <w:p><w:r><w:t>A tagged body paragraph with enough text to reconstruct.</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let pdf = office_to_pdf_opts(&build_docx(doc, None, &[]), &[], true).expect("docx converts");
+
+        // Catalog flags of a Tagged PDF: /StructTreeRoot + /MarkInfo <</Marked true>>.
+        let raw = String::from_utf8_lossy(&pdf);
+        assert!(raw.contains("StructTreeRoot"), "tagged o2p carries /StructTreeRoot");
+        assert!(raw.contains("MarkInfo"), "tagged o2p carries /MarkInfo");
+        assert!(raw.contains("StructElem"), "tagged o2p carries /StructElem roles");
+
+        // The gigapdf→gigapdf round-trip elects the FAITHFUL tagged path (a walkable
+        // declared-role tree), not the geometric-recon fallback.
+        let out = opens(&pdf);
+        let mut ids = crate::recon::IdGen::default();
+        let blocks = crate::recon::tag_tree::reconstruct_from_struct_tree(&out, &mut ids)
+            .expect("tagged reconstruction path is elected");
+        assert!(!blocks.is_empty(), "the struct tree yields blocks");
+        // Rendering-neutral: the text still extracts.
+        assert!(
+            norm(&out.to_text()).contains("Tagged Heading"),
+            "heading text survives tagging"
+        );
+    }
+
+    #[test]
+    fn office_to_pdf_defaults_to_untagged() {
+        let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>Plain body</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        // The public entry point (and the tagged=false opt-out) ship the untagged
+        // baseline — no structure tree — preserving the raw text-layer contract.
+        let plain = office_to_pdf(&bytes).expect("docx converts");
+        assert!(
+            !String::from_utf8_lossy(&plain).contains("StructTreeRoot"),
+            "default o2p output is untagged"
+        );
+        assert!(!String::from_utf8_lossy(
+            &office_to_pdf_opts(&bytes, &[], false).expect("docx converts")
+        )
+        .contains("StructTreeRoot"));
+        // Opting in adds the tree.
+        assert!(String::from_utf8_lossy(
+            &office_to_pdf_opts(&bytes, &[], true).expect("docx converts")
+        )
+        .contains("StructTreeRoot"));
+    }
+
+    // ─── Fix 3: run-level tabs expand to real (left) tab-stop advances ───
+
+    #[test]
+    fn docx_tabs_place_segments_at_increasing_x() {
+        // "Gauche<tab>Milieu<tab>Droite" with explicit left stops at 120pt / 300pt
+        // (2400 / 6000 twips).
+        let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+            <w:p>
+              <w:pPr><w:tabs>
+                <w:tab w:val="left" w:pos="2400"/>
+                <w:tab w:val="left" w:pos="6000"/>
+              </w:tabs></w:pPr>
+              <w:r><w:t>Gauche</w:t></w:r><w:r><w:tab/></w:r>
+              <w:r><w:t>Milieu</w:t></w:r><w:r><w:tab/></w:r>
+              <w:r><w:t>Droite</w:t></w:r>
+            </w:p>
+        </w:body></w:document>"#;
+        let pdf = docx_to_pdf(&read_zip(&build_docx(doc, None, &[])));
+        let out = opens(&pdf);
+        let els = out.page_text_elements(1);
+        let x_of = |needle: &str| els.iter().find(|e| e.text.contains(needle)).map(|e| e.x);
+        let gx = x_of("Gauche").expect("Gauche present");
+        let mx = x_of("Milieu").expect("Milieu present");
+        let dx = x_of("Droite").expect("Droite present");
+        assert!(gx < mx, "Milieu ({mx}) is right of Gauche ({gx})");
+        assert!(mx < dx, "Droite ({dx}) is right of Milieu ({mx})");
+        // A collapsed single space would leave the words ~one glyph-run apart; the
+        // tab stop pushes them substantially further.
+        assert!(mx - gx > 40.0, "tab advance to stop 1 is substantial: {}", mx - gx);
+    }
+
+    // ─── Fix 2: PPTX charts render (bars + labels) on the o2p display path ───
+
+    #[test]
+    fn pptx_to_pdf_renders_chart_shapes_and_labels() {
+        let chart = r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart><c:plotArea>
+    <c:barChart>
+      <c:barDir val="col"/>
+      <c:ser>
+        <c:idx val="0"/>
+        <c:cat><c:strRef><c:strCache>
+          <c:pt idx="0"><c:v>Alpha</c:v></c:pt>
+          <c:pt idx="1"><c:v>Beta</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache>
+          <c:pt idx="0"><c:v>10</c:v></c:pt>
+          <c:pt idx="1"><c:v>25</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+      <c:axId val="1"/><c:axId val="2"/>
+    </c:barChart>
+    <c:catAx><c:axId val="1"/></c:catAx>
+    <c:valAx><c:axId val="2"/></c:valAx>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "ppt/presentation.xml",
+            br#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+        );
+        z.add_stored(
+            "ppt/_rels/presentation.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+        );
+        z.add_stored(
+            "ppt/slides/slide1.xml",
+            br#"<p:sld xmlns:p="p" xmlns:a="a" xmlns:r="r"><p:cSld><p:spTree>
+              <p:graphicFrame>
+                <p:xfrm><a:off x="457200" y="457200"/><a:ext cx="4572000" cy="3200400"/></p:xfrm>
+                <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+                  <c:chart xmlns:c="c" r:id="rId1"/>
+                </a:graphicData></a:graphic>
+              </p:graphicFrame>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        z.add_stored(
+            "ppt/slides/_rels/slide1.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
+        );
+        z.add_stored("ppt/charts/chart1.xml", chart.as_bytes());
+
+        let pdf = pptx_to_pdf(&read_zip(&z.finish()));
+        let out = opens(&pdf);
+        // The bars (and axes / gridlines) render as real PDF vector paths.
+        let paths = out.page_vector_paths(1).expect("page 1 vector paths");
+        assert!(!paths.is_empty(), "chart shapes render as vector paths");
+        // A category / value label extracts as real, selectable PDF text.
+        let text = norm(&out.to_text());
+        assert!(
+            text.contains("Alpha") || text.contains("Beta") || text.contains("25"),
+            "chart labels extract as text: {text}"
+        );
+    }
+
     #[test]
     fn odp_custom_shape_text_positions_on_slide() {
         // LibreOffice emits its standard slide text boxes as `draw:custom-shape`
@@ -26882,7 +29879,13 @@ mod tests {
             .enumerate()
         {
             let runs = doc.page_text_runs((i + 1) as u32).unwrap();
-            let joined = norm(&runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" "));
+            let joined = norm(
+                &runs
+                    .iter()
+                    .map(|r| r.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
             assert!(
                 joined.contains(needle),
                 "slide {} text on page {}: {joined:?}",
@@ -26969,7 +29972,13 @@ mod tests {
         assert_eq!(doc.page_count(), 3, "one page per slide, no blanks");
         for (i, needle) in ["Deck Alpha", "Deck Beta", "Deck Gamma"].iter().enumerate() {
             let runs = doc.page_text_runs((i + 1) as u32).unwrap();
-            let joined = norm(&runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" "));
+            let joined = norm(
+                &runs
+                    .iter()
+                    .map(|r| r.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
             assert!(
                 joined.contains(needle),
                 "slide {} text on page {}: {joined:?}",
@@ -27005,5 +30014,598 @@ mod tests {
             body.contains("<img src=\"data:image/png;base64,"),
             "slide image resolved and inlined: {body}"
         );
+    }
+
+    // ── Office import wave A: table styles, character styles, themes,
+    //    print areas, hidden rows/cols, conditional formatting, autofit ──
+
+    /// Build a DOCX zip from the document XML plus arbitrary extra parts
+    /// (`word/styles.xml`, `word/theme/theme1.xml`, …) and lower it to the
+    /// model. Mirrors [`build_docx`] but with free-form parts.
+    fn docx_model_parts(document_xml: &str, extra: &[(&str, &str)]) -> Document {
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored("word/document.xml", document_xml.as_bytes());
+        for (name, xml) in extra {
+            z.add_stored(name, xml.as_bytes());
+        }
+        docx_to_model(&read_zip(&z.finish()))
+    }
+
+    /// Every top-level paragraph run of a lowered model document, in order.
+    fn docx_model_runs(doc: &Document) -> Vec<InlineRun> {
+        let mut out = Vec::new();
+        for s in &doc.sections {
+            for p in &s.pages {
+                for b in &p.blocks {
+                    if let BlockKind::Paragraph(par) = &b.kind {
+                        for i in &par.runs {
+                            if let Inline::Run(r) = i {
+                                out.push(r.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A minimal DOCX DrawingML theme part: Calibri minor / Cambria major faces
+    /// and a red `accent1` scheme slot.
+    const DOCX_THEME: &str = r#"<a:theme xmlns:a="a"><a:themeElements>
+      <a:clrScheme name="T">
+        <a:dk1><a:srgbClr val="000000"/></a:dk1>
+        <a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+        <a:accent1><a:srgbClr val="FF0000"/></a:accent1>
+      </a:clrScheme>
+      <a:fontScheme name="T">
+        <a:majorFont><a:latin typeface="Cambria"/></a:majorFont>
+        <a:minorFont><a:latin typeface="Calibri"/></a:minorFont>
+      </a:fontScheme>
+    </a:themeElements></a:theme>"#;
+
+    fn docx_wrap_body(body_xml: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>{body_xml}</w:body></w:document>"#
+        )
+    }
+
+    /// A `w:tblStyle`-referenced table style supplies its `w:tblBorders` to the
+    /// model's table-wide border when the table declares none inline.
+    #[test]
+    fn docx_table_style_borders_resolve_from_styles_xml() {
+        let styles = r#"<w:styles xmlns:w="x">
+          <w:style w:type="table" w:styleId="TableGrid">
+            <w:tblPr><w:tblBorders>
+              <w:top w:val="single" w:sz="4" w:color="000000"/>
+              <w:left w:val="single" w:sz="4" w:color="000000"/>
+            </w:tblBorders></w:tblPr>
+          </w:style>
+        </w:styles>"#;
+        let doc = docx_wrap_body(
+            r#"<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/></w:tblPr>
+               <w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        );
+        let model = docx_model_parts(&doc, &[("word/styles.xml", styles)]);
+        let table = docx_model_first_table(&model);
+        assert_eq!(table.border.width, 0.5, "w:sz=4 eighths → 0.5pt");
+        assert_eq!(table.border.color, [0.0, 0.0, 0.0]);
+    }
+
+    /// A table style with no own borders inherits them through its `w:basedOn`
+    /// chain; an inline `w:tblBorders` (even a thinner one) beats the style.
+    #[test]
+    fn docx_table_style_based_on_chain_and_inline_priority() {
+        let styles = r#"<w:styles xmlns:w="x">
+          <w:style w:type="table" w:styleId="Base">
+            <w:tblPr><w:tblBorders>
+              <w:top w:val="single" w:sz="24" w:color="0000FF"/>
+            </w:tblBorders></w:tblPr>
+          </w:style>
+          <w:style w:type="table" w:styleId="Derived">
+            <w:basedOn w:val="Base"/>
+          </w:style>
+        </w:styles>"#;
+        // Table 1: style via basedOn chain (no inline borders) → 3pt blue.
+        let doc = docx_wrap_body(
+            r#"<w:tbl><w:tblPr><w:tblStyle w:val="Derived"/></w:tblPr>
+               <w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        );
+        let model = docx_model_parts(&doc, &[("word/styles.xml", styles)]);
+        assert_eq!(
+            docx_model_first_table(&model).border.width,
+            3.0,
+            "basedOn chain resolves the parent style's borders"
+        );
+
+        // Table 2: inline w:tblBorders (1pt) primes over the 3pt style border.
+        let doc = docx_wrap_body(
+            r#"<w:tbl><w:tblPr><w:tblStyle w:val="Derived"/>
+                 <w:tblBorders><w:top w:val="single" w:sz="8" w:color="FF0000"/></w:tblBorders>
+               </w:tblPr>
+               <w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        );
+        let model = docx_model_parts(&doc, &[("word/styles.xml", styles)]);
+        assert_eq!(
+            docx_model_first_table(&model).border.width,
+            1.0,
+            "inline w:tblBorders beats the referenced style"
+        );
+
+        // Table 3: inline all-nil borders = explicit "no lines" — the style
+        // must NOT fill them back in.
+        let doc = docx_wrap_body(
+            r#"<w:tbl><w:tblPr><w:tblStyle w:val="Derived"/>
+                 <w:tblBorders><w:top w:val="nil"/></w:tblBorders>
+               </w:tblPr>
+               <w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        );
+        let model = docx_model_parts(&doc, &[("word/styles.xml", styles)]);
+        assert_eq!(
+            docx_model_first_table(&model).border.width,
+            0.0,
+            "inline nil borders suppress the style's"
+        );
+    }
+
+    /// The HTML render path resolves `w:tblStyle` borders too, so a Word table
+    /// styled only by name paints its grid in the o2p output.
+    #[test]
+    fn docx_html_table_style_borders_apply() {
+        let styles = r#"<w:styles xmlns:w="x">
+          <w:style w:type="table" w:styleId="TableGrid">
+            <w:tblPr><w:tblBorders>
+              <w:top w:val="single" w:sz="4" w:color="000000"/>
+              <w:insideV w:val="single" w:sz="4" w:color="000000"/>
+            </w:tblBorders></w:tblPr>
+          </w:style>
+        </w:styles>"#;
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/></w:tblPr>
+            <w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+                  <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr>
+          </w:tbl></w:body></w:document>"#;
+        let html = docx_html_with(doc, styles, "");
+        assert!(
+            html.contains("border-top:0.5pt solid #000000"),
+            "style top border reaches the HTML cells: {html}"
+        );
+    }
+
+    /// A table style declaring a `firstRow` conditional block marks the first
+    /// row as a header when the table's `w:tblLook` enables the region; an
+    /// explicit `firstRow="0"` look leaves it a body row.
+    #[test]
+    fn docx_table_style_first_row_marks_header() {
+        let styles = r#"<w:styles xmlns:w="x">
+          <w:style w:type="table" w:styleId="Med">
+            <w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4"/></w:tblBorders></w:tblPr>
+            <w:tblStylePr w:type="firstRow"><w:rPr><w:b/></w:rPr></w:tblStylePr>
+          </w:style>
+        </w:styles>"#;
+        let body = |look: &str| {
+            docx_wrap_body(&format!(
+                r#"<w:tbl><w:tblPr><w:tblStyle w:val="Med"/>{look}</w:tblPr>
+                   <w:tr><w:tc><w:p><w:r><w:t>H</w:t></w:r></w:p></w:tc></w:tr>
+                   <w:tr><w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+            ))
+        };
+
+        let model = docx_model_parts(
+            &body(r#"<w:tblLook w:firstRow="1"/>"#),
+            &[("word/styles.xml", styles)],
+        );
+        let t = docx_model_first_table(&model);
+        assert!(t.rows[0].is_header, "firstRow look + style block → header");
+        assert!(!t.rows[1].is_header);
+
+        let model = docx_model_parts(
+            &body(r#"<w:tblLook w:val="0000" w:firstRow="0"/>"#),
+            &[("word/styles.xml", styles)],
+        );
+        assert!(
+            !docx_model_first_table(&model).rows[0].is_header,
+            "an explicit firstRow=0 look disables the header region"
+        );
+
+        // The tblStylePr's conditional bold must NOT leak into the style's own
+        // run formatting (it is region-scoped).
+        let model = docx_model_parts(
+            &docx_wrap_body(
+                r#"<w:p><w:pPr><w:pStyle w:val="Med"/></w:pPr><w:r><w:t>plain</w:t></w:r></w:p>"#,
+            ),
+            &[("word/styles.xml", styles)],
+        );
+        let runs = docx_model_runs(&model);
+        assert!(
+            !runs[0].style.bold,
+            "firstRow rPr stays out of the style's own props"
+        );
+    }
+
+    /// `w:rStyle` character styles apply to runs: the referenced style's rPr
+    /// seeds the run, direct properties override it (`w:b w:val="0"` un-bolds),
+    /// and `w:basedOn` chains resolve.
+    #[test]
+    fn docx_rstyle_character_style_applies_and_direct_overrides() {
+        let styles = r#"<w:styles xmlns:w="x">
+          <w:style w:type="character" w:styleId="Strong">
+            <w:rPr><w:b/></w:rPr>
+          </w:style>
+          <w:style w:type="character" w:styleId="StrongItalic">
+            <w:basedOn w:val="Strong"/>
+            <w:rPr><w:i/></w:rPr>
+          </w:style>
+        </w:styles>"#;
+        let doc = docx_wrap_body(
+            r#"<w:p><w:r><w:rPr><w:rStyle w:val="Strong"/></w:rPr><w:t>one</w:t></w:r></w:p>
+               <w:p><w:r><w:rPr><w:rStyle w:val="Strong"/><w:b w:val="0"/></w:rPr><w:t>two</w:t></w:r></w:p>
+               <w:p><w:r><w:rPr><w:rStyle w:val="StrongItalic"/></w:rPr><w:t>three</w:t></w:r></w:p>"#,
+        );
+        let runs = docx_model_runs(&docx_model_parts(&doc, &[("word/styles.xml", styles)]));
+        assert_eq!(runs.len(), 3);
+        assert!(runs[0].style.bold, "rStyle Strong → bold");
+        assert!(
+            !runs[1].style.bold,
+            "direct w:b w:val=0 overrides the character style"
+        );
+        assert!(runs[2].style.bold, "basedOn chain keeps the parent's bold");
+        assert!(runs[2].style.italic, "child style adds italic");
+    }
+
+    /// DOCX theme fonts: `w:rFonts@asciiTheme` placeholders resolve against
+    /// `word/theme/theme1.xml` — for document defaults (a stock Word document's
+    /// Calibri body) and for direct run references; a literal `w:ascii` face
+    /// still wins.
+    #[test]
+    fn docx_theme_fonts_resolve_for_defaults_and_runs() {
+        let styles = r#"<w:styles xmlns:w="x">
+          <w:docDefaults><w:rPrDefault><w:rPr>
+            <w:rFonts w:asciiTheme="minorHAnsi"/>
+          </w:rPr></w:rPrDefault></w:docDefaults>
+        </w:styles>"#;
+        let doc = docx_wrap_body(
+            r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+               <w:p><w:r><w:rPr><w:rFonts w:asciiTheme="majorHAnsi"/></w:rPr><w:t>head</w:t></w:r></w:p>
+               <w:p><w:r><w:rPr><w:rFonts w:ascii="Arial"/></w:rPr><w:t>direct</w:t></w:r></w:p>"#,
+        );
+        let runs = docx_model_runs(&docx_model_parts(
+            &doc,
+            &[
+                ("word/styles.xml", styles),
+                ("word/theme/theme1.xml", DOCX_THEME),
+            ],
+        ));
+        assert_eq!(runs[0].style.family, "Calibri", "docDefaults minorHAnsi");
+        assert_eq!(runs[1].style.family, "Cambria", "run-level majorHAnsi");
+        assert_eq!(runs[2].style.family, "Arial", "literal w:ascii wins");
+    }
+
+    /// `w:color@themeColor` resolves against the theme palette, modulated by
+    /// `themeTint`/`themeShade` (hex bytes); a direct 6-hex `w:val` wins.
+    #[test]
+    fn docx_theme_color_tint_shade_resolve_and_direct_wins() {
+        let doc = docx_wrap_body(
+            r#"<w:p><w:r><w:rPr><w:color w:val="auto" w:themeColor="accent1" w:themeTint="80"/></w:rPr><w:t>tinted</w:t></w:r></w:p>
+               <w:p><w:r><w:rPr><w:color w:themeColor="accent1" w:themeShade="80"/></w:rPr><w:t>shaded</w:t></w:r></w:p>
+               <w:p><w:r><w:rPr><w:color w:val="00FF00" w:themeColor="accent1"/></w:rPr><w:t>direct</w:t></w:r></w:p>"#,
+        );
+        let runs = docx_model_runs(&docx_model_parts(
+            &doc,
+            &[("word/theme/theme1.xml", DOCX_THEME)],
+        ));
+        // accent1 = FF0000; tint 0x80 keeps 128/255 of the colour toward white.
+        assert_eq!(
+            runs[0].style.color,
+            Some([1.0, 127.0 / 255.0, 127.0 / 255.0]),
+            "themeTint lightens toward white"
+        );
+        // shade 0x80 multiplies toward black: FF → 0x80.
+        assert_eq!(
+            runs[1].style.color,
+            Some([128.0 / 255.0, 0.0, 0.0]),
+            "themeShade darkens toward black"
+        );
+        assert_eq!(
+            runs[2].style.color,
+            Some([0.0, 1.0, 0.0]),
+            "a literal w:val beats the theme slot"
+        );
+    }
+
+    /// Build an XLSX zip with a custom `xl/workbook.xml` (for defined names),
+    /// optional styles, and one worksheet; return the lowered model sheet.
+    fn xlsx_model_sheet_parts(workbook_xml: &str, styles: &str, sheet: &str) -> model::Sheet {
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored("xl/workbook.xml", workbook_xml.as_bytes());
+        if !styles.is_empty() {
+            z.add_stored("xl/styles.xml", styles.as_bytes());
+        }
+        z.add_stored("xl/worksheets/sheet1.xml", sheet.as_bytes());
+        let model = office_to_model(&z.finish()).expect("xlsx → model");
+        match model.sections[0].pages[0].blocks[0].kind.clone() {
+            BlockKind::Sheet(sb) => sb.sheets.into_iter().next().expect("one sheet"),
+            other => panic!("expected a Sheet block, got {other:?}"),
+        }
+    }
+
+    /// `_xlnm.Print_Area` restricts the import to the printed range: cells
+    /// outside it are dropped, and without a print area everything imports.
+    #[test]
+    fn xlsx_print_area_restricts_import() {
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" t="inlineStr"><is><t>a1</t></is></c>
+            <c r="B1" t="inlineStr"><is><t>b1</t></is></c>
+            <c r="C1" t="inlineStr"><is><t>c1</t></is></c>
+          </row>
+          <row r="3"><c r="A3" t="inlineStr"><is><t>a3</t></is></c></row>
+        </sheetData></worksheet>"#;
+
+        let wb = r#"<workbook><sheets><sheet name="S" sheetId="1"/></sheets>
+          <definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">S!$A$1:$B$2</definedName></definedNames>
+        </workbook>"#;
+        let s = xlsx_model_sheet_parts(wb, "", sheet);
+        assert_eq!(s.rows.len(), 1, "row 3 is outside the print area");
+        assert_eq!(s.rows[0].cells.len(), 2, "C1 dropped, A1..B1 kept");
+        assert_eq!(
+            s.rows[0].cells[0].value,
+            model::CellValue::Text("a1".into())
+        );
+        assert_eq!(
+            s.rows[0].cells[1].value,
+            model::CellValue::Text("b1".into())
+        );
+
+        // No Print_Area → everything imports.
+        let wb_plain = r#"<workbook><sheets><sheet name="S" sheetId="1"/></sheets></workbook>"#;
+        let s = xlsx_model_sheet_parts(wb_plain, "", sheet);
+        assert_eq!(s.rows.len(), 3);
+        assert_eq!(s.rows[0].cells.len(), 3);
+
+        // Multi-range union (comma-separated, quoted sheet name): A1 and C1
+        // survive, B1 (between the two ranges) is blanked in place.
+        let wb_multi = r#"<workbook><sheets><sheet name="S" sheetId="1"/></sheets>
+          <definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">'S'!$A$1:$A$1,'S'!$C$1:$C$1</definedName></definedNames>
+        </workbook>"#;
+        let s = xlsx_model_sheet_parts(wb_multi, "", sheet);
+        assert_eq!(s.rows.len(), 1);
+        assert_eq!(s.rows[0].cells.len(), 3);
+        assert_eq!(
+            s.rows[0].cells[0].value,
+            model::CellValue::Text("a1".into())
+        );
+        assert_eq!(s.rows[0].cells[1].value, model::CellValue::Empty);
+        assert_eq!(
+            s.rows[0].cells[2].value,
+            model::CellValue::Text("c1".into())
+        );
+    }
+
+    /// Hidden rows and columns vanish from the imported grid the way Excel
+    /// displays them — the surviving cells and column widths shift up/left.
+    #[test]
+    fn xlsx_hidden_rows_and_columns_are_removed() {
+        let sheet = r#"<worksheet>
+          <cols>
+            <col min="2" max="2" width="20" hidden="1"/>
+            <col min="3" max="3" width="30"/>
+          </cols>
+          <sheetData>
+          <row r="1">
+            <c r="A1" t="inlineStr"><is><t>a1</t></is></c>
+            <c r="B1" t="inlineStr"><is><t>b1</t></is></c>
+            <c r="C1" t="inlineStr"><is><t>c1</t></is></c>
+          </row>
+          <row r="2" hidden="1"><c r="A2" t="inlineStr"><is><t>a2</t></is></c></row>
+          <row r="3"><c r="A3" t="inlineStr"><is><t>a3</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let s = xlsx_model_sheet("", sheet, None);
+        assert_eq!(s.rows.len(), 2, "hidden row 2 removed");
+        assert_eq!(
+            s.rows[0].cells.len(),
+            2,
+            "hidden column B removed from row 1"
+        );
+        assert_eq!(
+            s.rows[0].cells[0].value,
+            model::CellValue::Text("a1".into())
+        );
+        assert_eq!(
+            s.rows[0].cells[1].value,
+            model::CellValue::Text("c1".into()),
+            "C shifts left into B's slot"
+        );
+        assert_eq!(
+            s.rows[1].cells[0].value,
+            model::CellValue::Text("a3".into())
+        );
+        // Widths shift with the columns: [A default, C=30ch] (B's 20ch gone).
+        assert_eq!(s.col_widths, vec![0.0, 210.0]);
+    }
+
+    /// Simple conditional formatting materialises as cell fills: `cellIs`
+    /// against a literal operand, `containsText` against `@text`; unsupported
+    /// rule kinds (colour scales…) are ignored without error.
+    #[test]
+    fn xlsx_conditional_formatting_fills_cells() {
+        let styles = r#"<styleSheet>
+          <dxfs count="2">
+            <dxf><font><color rgb="FF9C0006"/></font>
+                 <fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf>
+            <dxf><fill><patternFill><bgColor rgb="FF00FF00"/></patternFill></fill></dxf>
+          </dxfs>
+        </styleSheet>"#;
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1"><c r="A1"><v>3</v></c><c r="B1" t="inlineStr"><is><t>hello world</t></is></c></row>
+          <row r="2"><c r="A2"><v>10</v></c><c r="B2" t="inlineStr"><is><t>nope</t></is></c></row>
+        </sheetData>
+        <conditionalFormatting sqref="A1:A9">
+          <cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>5</formula></cfRule>
+        </conditionalFormatting>
+        <conditionalFormatting sqref="B1:B9">
+          <cfRule type="containsText" dxfId="1" priority="2" operator="containsText" text="World"/>
+        </conditionalFormatting>
+        <conditionalFormatting sqref="A1:B9">
+          <cfRule type="colorScale" priority="3"><colorScale/></cfRule>
+        </conditionalFormatting>
+        </worksheet>"#;
+        let s = xlsx_model_sheet(styles, sheet, None);
+        assert_eq!(s.rows[0].cells[0].fill, None, "3 > 5 is false");
+        assert_eq!(
+            s.rows[1].cells[0].fill,
+            Some([1.0, 199.0 / 255.0, 206.0 / 255.0]),
+            "10 > 5 → dxf 0 fill (bgColor)"
+        );
+        assert_eq!(
+            s.rows[0].cells[1].fill,
+            Some([0.0, 1.0, 0.0]),
+            "case-insensitive containsText match"
+        );
+        assert_eq!(s.rows[1].cells[1].fill, None, "no needle, no fill");
+    }
+
+    /// `a:tableStyleId` resolves through `ppt/tableStyles.xml`: the `wholeTbl`
+    /// border seeds the table-wide border and the region fills paint cells;
+    /// an unknown id leaves the table unchanged.
+    #[test]
+    fn pptx_table_style_id_supplies_border_and_fills() {
+        const TABLE_STYLES: &str = r#"<a:tblStyleLst xmlns:a="a" def="{S1}">
+          <a:tblStyle styleId="{S1}" styleName="Styled">
+            <a:wholeTbl><a:tcStyle>
+              <a:tcBdr><a:left><a:ln w="25400"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:ln></a:left></a:tcBdr>
+              <a:fill><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></a:fill>
+            </a:tcStyle></a:wholeTbl>
+            <a:firstRow><a:tcStyle>
+              <a:fill><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></a:fill>
+            </a:tcStyle></a:firstRow>
+          </a:tblStyle>
+        </a:tblStyleLst>"#;
+        let slide = |style_id: &str| {
+            format!(
+                r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:graphicFrame>
+                <p:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></p:xfrm>
+                <a:graphic><a:graphicData>
+                  <a:tbl><a:tblPr firstRow="1"><a:tableStyleId>{style_id}</a:tableStyleId></a:tblPr>
+                    <a:tblGrid><a:gridCol w="1270000"/></a:tblGrid>
+                    <a:tr><a:tc><a:txBody><a:p><a:r><a:t>H</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+                    <a:tr><a:tc><a:txBody><a:p><a:r><a:t>D</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+                  </a:tbl>
+                </a:graphicData></a:graphic>
+              </p:graphicFrame>
+            </p:spTree></p:cSld></p:sld>"#
+            )
+        };
+
+        let deck = slide("{S1}");
+        let s = pptx_model_slide_parts(
+            &[
+                ("ppt/slides/slide1.xml", deck.as_str()),
+                ("ppt/tableStyles.xml", TABLE_STYLES),
+            ],
+            &[],
+        );
+        let table = match &s.shapes[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected a Table, got {other:?}"),
+        };
+        assert_eq!(table.border.width, 2.0, "25400 EMU line → 2pt");
+        assert_eq!(table.border.color, [1.0, 0.0, 0.0]);
+        assert!(table.rows[0].is_header, "tblPr firstRow → header row");
+        assert_eq!(
+            table.rows[0].cells[0].shading,
+            Some([0.0, 0.0, 1.0]),
+            "header row takes the firstRow fill"
+        );
+        assert_eq!(
+            table.rows[1].cells[0].shading,
+            Some([0.0, 1.0, 0.0]),
+            "body row takes the wholeTbl fill"
+        );
+
+        // Unknown style id (or missing part) → untouched defaults.
+        let deck = slide("{UNKNOWN}");
+        let s = pptx_model_slide_parts(
+            &[
+                ("ppt/slides/slide1.xml", deck.as_str()),
+                ("ppt/tableStyles.xml", TABLE_STYLES),
+            ],
+            &[],
+        );
+        let table = match &s.shapes[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected a Table, got {other:?}"),
+        };
+        assert_eq!(table.border.width, 0.0);
+        assert_eq!(table.rows[1].cells[0].shading, None);
+    }
+
+    /// `a:normAutofit@fontScale` (thousandths of a percent) shrinks every
+    /// explicit run size of the shape.
+    #[test]
+    fn pptx_norm_autofit_font_scale_shrinks_run_sizes() {
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></a:xfrm></p:spPr>
+                <p:txBody><a:bodyPr><a:normAutofit fontScale="62500"/></a:bodyPr>
+                  <a:p><a:r><a:rPr sz="2000"/><a:t>shrunk</a:t></a:r></a:p>
+                </p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let BlockKind::TextBox(tb) = &slide.shapes[0].kind else {
+            panic!("expected a TextBox, got {:?}", slide.shapes[0].kind);
+        };
+        let BlockKind::Paragraph(p) = &tb.blocks[0].kind else {
+            panic!("expected a Paragraph");
+        };
+        let Inline::Run(run) = &p.runs[0] else {
+            panic!("expected a Run");
+        };
+        assert_eq!(run.style.size_pt, 12.5, "20pt × 62.5% = 12.5pt");
+    }
+
+    /// `a:rPr@spc` (hundredths of a point) lowers to letter spacing;
+    /// `a:rPr@cap="all"` rides the style as the `caps` display transform (the
+    /// run text keeps its ORIGINAL casing so a host can edit it), and
+    /// `cap="small"` lowers to `small_caps`.
+    #[test]
+    fn pptx_rpr_spc_letter_spacing_and_cap_all() {
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></a:xfrm></p:spPr>
+                <p:txBody><a:bodyPr/>
+                  <a:p><a:r><a:rPr spc="300" cap="all"/><a:t>Wide caps</a:t></a:r></a:p>
+                  <a:p><a:r><a:rPr cap="small"/><a:t>Petites Caps</a:t></a:r></a:p>
+                </p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let BlockKind::TextBox(tb) = &slide.shapes[0].kind else {
+            panic!("expected a TextBox, got {:?}", slide.shapes[0].kind);
+        };
+        let BlockKind::Paragraph(p) = &tb.blocks[0].kind else {
+            panic!("expected a Paragraph");
+        };
+        let Inline::Run(run) = &p.runs[0] else {
+            panic!("expected a Run");
+        };
+        assert_eq!(
+            run.text, "Wide caps",
+            "cap=all keeps the original casing (display transform)"
+        );
+        assert!(run.style.caps, "cap=all → CharStyle::caps");
+        assert!(!run.style.small_caps);
+        assert_eq!(run.style.letter_spacing_pt, 3.0, "spc=300 → 3pt");
+        let BlockKind::Paragraph(p1) = &tb.blocks[1].kind else {
+            panic!("expected the small-caps Paragraph");
+        };
+        let Inline::Run(small) = &p1.runs[0] else {
+            panic!("expected a Run");
+        };
+        assert_eq!(small.text, "Petites Caps", "cap=small never transforms");
+        assert!(small.style.small_caps, "cap=small → CharStyle::small_caps");
+        assert!(!small.style.caps);
     }
 }

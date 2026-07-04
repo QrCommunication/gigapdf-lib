@@ -7,6 +7,10 @@
 //! works on it with zero regression. Full-fidelity, structure-aware exporters
 //! land later; here the goal is **correct but simple**.
 //!
+//! For `model → PDF` specifically, [`pdf_from_model_rich`] is the shipping
+//! route (semantic HTML → the engine's HTML→PDF renderer: embedded fonts, full
+//! Unicode, images); [`pdf_from_model`] is the dependency-free compat fallback.
+//!
 //! ## Mapping
 //!
 //! Coordinates are **top-down points, origin top-left** — the same convention
@@ -30,7 +34,7 @@ use crate::convert::style::{Generic, TextStyle};
 use crate::convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 use crate::model::{
     Block, BlockKind, Blockquote, CharStyle, Document, Heading, ImageRef, Inline, LineHeight, List,
-    ListMarker, PageGeometry, Paragraph, Rect, Shape, Sheet, Slide, Table, TextBox,
+    ListMarker, PageGeometry, Paragraph, Rect, ResourceTable, Shape, Sheet, Slide, Table, TextBox,
 };
 
 /// Default column width (points) for grid cells whose sheet omits a width.
@@ -78,6 +82,20 @@ fn collect_inline_text(runs: &[Inline], out: &mut String) {
             Inline::Image(_) => {}
             Inline::Link { children, .. } => collect_inline_text(children, out),
             Inline::CommentRef { .. } => {}
+            // A note anchor has no text of its own (body in `Document::footnotes`).
+            Inline::FootnoteRef { .. } => {}
+        }
+    }
+}
+
+/// Every [`Inline::Image`] of a run list, in order (recursing into links) — the
+/// counterpart of [`collect_inline_text`] for the rasters the text pass skips.
+fn collect_inline_images<'m>(runs: &'m [Inline], out: &mut Vec<&'m ImageRef>) {
+    for run in runs {
+        match run {
+            Inline::Image(img) => out.push(img),
+            Inline::Link { children, .. } => collect_inline_images(children, out),
+            _ => {}
         }
     }
 }
@@ -132,31 +150,42 @@ fn line_advance(cs: &CharStyle, line_height: LineHeight) -> f64 {
 /// paragraph's ordinal there); every ordinal carries the list's
 /// [suffix](List::suffix) (`.` by default, `)` for `1)`-style sources).
 fn list_prefixes(list: &List) -> Vec<String> {
-    let s = list.suffix();
     // level → last emitted ordinal at that level.
     let mut counters: std::collections::BTreeMap<u8, usize> = std::collections::BTreeMap::new();
     list.items
         .iter()
         .map(|item| {
-            if let ListMarker::Bullet(c) = list.marker {
+            // Per-depth style when the list carries real multi-level
+            // definitions (`List::levels`, from `numbering.xml` / an ODF
+            // list-style); the table-wide marker/suffix otherwise, so
+            // level-less lists render exactly as before. The ordinal
+            // `marker_prefix` (a `"("` for `(a)`-style templates) opens
+            // every ordered marker.
+            let level_style = list.levels.get(item.level as usize);
+            let (marker, s) = match level_style {
+                Some(ls) => (ls.marker, ls.suffix.unwrap_or('.')),
+                None => (list.marker, list.suffix()),
+            };
+            if let ListMarker::Bullet(c) = marker {
                 return format!("{c} ");
             }
             counters.retain(|&l, _| l <= item.level);
-            let seed = if item.level == 0 {
-                list.start.max(1) as usize - 1
-            } else {
-                0
+            let seed = match level_style {
+                Some(ls) => ls.start.max(1) as usize - 1,
+                None if item.level == 0 => list.start.max(1) as usize - 1,
+                None => 0,
             };
             let n = counters.entry(item.level).or_insert(seed);
             *n += 1;
             let n = *n;
-            match list.marker {
+            let p = list.marker_prefix.as_deref().unwrap_or("");
+            match marker {
                 ListMarker::Bullet(_) => unreachable!("handled above"),
-                ListMarker::Decimal => format!("{n}{s} "),
-                ListMarker::LowerAlpha => format!("{}{s} ", alpha(n, false)),
-                ListMarker::UpperAlpha => format!("{}{s} ", alpha(n, true)),
-                ListMarker::LowerRoman => format!("{}{s} ", roman(n).to_lowercase()),
-                ListMarker::UpperRoman => format!("{}{s} ", roman(n)),
+                ListMarker::Decimal => format!("{p}{n}{s} "),
+                ListMarker::LowerAlpha => format!("{p}{}{s} ", alpha(n, false)),
+                ListMarker::UpperAlpha => format!("{p}{}{s} ", alpha(n, true)),
+                ListMarker::LowerRoman => format!("{p}{}{s} ", roman(n).to_lowercase()),
+                ListMarker::UpperRoman => format!("{p}{}{s} ", roman(n)),
             }
         })
         .collect()
@@ -208,7 +237,7 @@ fn roman(mut n: usize) -> String {
 /// A top-to-bottom flow layouter over one section's content column. Emits
 /// [`PlacedText`] lines and paginates onto fresh [`ConvPage`]s when the column
 /// fills. Absolute blocks bypass the pen and are placed at their frame.
-struct Flow {
+struct Flow<'a> {
     geometry: PageGeometry,
     /// Completed pages plus the page currently being filled (last element).
     pages: Vec<ConvPage>,
@@ -218,17 +247,22 @@ struct Flow {
     left: f64,
     /// Bottom limit of the content column (pen must stay above this).
     bottom: f64,
+    /// Image blobs referenced by the model's [`ImageRef`]s, so placements carry
+    /// the real bytes instead of an empty payload.
+    res: &'a ResourceTable,
 }
 
-impl Flow {
-    fn new(geometry: PageGeometry) -> Self {
+impl<'a> Flow<'a> {
+    fn new(geometry: PageGeometry, res: &'a ResourceTable) -> Self {
         let m = geometry.margins;
+        let bottom = geometry.height - m.bottom;
         let mut flow = Flow {
             geometry,
             pages: Vec::new(),
             y: m.top,
             left: m.left,
-            bottom: geometry.height - m.bottom,
+            bottom,
+            res,
         };
         flow.push_page();
         flow
@@ -306,15 +340,42 @@ impl Flow {
                 self.layout_blocks(&bq.blocks, indent + 18.0);
             }
             BlockKind::HorizontalRule => self.flow_rule(indent),
-            BlockKind::Image(_) | BlockKind::Shape(_) => {
-                // No frame ⇒ no geometry to flow a raster/vector into; skipped in
-                // the compat fallback (kept by the structured exporters later).
+            BlockKind::Image(img) => self.flow_image(img, indent),
+            BlockKind::Shape(_) => {
+                // No frame ⇒ no geometry to flow a vector into; skipped in the
+                // compat fallback (kept by the structured exporters later).
             }
             BlockKind::Sheet(_) | BlockKind::Slide(_) => {
                 // Sheets/slides are page-replacing and handled at the document
                 // level (one ConvPage per sheet/slide), never inside a flow.
             }
         }
+    }
+
+    /// Flow a frameless image at the pen: sized from its intrinsic pixel
+    /// dimensions (1px = 1pt), scaled down to fit the content column when
+    /// oversized, advancing the pen by the placed height. A dangling resource
+    /// id or an undecodable blob is skipped — there is no geometry to reserve.
+    fn flow_image(&mut self, img: &ImageRef, indent: f64) {
+        let Some(resource) = self.res.images.get(&img.resource) else {
+            return;
+        };
+        let Some(prep) = crate::content::image::prepare_image(&resource.bytes) else {
+            return;
+        };
+        let max_w = (self.bottom_right() - self.left - indent).max(1.0);
+        let max_h = (self.bottom - self.geometry.margins.top).max(1.0);
+        let (w, h) = (
+            f64::from(prep.width).max(1.0),
+            f64::from(prep.height).max(1.0),
+        );
+        let scale = (max_w / w).min(max_h / h).min(1.0);
+        let (w, h) = (w * scale, h * scale);
+        self.ensure_room(h);
+        let page = self.cur();
+        let frame = Rect::new(self.left + indent, self.y, w, h);
+        place_image(&mut self.pages[page], img, frame, self.res);
+        self.y += h;
     }
 
     /// Flow a code block: each source line emitted verbatim in a monospace style.
@@ -358,6 +419,14 @@ impl Flow {
         self.y += para.style.space_before_pt.max(0.0);
         let total_indent = indent + para.style.indent_left_pt.max(0.0);
         self.emit_line(total_indent, &text, &cs, para.style.line_height);
+        // Inline images ride on their own line below the text (the compat flow
+        // has no font metrics to split a run around a raster); each advances
+        // the pen by its own placed height.
+        let mut inline_images = Vec::new();
+        collect_inline_images(&para.runs, &mut inline_images);
+        for img in inline_images {
+            self.flow_image(img, total_indent);
+        }
         self.y += para.style.space_after_pt.max(0.0);
     }
 
@@ -439,7 +508,7 @@ impl Flow {
     fn place_absolute(&mut self, block: &Block, frame: Rect) {
         let page = self.cur();
         match &block.kind {
-            BlockKind::Image(img) => place_image(&mut self.pages[page], img, frame),
+            BlockKind::Image(img) => place_image(&mut self.pages[page], img, frame, self.res),
             BlockKind::Shape(shape) => place_shape(&mut self.pages[page], shape, frame),
             BlockKind::Paragraph(p) => place_text_block(&mut self.pages[page], &p_text(p), frame),
             BlockKind::Heading(h) => {
@@ -531,19 +600,23 @@ fn column_width(col_widths: &[f64], index: usize) -> f64 {
     }
 }
 
-/// Place an image XObject reference at `frame`. Resolution of the actual PNG
-/// bytes happens through the [`ResourceTable`](crate::model::ResourceTable) by
-/// the caller; here the bridge only carries the geometry plus an empty payload
-/// when no bytes are attached (the structured exporter re-embeds the real blob).
-fn place_image(page: &mut ConvPage, _img: &ImageRef, frame: Rect) {
-    // The compat fallback has no access to the resource table at this layer, so
-    // it records the placement box with an empty PNG; exporters that need the
-    // bytes resolve them from the model. Skipped entirely when zero-sized.
+/// Place an image at `frame`, resolving the actual blob through the model's
+/// [`ResourceTable`]. The bytes ride as stored (PNG, JPEG, …) — every consumer
+/// sniffs the magic ([`pdf_from_model`] re-embeds through
+/// [`prepare_image`](crate::content::image::prepare_image)); a dangling
+/// resource id still records the placement box with an empty payload so the
+/// geometry survives. Skipped entirely when zero-sized.
+fn place_image(page: &mut ConvPage, img: &ImageRef, frame: Rect, res: &ResourceTable) {
     if frame.w <= 0.0 || frame.h <= 0.0 {
         return;
     }
+    let png = res
+        .images
+        .get(&img.resource)
+        .map(|r| r.bytes.clone())
+        .unwrap_or_default();
     page.images.push(PlacedImage {
-        png: Vec::new(),
+        png,
         x: frame.x,
         y: frame.y,
         width: frame.w,
@@ -830,29 +903,29 @@ fn format_number(n: f64) -> String {
 
 /// Render one [`Slide`] onto a fresh [`ConvPage`], placing each shape and
 /// placeholder at its frame.
-fn slide_page(slide: &Slide) -> ConvPage {
+fn slide_page(slide: &Slide, res: &ResourceTable) -> ConvPage {
     let mut page = ConvPage {
         width: slide.geometry.width,
         height: slide.geometry.height,
         ..ConvPage::default()
     };
     for shape in &slide.shapes {
-        place_block_on(&mut page, shape);
+        place_block_on(&mut page, shape, res);
     }
     for ph in &slide.placeholders {
-        place_block_on(&mut page, &ph.block);
+        place_block_on(&mut page, &ph.block, res);
     }
     page
 }
 
 /// Place a single block on `page`, honouring its frame when present (slides give
 /// every shape a frame; a frameless one falls back to the page margin origin).
-fn place_block_on(page: &mut ConvPage, block: &Block) {
+fn place_block_on(page: &mut ConvPage, block: &Block, res: &ResourceTable) {
     let frame = block
         .frame
         .unwrap_or(Rect::new(36.0, 36.0, page.width - 72.0, page.height - 72.0));
     match &block.kind {
-        BlockKind::Image(img) => place_image(page, img, frame),
+        BlockKind::Image(img) => place_image(page, img, frame, res),
         BlockKind::Shape(shape) => place_shape(page, shape, frame),
         BlockKind::Paragraph(p) => place_text_block(page, &p_text(p), frame),
         BlockKind::Heading(h) => place_text_block(page, &p_text(&h.para), frame),
@@ -919,6 +992,7 @@ fn place_rule(page: &mut ConvPage, frame: Rect) {
 impl From<&Document> for Vec<ConvPage> {
     /// Lower a model document to the flat [`ConvPage`] IR (compat fallback).
     fn from(doc: &Document) -> Vec<ConvPage> {
+        let res = &doc.resources;
         let mut out: Vec<ConvPage> = Vec::new();
         for section in &doc.sections {
             for page in &section.pages {
@@ -936,7 +1010,7 @@ impl From<&Document> for Vec<ConvPage> {
                         }
                         BlockKind::Slide(sl) => {
                             for slide in &sl.slides {
-                                out.push(slide_page(slide));
+                                out.push(slide_page(slide, res));
                             }
                             handled_special = true;
                         }
@@ -952,7 +1026,7 @@ impl From<&Document> for Vec<ConvPage> {
                         .filter(|b| !matches!(b.kind, BlockKind::Sheet(_) | BlockKind::Slide(_)))
                         .collect();
                     if !rest.is_empty() {
-                        let mut flow = Flow::new(section.geometry);
+                        let mut flow = Flow::new(section.geometry.clone(), res);
                         for b in rest {
                             flow.layout_block(b, 0.0);
                         }
@@ -961,7 +1035,7 @@ impl From<&Document> for Vec<ConvPage> {
                     continue;
                 }
 
-                let mut flow = Flow::new(section.geometry);
+                let mut flow = Flow::new(section.geometry.clone(), res);
                 flow.layout_blocks(&page.blocks, 0.0);
                 out.extend(flow.pages);
             }
@@ -974,7 +1048,13 @@ impl From<&Document> for Vec<ConvPage> {
 /// the from-scratch [`PdfBuilder`](super::build::PdfBuilder) page path
 /// (standard-14 fonts, WinAnsi, zero embedded font bytes). Text runs become
 /// real `Tj` operators and shapes their bounding rectangles — the same
-/// reconstruction every `*→PDF` reverse converter uses.
+/// reconstruction every `*→PDF` reverse converter uses. Images resolved from
+/// the model's [`ResourceTable`] are then embedded as real XObjects in a
+/// second pass through [`Document::add_image`](crate::Document::add_image)
+/// (the builder itself is text/vector-only).
+///
+/// This is the **compat fallback**; [`pdf_from_model_rich`] is the shipping
+/// path (full Unicode, embedded fonts, styled layout).
 pub fn pdf_from_model(doc: &Document) -> Vec<u8> {
     use super::build::{PdfBuilder, StdFont};
 
@@ -1029,7 +1109,113 @@ pub fn pdf_from_model(doc: &Document) -> Vec<u8> {
             );
         }
     }
-    builder.finish()
+    embed_page_images(builder.finish(), &pages)
+}
+
+/// Second pass of [`pdf_from_model`]: re-open the built PDF and draw every
+/// placed image with resolved bytes as a real XObject via
+/// [`Document::add_image`](crate::Document::add_image) (PNG, JPEG, WebP, GIF,
+/// TIFF or AVIF — anything else is skipped cleanly, as is a placement whose
+/// resource never resolved). `y` flips from the ConvPage's top-down convention
+/// to PDF user space. Returns the input bytes untouched when there is nothing
+/// to draw or the round-trip fails.
+fn embed_page_images(pdf: Vec<u8>, pages: &[ConvPage]) -> Vec<u8> {
+    if pages
+        .iter()
+        .all(|p| p.images.iter().all(|i| i.png.is_empty()))
+    {
+        return pdf;
+    }
+    let Ok(mut doc) = crate::Document::open(&pdf) else {
+        return pdf;
+    };
+    let mut drawn = false;
+    for (idx, page) in pages.iter().enumerate() {
+        for img in &page.images {
+            if img.png.is_empty() {
+                continue;
+            }
+            // ConvPage y is the box's top edge (top-down); add_image wants the
+            // bottom-left corner in bottom-up PDF user space.
+            let y_pdf = page.height - img.y - img.height;
+            if doc
+                .add_image(
+                    (idx + 1) as u32,
+                    &img.png,
+                    img.x,
+                    y_pdf,
+                    img.width,
+                    img.height,
+                    1.0,
+                )
+                .is_ok()
+            {
+                drawn = true;
+            }
+        }
+    }
+    if drawn {
+        doc.save()
+    } else {
+        pdf
+    }
+}
+
+/// Lower a model [`Document`] to PDF through the **rich** renderer: the model's
+/// semantic HTML ([`html_from_model`](crate::convert::web::html_from_model) —
+/// full Unicode, styles, images as `data:` URIs) laid out by the engine's
+/// HTML→PDF pipeline ([`render_with`](crate::html::render_with)), which shapes
+/// with real embedded faces (the bundled fallback families guarantee output
+/// even with no host-provided fonts). This is the same engine every Office→PDF
+/// path renders through, so `model → PDF` keeps images, non-Latin scripts and
+/// run styling instead of the std-14/WinAnsi `?` substitution of
+/// [`pdf_from_model`] (which remains the dependency-free compat fallback).
+///
+/// Page geometry: a slide-deck model pages at the first slide's size with zero
+/// margins (mirroring the PPTX/ODP `office→PDF` paths); everything else uses
+/// the first section's size and margins.
+pub fn pdf_from_model_rich(doc: &Document) -> Vec<u8> {
+    let html = crate::convert::web::html_from_model(doc);
+    let (geometry, margins) = match first_slide_geometry(doc) {
+        Some(slide_geom) => (slide_geom, crate::html::Margins::uniform(0.0)),
+        None => {
+            let geom = doc
+                .sections
+                .first()
+                .map(|s| s.geometry.clone())
+                .unwrap_or_default();
+            let m = geom.margins;
+            (
+                geom,
+                crate::html::Margins {
+                    top: m.top,
+                    right: m.right,
+                    bottom: m.bottom,
+                    left: m.left,
+                },
+            )
+        }
+    };
+    let mut opts = crate::html::RenderOptions::new(geometry.width, geometry.height);
+    opts.margins = margins;
+    crate::html::render_with(&html, &[], &opts)
+}
+
+/// The geometry of the first slide of a slide-deck model, or `None` when the
+/// model carries no [`Slide`] block (i.e. it pages like prose/sheets).
+fn first_slide_geometry(doc: &Document) -> Option<PageGeometry> {
+    for section in &doc.sections {
+        for page in &section.pages {
+            for block in &page.blocks {
+                if let BlockKind::Slide(sb) = &block.kind {
+                    if let Some(slide) = sb.slides.first() {
+                        return Some(slide.geometry.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1160,6 +1346,7 @@ mod tests {
             ],
             merges: Vec::new(),
             col_widths: vec![120.0, 80.0],
+            ..Default::default()
         };
 
         let doc = Document {
@@ -1335,6 +1522,8 @@ mod tests {
         // N same-level items: the prefix of the last one exercises ordinal N.
         let mk = |marker: ListMarker, n: usize| List {
             marker_suffix: None,
+            levels: Vec::new(),
+            marker_prefix: None,
             ordered: true,
             marker,
             items: vec![ListItem::default(); n],
@@ -1362,6 +1551,8 @@ mod tests {
             ],
             start: 4,
             marker_suffix: Some(')'),
+            levels: Vec::new(),
+            marker_prefix: None,
         };
         assert_eq!(list_prefixes(&numbered), vec!["4) ", "1) ", "5) "]);
     }
@@ -1415,6 +1606,8 @@ mod tests {
     fn ordered_list_lowers_with_numbered_prefixes() {
         let list = List {
             marker_suffix: None,
+            levels: Vec::new(),
+            marker_prefix: None,
             ordered: true,
             marker: ListMarker::Decimal,
             items: vec![
@@ -1485,6 +1678,7 @@ mod tests {
             stroke: Some([0.0, 0.0, 1.0]),
             stroke_width: 2.0,
             dash: vec![3.0, 2.0],
+            ..Default::default()
         }
     }
 
@@ -1523,13 +1717,16 @@ mod tests {
         let img = ImageRef {
             resource: 7,
             alt: None,
+            ..Default::default()
         };
         let frame = Rect::new(50.0, 60.0, 120.0, 90.0);
         let pages: Vec<ConvPage> = (&doc_with(BlockKind::Image(img.clone()), Some(frame))).into();
         assert_eq!(pages[0].images.len(), 1);
         let pi = &pages[0].images[0];
         assert_eq!((pi.x, pi.y, pi.width, pi.height), (50.0, 60.0, 120.0, 90.0));
-        assert!(pi.png.is_empty(), "compat fallback carries no bytes");
+        // Resource 7 is dangling (empty ResourceTable): the placement box is
+        // still recorded, with an empty payload.
+        assert!(pi.png.is_empty(), "dangling resource carries no bytes");
 
         // A zero-sized frame is skipped entirely (the early return).
         let pages: Vec<ConvPage> =
@@ -1537,10 +1734,142 @@ mod tests {
         assert!(pages[0].images.is_empty(), "zero-width image not placed");
     }
 
+    /// A real 1×1 PNG (valid, decodable) for image-carrying model fixtures.
+    fn tiny_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xDA, 0x63, 0xFC, 0xCF, 0xC0, 0x50, 0x0F, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xA9,
+            0x8C, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    /// Register `tiny_png` under resource id 7 in `doc`'s ResourceTable.
+    fn with_tiny_png(mut doc: Document) -> Document {
+        doc.resources.images.insert(
+            7,
+            crate::model::ImageResource {
+                bytes: tiny_png(),
+                format: "png".into(),
+            },
+        );
+        doc
+    }
+
+    /// An image whose resource id resolves carries the actual blob bytes onto
+    /// the `PlacedImage` (no more empty payload).
+    #[test]
+    fn absolute_image_resolves_resource_bytes() {
+        let img = ImageRef {
+            resource: 7,
+            alt: None,
+            ..Default::default()
+        };
+        let doc = with_tiny_png(doc_with(
+            BlockKind::Image(img),
+            Some(Rect::new(50.0, 60.0, 120.0, 90.0)),
+        ));
+        let pages: Vec<ConvPage> = (&doc).into();
+        assert_eq!(pages[0].images.len(), 1);
+        let pi = &pages[0].images[0];
+        assert_eq!(pi.png, tiny_png(), "resolved blob rides on the placement");
+    }
+
+    /// A frameless image block flows at the pen, sized from its intrinsic pixel
+    /// dimensions (1px = 1pt for a 1×1 PNG).
+    #[test]
+    fn frameless_image_flows_at_intrinsic_size() {
+        let img = ImageRef {
+            resource: 7,
+            alt: None,
+            ..Default::default()
+        };
+        let doc = with_tiny_png(doc_with(BlockKind::Image(img), None));
+        let pages: Vec<ConvPage> = (&doc).into();
+        assert_eq!(pages[0].images.len(), 1, "frameless image placed in flow");
+        let pi = &pages[0].images[0];
+        assert!(
+            (pi.width - 1.0).abs() < 0.01 && (pi.height - 1.0).abs() < 0.01,
+            "1×1 px sizes to 1×1 pt, got {}×{}",
+            pi.width,
+            pi.height
+        );
+        assert_eq!(pi.x, PageGeometry::a4().margins.left, "placed at the pen");
+        assert!(!pi.png.is_empty(), "bytes resolved for the flow placement");
+    }
+
+    /// `pdf_from_model` embeds a resolved image as a real XObject: the reopened
+    /// PDF reports one image element on the page, at the frame's box.
+    #[test]
+    fn pdf_from_model_embeds_resolved_images() {
+        let img = ImageRef {
+            resource: 7,
+            alt: None,
+            ..Default::default()
+        };
+        let doc = with_tiny_png(doc_with(
+            BlockKind::Image(img),
+            Some(Rect::new(50.0, 60.0, 120.0, 90.0)),
+        ));
+        let pdf = pdf_from_model(&doc);
+        let reopened = crate::Document::open(&pdf).expect("re-open built PDF");
+        let images = reopened.page_image_elements(1);
+        assert_eq!(images.len(), 1, "the placed image is a real XObject");
+        // A dangling resource id must not regress into a broken embed: the
+        // second pass skips empty payloads and the PDF still opens.
+        let dangling = doc_with(
+            BlockKind::Image(ImageRef {
+                resource: 99,
+                alt: None,
+                ..Default::default()
+            }),
+            Some(Rect::new(10.0, 10.0, 40.0, 40.0)),
+        );
+        let pdf = pdf_from_model(&dangling);
+        let reopened = crate::Document::open(&pdf).expect("re-open dangling-image PDF");
+        assert!(reopened.page_image_elements(1).is_empty());
+    }
+
+    /// The rich route (`pdf_from_model_rich`) keeps full Unicode — no WinAnsi
+    /// `?` substitution — AND draws the model's images as real XObjects.
+    #[test]
+    fn pdf_from_model_rich_keeps_unicode_and_draws_images() {
+        let mut doc = with_tiny_png(doc_with(
+            BlockKind::Paragraph(paragraph("Prix : 3 € — café")),
+            None,
+        ));
+        // Add the image alongside the paragraph on the same page.
+        doc.sections[0].pages[0].blocks.push(block(
+            BlockKind::Image(ImageRef {
+                resource: 7,
+                alt: None,
+                ..Default::default()
+            }),
+            Some(Rect::new(100.0, 300.0, 80.0, 80.0)),
+        ));
+
+        let pdf = pdf_from_model_rich(&doc);
+        assert!(pdf.starts_with(b"%PDF-"), "rich route emits a PDF");
+        let reopened = crate::Document::open(&pdf).expect("re-open rich PDF");
+        assert!(reopened.page_count() >= 1);
+        let text = reopened.to_text();
+        assert!(
+            text.contains('€') && text.contains("café"),
+            "Unicode survives the rich route (no '?' substitution): {text}"
+        );
+        assert!(
+            !reopened.page_image_elements(1).is_empty(),
+            "the model image is drawn as a real XObject"
+        );
+    }
+
     #[test]
     fn absolute_list_box_places_each_item_with_prefix_and_indent() {
         let list = List {
             marker_suffix: None,
+            levels: Vec::new(),
+            marker_prefix: None,
             ordered: false,
             marker: ListMarker::Bullet('*'),
             items: vec![
@@ -1683,6 +2012,7 @@ mod tests {
             placeholders: vec![title],
             notes: None,
             background: None,
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![Section {
@@ -1725,6 +2055,7 @@ mod tests {
             }],
             merges: Vec::new(),
             col_widths: vec![80.0],
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![Section {
@@ -1777,6 +2108,8 @@ mod tests {
         // Item 2: empty → still emits the bare marker (the else branch).
         let nested = List {
             marker_suffix: None,
+            levels: Vec::new(),
+            marker_prefix: None,
             ordered: false,
             marker: ListMarker::Bullet('-'),
             items: vec![ListItem {
@@ -1787,6 +2120,8 @@ mod tests {
         };
         let list = List {
             marker_suffix: None,
+            levels: Vec::new(),
+            marker_prefix: None,
             ordered: true,
             marker: ListMarker::Decimal,
             items: vec![
@@ -1989,6 +2324,7 @@ mod tests {
                 Inline::Image(ImageRef {
                     resource: 1,
                     alt: None,
+                    ..Default::default()
                 }),
                 Inline::Link {
                     href: crate::model::LinkTarget::Url("http://x".into()),

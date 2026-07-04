@@ -1186,7 +1186,7 @@ fn build_document(sheets: Vec<Sheet>) -> Document {
             bottom: MARGIN,
             left: MARGIN,
         },
-        column_count: 1,
+        ..PageGeometry::default()
     };
     let block = Block {
         kind: BlockKind::Sheet(SheetBlock { sheets }),
@@ -1195,12 +1195,11 @@ fn build_document(sheets: Vec<Sheet>) -> Document {
     Document {
         sections: vec![Section {
             geometry,
-            header: None,
-            footer: None,
             pages: vec![Page {
                 blocks: vec![block],
                 absolute: false,
             }],
+            ..Default::default()
         }],
         ..Document::default()
     }

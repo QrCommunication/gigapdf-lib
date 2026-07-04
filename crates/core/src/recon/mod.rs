@@ -104,19 +104,36 @@ impl ReconRun {
 /// (`"DESENFANTS"`). The decision is therefore **gap-based**, mirroring the
 /// already-correct line builder in [`crate::content::group_lines`]:
 ///
-///  - a tiny gap in a band around zero (`-0.5·h ..= 0.25·h`) is normal intra-word
-///    kerning or a glyph drawn from another font butting the previous one → join;
+///  - a tiny gap in a band around zero is normal intra-word kerning (a few
+///    hundredths of an em) or a glyph drawn from another font butting the
+///    previous one → join;
 ///  - a clear positive gap is a real inter-word space → don't join;
 ///  - a large negative gap means the run wrapped back to the left margin (a new
 ///    visual line inside the same baseline-row cluster) → still a boundary, don't
 ///    join (else a wrapped opener fuses onto the previous line's tail).
 ///
+/// ## Threshold — expressed in **font size**, not box height
+///
+/// `height` is the run's bounding-**box** height, which this engine derives as
+/// exactly `1.2 ×` the effective font size (`text_bounds` spans `−0.2·fs` under
+/// the baseline to `+1.0·fs` above — see `crate::content`). A real space glyph
+/// advances ~`0.25–0.28 em` (Times 0.25, Helvetica 0.278), while intra-word
+/// kerning / split-word butts sit at `~0.02–0.05 em`. The join cut-off is set at
+/// **`0.18 em` = `0.15 × height`**: comfortably above every kerning gap, and
+/// below the narrowest common space. The previous cut-off (`0.25 × height` =
+/// `0.30 em`) sat *above* a real space, so word-positioned PDFs (each word its
+/// own `Td`/`TJ` placement — including this engine's own Office→PDF output)
+/// fused into `"GaucheTabMilieuTabDroite"`.
+///
 /// `prev_right`/`cur_x` are PDF user-space X (points); `height` is a positive
-/// representative font extent (the larger of the two runs' heights).
+/// representative font extent (the larger of the two runs' box heights). The
+/// space glyph's *actual* width is not knowable here (this is a pure-geometry
+/// helper; the font program is long gone), so the em-derived constant stands in.
 pub(crate) fn runs_join(prev_right: f64, cur_x: f64, height: f64) -> bool {
     let h = height.max(1.0);
     let gap = cur_x - prev_right;
-    gap <= h * 0.25 && gap >= -h * 0.5
+    // 0.15 × box height (= 0.18 em at the engine's fixed 1.2 box/em ratio).
+    gap <= h * 0.15 && gap >= -h * 0.5
 }
 
 /// Median of a slice, robust to a few outliers in a way the mean is not. Empty
@@ -187,25 +204,7 @@ pub fn runs_from_elements(
         if e.label.trim().is_empty() {
             continue;
         }
-        // Prefer the style resolved at extraction against the run's OWN scope
-        // (page or form XObject): form-XObject text must be styled with the
-        // form's fonts, not the page's. Rebuild the full `TextStyle` from the
-        // raw `/BaseFont` (for the generic class) overlaid with the resolved
-        // family + refined bold/italic. Fall back to the page-scope table only
-        // when the run carried no resolved style.
-        let mut style = e
-            .font_style
-            .as_ref()
-            .map(|fs| {
-                let mut ts = crate::convert::style::parse_base_font(&fs.base_font);
-                ts.family = fs.family.clone();
-                ts.bold = fs.bold;
-                ts.italic = fs.italic;
-                ts
-            })
-            .or_else(|| e.font.as_deref().and_then(|f| font_styles.get(f)).cloned())
-            .unwrap_or_default();
-        style.color = e.color;
+        let style = element_text_style(e, font_styles);
         out.push(ReconRun {
             text: e.label.clone(),
             x: b.x,
@@ -223,6 +222,36 @@ pub fn runs_from_elements(
         });
     }
     out
+}
+
+/// Resolve a text [`ContentElement`]'s recovered [`TextStyle`] — family,
+/// generic class, bold/italic and fill colour.
+///
+/// Prefers the style resolved at extraction against the run's OWN scope (page
+/// or form XObject): form-XObject text must be styled with the form's fonts,
+/// not the page's. Rebuilds the full `TextStyle` from the raw `/BaseFont` (for
+/// the generic class) overlaid with the resolved family + refined bold/italic,
+/// and falls back to the page-scope table only when the run carried no resolved
+/// style. Shared by [`runs_from_elements`] (heuristic path) and the tag-tree
+/// walker (tagged path) so both reconstruct **the same** style for a given run.
+pub(crate) fn element_text_style(
+    e: &ContentElement,
+    font_styles: &std::collections::BTreeMap<String, TextStyle>,
+) -> TextStyle {
+    let mut style = e
+        .font_style
+        .as_ref()
+        .map(|fs| {
+            let mut ts = crate::convert::style::parse_base_font(&fs.base_font);
+            ts.family = fs.family.clone();
+            ts.bold = fs.bold;
+            ts.italic = fs.italic;
+            ts
+        })
+        .or_else(|| e.font.as_deref().and_then(|f| font_styles.get(f)).cloned())
+        .unwrap_or_default();
+    style.color = e.color;
+    style
 }
 
 /// A monotonically increasing [`BlockId`] source. One instance per
@@ -506,6 +535,90 @@ pub(crate) fn mark_strikes(runs: &mut [ReconRun], vpaths: &[VectorPath]) -> Vec<
     consumed.into_iter().collect()
 }
 
+/// Classify one painted path as a paragraph-decoration candidate (fix: CERFA
+/// encadrés) — an axis-aligned rectangle, or a thin ruling line (one border
+/// side). Anything else (curves, free-form polygons) is `None`: it can only be
+/// an ordinary [`Shape`]. Paint with an effective alpha under 0.5 is treated as
+/// unpainted (a glass highlight is not a frame).
+fn page_decor_of(vp: &VectorPath) -> Option<paragraphs::DecorShape> {
+    use paragraphs::DecorShape;
+    let b = vp.bounds?;
+    if vp.segments.iter().any(|s| matches!(s, PathSeg::Cubic(..))) {
+        return None;
+    }
+    let fill = vp.fill.filter(|_| vp.fill_alpha >= 0.5);
+    let stroke = vp.stroke.filter(|_| vp.stroke_alpha >= 0.5);
+    // Thin bars/lines are border-side candidates, whatever paints them (a
+    // "line" is often a hair-thin filled rect).
+    match ruling_orientation(vp) {
+        Some(Ruling::Horizontal { y, x0, x1 }) => {
+            let color = stroke.or(fill)?;
+            let width = if stroke.is_some() {
+                vp.stroke_width.max(0.5)
+            } else {
+                b.height.max(0.5)
+            };
+            return Some(DecorShape::HRule {
+                y,
+                x0,
+                x1,
+                color,
+                width,
+            });
+        }
+        Some(Ruling::Vertical { x, y0, y1 }) => {
+            let color = stroke.or(fill)?;
+            let width = if stroke.is_some() {
+                vp.stroke_width.max(0.5)
+            } else {
+                b.width.max(0.5)
+            };
+            return Some(DecorShape::VRule {
+                x,
+                y0,
+                y1,
+                color,
+                width,
+            });
+        }
+        None => {}
+    }
+    // An axis-aligned rectangle: every path point sits on a corner of the
+    // bounds (a rect path has no other points), and the box has real extent in
+    // both dimensions (thin bars were handled above).
+    if fill.is_none() && stroke.is_none() {
+        return None;
+    }
+    let (x0, y0, x1, y1) = (b.x, b.y, b.x + b.width, b.y + b.height);
+    let eps = 0.75_f64;
+    let on_corner = |px: f64, py: f64| {
+        ((px - x0).abs() <= eps || (px - x1).abs() <= eps)
+            && ((py - y0).abs() <= eps || (py - y1).abs() <= eps)
+    };
+    let mut corners = 0usize;
+    for seg in &vp.segments {
+        match *seg {
+            PathSeg::Move(px, py) | PathSeg::Line(px, py) => {
+                if !on_corner(px, py) {
+                    return None;
+                }
+                corners += 1;
+            }
+            PathSeg::Close => {}
+            PathSeg::Cubic(..) => return None,
+        }
+    }
+    (corners >= 4 && b.width > 2.5 && b.height > 2.5).then_some(DecorShape::Box {
+        x0,
+        y0,
+        x1,
+        y1,
+        fill,
+        stroke,
+        stroke_width: vp.stroke_width,
+    })
+}
+
 /// Assemble all logical blocks for one page from its text runs, painted paths
 /// and images. The reading order is column-major (left band first, top→bottom
 /// within a band); each block keeps `frame = Some(rect)` for fidelity. Non-rule
@@ -560,6 +673,23 @@ pub fn reconstruct_page(
     // prose. A table consumes the line indices that fall inside its grid.
     let table_plan = tables::plan_tables(&lines, vpaths, &consumed_rule_paths);
 
+    // Paragraph border/background candidates (drawn encadrés): every rect/rule
+    // path not owned by a table grid nor consumed as an underline/strike rule.
+    // A candidate a paragraph actually claims lands in `claimed_decor` and is
+    // dropped from the standalone-shape pass below — the decoration is carried
+    // by the paragraph's style, never drawn twice.
+    let decors: Vec<paragraphs::PageDecor> = vpaths
+        .iter()
+        .filter(|vp| !table_plan.uses_path(vp.index) && !consumed_rule_paths.contains(&vp.index))
+        .filter_map(|vp| {
+            Some(paragraphs::PageDecor {
+                index: vp.index,
+                shape: page_decor_of(vp)?,
+            })
+        })
+        .collect();
+    let mut claimed_decor: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+
     for &line_idx in &order {
         if let Some(tbl) = table_plan.take_if_starts_at(line_idx) {
             // Build the Table block from its covered lines.
@@ -589,6 +719,8 @@ pub fn reconstruct_page(
         &heading_levels,
         x0,
         links,
+        &decors,
+        &mut claimed_decor,
         ids,
         |x, y, w, h| frame_top_down(x, y, w, h, x0, y0, page_h),
     );
@@ -599,7 +731,10 @@ pub fn reconstruct_page(
     // ruling line not consumed by a table also survives as a shape so nothing is
     // silently dropped.
     for vp in vpaths {
-        if table_plan.uses_path(vp.index) || consumed_rule_paths.contains(&vp.index) {
+        if table_plan.uses_path(vp.index)
+            || consumed_rule_paths.contains(&vp.index)
+            || claimed_decor.contains(&vp.index)
+        {
             continue;
         }
         let Some(b) = vp.bounds else { continue };
@@ -630,6 +765,7 @@ pub fn reconstruct_page(
                 stroke: vp.stroke,
                 stroke_width: vp.stroke_width,
                 dash: vp.dash.clone(),
+                ..Default::default()
             }),
         });
     }
@@ -650,6 +786,7 @@ pub fn reconstruct_page(
             kind: BlockKind::Image(ImageRef {
                 resource: img.resource,
                 alt,
+                ..Default::default()
             }),
         });
     }
@@ -812,6 +949,9 @@ fn paragraph_text(para: &crate::model::Paragraph) -> String {
             }
             Inline::Image(_) => {}
             Inline::CommentRef { .. } => {}
+            // A note anchor carries no text (the body lives in
+            // `Document::footnotes`), so it contributes nothing to a title.
+            Inline::FootnoteRef { .. } => {}
         }
     }
     s.trim().to_string()
@@ -931,6 +1071,9 @@ fn pending_line(block: &Block) -> Option<usize> {
 /// preserving the interleaving with already-built (table/shape) blocks.
 /// `page_left` is the MediaBox left (PDF user space) and `links` the page's
 /// hyperlinks; both flow into each prose paragraph's [`paragraphs::ParaContext`].
+/// `decors` are the page's border/background candidates; the indices of the
+/// paths a paragraph claims are accumulated into `claimed_decor` so the caller
+/// drops them from the standalone-shape pass.
 #[allow(clippy::too_many_arguments)]
 fn resolve_text_blocks(
     blocks: Vec<Block>,
@@ -939,6 +1082,8 @@ fn resolve_text_blocks(
     heading_levels: &headings::HeadingLevels,
     page_left: f64,
     links: &[ParaLink],
+    decors: &[paragraphs::PageDecor],
+    claimed_decor: &mut std::collections::BTreeSet<usize>,
     ids: &mut IdGen,
     to_frame: impl Fn(f64, f64, f64, f64) -> Rect + Copy,
 ) -> Vec<Block> {
@@ -951,7 +1096,10 @@ fn resolve_text_blocks(
     let all_lines: Vec<&lines::ReconLine> = lines.iter().collect();
     let doc_leading = paragraphs::document_leading(&all_lines, body);
 
-    let flush = |pending: &mut Vec<usize>, out: &mut Vec<Block>, ids: &mut IdGen| {
+    let flush = |pending: &mut Vec<usize>,
+                 out: &mut Vec<Block>,
+                 claimed: &mut std::collections::BTreeSet<usize>,
+                 ids: &mut IdGen| {
         if pending.is_empty() {
             return;
         }
@@ -962,6 +1110,8 @@ fn resolve_text_blocks(
             heading_levels,
             page_left,
             links,
+            decors,
+            claimed,
             doc_leading,
             ids,
             to_frame,
@@ -974,17 +1124,17 @@ fn resolve_text_blocks(
         if let Some(line_idx) = pending_line(&block) {
             pending.push(line_idx);
         } else {
-            flush(&mut pending, &mut out, ids);
+            flush(&mut pending, &mut out, claimed_decor, ids);
             out.push(block);
         }
     }
-    flush(&mut pending, &mut out, ids);
+    flush(&mut pending, &mut out, claimed_decor, ids);
     out
 }
 
 /// Lower a contiguous group of text lines (already in reading order) to blocks:
-/// paragraphs (with recovered spacing/indents + link-wrapped runs), with
-/// headings and lists promoted out of them.
+/// paragraphs (with recovered spacing/indents, border/background decorations
+/// and link-wrapped runs), with headings and lists promoted out of them.
 #[allow(clippy::too_many_arguments)]
 fn lower_text_group(
     group: &[&lines::ReconLine],
@@ -992,6 +1142,8 @@ fn lower_text_group(
     heading_levels: &headings::HeadingLevels,
     page_left: f64,
     links: &[ParaLink],
+    decors: &[paragraphs::PageDecor],
+    claimed_decor: &mut std::collections::BTreeSet<usize>,
     doc_leading: f64,
     ids: &mut IdGen,
     to_frame: impl Fn(f64, f64, f64, f64) -> Rect + Copy,
@@ -1012,23 +1164,46 @@ fn lower_text_group(
                 // spacing: one leading and one body-left for the whole prose run.
                 let leading = paragraphs::group_leading(&lines, body, doc_leading);
                 let group_left = paragraphs::group_left(&lines);
+                // The group's right margin closes the body measure for the
+                // wrap-vs-deliberate line-break classification (soft_breaks).
+                let group_right = paragraphs::group_right(&lines);
                 let mut prev_bottom: Option<f64> = None;
                 // The REAL page-wide leading flows into the split so a short
                 // group (2 lines) is judged against what the page actually
                 // uses, never against its own single — possibly huge — step.
-                for para_lines in paragraphs::split_paragraphs(&lines, body, doc_leading) {
+                let paras = paragraphs::split_paragraphs(&lines, body, doc_leading);
+                for (i, para_lines) in paras.iter().enumerate() {
                     let ctx = paragraphs::ParaContext {
                         body,
                         leading,
                         group_left,
+                        group_right,
                         page_left,
                         prev_bottom,
+                        // The following paragraph's top drives space_after —
+                        // the mirror of `prev_bottom`/space_before.
+                        next_top: paras.get(i + 1).map(|p| paragraphs::paragraph_top(p)),
                         links,
                     };
-                    let block =
-                        paragraphs::build_paragraph_styled(&para_lines, &ctx, ids, to_frame);
+                    let mut block =
+                        paragraphs::build_paragraph_styled(para_lines, &ctx, ids, to_frame);
+                    // Drawn encadré: a filled/stroked box hugging this
+                    // paragraph becomes its background/borders; the claimed
+                    // paths are consumed (never re-emitted as Shape blocks).
+                    let deco = paragraphs::paragraph_decorations(para_lines, decors, body);
+                    if deco.background.is_some() || deco.borders.is_some() {
+                        if let BlockKind::Paragraph(p) = &mut block.kind {
+                            if deco.background.is_some() {
+                                p.style.background = deco.background;
+                            }
+                            if let Some(borders) = deco.borders {
+                                p.style.borders = borders;
+                            }
+                            claimed_decor.extend(deco.claimed);
+                        }
+                    }
                     // Remember this paragraph's bottom for the next one's gap.
-                    prev_bottom = Some(paragraphs::paragraph_bottom(&para_lines));
+                    prev_bottom = Some(paragraphs::paragraph_bottom(para_lines));
                     out.push(headings::promote(block, body, heading_levels));
                 }
             }
@@ -1063,6 +1238,48 @@ mod tests {
         assert_eq!(median(&mut v, 0.0), 10.0);
         let mut empty: Vec<f64> = Vec::new();
         assert_eq!(median(&mut empty, 7.0), 7.0);
+    }
+
+    // ── runs_join: inter-word space synthesis threshold (font-size based) ────
+    //
+    // The engine's text bounds are exactly 1.2 × the effective font size
+    // (`text_bounds`: −0.2·fs … +1.0·fs), so a run of size 10 pt carries
+    // `h = 12`. The tests below are phrased in font-size (em) units — the
+    // quantity the threshold is really about.
+
+    #[test]
+    fn a_real_space_gap_is_a_word_boundary() {
+        // fs = 10 → box h = 12. A space glyph advances ~0.25–0.28 em; a
+        // word-positioned PDF (each word its own placement) leaves exactly that
+        // gap between runs. gap = 0.28 × fs = 2.8 must NOT join → a space is
+        // synthesized between the words.
+        assert!(
+            !runs_join(100.0, 102.8, 12.0),
+            "0.28 em gap is a real inter-word space"
+        );
+        // The narrowest common space (Times, 0.25 em) is a boundary too.
+        assert!(
+            !runs_join(100.0, 102.5, 12.0),
+            "0.25 em gap is a real inter-word space"
+        );
+    }
+
+    #[test]
+    fn kerning_and_split_word_butts_join_without_a_space() {
+        // fs = 10 → box h = 12. Intra-word kerning / a multi-font split word
+        // ("ENFANT"+"S") butts at ~0.02–0.05 em. gap = 0.03 × fs = 0.3 → join.
+        assert!(runs_join(100.0, 100.3, 12.0), "0.03 em kerning gap joins");
+        // Negative kerning (glyph overhang, "AV"-style pairs) also joins.
+        assert!(runs_join(100.0, 99.5, 12.0), "negative kerning gap joins");
+        // Exactly butting runs join.
+        assert!(runs_join(100.0, 100.0, 12.0), "gap 0 joins");
+    }
+
+    #[test]
+    fn a_wrapped_run_far_left_is_a_boundary() {
+        // A large negative gap = the run wrapped back to the left margin (a new
+        // visual line inside one baseline-row cluster) → boundary, not a join.
+        assert!(!runs_join(300.0, 100.0, 12.0), "wrap-around never joins");
     }
 
     /// `run` carrying a baseline rotation (degrees CCW), for the #28 helpers.
@@ -1839,6 +2056,58 @@ mod tests {
         );
     }
 
+    /// M1 fix 4: a link annotation whose action is neither `/URI` nor `/GoTo`
+    /// (here a `/GoToR` remote jump) is no longer dropped — it surfaces in
+    /// `page_blocks` as a typed `LinkTarget::Other` carrying the action
+    /// summary (`"GoToR:<file>"`).
+    #[test]
+    fn page_blocks_expose_a_gotor_link_as_other() {
+        use crate::action::{Action, Destination};
+
+        let mut b = PdfBuilder::new();
+        let page = b.add_page(612.0, 792.0);
+        b.text(
+            page,
+            72.0,
+            140.0,
+            12.0,
+            "See the annexe document",
+            StdFont::Helvetica,
+            [0.0; 3],
+        );
+        let mut doc = open(b.finish());
+        doc.add_link(
+            1,
+            [70.0, 637.0, 320.0, 655.0],
+            &Action::GoToR {
+                file: "annexe.pdf".to_string(),
+                dest: Destination::Fit { page: 1 },
+            },
+        )
+        .expect("add GoToR link");
+
+        let blocks = doc.page_blocks(1);
+        let mut found: Option<crate::model::LinkTarget> = None;
+        for bl in &blocks {
+            let para = match &bl.kind {
+                BK::Paragraph(p) => Some(p),
+                BK::Heading(h) => Some(&h.para),
+                _ => None,
+            };
+            let Some(p) = para else { continue };
+            for inl in &p.runs {
+                if let crate::model::Inline::Link { href, .. } = inl {
+                    found = Some(href.clone());
+                }
+            }
+        }
+        assert_eq!(
+            found.expect("the GoToR link is exposed instead of dropped"),
+            crate::model::LinkTarget::Other("GoToR:annexe.pdf".to_string()),
+            "the action summary carries the kind and the remote file"
+        );
+    }
+
     // ── outline folding (#4) ────────────────────────────────────────────────
 
     fn flat(title: &str, level: usize, page: usize) -> FlatOutline {
@@ -1976,6 +2245,129 @@ mod tests {
         )];
         assert!(take_caption_for(&mut blocks, &image_frame).is_none());
         assert_eq!(blocks.len(), 1);
+    }
+
+    // ── V3c fix 2: drawn encadrés become paragraph borders/background ─────────
+
+    /// A rect path (PDF user space), filled and/or stroked.
+    fn rect_path(
+        index: usize,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        fill: Option<[f64; 3]>,
+        stroke: Option<[f64; 3]>,
+    ) -> crate::content::vector::VectorPath {
+        use crate::content::vector::{PathSeg, VectorPath};
+        use crate::content::Bounds;
+        VectorPath {
+            index,
+            bounds: Some(Bounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            }),
+            segments: vec![
+                PathSeg::Move(x, y),
+                PathSeg::Line(x + w, y),
+                PathSeg::Line(x + w, y + h),
+                PathSeg::Line(x, y + h),
+                PathSeg::Close,
+            ],
+            fill,
+            stroke,
+            stroke_width: if stroke.is_some() { 1.0 } else { 0.0 },
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_stroked_encadre_becomes_paragraph_borders_and_is_consumed() {
+        // Two body lines (x 72..~222, y 686..712) framed by a stroked rect a few
+        // points outside the text box. The paragraph must carry four borders and
+        // the rect must NOT survive as a standalone Shape block (no double-draw
+        // — the same hygiene as underline rules).
+        let runs = vec![
+            run("first framed body line here", 72.0, 700.0, 12.0),
+            run("second framed body line too", 72.0, 686.0, 12.0),
+        ];
+        let frame = rect_path(3, 66.0, 682.0, 170.0, 34.0, None, Some([0.0, 0.0, 0.0]));
+
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_page(
+            runs,
+            std::slice::from_ref(&frame),
+            &[],
+            (0.0, 0.0, 612.0, 792.0),
+            &mut ids,
+            &[],
+            None,
+        );
+
+        let para = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BK::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("the framed lines stay a paragraph");
+        assert!(
+            para.style.borders.iter().all(Option::is_some),
+            "four borders recovered, got {:?}",
+            para.style.borders
+        );
+        assert_eq!(
+            count_kind(&blocks, |k| matches!(k, BK::Shape(_))),
+            0,
+            "the claimed frame is consumed, not re-emitted as a Shape"
+        );
+    }
+
+    #[test]
+    fn a_shaded_paragraph_recovers_background_and_unrelated_boxes_survive() {
+        // A gray filled rect hugs the two body lines → background; a second,
+        // far-away filled box is unrelated page furniture and must survive as
+        // a Shape block untouched.
+        let runs = vec![
+            run("first shaded body line here", 72.0, 700.0, 12.0),
+            run("second shaded body line too", 72.0, 686.0, 12.0),
+        ];
+        let shading = rect_path(0, 68.0, 682.0, 172.0, 34.0, Some([0.85, 0.85, 0.85]), None);
+        let furniture = rect_path(1, 400.0, 200.0, 80.0, 60.0, Some([0.2, 0.4, 0.6]), None);
+        let vpaths = [shading, furniture];
+
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_page(
+            runs,
+            &vpaths,
+            &[],
+            (0.0, 0.0, 612.0, 792.0),
+            &mut ids,
+            &[],
+            None,
+        );
+
+        let para = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BK::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("the shaded lines stay a paragraph");
+        assert_eq!(
+            para.style.background,
+            Some([0.85, 0.85, 0.85]),
+            "the hugging fill becomes the paragraph shading"
+        );
+        assert_eq!(
+            count_kind(&blocks, |k| matches!(k, BK::Shape(_))),
+            1,
+            "the unrelated box survives as a Shape; the claimed one is consumed"
+        );
     }
 
     // ── reading-order interleave of shapes (wave R7, objective #3) ────────────

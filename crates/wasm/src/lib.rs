@@ -4505,6 +4505,12 @@ pub extern "C" fn gp_model_to_epub(
 }
 
 /// Export a model (JSON) back to a PDF.
+///
+/// Routed through the rich model→HTML→PDF renderer (full Unicode, run styling,
+/// images, real embedded faces — the bundled families guarantee output with no
+/// host-provided fonts), the same engine every Office→PDF path uses. The
+/// std-14/WinAnsi `pdf_from_model` remains available in-core as the
+/// dependency-free compat fallback.
 #[no_mangle]
 pub extern "C" fn gp_model_to_pdf(
     model_ptr: *const u8,
@@ -4512,7 +4518,7 @@ pub extern "C" fn gp_model_to_pdf(
     out_len: *mut usize,
 ) -> *mut u8 {
     model_export(model_ptr, model_len, out_len, |m| {
-        gigapdf_core::convert::project::pdf_from_model(m)
+        gigapdf_core::convert::project::pdf_from_model_rich(m)
     })
 }
 
@@ -4726,6 +4732,9 @@ pub extern "C" fn gp_html_render_opts(
         footer_offset,
         start_page_number: start_page_number.max(1),
         resources: parse_resources_blob(res_blob),
+        // Browser print behaviour: an author `@page { size; margin }` rule
+        // overrides the host geometry (documents without one are unaffected).
+        honor_page_rule: true,
     };
     let pdf = gigapdf_core::html::render_with(html, &fonts, &opts);
     unsafe { bytes_into_host(pdf, out_len) }

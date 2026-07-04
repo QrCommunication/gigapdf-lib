@@ -334,31 +334,7 @@ pub fn decode_entities(s: &str) -> String {
                     };
                     code.and_then(char::from_u32)
                 } else {
-                    match ent {
-                        "amp" => Some('&'),
-                        "lt" => Some('<'),
-                        "gt" => Some('>'),
-                        "quot" => Some('"'),
-                        "apos" => Some('\''),
-                        "nbsp" => Some('\u{00A0}'),
-                        "copy" => Some('©'),
-                        "reg" => Some('®'),
-                        "trade" => Some('™'),
-                        "mdash" => Some('—'),
-                        "ndash" => Some('–'),
-                        "hellip" => Some('…'),
-                        "laquo" => Some('«'),
-                        "raquo" => Some('»'),
-                        "eacute" => Some('é'),
-                        "egrave" => Some('è'),
-                        "agrave" => Some('à'),
-                        "ccedil" => Some('ç'),
-                        "rsquo" => Some('\u{2019}'),
-                        "lsquo" => Some('\u{2018}'),
-                        "ldquo" => Some('\u{201C}'),
-                        "rdquo" => Some('\u{201D}'),
-                        _ => None,
-                    }
+                    named_entity(ent)
                 };
                 if let Some(c) = decoded {
                     out.push(c);
@@ -376,6 +352,99 @@ pub fn decode_entities(s: &str) -> String {
         }
     }
     out
+}
+
+/// The named character references real documents use: the full HTML4 set
+/// (Latin-1 letters, `latin-extended`, general punctuation, currency, Greek,
+/// letter-like symbols, arrows, mathematical operators, geometric shapes) plus
+/// the handful of HTML5 favourites. Case-sensitive, per the standard (`&Eacute;`
+/// ≠ `&eacute;`). Returns `None` for an unknown name so the caller leaves the
+/// text untouched (lenient recovery).
+#[rustfmt::skip]
+fn named_entity(ent: &str) -> Option<char> {
+    Some(match ent {
+        // ── markup basics ──
+        "amp" => '&', "lt" => '<', "gt" => '>', "quot" => '"', "apos" => '\'',
+        // ── Latin-1 (ISO 8859-1) — &#160; … &#255; ──
+        "nbsp" => '\u{00A0}', "iexcl" => '¡', "cent" => '¢', "pound" => '£',
+        "curren" => '¤', "yen" => '¥', "brvbar" => '¦', "sect" => '§',
+        "uml" => '¨', "copy" => '©', "ordf" => 'ª', "laquo" => '«',
+        "not" => '¬', "shy" => '\u{00AD}', "reg" => '®', "macr" => '¯',
+        "deg" => '°', "plusmn" => '±', "sup2" => '²', "sup3" => '³',
+        "acute" => '´', "micro" => 'µ', "para" => '¶', "middot" => '·',
+        "cedil" => '¸', "sup1" => '¹', "ordm" => 'º', "raquo" => '»',
+        "frac14" => '¼', "frac12" => '½', "frac34" => '¾', "iquest" => '¿',
+        "Agrave" => 'À', "Aacute" => 'Á', "Acirc" => 'Â', "Atilde" => 'Ã',
+        "Auml" => 'Ä', "Aring" => 'Å', "AElig" => 'Æ', "Ccedil" => 'Ç',
+        "Egrave" => 'È', "Eacute" => 'É', "Ecirc" => 'Ê', "Euml" => 'Ë',
+        "Igrave" => 'Ì', "Iacute" => 'Í', "Icirc" => 'Î', "Iuml" => 'Ï',
+        "ETH" => 'Ð', "Ntilde" => 'Ñ', "Ograve" => 'Ò', "Oacute" => 'Ó',
+        "Ocirc" => 'Ô', "Otilde" => 'Õ', "Ouml" => 'Ö', "times" => '×',
+        "Oslash" => 'Ø', "Ugrave" => 'Ù', "Uacute" => 'Ú', "Ucirc" => 'Û',
+        "Uuml" => 'Ü', "Yacute" => 'Ý', "THORN" => 'Þ', "szlig" => 'ß',
+        "agrave" => 'à', "aacute" => 'á', "acirc" => 'â', "atilde" => 'ã',
+        "auml" => 'ä', "aring" => 'å', "aelig" => 'æ', "ccedil" => 'ç',
+        "egrave" => 'è', "eacute" => 'é', "ecirc" => 'ê', "euml" => 'ë',
+        "igrave" => 'ì', "iacute" => 'í', "icirc" => 'î', "iuml" => 'ï',
+        "eth" => 'ð', "ntilde" => 'ñ', "ograve" => 'ò', "oacute" => 'ó',
+        "ocirc" => 'ô', "otilde" => 'õ', "ouml" => 'ö', "divide" => '÷',
+        "oslash" => 'ø', "ugrave" => 'ù', "uacute" => 'ú', "ucirc" => 'û',
+        "uuml" => 'ü', "yacute" => 'ý', "thorn" => 'þ', "yuml" => 'ÿ',
+        // ── Latin extended / ligatures ──
+        "OElig" => 'Œ', "oelig" => 'œ', "Scaron" => 'Š', "scaron" => 'š',
+        "Yuml" => 'Ÿ', "fnof" => 'ƒ', "circ" => 'ˆ', "tilde" => '˜',
+        // ── general punctuation ──
+        "ensp" => '\u{2002}', "emsp" => '\u{2003}', "thinsp" => '\u{2009}',
+        "zwnj" => '\u{200C}', "zwj" => '\u{200D}', "lrm" => '\u{200E}',
+        "rlm" => '\u{200F}', "ndash" => '–', "mdash" => '—', "horbar" => '―',
+        "lsquo" => '\u{2018}', "rsquo" => '\u{2019}', "sbquo" => '\u{201A}',
+        "ldquo" => '\u{201C}', "rdquo" => '\u{201D}', "bdquo" => '\u{201E}',
+        "dagger" => '†', "Dagger" => '‡', "bull" => '•', "hellip" => '…',
+        "permil" => '‰', "prime" => '′', "Prime" => '″', "lsaquo" => '‹',
+        "rsaquo" => '›', "oline" => '‾', "frasl" => '⁄',
+        // ── currency ──
+        "euro" => '€',
+        // ── letter-like symbols ──
+        "weierp" => '℘', "image" => 'ℑ', "real" => 'ℜ', "trade" => '™',
+        "alefsym" => 'ℵ',
+        // ── arrows ──
+        "larr" => '←', "uarr" => '↑', "rarr" => '→', "darr" => '↓',
+        "harr" => '↔', "crarr" => '↵', "lArr" => '⇐', "uArr" => '⇑',
+        "rArr" => '⇒', "dArr" => '⇓', "hArr" => '⇔',
+        // ── Greek ──
+        "Alpha" => 'Α', "Beta" => 'Β', "Gamma" => 'Γ', "Delta" => 'Δ',
+        "Epsilon" => 'Ε', "Zeta" => 'Ζ', "Eta" => 'Η', "Theta" => 'Θ',
+        "Iota" => 'Ι', "Kappa" => 'Κ', "Lambda" => 'Λ', "Mu" => 'Μ',
+        "Nu" => 'Ν', "Xi" => 'Ξ', "Omicron" => 'Ο', "Pi" => 'Π',
+        "Rho" => 'Ρ', "Sigma" => 'Σ', "Tau" => 'Τ', "Upsilon" => 'Υ',
+        "Phi" => 'Φ', "Chi" => 'Χ', "Psi" => 'Ψ', "Omega" => 'Ω',
+        "alpha" => 'α', "beta" => 'β', "gamma" => 'γ', "delta" => 'δ',
+        "epsilon" => 'ε', "zeta" => 'ζ', "eta" => 'η', "theta" => 'θ',
+        "iota" => 'ι', "kappa" => 'κ', "lambda" => 'λ', "mu" => 'μ',
+        "nu" => 'ν', "xi" => 'ξ', "omicron" => 'ο', "pi" => 'π',
+        "rho" => 'ρ', "sigmaf" => 'ς', "sigma" => 'σ', "tau" => 'τ',
+        "upsilon" => 'υ', "phi" => 'φ', "chi" => 'χ', "psi" => 'ψ',
+        "omega" => 'ω', "thetasym" => 'ϑ', "upsih" => 'ϒ', "piv" => 'ϖ',
+        // ── mathematical operators ──
+        "forall" => '∀', "part" => '∂', "exist" => '∃', "empty" => '∅',
+        "nabla" => '∇', "isin" => '∈', "notin" => '∉', "ni" => '∋',
+        "prod" => '∏', "sum" => '∑', "minus" => '−', "lowast" => '∗',
+        "radic" => '√', "prop" => '∝', "infin" => '∞', "ang" => '∠',
+        "and" => '∧', "or" => '∨', "cap" => '∩', "cup" => '∪',
+        "int" => '∫', "there4" => '∴', "sim" => '∼', "cong" => '≅',
+        "asymp" => '≈', "ne" => '≠', "equiv" => '≡', "le" => '≤',
+        "ge" => '≥', "sub" => '⊂', "sup" => '⊃', "nsub" => '⊄',
+        "sube" => '⊆', "supe" => '⊇', "oplus" => '⊕', "otimes" => '⊗',
+        "perp" => '⊥', "sdot" => '⋅',
+        // ── technical / shapes / cards ──
+        "lceil" => '⌈', "rceil" => '⌉', "lfloor" => '⌊', "rfloor" => '⌋',
+        "lang" => '〈', "rang" => '〉', "loz" => '◊', "spades" => '♠',
+        "clubs" => '♣', "hearts" => '♥', "diams" => '♦',
+        // ── HTML5 conveniences seen in the wild ──
+        "check" => '✓', "cross" => '✗', "starf" => '★', "star" => '☆',
+        "phone" => '☎', "female" => '♀', "male" => '♂',
+        _ => return None,
+    })
 }
 
 fn utf8_len(b: u8) -> usize {
@@ -449,6 +518,38 @@ mod tests {
         let style = first_element(&nodes);
         assert_eq!(style.tag, "style");
         assert!(matches!(&style.children[0], Node::Text(t) if t.contains("color: red")));
+    }
+
+    /// The extended named-entity table: currency, symbols, punctuation and
+    /// non-breaking spaces all decode instead of leaking `&name;` literally.
+    #[test]
+    fn decodes_extended_named_entities() {
+        for (src, want) in [
+            ("&euro;", "€"),
+            ("&deg;", "°"),
+            ("&hellip;", "…"),
+            ("&mdash;", "—"),
+            ("&laquo;x&raquo;", "«x»"),
+            ("&nbsp;", "\u{00A0}"),
+            ("&ensp;", "\u{2002}"),
+            ("&thinsp;", "\u{2009}"),
+            ("&Eacute;", "É"),
+            ("&alpha;&Omega;", "αΩ"),
+            ("&rarr;", "→"),
+            ("&ne;", "≠"),
+            ("&frac12;", "½"),
+            ("&bull;", "•"),
+            ("&sect;", "§"),
+            ("&middot;", "·"),
+            ("&trade;", "™"),
+            ("&oelig;", "œ"),
+        ] {
+            assert_eq!(decode_entities(src), want, "entity {src}");
+        }
+        // Unknown names still pass through untouched (lenient recovery).
+        assert_eq!(decode_entities("&notarealentity;"), "&notarealentity;");
+        // Case matters: &Eacute; ≠ &eacute;.
+        assert_eq!(decode_entities("&eacute;"), "é");
     }
 
     #[test]

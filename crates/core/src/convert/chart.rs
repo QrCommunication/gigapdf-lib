@@ -120,6 +120,54 @@ enum Grouping {
     PercentStacked,
 }
 
+/// Which pieces a data label shows (`c:showVal` & friends inside a
+/// `c:dLbls` group or a per-point `c:dLbl`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LabelFlags {
+    /// `c:showVal` — the point's numeric value.
+    show_val: bool,
+    /// `c:showCatName` — the point's category text.
+    show_cat_name: bool,
+    /// `c:showSerName` — the series display name.
+    show_ser_name: bool,
+    /// `c:showPercent` — the point's share of the series total (pies).
+    show_percent: bool,
+}
+
+impl LabelFlags {
+    /// Whether anything at all is shown.
+    fn any(self) -> bool {
+        self.show_val || self.show_cat_name || self.show_ser_name || self.show_percent
+    }
+}
+
+/// One per-point `c:dLbl` override inside a `c:dLbls` group.
+#[derive(Debug, Clone, Default)]
+struct PointLabel {
+    /// `c:delete val="1"` — this point's label is suppressed.
+    deleted: bool,
+    /// Point-level show flags; only meaningful when [`Self::has_flags`].
+    flags: LabelFlags,
+    /// Whether the `c:dLbl` stated its own show flags (else the group's apply).
+    has_flags: bool,
+    /// Point-level `c:numFmt@formatCode`, if any.
+    format: Option<String>,
+}
+
+/// Data-label settings from one `c:dLbls` group (series- or chart-group-level).
+/// Absent `c:dLbls` ⇒ **no** labels, matching Office's default.
+#[derive(Debug, Clone, Default)]
+struct DataLabels {
+    /// Group-level `c:delete val="1"` — labels explicitly off for the group.
+    deleted: bool,
+    /// Group-level show flags (the default for every point).
+    flags: LabelFlags,
+    /// Group-level `c:numFmt@formatCode`, if any.
+    format: Option<String>,
+    /// Per-point `c:dLbl` overrides keyed by their `c:idx@val`.
+    points: std::collections::BTreeMap<usize, PointLabel>,
+}
+
 /// One data series.
 #[derive(Debug, Clone, Default)]
 struct Series {
@@ -131,6 +179,8 @@ struct Series {
     values: Vec<f64>,
     /// X numbers for a scatter series (`c:xVal`); empty for non-scatter.
     x_values: Vec<f64>,
+    /// The series' own `c:dLbls` data-label settings, if present.
+    labels: Option<DataLabels>,
 }
 
 /// The fully-parsed chart.
@@ -149,6 +199,8 @@ struct Chart {
     cat_axis_title: String,
     /// Value-axis title text, if any.
     val_axis_title: String,
+    /// Chart-group-level `c:dLbls` (the default for series without their own).
+    default_labels: Option<DataLabels>,
 }
 
 impl Chart {
@@ -181,6 +233,35 @@ impl Chart {
             .map(|s| s.values.len())
             .max()
             .unwrap_or(0)
+    }
+
+    /// The effective data-label settings for point `idx` of series `si`: the
+    /// series' own `c:dLbls` (falling back to the chart-group default), then
+    /// any matching per-point `c:dLbl` override. `None` ⇒ no label for that
+    /// point — which is also the Office default when no `c:dLbls` exists.
+    fn point_label(&self, si: usize, idx: usize) -> Option<(LabelFlags, Option<&str>)> {
+        let base = self
+            .series
+            .get(si)
+            .and_then(|s| s.labels.as_ref())
+            .or(self.default_labels.as_ref())?;
+        if base.deleted {
+            return None;
+        }
+        let mut flags = base.flags;
+        let mut format = base.format.as_deref();
+        if let Some(p) = base.points.get(&idx) {
+            if p.deleted {
+                return None;
+            }
+            if p.has_flags {
+                flags = p.flags;
+            }
+            if let Some(f) = p.format.as_deref() {
+                format = Some(f);
+            }
+        }
+        flags.any().then_some((flags, format))
     }
 }
 
@@ -500,6 +581,14 @@ fn parse_chart_xml(xml: &str) -> Chart {
     // Number of strRef/numRef nesting for the current field (so a stray `c:v`
     // outside cat/val isn't captured).
 
+    // Data-label (`c:dLbls`) accumulation: the group being read, plus a
+    // per-point `c:dLbl` override in progress inside it.
+    let mut in_dlbls = false;
+    let mut dlbls = DataLabels::default();
+    let mut in_dlbl = false;
+    let mut dlbl = PointLabel::default();
+    let mut dlbl_idx: Option<usize> = None;
+
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
@@ -575,7 +664,9 @@ fn parse_chart_xml(xml: &str) -> Chart {
                         in_ser = true;
                         ser = Series::default();
                     }
-                    "tx" if in_ser => field = Field::SerTx,
+                    // A `c:dLbl/c:tx` holds custom rich label text, not the
+                    // series name — keep the SerTx capture out of `c:dLbls`.
+                    "tx" if in_ser && !in_dlbls => field = Field::SerTx,
                     "cat" if in_ser => field = Field::Cat,
                     "val" if in_ser => field = Field::Val,
                     "xVal" if in_ser => field = Field::XVal,
@@ -583,6 +674,53 @@ fn parse_chart_xml(xml: &str) -> Chart {
                     "v" if !sc => {
                         depth_in_v = true;
                         v_buf.clear();
+                    }
+                    // Data labels: a `c:dLbls` group (series- or chart-level)
+                    // and its per-point `c:dLbl` overrides.
+                    "dLbls" if !sc => {
+                        in_dlbls = true;
+                        dlbls = DataLabels::default();
+                    }
+                    "dLbl" if in_dlbls && !sc => {
+                        in_dlbl = true;
+                        dlbl = PointLabel::default();
+                        dlbl_idx = None;
+                    }
+                    "idx" if in_dlbl => {
+                        dlbl_idx = attr(&attrs, "val").and_then(|v| v.parse::<usize>().ok());
+                    }
+                    "delete" if in_dlbls => {
+                        let on = xml_bool(attr(&attrs, "val"));
+                        if in_dlbl {
+                            dlbl.deleted = on;
+                        } else {
+                            dlbls.deleted = on;
+                        }
+                    }
+                    "showVal" | "showCatName" | "showSerName" | "showPercent" if in_dlbls => {
+                        let on = xml_bool(attr(&attrs, "val"));
+                        let flags = if in_dlbl {
+                            dlbl.has_flags = true;
+                            &mut dlbl.flags
+                        } else {
+                            &mut dlbls.flags
+                        };
+                        match ln {
+                            "showVal" => flags.show_val = on,
+                            "showCatName" => flags.show_cat_name = on,
+                            "showSerName" => flags.show_ser_name = on,
+                            _ => flags.show_percent = on,
+                        }
+                    }
+                    "numFmt" if in_dlbls => {
+                        if let Some(f) = attr(&attrs, "formatCode") {
+                            let f = Some(f.to_string());
+                            if in_dlbl {
+                                dlbl.format = f;
+                            } else {
+                                dlbls.format = f;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -617,8 +755,30 @@ fn parse_chart_xml(xml: &str) -> Chart {
                         }
                     }
                     "tx" | "cat" | "val" | "xVal" | "yVal" => field = Field::None,
+                    "dLbl" if in_dlbl => {
+                        in_dlbl = false;
+                        if let Some(i) = dlbl_idx.take() {
+                            dlbls.points.insert(i, std::mem::take(&mut dlbl));
+                        }
+                    }
+                    "dLbls" if in_dlbls => {
+                        in_dlbls = false;
+                        in_dlbl = false;
+                        let d = std::mem::take(&mut dlbls);
+                        if in_ser {
+                            ser.labels = Some(d);
+                        } else if chart.default_labels.is_none() {
+                            // A chart-group `c:dLbls` (sibling of the `c:ser`s):
+                            // the default for series without their own group.
+                            chart.default_labels = Some(d);
+                        }
+                    }
                     "ser" => {
                         in_ser = false;
+                        // Tolerance: an unclosed `c:dLbls` must not leak into
+                        // the next series.
+                        in_dlbls = false;
+                        in_dlbl = false;
                         chart.series.push(std::mem::take(&mut ser));
                     }
                     "catAx" => axis_scope = TitleScope::None,
@@ -746,6 +906,75 @@ fn fmt_num(v: f64) -> String {
     s
 }
 
+/// An OOXML boolean attribute: absent ⇒ `true` (the CT_Boolean default),
+/// otherwise `"1"` / `"true"`.
+fn xml_bool(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => s == "1" || s.eq_ignore_ascii_case("true"),
+    }
+}
+
+/// Format `v` following a **simple** spreadsheet `formatCode`: the common
+/// numeric shapes — `0`, `0.0`, `#,##0`, `#,##0.00`, `0%`, `0.0%`, … — i.e.
+/// codes built solely from `0 # , . %` (and spaces). A `%` code scales by 100
+/// and appends the sign; `,` before a digit groups thousands. Anything fancier
+/// (dates, currencies, colours, conditions) falls back to the compact default
+/// [`fmt_num`] rather than printing something wrong.
+fn fmt_with_code(v: f64, code: Option<&str>) -> String {
+    let Some(code) = code.map(str::trim).filter(|c| !c.is_empty()) else {
+        return fmt_num(v);
+    };
+    if code.eq_ignore_ascii_case("general") {
+        return fmt_num(v);
+    }
+    // Only the positive section of a `pos;neg;zero` code is interpreted.
+    let sect = code.split(';').next().unwrap_or(code).trim();
+    if sect.is_empty()
+        || !sect
+            .bytes()
+            .all(|b| matches!(b, b'0' | b'#' | b',' | b'.' | b'%' | b' '))
+    {
+        return fmt_num(v);
+    }
+    let percent = sect.contains('%');
+    let decimals = match sect.find('.') {
+        Some(dot) => sect[dot + 1..]
+            .bytes()
+            .take_while(|b| matches!(b, b'0' | b'#'))
+            .count(),
+        None => 0,
+    };
+    let grouped = sect.contains(",#") || sect.contains(",0");
+    let scaled = if percent { v * 100.0 } else { v };
+    let mut s = format!("{scaled:.decimals$}");
+    if grouped {
+        let neg = s.starts_with('-');
+        let body = if neg { &s[1..] } else { s.as_str() };
+        let (int_part, frac_part) = match body.find('.') {
+            Some(d) => (&body[..d], &body[d..]),
+            None => (body, ""),
+        };
+        let mut out = String::with_capacity(s.len() + int_part.len() / 3 + 1);
+        if neg {
+            out.push('-');
+        }
+        let digits = int_part.as_bytes();
+        for (i, b) in digits.iter().enumerate() {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(*b as char);
+        }
+        out.push_str(frac_part);
+        s = out;
+    }
+    if percent {
+        s.push('%');
+    }
+    s
+}
+
 // ─────────────────────────── shape & text block helpers ───────────────────────
 
 /// A `Shape` block spanning the chart canvas, with `segments` in canvas-local
@@ -763,7 +992,7 @@ fn shape_block(
             fill,
             stroke,
             stroke_width,
-            dash: Vec::new(),
+            ..Default::default()
         }),
         ..Block::default()
     }
@@ -827,6 +1056,89 @@ fn label_block(text: &str, x: f64, y_top: f64, w: f64, size_pt: f64, align: Alig
     }
 }
 
+/// Font size (points) of the per-point data-value labels (`c:dLbls`) — a step
+/// smaller than the 8 pt axis/legend text, as Office draws them.
+const DATA_LABEL_SIZE: f64 = 7.0;
+
+/// The finished label text for point `ci` of series `si` (raw value `v`), or
+/// `None` when the chart's `c:dLbls` settings show nothing there. Parts join
+/// Office-style — series name, category name, value, percentage — with `", "`.
+/// The percentage is the point's share of the series' positive total (the pie
+/// convention), formatted by the label's `numFmt` when that is a `%` code,
+/// else as a rounded integer + `%`.
+fn data_label(chart: &Chart, si: usize, ci: usize, v: f64, cats: &[String]) -> Option<String> {
+    let (flags, format) = chart.point_label(si, ci)?;
+    let mut parts: Vec<String> = Vec::new();
+    if flags.show_ser_name {
+        if let Some(s) = chart.series.get(si) {
+            parts.push(if s.name.is_empty() {
+                format!("Series {}", si + 1)
+            } else {
+                s.name.clone()
+            });
+        }
+    }
+    if flags.show_cat_name {
+        if let Some(c) = cats.get(ci) {
+            parts.push(c.clone());
+        }
+    }
+    if flags.show_val {
+        parts.push(fmt_with_code(v, format));
+    }
+    if flags.show_percent {
+        let total: f64 = chart
+            .series
+            .get(si)
+            .map(|s| s.values.iter().map(|x| x.max(0.0)).sum())
+            .unwrap_or(0.0);
+        if total > 0.0 {
+            let frac = v.max(0.0) / total;
+            parts.push(match format {
+                Some(code) if code.contains('%') => fmt_with_code(frac, Some(code)),
+                _ => format!("{}%", (frac * 100.0).round() as i64),
+            });
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Push one data label at `(x, y_top, w)` (top-left / Y-down canvas frame),
+/// **nudging it upward** when it would overlap an already-placed label of this
+/// chart by more than half a label height. A best-effort de-collision only —
+/// labels hop above the blocker, never sideways, and give up after a few hops
+/// (no full avoidance engine).
+fn push_data_label(
+    out: &mut Vec<Block>,
+    placed: &mut Vec<Rect>,
+    text: &str,
+    x: f64,
+    mut y_top: f64,
+    w: f64,
+    align: Align,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let h = DATA_LABEL_SIZE * 1.4;
+    for _ in 0..8 {
+        let mut moved = false;
+        for r in placed.iter() {
+            let ox = (x + w).min(r.x + r.w) - x.max(r.x);
+            let oy = (y_top + h).min(r.y + r.h) - y_top.max(r.y);
+            if ox > 0.0 && oy > h.min(r.h) * 0.5 {
+                y_top = r.y - h; // hop just above the blocker
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    placed.push(Rect::new(x, y_top, w, h));
+    out.push(label_block(text, x, y_top, w, DATA_LABEL_SIZE, align));
+}
+
 /// Wrap a [`Table`] in a block.
 fn table_block(table: Table) -> Block {
     Block {
@@ -854,9 +1166,36 @@ const GLYPH_ADVANCE: f64 = 0.62;
 /// Extra gap between glyph cells, as a fraction of the cap height.
 const GLYPH_GAP: f64 = 0.16;
 
-/// Strokes for a character (uppercased). Unknown ⇒ an empty glyph (blank cell).
+/// Fold a character to the nearest glyph the stroke font can draw: Latin
+/// diacritics collapse onto their base letter (`é`→`E`, `ç`→`C`, `ü`→`U`, …)
+/// and typographic dashes / quotes onto their ASCII kin, so a French/German/
+/// Spanish axis title renders every letter instead of leaving holes. Characters
+/// with no fold pass through unchanged.
+fn fold_glyph_char(c: char) -> char {
+    match c {
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'A',
+        'Æ' | 'æ' => 'A',
+        'Ç' | 'ç' => 'C',
+        'È' | 'É' | 'Ê' | 'Ë' | 'è' | 'é' | 'ê' | 'ë' => 'E',
+        'Ì' | 'Í' | 'Î' | 'Ï' | 'ì' | 'í' | 'î' | 'ï' => 'I',
+        'Ñ' | 'ñ' => 'N',
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => 'O',
+        'Œ' | 'œ' => 'O',
+        'Ù' | 'Ú' | 'Û' | 'Ü' | 'ù' | 'ú' | 'û' | 'ü' => 'U',
+        'Ý' | 'ý' | 'ÿ' => 'Y',
+        'Š' | 'š' => 'S',
+        'Ž' | 'ž' => 'Z',
+        // Dashes (en/em/minus) → hyphen; curly quotes / backtick → apostrophe.
+        '–' | '—' | '−' => '-',
+        '’' | '‘' | '`' => '\'',
+        other => other,
+    }
+}
+
+/// Strokes for a character (diacritic-folded, then uppercased). Unknown ⇒ an
+/// empty glyph (blank cell).
 fn glyph(c: char) -> Glyph {
-    match c.to_ascii_uppercase() {
+    match fold_glyph_char(c).to_ascii_uppercase() {
         'A' => &[
             &[(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
             &[(0.18, 0.36), (0.82, 0.36)],
@@ -1044,6 +1383,41 @@ fn glyph(c: char) -> Glyph {
                 (0.1, 0.85),
             ],
             &[(0.7, 0.0), (0.9, 0.0), (0.9, 0.15), (0.7, 0.15), (0.7, 0.0)],
+        ],
+        ':' => &[
+            &[
+                (0.4, 0.1),
+                (0.55, 0.1),
+                (0.55, 0.22),
+                (0.4, 0.22),
+                (0.4, 0.1),
+            ],
+            &[
+                (0.4, 0.62),
+                (0.55, 0.62),
+                (0.55, 0.74),
+                (0.4, 0.74),
+                (0.4, 0.62),
+            ],
+        ],
+        '\'' => &[&[(0.5, 1.0), (0.42, 0.78)]],
+        '+' => &[&[(0.5, 0.22), (0.5, 0.78)], &[(0.22, 0.5), (0.78, 0.5)]],
+        '&' => &[&[
+            (1.0, 0.0),
+            (0.25, 0.72),
+            (0.3, 0.94),
+            (0.5, 1.0),
+            (0.68, 0.86),
+            (0.12, 0.34),
+            (0.16, 0.08),
+            (0.5, 0.0),
+            (0.92, 0.38),
+        ]],
+        // The euro sign: the 'C' curve of the stroke font plus two cross-bars.
+        '€' => &[
+            &[(1.0, 0.85), (0.5, 1.0), (0.0, 0.5), (0.5, 0.0), (1.0, 0.15)],
+            &[(0.0, 0.62), (0.7, 0.62)],
+            &[(0.0, 0.38), (0.7, 0.38)],
         ],
         _ => &[],
     }
@@ -1241,6 +1615,8 @@ fn render_bars(chart: &Chart, out: &mut Vec<Block>, horizontal: bool) {
     let n_ser = chart.series.len().max(1);
     let stacked = matches!(chart.grouping, Grouping::Stacked | Grouping::PercentStacked);
     let percent = matches!(chart.grouping, Grouping::PercentStacked);
+    // Data labels placed so far (for the best-effort overlap nudge).
+    let mut placed: Vec<Rect> = Vec::new();
 
     if horizontal {
         // Horizontal bars: value runs along X, categories down Y.
@@ -1317,6 +1693,18 @@ fn render_bars(chart: &Chart, out: &mut Vec<Block>, horizontal: bool) {
                         Some([1.0, 1.0, 1.0]),
                         0.5,
                     ));
+                    // Segment label centred inside the stacked segment.
+                    if let Some(text) = data_label(chart, si, c, raw, &cats) {
+                        push_data_label(
+                            out,
+                            &mut placed,
+                            &text,
+                            (x_from + x_to) / 2.0 - 20.0,
+                            CHART_H - cy_up - DATA_LABEL_SIZE * 0.7,
+                            40.0,
+                            Align::Center,
+                        );
+                    }
                     acc += v;
                 }
             } else {
@@ -1337,6 +1725,34 @@ fn render_bars(chart: &Chart, out: &mut Vec<Block>, horizontal: bool) {
                         None,
                         0.0,
                     ));
+                    // Value label just past the bar's free end (right of a
+                    // positive bar, left of a negative one), on the bar's row.
+                    if let Some(text) = data_label(chart, si, c, v, &cats) {
+                        let y_top = CHART_H - (by + bar_h * 0.45) - DATA_LABEL_SIZE * 0.7;
+                        // Clamp inside the canvas: a full-width bar's label
+                        // falls back to sitting over the bar end (inside-end).
+                        if v >= 0.0 {
+                            push_data_label(
+                                out,
+                                &mut placed,
+                                &text,
+                                (x_to + 3.0).min(CHART_W - 48.0),
+                                y_top,
+                                46.0,
+                                Align::Left,
+                            );
+                        } else {
+                            push_data_label(
+                                out,
+                                &mut placed,
+                                &text,
+                                (x_to - 49.0).max(2.0),
+                                y_top,
+                                46.0,
+                                Align::Right,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1378,6 +1794,18 @@ fn render_bars(chart: &Chart, out: &mut Vec<Block>, horizontal: bool) {
                         Some([1.0, 1.0, 1.0]),
                         0.5,
                     ));
+                    // Segment label centred inside the stacked segment.
+                    if let Some(text) = data_label(chart, si, c, raw, &cats) {
+                        push_data_label(
+                            out,
+                            &mut placed,
+                            &text,
+                            bx + bw / 2.0 - 20.0,
+                            CHART_H - (y_from + y_to) / 2.0 - DATA_LABEL_SIZE * 0.7,
+                            40.0,
+                            Align::Center,
+                        );
+                    }
                     acc += v;
                 }
             } else {
@@ -1398,6 +1826,24 @@ fn render_bars(chart: &Chart, out: &mut Vec<Block>, horizontal: bool) {
                         None,
                         0.0,
                     ));
+                    // Value label just past the column's free end (above a
+                    // positive column, below a negative one), centred on it.
+                    if let Some(text) = data_label(chart, si, c, v, &cats) {
+                        let y_top = if v >= 0.0 {
+                            CHART_H - y_to - 2.0 - DATA_LABEL_SIZE * 1.4
+                        } else {
+                            CHART_H - y_to + 2.0
+                        };
+                        push_data_label(
+                            out,
+                            &mut placed,
+                            &text,
+                            bx + bar_w * 0.45 - 20.0,
+                            y_top,
+                            40.0,
+                            Align::Center,
+                        );
+                    }
                 }
             }
         }
@@ -1422,6 +1868,8 @@ fn render_line_or_area(chart: &Chart, out: &mut Vec<Block>, area: bool) {
     let baseline = draw_value_axis(chart, out, lo, hi);
     draw_category_labels(&cats, out);
     draw_cat_axis_title(chart, out, false);
+    // Data labels placed so far (for the best-effort overlap nudge).
+    let mut placed: Vec<Rect> = Vec::new();
 
     let n_cat = chart.cat_count().max(1);
     // Point at the centre of each category slot.
@@ -1466,6 +1914,20 @@ fn render_line_or_area(chart: &Chart, out: &mut Vec<Block>, area: bool) {
         // Point markers.
         for &(x, y) in &pts {
             out.push(marker_shape(x, y, 2.0, color));
+        }
+        // Data-value labels just above the points.
+        for (i, (&(x, y), &v)) in pts.iter().zip(&s.values).enumerate() {
+            if let Some(text) = data_label(chart, si, i, v, &cats) {
+                push_data_label(
+                    out,
+                    &mut placed,
+                    &text,
+                    x - 20.0,
+                    CHART_H - y - 4.0 - DATA_LABEL_SIZE * 1.4,
+                    40.0,
+                    Align::Center,
+                );
+            }
         }
     }
 
@@ -1679,7 +2141,15 @@ fn render_pie(chart: &Chart, out: &mut Vec<Block>) {
     let radius = w.min(h) / 2.0 * 0.9;
     let inner = radius * chart.inner_fraction;
 
+    // Slice names (data labels + legend): the categories, or 1..n fallbacks.
+    let cats: Vec<String> = if !series.categories.is_empty() {
+        series.categories.clone()
+    } else {
+        (1..=series.values.len()).map(|i| i.to_string()).collect()
+    };
+
     // Wedges sweep clockwise from the top (12 o'clock), as Office draws them.
+    let mut placed: Vec<Rect> = Vec::new();
     let mut a0 = std::f64::consts::FRAC_PI_2;
     for (i, &v) in series.values.iter().enumerate() {
         let frac = v.max(0.0) / total;
@@ -1694,6 +2164,27 @@ fn render_pie(chart: &Chart, out: &mut Vec<Block>) {
             Some([1.0, 1.0, 1.0]),
             0.75,
         ));
+        // Data label at the middle of the wedge's arc: ~0.7 of the radius for
+        // a solid pie, the ring's midpoint for a doughnut.
+        if let Some(text) = data_label(chart, 0, i, v, &cats) {
+            let am = (a0 + a1) / 2.0;
+            let lr = if inner > 0.0 {
+                (inner + radius) / 2.0
+            } else {
+                radius * 0.7
+            };
+            let lx = cx + lr * am.cos();
+            let ly = cy + lr * am.sin();
+            push_data_label(
+                out,
+                &mut placed,
+                &text,
+                lx - 30.0,
+                CHART_H - ly - DATA_LABEL_SIZE * 0.7,
+                60.0,
+                Align::Center,
+            );
+        }
         a0 = a1;
     }
 
@@ -1715,11 +2206,6 @@ fn render_pie(chart: &Chart, out: &mut Vec<Block>) {
     }
 
     // Pie legend lists the categories (each is a slice).
-    let cats = if !series.categories.is_empty() {
-        series.categories.clone()
-    } else {
-        (1..=series.values.len()).map(|i| i.to_string()).collect()
-    };
     draw_legend_items(&cats, out, series_color);
 }
 
@@ -2262,7 +2748,7 @@ fn smartart_drawing_shapes(xml: &str, out: &mut Vec<Block>) {
                     fill: *fill,
                     stroke: *stroke,
                     stroke_width: if stroke.is_some() { 1.0 } else { 0.0 },
-                    dash: Vec::new(),
+                    ..Default::default()
                 }),
                 ..Block::default()
             });
@@ -2811,6 +3297,61 @@ mod tests {
         );
     }
 
+    // Audit fix — the stroke font covers accented French/German/Spanish letters
+    // (folded to their base glyph) and common punctuation, so a localized axis
+    // title renders every character instead of leaving holes.
+    #[test]
+    fn stroke_font_covers_accented_letters_and_common_punctuation() {
+        // Every non-space character of a typical French title maps to strokes.
+        for c in "Ventes (€) — Année".chars().filter(|c| !c.is_whitespace()) {
+            assert!(
+                !glyph(c).is_empty(),
+                "glyph for {c:?} must not be a hole in the title"
+            );
+        }
+        // Diacritics fold onto their base letter: same strokes as the plain one.
+        assert_eq!(glyph('é'), glyph('E'));
+        assert_eq!(glyph('ç'), glyph('C'));
+        assert_eq!(glyph('ü'), glyph('U'));
+        assert_eq!(glyph('à'), glyph('a'));
+        // New punctuation glyphs draw; the em-dash folds to the hyphen.
+        for c in [':', '&', '\'', '+', '€'] {
+            assert!(!glyph(c).is_empty(), "punctuation {c:?} must draw");
+        }
+        assert_eq!(glyph('—'), glyph('-'));
+        assert_eq!(glyph('’'), glyph('\''));
+        // A genuinely uncovered character still advances as a blank cell.
+        assert!(glyph('日').is_empty());
+    }
+
+    // Audit fix — a localized title becomes ONE text path whose glyph strokes
+    // cover every character (one `Move` per stroke, no skipped/blank letters).
+    #[test]
+    fn localized_text_path_has_no_holes() {
+        let text = "Ventes (€) — Année";
+        let block =
+            text_path_shape(text, 0.0, 0.0, 8.0, 0.0, [0.0, 0.0, 0.0]).expect("a drawable path");
+        let BlockKind::Shape(shape) = &block.kind else {
+            panic!("text path is a shape block");
+        };
+        let moves = shape
+            .segments
+            .iter()
+            .filter(|s| matches!(s, PathSeg::Move(..)))
+            .count();
+        let expected: usize = text
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| glyph(c).len())
+            .sum();
+        assert_eq!(
+            moves, expected,
+            "every character's strokes are drawn (one Move per stroke)"
+        );
+        // Sanity: strictly more strokes than characters (no degenerate output).
+        assert!(expected > text.chars().filter(|c| !c.is_whitespace()).count());
+    }
+
     // #110 — the category-axis title is placed in BOTH bar and column paths: a
     // horizontal label below a column chart, a rotated text path beside a bar.
     #[test]
@@ -3012,6 +3553,281 @@ mod tests {
             rows.len() >= 2,
             "legend with 12 series should wrap onto ≥2 rows, got {} distinct row(s)",
             rows.len(),
+        );
+    }
+
+    // ── C5 — data labels (`c:dLbls`) ─────────────────────────────────────────
+
+    /// The data-value labels only — the [`DATA_LABEL_SIZE`]-pt paragraphs —
+    /// as `(text, frame)` in document order. Axis ticks / category / legend
+    /// text is 8 pt, so the size is the discriminator.
+    fn data_labels(blocks: &[Block]) -> Vec<(String, Rect)> {
+        blocks
+            .iter()
+            .filter_map(|b| match (&b.kind, b.frame) {
+                (BlockKind::Paragraph(p), Some(f)) => {
+                    let is_data = p.runs.iter().any(|r| {
+                        matches!(r, Inline::Run(ir)
+                            if (ir.style.size_pt - DATA_LABEL_SIZE).abs() < 1e-9)
+                    });
+                    is_data.then(|| {
+                        let mut s = String::new();
+                        for run in &p.runs {
+                            if let Inline::Run(r) = run {
+                                s.push_str(&r.text);
+                            }
+                        }
+                        (s, f)
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The frame of the data label whose text is exactly `text` (panics with a
+    /// message when absent).
+    fn data_label_frame(blocks: &[Block], text: &str) -> Rect {
+        data_labels(blocks)
+            .into_iter()
+            .find(|(t, _)| t == text)
+            .unwrap_or_else(|| panic!("expected a data label {text:?}"))
+            .1
+    }
+
+    const BAR_CHART_SHOWVAL: &str = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart><c:plotArea>
+    <c:barChart>
+      <c:barDir val="col"/>
+      <c:ser>
+        <c:dLbls><c:showVal val="1"/></c:dLbls>
+        <c:cat><c:strRef><c:strCache>
+          <c:pt idx="0"><c:v>Q1</c:v></c:pt>
+          <c:pt idx="1"><c:v>Q2</c:v></c:pt>
+          <c:pt idx="2"><c:v>Q3</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache>
+          <c:pt idx="0"><c:v>10</c:v></c:pt>
+          <c:pt idx="1"><c:v>25</c:v></c:pt>
+          <c:pt idx="2"><c:v>17</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:barChart>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+
+    // C5 — `c:showVal` puts one real-text label per column, sitting above the
+    // column's top (taller column ⇒ higher label), left-to-right in category
+    // order.
+    #[test]
+    fn bar_show_val_places_a_label_above_each_column() {
+        let blocks = parse_chart(BAR_CHART_SHOWVAL);
+        let labels = data_labels(&blocks);
+        let texts: Vec<&str> = labels.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(texts, vec!["10", "25", "17"], "one label per bar, in order");
+
+        let f10 = data_label_frame(&blocks, "10");
+        let f25 = data_label_frame(&blocks, "25");
+        let f17 = data_label_frame(&blocks, "17");
+        // The tallest column's label is the highest on the page (smallest y).
+        assert!(f25.y < f10.y, "label of 25 above label of 10");
+        assert!(f25.y < f17.y, "label of 25 above label of 17");
+        // Labels follow the category slots left to right.
+        assert!(f10.x < f25.x && f25.x < f17.x, "labels in slot order");
+        // All labels float above the category baseline (they cap the bars).
+        for (t, f) in &labels {
+            assert!(
+                f.y + f.h < CHART_H - MARGIN_BOTTOM + 1.0,
+                "label {t:?} must sit above the plot baseline",
+            );
+        }
+    }
+
+    // C5 — `c:showPercent` on a pie labels each slice with its integer share
+    // of the series total, placed at the middle of the wedge's arc.
+    #[test]
+    fn pie_show_percent_labels_each_slice_inside_the_pie() {
+        let xml = PIE_CHART.replace(
+            "<c:ser>",
+            "<c:ser><c:dLbls><c:showPercent val=\"1\"/></c:dLbls>",
+        );
+        let blocks = parse_chart(&xml);
+        let labels = data_labels(&blocks);
+        let mut texts: Vec<&str> = labels.iter().map(|(t, _)| t.as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, vec!["20%", "30%", "50%"], "3 + 5 + 2 = shares of 10");
+
+        // Each label's centre lies at the arc middle: inside the pie circle.
+        let (x0, y0, w, h) = plot_rect();
+        let (cx, cy) = (x0 + w / 2.0, y0 + h / 2.0);
+        let radius = w.min(h) / 2.0 * 0.9;
+        for (t, f) in &labels {
+            let lx = f.x + f.w / 2.0;
+            let ly_up = CHART_H - (f.y + f.h / 2.0);
+            let dist = ((lx - cx).powi(2) + (ly_up - cy).powi(2)).sqrt();
+            assert!(
+                dist < radius,
+                "label {t:?} should sit inside the pie (dist {dist:.1} ≥ r {radius:.1})",
+            );
+        }
+    }
+
+    // C5 — a per-point `c:dLbl` with `c:delete` suppresses exactly that
+    // point's label; its neighbours keep theirs.
+    #[test]
+    fn point_dlbl_delete_suppresses_that_label_only() {
+        let xml = BAR_CHART_SHOWVAL.replace(
+            "<c:dLbls><c:showVal val=\"1\"/></c:dLbls>",
+            "<c:dLbls><c:dLbl><c:idx val=\"1\"/><c:delete val=\"1\"/></c:dLbl><c:showVal val=\"1\"/></c:dLbls>",
+        );
+        let blocks = parse_chart(&xml);
+        let texts: Vec<String> = data_labels(&blocks).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            texts,
+            vec!["10", "17"],
+            "the idx=1 point (value 25) is deleted, the others stay",
+        );
+    }
+
+    // C5 — the simple-numeric `formatCode` subset formats values; anything
+    // fancier falls back to the compact default instead of printing garbage.
+    #[test]
+    fn fmt_with_code_handles_simple_codes_and_falls_back() {
+        assert_eq!(fmt_with_code(0.25, Some("0.0%")), "25.0%");
+        assert_eq!(fmt_with_code(0.5, Some("0%")), "50%");
+        assert_eq!(fmt_with_code(1234567.0, Some("#,##0")), "1,234,567");
+        assert_eq!(fmt_with_code(1234.5, Some("#,##0.00")), "1,234.50");
+        assert_eq!(fmt_with_code(3.456, Some("0.00")), "3.46");
+        assert_eq!(fmt_with_code(12.0, Some("General")), "12");
+        // Dates / currencies / conditions → compact fallback.
+        assert_eq!(fmt_with_code(12.5, Some("mm/dd/yy")), "12.5");
+        assert_eq!(fmt_with_code(7.0, None), "7");
+    }
+
+    // C5 — a `c:numFmt` inside `c:dLbls` formats the rendered value labels
+    // (here a percent code on fractional values).
+    #[test]
+    fn numfmt_percent_code_formats_rendered_labels() {
+        let xml = BAR_CHART_SHOWVAL
+            .replace(
+                "<c:dLbls><c:showVal val=\"1\"/></c:dLbls>",
+                "<c:dLbls><c:numFmt formatCode=\"0.0%\" sourceLinked=\"0\"/><c:showVal val=\"1\"/></c:dLbls>",
+            )
+            .replace("<c:v>10</c:v>", "<c:v>0.25</c:v>")
+            .replace("<c:v>25</c:v>", "<c:v>0.5</c:v>")
+            .replace("<c:v>17</c:v>", "<c:v>0.1</c:v>");
+        let blocks = parse_chart(&xml);
+        let texts: Vec<String> = data_labels(&blocks).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts, vec!["25.0%", "50.0%", "10.0%"]);
+    }
+
+    // C5 — non-regression: without any `c:dLbls`, no data labels appear (the
+    // Office default), so the existing chart fixtures render exactly as before.
+    #[test]
+    fn charts_without_dlbls_render_no_data_labels() {
+        assert!(data_labels(&parse_chart(BAR_CHART)).is_empty());
+        assert!(data_labels(&parse_chart(PIE_CHART)).is_empty());
+        assert!(data_labels(&parse_chart(LINE_CHART)).is_empty());
+    }
+
+    // C5 — `c:showCatName` + `c:showVal` join Office-style with ", ".
+    #[test]
+    fn cat_name_and_value_join_with_a_comma() {
+        let xml = BAR_CHART_SHOWVAL.replace(
+            "<c:dLbls><c:showVal val=\"1\"/></c:dLbls>",
+            "<c:dLbls><c:showVal val=\"1\"/><c:showCatName val=\"1\"/></c:dLbls>",
+        );
+        let blocks = parse_chart(&xml);
+        let texts: Vec<String> = data_labels(&blocks).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts, vec!["Q1, 10", "Q2, 25", "Q3, 17"]);
+    }
+
+    // C5 — line-chart labels sit just above their points (higher value ⇒
+    // higher label).
+    #[test]
+    fn line_labels_sit_above_their_points() {
+        let xml = LINE_CHART.replace(
+            "<c:ser>",
+            "<c:ser><c:dLbls><c:showVal val=\"1\"/></c:dLbls>",
+        );
+        let blocks = parse_chart(&xml);
+        let labels = data_labels(&blocks);
+        assert_eq!(labels.len(), 4, "one label per point");
+        let f20 = data_label_frame(&blocks, "20");
+        let f9 = data_label_frame(&blocks, "9");
+        assert!(f20.y < f9.y, "the higher point's label is higher up");
+    }
+
+    // C5 — horizontal bars put the label past the bar's end: a longer bar's
+    // label sits further right (clamped inside the canvas for the longest).
+    #[test]
+    fn horizontal_bar_labels_follow_the_bar_ends() {
+        let xml = BAR_CHART_SHOWVAL.replace(
+            r#"<c:barDir val="col"/>"#,
+            r#"<c:barDir val="bar"/>"#,
+        );
+        let blocks = parse_chart(&xml);
+        let f10 = data_label_frame(&blocks, "10");
+        let f25 = data_label_frame(&blocks, "25");
+        assert!(
+            f25.x > f10.x,
+            "the longer bar's label sits further right ({} ≤ {})",
+            f25.x,
+            f10.x,
+        );
+        for (t, f) in data_labels(&blocks) {
+            assert!(
+                f.x >= 0.0 && f.x + f.w <= CHART_W + 1.0,
+                "label {t:?} stays inside the canvas",
+            );
+        }
+    }
+
+    // C5 — a chart-group-level `c:dLbls` (sibling of the `c:ser`s, as
+    // LibreOffice writes it) applies to series without their own group.
+    #[test]
+    fn chart_group_dlbls_apply_to_series_without_their_own() {
+        let xml = BAR_CHART_SHOWVAL.replace(
+            "<c:dLbls><c:showVal val=\"1\"/></c:dLbls>",
+            "",
+        );
+        let xml = xml.replace(
+            "</c:ser>",
+            "</c:ser><c:dLbls><c:showVal val=\"1\"/></c:dLbls>",
+        );
+        let blocks = parse_chart(&xml);
+        let texts: Vec<String> = data_labels(&blocks).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts, vec!["10", "25", "17"], "group defaults reach the series");
+    }
+
+    // C5 — two labels landing on the same spot nudge apart vertically (the
+    // best-effort de-collision), so both stay legible.
+    #[test]
+    fn coincident_labels_nudge_apart_vertically() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart><c:plotArea>
+    <c:lineChart>
+      <c:ser>
+        <c:dLbls><c:showVal val="1"/></c:dLbls>
+        <c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>A</c:v></c:pt></c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt></c:numCache></c:numRef></c:val>
+      </c:ser>
+      <c:ser>
+        <c:dLbls><c:showVal val="1"/></c:dLbls>
+        <c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>A</c:v></c:pt></c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt></c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:lineChart>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let blocks = parse_chart(xml);
+        let labels = data_labels(&blocks);
+        assert_eq!(labels.len(), 2, "both series keep their label");
+        assert_eq!(labels[0].0, "10");
+        assert_eq!(labels[1].0, "10");
+        assert!(
+            (labels[0].1.y - labels[1].1.y).abs() > 1.0,
+            "coincident labels must not stack on the same y",
         );
     }
 }

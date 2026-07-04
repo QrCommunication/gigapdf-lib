@@ -11,7 +11,8 @@
 use super::bidi;
 use super::css::{
     Align, AlignItems, BorderStyle, Clear, CssGradient, Direction, Display, FloatSide, Justify,
-    Len, Position, Style, Stylesheet, TrackSize, VAlign,
+    Len, ObjectFit, Position, Style, Stylesheet, TrackSize, VAlign, VShift, WhiteSpace,
+    WritingMode,
 };
 use super::dom::{Element, Node};
 use crate::svg::SvgImage;
@@ -70,6 +71,12 @@ pub enum Fragment {
         w: f64,
         h: f64,
         src: String,
+        /// `object-fit` — how the decoded pixels map into the `w×h` box. The
+        /// painter (which knows the intrinsic size once the bytes are decoded)
+        /// letterboxes (`contain`), scales-and-clips (`cover`), or centres
+        /// (`none`/`scale-down`) accordingly; `Fill` (the default) stretches
+        /// exactly as before.
+        fit: ObjectFit,
     },
     /// A vector SVG placed at `(x, y)` with size `w×h` (top-down), drawn as
     /// native PDF paths (not rasterized) by the paint layer.
@@ -98,6 +105,20 @@ pub enum Fragment {
         color: [f64; 3],
         style: BorderStyle,
         opacity: f64,
+        /// Outer `border-radius` of the corner adjoining the band's **start**
+        /// (its top/left end), `0` for a square corner. When non-zero the band
+        /// has already been shortened by this amount and the painter continues
+        /// the dash/dot/double pattern along the corner's quarter-arc half —
+        /// so a rounded dashed border follows the curve instead of overshooting
+        /// it with square bars. All-zero radii reproduce the previous output
+        /// byte-for-byte.
+        radius_start: f64,
+        /// Outer corner radius adjoining the band's **end** (bottom/right end).
+        radius_end: f64,
+        /// `true` when the side sits at the box's far edge (bottom side of a
+        /// horizontal band, right side of a vertical one) — orients which way
+        /// the corner arcs curve.
+        far: bool,
     },
     /// A CSS gradient background filling the box `(x, y, w, h)` (top-down):
     /// `linear`/`radial` as a true PDF shading clipped to the box, `conic` as a
@@ -154,16 +175,67 @@ impl Fragment {
     }
 }
 
+/// One level of a fragment's stacking-context path: `(band, z-index)`.
+///
+/// CSS 2.1 paint order **within** a stacking context, encoded as bands so a
+/// plain tuple comparison yields the right order:
+/// * [`BAND_OWN_DECOR`] — the context element's own background/borders;
+/// * [`BAND_NEG`] — child stacking contexts with a negative `z-index`
+///   (ascending), painted above the context's own background but under its
+///   normal flow;
+/// * [`BAND_FLOW`] — normal-flow content (the *implicit* terminal every plain
+///   fragment gets at comparison time, see [`cmp_stack`]);
+/// * [`BAND_POS`] — positioned content and child contexts with `z-index ≥ 0`
+///   (ascending), painted above the flow.
+///
+/// A fragment's full key is the chain of such entries for every enclosing
+/// stacking context (outermost first). Descendant `z-index`es therefore stay
+/// **local to their context**: `z-index: 9999` inside a `z-index: 1` context
+/// compares as `[(POS,1), (POS,9999)]` — under a sibling `[(POS,2)]` context
+/// no matter how large the inner value is.
+type StackLevel = (i8, i32);
+
+/// Band: the stacking context's own background/borders (its "layer 1").
+const BAND_OWN_DECOR: i8 = 0;
+/// Band: child stacking contexts with `z-index < 0`.
+const BAND_NEG: i8 = 1;
+/// Band: normal-flow content (implicit terminal of every path).
+const BAND_FLOW: i8 = 2;
+/// Band: positioned content / child contexts with `z-index ≥ 0`.
+const BAND_POS: i8 = 3;
+
+/// The implicit terminal a path is padded with when it runs out during
+/// comparison — plain in-flow content of the enclosing context.
+const STACK_FLOW: StackLevel = (BAND_FLOW, 0);
+
 #[derive(Debug, Clone)]
 struct Abs {
     /// z=0 backgrounds/borders, z=1 content (text/images) — paint order within
     /// a stacking level.
     z: u8,
-    /// CSS `z-index` stacking order (higher paints later). Positioned subtrees
-    /// stamp their `z-index` here so they paint above/below in-flow content
-    /// (which stays at 0).
-    zi: i32,
+    /// Stacking-context path (outermost context first; empty ⇒ root normal
+    /// flow). Each stacking context wraps its finished subtree via
+    /// [`Flow::stamp_context`], which *prepends* its own level — so inner
+    /// contexts stamp first and end up deeper in the path.
+    zk: Vec<StackLevel>,
     frag: Fragment,
+}
+
+/// Lexicographic comparison of two stacking paths, padding the exhausted side
+/// with the implicit [`STACK_FLOW`] terminal: a context's plain content sits
+/// between its negative and its non-negative child contexts, and a context
+/// entry itself orders against its siblings' flow content the same way.
+fn cmp_stack(a: &[StackLevel], b: &[StackLevel]) -> std::cmp::Ordering {
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let av = a.get(i).copied().unwrap_or(STACK_FLOW);
+        let bv = b.get(i).copied().unwrap_or(STACK_FLOW);
+        match av.cmp(&bv) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// The laid-out document: fragments grouped per page (top-down points).
@@ -218,6 +290,11 @@ pub fn layout_document_framed(
     measure: &dyn Measure,
     frame: &Frame,
 ) -> Layout {
+    // `vw`/`vh` lengths resolve against THIS page's real size for the whole
+    // layout (styles are computed lazily during the walk); the guard restores
+    // the reference viewport on exit. Synthetic frames (the "endless page"
+    // used to measure header/footer bands) are filtered by the setter.
+    let _viewport = super::css::set_viewport_for_layout(frame.page_w, frame.page_h);
     let content_w = (frame.page_w - frame.left - frame.right).max(1.0);
     let page_cb = Cb {
         x: frame.left,
@@ -236,6 +313,8 @@ pub fn layout_document_framed(
         cb: page_cb,
         flow_cb: page_cb,
         floats: FloatCtx::default(),
+        fixed_templates: Vec::new(),
+        last_decor: None,
     };
     // Find <body> if present, else lay out the whole forest.
     let roots = find_body(nodes).unwrap_or(nodes);
@@ -247,6 +326,30 @@ pub fn layout_document_framed(
     // The page (root) is the top-level block formatting context.
     y = flow.block_children(roots, &root_style, frame.left, content_w, y, &[], true);
     let _ = y;
+
+    // `position: fixed` is viewport-attached: repeat each fixed subtree on every
+    // page after the first (its template is already positioned in the page-1
+    // band; shifting by whole page bands re-lands it at the same page-local
+    // spot). The page count comes from the fragments actually produced.
+    if !flow.fixed_templates.is_empty() {
+        let content_h = page_cb.h;
+        let max_bottom = flow
+            .out
+            .iter()
+            .map(|a| fragment_bbox(&a.frag).3)
+            .fold(frame.top, f64::max);
+        let last_page = (((max_bottom - frame.top - 0.05).max(0.0)) / content_h) as usize;
+        let templates = std::mem::take(&mut flow.fixed_templates);
+        for p in 1..=last_page {
+            for tpl in &templates {
+                for abs in tpl {
+                    let mut clone = abs.clone();
+                    shift_fragment(&mut clone.frag, 0.0, p as f64 * content_h);
+                    flow.out.push(clone);
+                }
+            }
+        }
+    }
 
     Layout {
         pages: paginate(flow.out, frame.page_h, frame.top, frame.bottom),
@@ -404,6 +507,18 @@ struct Flow<'a> {
     /// Floats active in the current block container (narrow inline lines that
     /// overlap their vertical band). Saved/restored per container.
     floats: FloatCtx,
+    /// `position: fixed` subtrees, captured as already-positioned fragment
+    /// templates (page-1 band coordinates). Fixed boxes are viewport-attached:
+    /// once the document's page count is known, [`layout_document_framed`]
+    /// re-stamps each template onto every page after the first (the same
+    /// replay model as multi-page `position: sticky`).
+    fixed_templates: Vec<Vec<Abs>>,
+    /// The `self.out` range of the **most recent** `emit_box_decoration` call.
+    /// A block emits its own decoration *after* its children, so right after
+    /// `block(el)` returns this is `el`'s own background/border range — which
+    /// [`Flow::stamp_context`] marks as the stacking context's "own layer"
+    /// (painted before negative-z child contexts, per CSS 2.1 Appendix E).
+    last_decor: Option<(usize, usize)>,
 }
 
 impl Flow<'_> {
@@ -438,14 +553,37 @@ impl Flow<'_> {
         }
     }
 
-    /// Stamp `zi` (CSS `z-index`) on every fragment at `self.out[start..]` so a
-    /// positioned subtree paints as one stacking unit.
-    fn stamp_z(&mut self, start: usize, zi: i32) {
-        if zi == 0 {
-            return;
+    /// Close a **stacking context** over the fragments at `self.out[start..]`:
+    /// prepend `(band, z)` to every fragment's path so the whole subtree moves
+    /// as one unit in the enclosing context while its descendants' own entries
+    /// (already stamped — inner contexts finish first) stay *local* to it.
+    ///
+    /// `z` places the context in its parent: negative ⇒ under the parent's
+    /// flow (but above the parent's own background), positive ⇒ above,
+    /// `0` ⇒ in flow order (the `opacity`/`transform` trigger with `z-index:
+    /// auto` — containment without lifting).
+    ///
+    /// The context element's **own** decoration (the most recent
+    /// `emit_box_decoration` range — a block emits it after its children) is
+    /// marked [`BAND_OWN_DECOR`] so it paints first inside the context,
+    /// under negative-z children (CSS 2.1 Appendix E steps 1–2).
+    fn stamp_context(&mut self, start: usize, z: i32) {
+        let entry: StackLevel = match z.cmp(&0) {
+            std::cmp::Ordering::Less => (BAND_NEG, z),
+            std::cmp::Ordering::Equal => (BAND_FLOW, 0),
+            std::cmp::Ordering::Greater => (BAND_POS, z),
+        };
+        if let Some((ds, de)) = self.last_decor {
+            if ds >= start && de <= self.out.len() {
+                for a in &mut self.out[ds..de] {
+                    if a.zk.is_empty() {
+                        a.zk.push((BAND_OWN_DECOR, 0));
+                    }
+                }
+            }
         }
         for a in &mut self.out[start..] {
-            a.zi = zi;
+            a.zk.insert(0, entry);
         }
     }
 
@@ -632,7 +770,9 @@ fn intrinsic_replaced_width(el: &Element) -> f64 {
 #[derive(Clone)]
 enum Media {
     Raster(f64, f64, String),
-    Svg(f64, f64, SvgImage),
+    /// An inline vector image: placed size, the parsed SVG, and its
+    /// `preserveAspectRatio` (drives the viewBox→box mapping at placement).
+    Svg(f64, f64, SvgImage, crate::svg::PreserveAspectRatio),
 }
 
 impl Media {
@@ -866,11 +1006,15 @@ impl Flow<'_> {
                     };
                     // Collapse this block's top margin against the previous
                     // block's bottom margin: pull `y` up by the overlap so the
-                    // visible gap becomes `max(prev.bottom, this.top)`. Skipped
-                    // when clearance already moved the block down.
+                    // visible gap becomes `max(prev.bottom, this.top)`. The
+                    // block's *effective* top margin includes any first-child
+                    // margin that collapses through it. Skipped when clearance
+                    // already moved the block down.
                     if !cleared {
                         if let Some(prev_bottom) = prev_block_bottom {
-                            y -= prev_bottom.min(st.margin.top).max(0.0);
+                            let eff_top =
+                                st.margin.top.max(self.top_margin_escape(e, &st, ancestors));
+                            y -= prev_bottom.min(eff_top).max(0.0);
                         }
                     }
                     if st.page_break_before {
@@ -939,10 +1083,7 @@ impl Flow<'_> {
                             self.clamp_sticky_offset(dx, dy, x, y_before, avail_w, y - y_before);
                         let content_h = (self.page_h - self.top - self.bottom).max(1.0);
                         let height = y - y_before;
-                        let resolve = |len: Len| match len {
-                            Len::Pt(p) => p,
-                            Len::Percent(pc) => content_h * pc / 100.0,
-                        };
+                        let resolve = |len: Len| len.resolve(content_h);
                         let stuck = if let Some(t) = st.inset[0] {
                             Some((self.top + resolve(t), false))
                         } else {
@@ -964,14 +1105,28 @@ impl Flow<'_> {
                             None => self.translate_range(start, dx, dy),
                         }
                     }
-                    if st.z_index != 0 {
-                        self.stamp_z(start, st.z_index);
+                    // A stacking context forms on the classic triggers: an
+                    // explicit `z-index`, `opacity < 1`, or a `transform`.
+                    // `z-index: 0` here means "auto" (the two are not
+                    // distinguished), so opacity/transform contexts stamp a
+                    // flow-ordered entry — containment without lifting.
+                    if st.z_index != 0
+                        || st.own_opacity.is_some_and(|o| o < 1.0)
+                        || st.transform.is_some()
+                    {
+                        self.stamp_context(start, st.z_index);
                     }
                     if st.page_break_after {
                         y = self.break_to_next_page(y);
                         prev_block_bottom = None;
                     } else {
-                        prev_block_bottom = Some(st.margin.bottom);
+                        // The block's effective trailing margin includes any
+                        // last-child margin that collapsed through its bottom.
+                        prev_block_bottom = Some(
+                            st.margin
+                                .bottom
+                                .max(self.bottom_margin_escape(e, &st, ancestors)),
+                        );
                     }
                 }
             } else {
@@ -1106,10 +1261,7 @@ impl Flow<'_> {
     /// the negated `bottom`/`right` when only those are set), resolved against
     /// the containing width/height.
     fn relative_offset(&self, st: &Style, avail_w: f64) -> (f64, f64) {
-        let resolve = |len: Len, base: f64| match len {
-            Len::Pt(p) => p,
-            Len::Percent(pc) => base * pc / 100.0,
-        };
+        let resolve = |len: Len, base: f64| len.resolve(base);
         let dx = match (st.inset[3], st.inset[1]) {
             (Some(l), _) => resolve(l, avail_w),
             (None, Some(r)) => -resolve(r, avail_w),
@@ -1173,10 +1325,7 @@ impl Flow<'_> {
         };
         // Resolve width: explicit `width`, else left+right insets pin both
         // edges, else shrink to the containing block.
-        let resolve = |len: Len, base: f64| match len {
-            Len::Pt(p) => p,
-            Len::Percent(pc) => base * pc / 100.0,
-        };
+        let resolve = |len: Len, base: f64| len.resolve(base);
         let left = st.inset[3].map(|l| resolve(l, cb.w));
         let right = st.inset[1].map(|r| resolve(r, cb.w));
         let top = st.inset[0].map(|t| resolve(t, cb.h));
@@ -1221,7 +1370,16 @@ impl Flow<'_> {
         };
         self.translate_range(start, final_x - cb.x, final_y - cb.y);
         // Absolutely-positioned content stacks above in-flow content by default.
-        self.stamp_z(start, if st.z_index != 0 { st.z_index } else { 1 });
+        self.stamp_context(start, if st.z_index != 0 { st.z_index } else { 1 });
+
+        // A fixed box repeats on EVERY page (it is attached to the viewport, and
+        // paged output has no scroll). Capture the positioned fragments as a
+        // template; the document-level pass clones it onto each later page once
+        // the page count is known.
+        if st.position == Position::Fixed {
+            let template: Vec<Abs> = self.out[start..].to_vec();
+            self.fixed_templates.push(template);
+        }
 
         self.cb = saved_cb;
         self.floats = saved_floats;
@@ -1258,6 +1416,7 @@ impl Flow<'_> {
         let box_w = match st.width {
             Some(Len::Pt(w)) => w,
             Some(Len::Percent(pc)) => avail_w * pc / 100.0,
+            Some(Len::Calc { pt, pct }) => avail_w * pct / 100.0 + pt,
             None if is_replaced(el) => intrinsic_replaced_width(el),
             None => self.measure_float_max_content(el, &bstyle, x, y, ancestors, avail_w),
         }
@@ -1276,7 +1435,7 @@ impl Flow<'_> {
         let bottom_y = self.block(el, &bstyle, st, box_x, box_w, y, ancestors, 0);
 
         if st.z_index != 0 {
-            self.stamp_z(start, st.z_index);
+            self.stamp_context(start, st.z_index);
         }
         self.floats.boxes.push(FloatBox {
             left,
@@ -1309,9 +1468,34 @@ impl Flow<'_> {
         // A band wide enough that intrinsic content never wraps. Bounded so a
         // pathological style can't overflow arithmetic.
         const HUGE_W: f64 = 1.0e6;
+        self.measure_intrinsic_width(el, bstyle, x, y, ancestors, HUGE_W, avail_w)
+    }
+
+    /// Shared intrinsic-width probe: lay `el` out in a throwaway pass at
+    /// `probe_w` available width and report the widest content extent reached,
+    /// clamped to `[1, cap]`. `probe_w` huge ⇒ **max-content** (nothing wraps);
+    /// `probe_w` ≈ 1 ⇒ **min-content** (every breakable token wraps, so the
+    /// widest single token wins). The probe fully isolates itself: fragments are
+    /// discarded, the float context is untouched, and any `position: fixed`
+    /// template captured by the throwaway pass is dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn measure_intrinsic_width(
+        &mut self,
+        el: &Element,
+        bstyle: &Style,
+        x: f64,
+        y: f64,
+        ancestors: &[&Element],
+        probe_w: f64,
+        cap: f64,
+    ) -> f64 {
         let probe = self.out.len();
-        // Lay the content out at the origin with effectively-infinite width.
-        self.block(el, bstyle, bstyle, x, HUGE_W, y, ancestors, 0);
+        let fixed_mark = self.fixed_templates.len();
+        // Isolate the float context: a non-BFC subtree would otherwise register
+        // its floats on `self.floats` and leak probe geometry into the real flow.
+        let saved_floats = std::mem::take(&mut self.floats);
+        // Lay the content out at the origin with the probe width.
+        self.block(el, bstyle, bstyle, x, probe_w, y, ancestors, 0);
         // Widest right edge among the **content** fragments (text / images),
         // minus the origin. Box decorations (background fills, borders, gradients)
         // are skipped: laid at the huge band, a block's own full-width background
@@ -1329,13 +1513,14 @@ impl Flow<'_> {
             .map(|a| fragment_right(&a.frag, self.m))
             .fold(x, f64::max);
         // Discard the throwaway fragments; the real layout re-runs at the
-        // clamped width. (A float establishes a BFC, so no float was registered
-        // on `self.floats` by this pass.)
+        // clamped width.
         self.out.truncate(probe);
+        self.fixed_templates.truncate(fixed_mark);
+        self.floats = saved_floats;
         // The used box width adds the right padding/border (the left side is
         // already in `content_right`).
         let box_w = (content_right - x) + bstyle.padding.right + bstyle.border_width.right;
-        box_w.clamp(1.0, avail_w.max(1.0)).min(HUGE_W)
+        box_w.clamp(1.0, cap.max(1.0))
     }
 
     /// Lay out an inline run, applying the active floats so lines wrap around
@@ -1354,7 +1539,7 @@ impl Flow<'_> {
         }
         let mut items = Vec::new();
         for n in nodes {
-            self.collect_inline(n, style, ancestors, &mut items);
+            self.collect_inline(n, style, ancestors, avail_w, &mut items);
         }
         let floats = self.floats.clone();
         self.flow_lines_floated(
@@ -1367,6 +1552,98 @@ impl Flow<'_> {
             &floats,
             style.direction,
         )
+    }
+
+    /// The top margin that **collapses through** `el`'s top edge (CSS 2.1
+    /// §8.3.1 "adjoining margins"): the largest top margin along `el`'s
+    /// first-in-flow-block-child chain, or `0` when nothing collapses. Margins
+    /// collapse only when nothing separates them: `el` must have no top
+    /// border/padding and must not establish a new BFC; the chain stops at the
+    /// first level whose child is inline content, out-of-flow, positioned or
+    /// clearance-bearing. Positioned (`relative`/`sticky`) children are excluded
+    /// as a pragmatic safety: their post-layout shift math reads the pre-margin
+    /// flow position, so collapsing around them would move their clamp anchor.
+    fn top_margin_escape(&self, el: &Element, style: &Style, ancestors: &[&Element]) -> f64 {
+        if style.border_width.top > 0.0 || style.padding.top > 0.0 || establishes_bfc(style) {
+            return 0.0;
+        }
+        let na = push_ancestor(ancestors, el);
+        for n in &el.children {
+            match n {
+                Node::Text(t) if t.trim().is_empty() => continue,
+                Node::Text(_) => return 0.0,
+                Node::Element(e) => {
+                    let st = self.style_of(e, style, &na);
+                    if st.display == Display::None {
+                        continue;
+                    }
+                    if st.float != FloatSide::None
+                        || st.position != Position::Static
+                        || st.clear != Clear::None
+                        || !matches!(
+                            st.display,
+                            Display::Block
+                                | Display::ListItem
+                                | Display::Table
+                                | Display::Flex
+                                | Display::Grid
+                        )
+                    {
+                        return 0.0;
+                    }
+                    let own = st.margin.top.max(0.0);
+                    return own.max(self.top_margin_escape(e, &st, &na));
+                }
+            }
+        }
+        0.0
+    }
+
+    /// The bottom-edge counterpart of [`Flow::top_margin_escape`]: the largest
+    /// bottom margin along `el`'s last-in-flow-block-child chain. Additionally
+    /// gated on `el` having an automatic height — a definite `height`,
+    /// `min-height` or `aspect-ratio` separates the child's bottom margin from
+    /// `el`'s own (CSS: only auto heights collapse through the bottom).
+    fn bottom_margin_escape(&self, el: &Element, style: &Style, ancestors: &[&Element]) -> f64 {
+        if style.border_width.bottom > 0.0
+            || style.padding.bottom > 0.0
+            || establishes_bfc(style)
+            || style.height.is_some()
+            || style.min_height.is_some()
+            || style.aspect_ratio.is_some()
+        {
+            return 0.0;
+        }
+        let na = push_ancestor(ancestors, el);
+        for n in el.children.iter().rev() {
+            match n {
+                Node::Text(t) if t.trim().is_empty() => continue,
+                Node::Text(_) => return 0.0,
+                Node::Element(e) => {
+                    let st = self.style_of(e, style, &na);
+                    if st.display == Display::None {
+                        continue;
+                    }
+                    if st.float != FloatSide::None
+                        || st.position != Position::Static
+                        || st.clear != Clear::None
+                        || !matches!(
+                            st.display,
+                            Display::Block
+                                | Display::ListItem
+                                | Display::Table
+                                | Display::Flex
+                                | Display::Grid
+                        )
+                    {
+                        return 0.0;
+                    }
+                    let own = st.margin.bottom.max(0.0);
+                    return own.max(self.bottom_margin_escape(e, &st, &na));
+                }
+            }
+        }
+        0.0
     }
 
     /// If `el` is a Mermaid flowchart container, lay the diagram out within
@@ -1392,7 +1669,7 @@ impl Flow<'_> {
         // The vector geometry (boxes + edges + arrow-heads) as one Svg fragment.
         self.out.push(Abs {
             z: 1,
-            zi: 0,
+            zk: Vec::new(),
             frag: Fragment::Svg {
                 x: dx,
                 y: top,
@@ -1422,7 +1699,7 @@ impl Flow<'_> {
             let ly = top + label.cy - label.font_size * 0.8;
             self.out.push(Abs {
                 z: 1,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Text {
                     x: lx,
                     y: ly,
@@ -1434,6 +1711,69 @@ impl Flow<'_> {
         }
 
         Some(top + diagram.height + style.margin.bottom)
+    }
+
+    /// A `writing-mode: vertical-rl | vertical-lr` block — the **rotated
+    /// label** approximation. The block's content is laid out as a normal
+    /// horizontal block into a strip whose *width* is the vertical box's
+    /// height budget (an explicit `height`, else the content's natural
+    /// max-content width), then the whole strip — box decoration included —
+    /// is wrapped in a `Transformed` rotation: 90° clockwise for
+    /// `vertical-rl`, 90° counter-clockwise for `vertical-lr`. Width and
+    /// height swap: the strip's height becomes the box's width and vice
+    /// versa, giving the narrow-and-tall geometry vertical table headers and
+    /// spine labels want.
+    ///
+    /// Documented limits of the first level: glyphs are rotated (no upright
+    /// CJK `text-orientation`), line stacking beyond the rotation is not
+    /// remodelled, and the strip's own margins rotate with it (the flow
+    /// advances by the rotated height only).
+    #[allow(clippy::too_many_arguments)]
+    fn vertical_block(
+        &mut self,
+        el: &Element,
+        style: &Style,
+        parent_style: &Style,
+        x: f64,
+        avail_w: f64,
+        y: f64,
+        ancestors: &[&Element],
+        list_index: usize,
+    ) -> f64 {
+        let start = self.out.len();
+        // Re-enter the normal path with the mode reset (breaks the recursion)
+        // and the box constraints swapped: the strip has no width/height of
+        // its own — its width IS the vertical box's height budget.
+        let hstyle = Style {
+            writing_mode: WritingMode::HorizontalTb,
+            width: None,
+            height: None,
+            ..style.clone()
+        };
+        let strip_w = match style.height {
+            Some(h) => h.max(1.0),
+            // No explicit vertical extent: the natural (max-content) width of
+            // the strip, clamped to something sane for pathological content.
+            None => self
+                .measure_float_max_content(el, &hstyle, x, y, ancestors, avail_w)
+                .max(1.0),
+        };
+        let bottom = self.block(el, &hstyle, parent_style, x, strip_w, y, ancestors, list_index);
+        let strip_h = (bottom - y).max(0.1);
+
+        // Rotate the strip about its top-left, then slide it back so the
+        // rotated box's top-left lands on (x, y):
+        //   vertical-rl: +90° (cw), shifted right by the strip height;
+        //   vertical-lr: −90° (ccw), shifted down by the strip width.
+        // CSS-space affine [a, b, c, d, e, f]: p' = (a·px + c·py + e,
+        // b·px + d·py + f).
+        let m = match style.writing_mode {
+            WritingMode::VerticalRl => [0.0, 1.0, -1.0, 0.0, x + strip_h + y, y - x],
+            _ => [0.0, -1.0, 1.0, 0.0, x - y, y + strip_w + x],
+        };
+        self.transform_range(start, m);
+        // The vertical box occupies `strip_h × strip_w`; flow resumes below it.
+        y + strip_w
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1450,6 +1790,11 @@ impl Flow<'_> {
     ) -> f64 {
         if style.display == Display::None {
             return y;
+        }
+        // `writing-mode: vertical-rl | vertical-lr` — the rotated-label model:
+        // lay the block out horizontally, then rotate the subtree ±90°.
+        if style.writing_mode != WritingMode::HorizontalTb {
+            return self.vertical_block(el, style, _parent_style, x, avail_w, y, ancestors, list_index);
         }
         // Mermaid flowchart blocks (`<pre class="mermaid">`, `<div class="mermaid">`,
         // `<pre><code class="language-mermaid">`) render as native vector diagrams.
@@ -1478,17 +1823,23 @@ impl Flow<'_> {
         let p = &style.padding;
         let b = &style.border_width;
 
-        y += m.top;
+        // Parent/first-child margin collapsing (CSS 2.1 §8.3.1): with no top
+        // border/padding and no BFC boundary, the first in-flow block child's
+        // top margin collapses with this block's own — the box applies
+        // `max(own, escaped)` and the child flow starts `escape` above the
+        // content top, so the child's own `margin-top` re-lands it exactly at
+        // the content edge (no double gap).
+        let top_escape = self.top_margin_escape(el, style, ancestors);
+        y += m.top.max(top_escape);
         let box_top = y;
-        let resolve_w = |len: Len| match len {
-            Len::Pt(w) => w,
-            Len::Percent(pc) => avail_w * pc / 100.0,
-        };
+        let resolve_w = |len: Len| len.resolve(avail_w);
         let mut box_w = match style.width {
             // `box-sizing: border-box` → `width` already includes padding+border.
             Some(Len::Pt(w)) if style.border_box => w,
             Some(Len::Pt(w)) => w + p.left + p.right + b.left + b.right,
             Some(Len::Percent(pc)) => avail_w * pc / 100.0,
+            // A mixed `calc()` resolves like a percentage (border-box style).
+            Some(Len::Calc { pt, pct }) => avail_w * pct / 100.0 + pt,
             None => avail_w - m.left - m.right,
         };
         if let Some(mw) = style.max_width {
@@ -1532,7 +1883,7 @@ impl Flow<'_> {
                 let mw = self.m.width(&marker, &mstyle);
                 self.out.push(Abs {
                     z: 1,
-                    zi: 0,
+                    zk: Vec::new(),
                     frag: Fragment::Text {
                         x: content_x - mw - 4.0,
                         y: cy,
@@ -1577,7 +1928,10 @@ impl Flow<'_> {
             style,
             content_x,
             content_w,
-            cy,
+            // The collapsed-through child re-applies its own top margin, so the
+            // child flow starts `top_escape` above the content edge (zero in
+            // the common non-collapsing case — identical geometry).
+            cy - top_escape,
             &new_ancestors,
             // Whether this block isolates its children's floats. A plain in-flow
             // block does not (its floats flow to the parent's following siblings
@@ -1587,6 +1941,10 @@ impl Flow<'_> {
         self.flow_cb = saved_flow_cb;
 
         cy += p.bottom + b.bottom;
+        // Parent/last-child collapsing (the bottom-edge mirror): the escaped
+        // child margin leaves the box (excluded from its height) and collapses
+        // with this block's own bottom margin below.
+        let bottom_escape = self.bottom_margin_escape(el, style, ancestors);
         // A definite `height` caps the box (content overflows — and is clipped
         // under `overflow: hidden`). Failing that, `aspect-ratio` derives the
         // height from the resolved width (`box_w / ratio`); otherwise the box
@@ -1594,8 +1952,14 @@ impl Flow<'_> {
         let mut box_h = match (style.height, style.aspect_ratio) {
             (Some(h), _) => h,
             (None, Some(ratio)) if ratio > 0.0 => (box_w / ratio).max(0.1),
-            _ => (cy - box_top).max(0.1),
+            _ => (cy - bottom_escape - box_top).max(0.1),
         };
+        // `max-height` caps the tentative height (content overflows, visible
+        // unless `overflow` clips); `min-height` floors it afterwards — the
+        // CSS §10.7 order, where min wins over max when they conflict.
+        if let Some(mh) = style.max_height {
+            box_h = box_h.min(mh);
+        }
         if let Some(mh) = style.min_height {
             box_h = box_h.max(mh);
         }
@@ -1635,14 +1999,22 @@ impl Flow<'_> {
         self.emit_box_decoration(style, box_x, box_top, box_w, box_h);
 
         // CSS `transform`: wrap this element's whole subtree (box + children) in a
-        // `Transformed` fragment, pivoting about the border-box centre.
+        // `Transformed` fragment, pivoting about the `transform-origin` — the
+        // border-box centre (`50% 50%`) unless the author moved it. Percentages
+        // resolve against the border-box dimensions, lengths from its top-left.
         if let Some(raw) = style.transform {
-            let tm =
-                super::css::transform_about_origin(raw, box_x + box_w / 2.0, box_top + box_h / 2.0);
+            let resolve = |len: &Len, dim: f64| len.resolve(dim);
+            let (ox, oy) = match &style.transform_origin {
+                Some((x, y)) => (box_x + resolve(x, box_w), box_top + resolve(y, box_h)),
+                None => (box_x + box_w / 2.0, box_top + box_h / 2.0),
+            };
+            let tm = super::css::transform_about_origin(raw, ox, oy);
             self.transform_range(children_start, tm);
         }
 
-        box_top + box_h + m.bottom
+        // The trailing margin below the box is the collapsed pair (own bottom
+        // margin ⊔ escaped last-child margin).
+        box_top + box_h + m.bottom.max(bottom_escape)
     }
 
     /// Lay out a run of inline nodes into line boxes; returns the bottom `y`.
@@ -1657,7 +2029,7 @@ impl Flow<'_> {
     ) -> f64 {
         let mut items = Vec::new();
         for n in nodes {
-            self.collect_inline(n, style, ancestors, &mut items);
+            self.collect_inline(n, style, ancestors, avail_w, &mut items);
         }
         self.flow_lines(
             &items,
@@ -1675,6 +2047,7 @@ impl Flow<'_> {
         node: &Node,
         parent_style: &Style,
         ancestors: &[&Element],
+        avail_w: f64,
         out: &mut Vec<InlineItem>,
     ) {
         match node {
@@ -1724,24 +2097,46 @@ impl Flow<'_> {
                         out.push(InlineItem {
                             text: String::new(),
                             style: st,
-                            media: Some(Media::Svg(w, h, img)),
+                            media: Some(Media::Svg(
+                                w,
+                                h,
+                                img,
+                                crate::svg::preserve_aspect_ratio_of(e),
+                            )),
                         });
                     }
                     return;
                 }
                 if e.tag == "img" {
-                    let w = e
-                        .attr("width")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(64.0);
-                    let h = e
-                        .attr("height")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(64.0);
+                    // Intrinsic size from the HTML attributes (64pt fallback).
+                    let attr_w = e.attr("width").and_then(|v| v.parse::<f64>().ok());
+                    let attr_h = e.attr("height").and_then(|v| v.parse::<f64>().ok());
+                    let iw = attr_w.filter(|v| *v > 0.0).unwrap_or(64.0);
+                    let ih = attr_h.filter(|v| *v > 0.0).unwrap_or(64.0);
+                    // CSS `width`/`height` override the attributes; a single CSS
+                    // dimension preserves the intrinsic aspect ratio (percentages
+                    // resolve against the inline containing block width).
+                    let resolve = |len: Len| len.resolve(avail_w).max(0.0);
+                    let css_w = st.width.map(resolve);
+                    let css_h = st.height.map(|h| h.max(0.0));
+                    let (mut w, mut h) = match (css_w, css_h) {
+                        (Some(cw), Some(ch)) => (cw, ch),
+                        (Some(cw), None) => (cw, if iw > 0.0 { cw * ih / iw } else { ih }),
+                        (None, Some(ch)) => (if ih > 0.0 { ch * iw / ih } else { iw }, ch),
+                        (None, None) => (iw, ih),
+                    };
+                    // `max-width` clamps the used width, scaling the height to
+                    // keep the (used) ratio.
+                    if let Some(mw) = st.max_width.map(resolve) {
+                        if w > mw && w > 0.0 {
+                            h *= mw / w;
+                            w = mw;
+                        }
+                    }
                     let src = e.attr("src").unwrap_or_default().to_string();
                     // A `data:image/svg+xml` source renders as native vector, not a bitmap.
-                    let media = crate::svg::parse_data_uri(&src)
-                        .map(|img| Media::Svg(w, h, img))
+                    let media = crate::svg::parse_data_uri_with_aspect(&src)
+                        .map(|(img, par)| Media::Svg(w, h, img, par))
                         .unwrap_or(Media::Raster(w, h, src));
                     out.push(InlineItem {
                         text: String::new(),
@@ -1752,15 +2147,18 @@ impl Flow<'_> {
                 }
                 let na = push_ancestor(ancestors, e);
                 for c in &e.children {
-                    self.collect_inline(c, &st, &na, out);
+                    self.collect_inline(c, &st, &na, avail_w, out);
                 }
             }
         }
     }
 
     /// Tokenise inline items into measured [`Word`]s for line breaking,
-    /// honouring `white-space: pre` (newlines kept) and `letter-spacing`
-    /// (added to each token's measured width).
+    /// honouring `white-space` — `pre` keeps whitespace + newlines with no
+    /// wrapping, `pre-wrap` keeps them but wraps between space runs,
+    /// `pre-line` collapses spaces yet preserves newlines, and `nowrap` makes
+    /// each run a single unbreakable token — and `letter-spacing` (added to
+    /// each token's measured width).
     fn build_words(&self, items: &[InlineItem]) -> Vec<Word> {
         let mut words: Vec<Word> = Vec::new();
         let push_text = |words: &mut Vec<Word>, text: String, style: &Style, space: bool| {
@@ -1775,6 +2173,15 @@ impl Flow<'_> {
                 space_after: space,
             });
         };
+        let push_newline = |words: &mut Vec<Word>, style: &Style| {
+            words.push(Word {
+                text: "\n".into(),
+                style: style.clone(),
+                w: 0.0,
+                media: None,
+                space_after: false,
+            });
+        };
         for it in items {
             if let Some(m) = &it.media {
                 words.push(Word {
@@ -1787,33 +2194,59 @@ impl Flow<'_> {
                 continue;
             }
             if it.style.pre {
-                // Preserve whitespace: split only on newlines, keep runs.
+                // Preserve whitespace: split on newlines. `pre` keeps each
+                // line as ONE unbreakable token (never wraps); `pre-wrap`
+                // splits the line into space-preserving tokens so an over-long
+                // line can still wrap between space runs.
+                let wrapping = it.style.white_space == WhiteSpace::PreWrap;
                 for (i, seg) in it.text.split('\n').enumerate() {
                     if i > 0 {
-                        words.push(Word {
-                            text: "\n".into(),
-                            style: it.style.clone(),
-                            w: 0.0,
-                            media: None,
-                            space_after: false,
-                        });
+                        push_newline(&mut words, &it.style);
                     }
-                    if !seg.is_empty() {
+                    if seg.is_empty() {
+                        continue;
+                    }
+                    if wrapping {
+                        for tok in split_space_runs(seg) {
+                            push_text(&mut words, tok.to_string(), &it.style, false);
+                        }
+                    } else {
                         push_text(&mut words, seg.to_string(), &it.style, false);
                     }
+                }
+                continue;
+            }
+            if it.style.white_space == WhiteSpace::PreLine {
+                // Collapse runs of spaces but honour the source newlines.
+                for (i, seg) in it.text.split('\n').enumerate() {
+                    if i > 0 {
+                        push_newline(&mut words, &it.style);
+                    }
+                    for token in collapse_ws(seg).split(' ') {
+                        if !token.is_empty() {
+                            push_text(&mut words, token.to_string(), &it.style, true);
+                        }
+                    }
+                }
+                continue;
+            }
+            if it.style.white_space == WhiteSpace::Nowrap {
+                // The whole (collapsed) run is ONE token: the line breaker can
+                // never split inside it. Breaks stay possible at boundaries
+                // between differently-styled sibling runs — a pragmatic
+                // subset of `nowrap`, and exactly what single-run labels and
+                // `text-overflow: ellipsis` cells need.
+                let collapsed = collapse_ws(&it.text);
+                let trimmed = collapsed.trim();
+                if !trimmed.is_empty() {
+                    push_text(&mut words, trimmed.to_string(), &it.style, true);
                 }
                 continue;
             }
             let normalized = collapse_ws(&it.text);
             for token in normalized.split(' ') {
                 if token == "\n" {
-                    words.push(Word {
-                        text: "\n".into(),
-                        style: it.style.clone(),
-                        w: 0.0,
-                        media: None,
-                        space_after: false,
-                    });
+                    push_newline(&mut words, &it.style);
                     continue;
                 }
                 if token.is_empty() {
@@ -1825,23 +2258,225 @@ impl Flow<'_> {
         words
     }
 
+    /// Post-process measured words for the overflow properties: a text word
+    /// wider than the line `budget` is either truncated with `…`
+    /// (`text-overflow: ellipsis` on a `nowrap` run inside an `overflow`-
+    /// clipped box) or broken into budget-sized pieces at character
+    /// boundaries (`overflow-wrap: break-word` / `word-break: break-all`).
+    /// Words that fit — the overwhelming common case — pass through
+    /// untouched, keeping existing layouts byte-identical.
+    fn fit_overlong_words(&self, words: Vec<Word>, budget: f64) -> Vec<Word> {
+        let needs_fit = |w: &Word| {
+            w.media.is_none()
+                && w.text != "\n"
+                && w.w > budget
+                && (w.style.break_word
+                    || (w.style.text_overflow_ellipsis
+                        && w.style.white_space == WhiteSpace::Nowrap
+                        && w.style.overflow_clip))
+        };
+        if budget <= 0.0 || !words.iter().any(needs_fit) {
+            return words;
+        }
+        // Measured width of a token, mirroring `build_words`'s letter-spacing.
+        let measure = |t: &str, style: &Style| {
+            self.m.width(t, style) + style.letter_spacing * t.chars().count().max(1) as f64
+        };
+        let mut out: Vec<Word> = Vec::with_capacity(words.len());
+        for w in words {
+            if !needs_fit(&w) {
+                out.push(w);
+                continue;
+            }
+            let chars: Vec<char> = w.text.chars().collect();
+            if w.style.text_overflow_ellipsis
+                && w.style.white_space == WhiteSpace::Nowrap
+                && w.style.overflow_clip
+            {
+                // Longest prefix such that `prefix + …` fits the budget.
+                let mut best = "\u{2026}".to_string();
+                for i in (1..chars.len()).rev() {
+                    let cand: String = chars[..i].iter().collect::<String>() + "\u{2026}";
+                    if measure(&cand, &w.style) <= budget {
+                        best = cand;
+                        break;
+                    }
+                }
+                let bw = measure(&best, &w.style);
+                out.push(Word {
+                    text: best,
+                    w: bw,
+                    style: w.style.clone(),
+                    media: None,
+                    space_after: w.space_after,
+                });
+                continue;
+            }
+            // `break-word`: greedy budget-sized pieces (each ≥ 1 char so the
+            // loop always advances, even against an absurdly small budget).
+            let mut start = 0usize;
+            while start < chars.len() {
+                let mut end = start + 1;
+                let mut piece: String = chars[start..end].iter().collect();
+                let mut pw = measure(&piece, &w.style);
+                while end < chars.len() {
+                    let cand: String = chars[start..=end].iter().collect();
+                    let cw = measure(&cand, &w.style);
+                    if cw > budget {
+                        break;
+                    }
+                    end += 1;
+                    piece = cand;
+                    pw = cw;
+                }
+                let last = end >= chars.len();
+                out.push(Word {
+                    text: piece,
+                    w: pw,
+                    style: w.style.clone(),
+                    media: None,
+                    space_after: if last { w.space_after } else { false },
+                });
+                start = end;
+            }
+        }
+        out
+    }
+
+    /// Split one logical line into **visually ordered** segments under the
+    /// Unicode Bidirectional Algorithm. The levels are resolved **per
+    /// character over the whole line** (inter-word spaces included, so
+    /// neutrals resolve across token boundaries exactly as UAX #9 requires),
+    /// *then* the visual order is grouped back into word segments. A token
+    /// whose characters straddle a level boundary — e.g. `world!` at the end
+    /// of an RTL sentence, whose `!` resolves to the base (RTL) level — splits
+    /// at that boundary so each part lands on its correct side, instead of the
+    /// whole token dragging its punctuation along (the old word-granularity
+    /// model, which classified a token by its first character only).
+    ///
+    /// Returns owned [`Word`] segments in visual (left→right) order:
+    /// * a segment's `text` keeps the **logical** character order (the painter
+    ///   draws glyph runs; intra-run glyph mirroring stays its concern);
+    /// * `space_after` is set on the segment to the left of each inter-word
+    ///   space, so split fragments of one token stay glued (no phantom gap);
+    /// * replaced boxes (images/SVG) travel as opaque one-atom units.
+    fn bidi_visual_segments(&self, line: &[&Word], base: u8) -> Vec<Word> {
+        /// What one bidi atom stands for.
+        #[derive(Clone, Copy)]
+        enum Owner {
+            /// The `ci`-th character (char index) of `line[word]`.
+            Char { word: usize, ci: usize },
+            /// An inter-word space (becomes the left segment's trailing gap).
+            Space,
+            /// An opaque unit box (replaced content / empty text).
+            Unit(usize),
+        }
+        let mut atoms: Vec<String> = Vec::new();
+        let mut owners: Vec<Owner> = Vec::new();
+        for (wi, w) in line.iter().enumerate() {
+            if w.media.is_some() || w.text.is_empty() {
+                // One (empty ⇒ boundary-neutral) atom: the box rides the flow.
+                atoms.push(String::new());
+                owners.push(Owner::Unit(wi));
+            } else {
+                for (ci, c) in w.text.chars().enumerate() {
+                    atoms.push(c.to_string());
+                    owners.push(Owner::Char { word: wi, ci });
+                }
+            }
+            if w.space_after && wi + 1 < line.len() {
+                atoms.push(" ".to_string());
+                owners.push(Owner::Space);
+            }
+        }
+        let refs: Vec<&str> = atoms.iter().map(|s| s.as_str()).collect();
+        let order = bidi::reorder(&refs, base);
+
+        // Group the visual char walk into segments: a maximal visual run of
+        // characters of the same word at consecutive (±1) char indices is one
+        // segment (L2 only reverses whole runs, so such a run is a contiguous
+        // logical slice — sliced in logical order).
+        struct Group {
+            word: usize,
+            lo: usize,
+            hi: usize,
+            prev: usize,
+        }
+        let m = self.m;
+        let mut segments: Vec<Word> = Vec::new();
+        let mut cur: Option<Group> = None;
+        let flush = |cur: &mut Option<Group>, segments: &mut Vec<Word>| {
+            if let Some(g) = cur.take() {
+                let w = line[g.word];
+                let text: String = w.text.chars().skip(g.lo).take(g.hi - g.lo + 1).collect();
+                let n_chars = (g.hi - g.lo + 1) as f64;
+                let width = m.width(&text, &w.style) + w.style.letter_spacing * n_chars.max(1.0);
+                segments.push(Word {
+                    text,
+                    style: w.style.clone(),
+                    w: width,
+                    media: None,
+                    space_after: false,
+                });
+            }
+        };
+        for &ai in &order {
+            match owners[ai] {
+                Owner::Space => {
+                    flush(&mut cur, &mut segments);
+                    if let Some(prev) = segments.last_mut() {
+                        prev.space_after = true;
+                    }
+                }
+                Owner::Unit(wi) => {
+                    flush(&mut cur, &mut segments);
+                    let w = line[wi];
+                    segments.push(Word {
+                        text: w.text.clone(),
+                        style: w.style.clone(),
+                        w: w.w,
+                        media: w.media.clone(),
+                        space_after: false,
+                    });
+                }
+                Owner::Char { word, ci } => match &mut cur {
+                    Some(g) if g.word == word && ci.abs_diff(g.prev) == 1 => {
+                        g.lo = g.lo.min(ci);
+                        g.hi = g.hi.max(ci);
+                        g.prev = ci;
+                    }
+                    _ => {
+                        flush(&mut cur, &mut segments);
+                        cur = Some(Group {
+                            word,
+                            lo: ci,
+                            hi: ci,
+                            prev: ci,
+                        });
+                    }
+                },
+            }
+        }
+        flush(&mut cur, &mut segments);
+        segments
+    }
+
     /// Emit one line of words at vertical position `*y`, aligned within
     /// `[line_x, line_x + line_avail)`, then advance `*y` by the line height.
     /// `space_w` is the inter-word space; `word_extra` is added at each space on
     /// top of it (used by `word-spacing`). `last` suppresses justification.
     ///
-    /// `dir` is the inline base direction. With [`Direction::Ltr`] (the default,
-    /// and the only value reachable for any existing document) the original
-    /// left-to-right placement runs verbatim — the word slice is the identity
-    /// order, so output is byte-identical. With [`Direction::Rtl`] the line's
-    /// word boxes are first reordered into **visual order** by the Unicode
-    /// Bidirectional Algorithm ([`bidi::reorder`], UAX #9): the base level is RTL,
-    /// so a pure-RTL line is fully mirrored, but an embedded Latin word or a
-    /// number run keeps its own (LTR) sub-order instead of being naively
-    /// reversed. The visually-ordered boxes are then placed left-to-right from a
-    /// start `x` that encodes the resolved alignment (the RTL default hugs the
-    /// right edge). The glyphs *inside* a box keep the order the font/shaper
-    /// produced; intra-word bidi splitting is out of scope (see [`bidi`]).
+    /// `dir` is the inline base direction. A left-to-right line whose
+    /// characters are all bidi-inert takes the original verbatim placement
+    /// (byte-identical fast path). Any RTL base — or an LTR line carrying
+    /// RTL/AN content or a bidi control — goes through the Unicode
+    /// Bidirectional Algorithm **at character granularity over the whole line**
+    /// ([`Flow::bidi_visual_segments`]): levels resolve across token
+    /// boundaries, mixed tokens split at their level boundaries (so trailing
+    /// punctuation lands on its correct side), and the visually-ordered
+    /// segments are placed left-to-right from a start `x` that encodes the
+    /// resolved alignment (the RTL default hugs the right edge). The glyphs
+    /// *inside* a segment keep logical order (the painter's concern).
     #[allow(clippy::too_many_arguments)]
     fn emit_line(
         &mut self,
@@ -1867,18 +2502,31 @@ impl Flow<'_> {
         let align = align.resolve(dir);
         let extra = (line_avail - line_w).max(0.0);
 
-        // Reorder the line's word boxes into visual order via the Unicode bidi
-        // algorithm (rule L2) at the paragraph base level. For a pure-LTR line at
-        // base 0 this is the identity, so we fall through to the original
-        // verbatim placement and keep byte-identical output; an RTL base, or an
-        // LTR line carrying an embedded RTL run, yields a real reordering that we
-        // place via the shared visual placer.
+        // Resolve the line through the Unicode bidi algorithm at CHARACTER
+        // granularity (spaces included) and place the visual segments. A
+        // pure-LTR line with only bidi-inert characters skips all of it and
+        // falls through to the original verbatim placement (byte-identical).
         let base = if dir == Direction::Rtl { 1 } else { 0 };
-        let texts: Vec<&str> = line.iter().map(|w| w.text.as_str()).collect();
-        let order = bidi::reorder(&texts, base);
-        let identity = order.iter().enumerate().all(|(i, &j)| i == j);
-        if dir == Direction::Rtl || !identity {
-            let visual: Vec<&Word> = order.iter().map(|&i| line[i]).collect();
+        let is_significant = |c: char| {
+            matches!(
+                bidi::bidi_class(c),
+                bidi::BidiClass::R
+                    | bidi::BidiClass::Al
+                    | bidi::BidiClass::An
+                    | bidi::BidiClass::Lre
+                    | bidi::BidiClass::Rle
+                    | bidi::BidiClass::Lro
+                    | bidi::BidiClass::Rlo
+                    | bidi::BidiClass::Pdf
+                    | bidi::BidiClass::Lri
+                    | bidi::BidiClass::Rli
+                    | bidi::BidiClass::Fsi
+                    | bidi::BidiClass::Pdi
+            )
+        };
+        if dir == Direction::Rtl || line.iter().any(|w| w.text.chars().any(is_significant)) {
+            let segments = self.bidi_visual_segments(line, base);
+            let visual: Vec<&Word> = segments.iter().collect();
             self.place_line_visual(&visual, y, last, line_x, align, space_w, extra);
             *y += line_h;
             return;
@@ -1901,28 +2549,23 @@ impl Flow<'_> {
                 Some(Media::Raster(iw, ih, src)) => {
                     self.out.push(Abs {
                         z: 1,
-                        zi: 0,
+                        zk: Vec::new(),
                         frag: Fragment::Image {
                             x: cx,
                             y: *y,
                             w: *iw,
                             h: *ih,
                             src: src.clone(),
+                            fit: w.style.object_fit,
                         },
                     });
                     cx += iw + space_w;
                 }
-                Some(Media::Svg(iw, ih, image)) => {
+                Some(Media::Svg(iw, ih, image, par)) => {
                     self.out.push(Abs {
                         z: 1,
-                        zi: 0,
-                        frag: Fragment::Svg {
-                            x: cx,
-                            y: *y,
-                            w: *iw,
-                            h: *ih,
-                            image: image.clone(),
-                        },
+                        zk: Vec::new(),
+                        frag: svg_fragment(cx, *y, *iw, *ih, image, *par),
                     });
                     cx += iw + space_w;
                 }
@@ -1936,12 +2579,14 @@ impl Flow<'_> {
                     push_run_highlight(&mut self.out, cx, *y, w);
                     // `vertical-align: super|sub` raises/lowers the run's baseline
                     // within the line (negative = up). Width/advance are unchanged.
+                    // The line-relative values (`middle`/`bottom`) add an offset
+                    // within the line box, resolved against this line's height.
                     self.out.push(Abs {
                         z: 1,
-                        zi: 0,
+                        zk: Vec::new(),
                         frag: Fragment::Text {
                             x: cx,
-                            y: *y + w.style.valign_shift,
+                            y: *y + w.style.valign_shift + inline_valign_delta(&w.style, line_h),
                             w: w.w,
                             style: w.style.clone(),
                             text: w.text.clone(),
@@ -1967,8 +2612,9 @@ impl Flow<'_> {
     ///
     /// `line` holds the boxes in visual (left→right) order; `extra` is the line's
     /// slack (`line_avail - content`). The per-box trailing inter-word advance
-    /// (space + `word-spacing`, plus the justification gap) is added between
-    /// visually adjacent boxes; the last box draws no trailing space.
+    /// (space + `word-spacing`, plus the justification gap) is added after each
+    /// box that carries `space_after` — visually adjacent fragments of one
+    /// split token stay glued — and the last box draws no trailing space.
     #[allow(clippy::too_many_arguments)]
     fn place_line_visual(
         &mut self,
@@ -1992,63 +2638,71 @@ impl Flow<'_> {
             // `Start`/`End` are resolved to physical edges before this call.
             Align::Start | Align::End => line_x,
         };
+        let last_idx = line.len().saturating_sub(1);
         let gap_extra = if matches!(align, Align::Justify) && !last {
-            let gaps = line.len().saturating_sub(1).max(1);
+            // One justification gap per real inter-word space (the last box's
+            // trailing space never draws, so it doesn't count).
+            let gaps = line
+                .iter()
+                .take(last_idx)
+                .filter(|w| w.space_after)
+                .count()
+                .max(1);
             extra / gaps as f64
         } else {
             0.0
         };
-        let last_idx = line.len().saturating_sub(1);
+        // This line's height, for the line-relative `vertical-align` values
+        // (mirrors the computation in `emit_line`).
+        let line_h = line
+            .iter()
+            .map(|w| w.style.font_size * w.style.line_height.max(1.0))
+            .fold(0.0_f64, f64::max);
         for (i, w) in line.iter().enumerate() {
-            let is_last = i == last_idx;
+            let spaced = i != last_idx && w.space_after;
             match &w.media {
                 Some(Media::Raster(iw, ih, src)) => {
                     self.out.push(Abs {
                         z: 1,
-                        zi: 0,
+                        zk: Vec::new(),
                         frag: Fragment::Image {
                             x: cx,
                             y: *y,
                             w: *iw,
                             h: *ih,
                             src: src.clone(),
+                            fit: w.style.object_fit,
                         },
                     });
-                    cx += iw + if is_last { 0.0 } else { space_w };
+                    cx += iw + if spaced { space_w } else { 0.0 };
                 }
-                Some(Media::Svg(iw, ih, image)) => {
+                Some(Media::Svg(iw, ih, image, par)) => {
                     self.out.push(Abs {
                         z: 1,
-                        zi: 0,
-                        frag: Fragment::Svg {
-                            x: cx,
-                            y: *y,
-                            w: *iw,
-                            h: *ih,
-                            image: image.clone(),
-                        },
+                        zk: Vec::new(),
+                        frag: svg_fragment(cx, *y, *iw, *ih, image, *par),
                     });
-                    cx += iw + if is_last { 0.0 } else { space_w };
+                    cx += iw + if spaced { space_w } else { 0.0 };
                 }
                 None => {
                     // Inline highlight behind the glyphs (see the LTR path).
                     push_run_highlight(&mut self.out, cx, *y, w);
                     self.out.push(Abs {
                         z: 1,
-                        zi: 0,
+                        zk: Vec::new(),
                         frag: Fragment::Text {
                             x: cx,
-                            y: *y + w.style.valign_shift,
+                            y: *y + w.style.valign_shift + inline_valign_delta(&w.style, line_h),
                             w: w.w,
                             style: w.style.clone(),
                             text: w.text.clone(),
                         },
                     });
                     cx += w.w
-                        + if is_last {
-                            0.0
-                        } else {
+                        + if spaced {
                             space_w + gap_extra + w.style.word_spacing
+                        } else {
+                            0.0
                         };
                 }
             }
@@ -2069,6 +2723,10 @@ impl Flow<'_> {
         dir: Direction,
     ) -> f64 {
         let words = self.build_words(items);
+        // Overflow handling for words wider than the line (`break-word` split,
+        // `text-overflow: ellipsis` truncation) — a no-op pass-through unless
+        // such a word exists. Budgeted against the tighter (indented) line.
+        let words = self.fit_overlong_words(words, (avail_w - indent.max(0.0)).max(1.0));
         let mut line: Vec<&Word> = Vec::new();
         let mut line_w = 0.0;
         let space_w = self.m.width(" ", &Style::default());
@@ -2137,6 +2795,10 @@ impl Flow<'_> {
         dir: Direction,
     ) -> f64 {
         let words = self.build_words(items);
+        // Overflow handling (`break-word` / ellipsis). The float insets vary
+        // per line band, so the full width is the budget — pieces re-fit at
+        // the actual wrap points anyway.
+        let words = self.fit_overlong_words(words, (avail_w - indent.max(0.0)).max(1.0));
         let space_w = self.m.width(" ", &Style::default());
         let mut line: Vec<&Word> = Vec::new();
         let mut line_w = 0.0;
@@ -2192,8 +2854,9 @@ impl Flow<'_> {
 
     /// Pragmatic table layout. Column widths come from a `<colgroup>`/`<col>`
     /// set or the first row's per-cell `width`, normalised to fit `avail_w`
-    /// (fixed-layout style); columns with no declared width share the remainder
-    /// equally, so a table that declares nothing keeps **equal** columns. Cells
+    /// (fixed-layout style); columns with no declared width are sized to their
+    /// content — the remainder is split proportionally to each column's
+    /// max-content width, floored at its min-content (CSS auto layout). Cells
     /// are placed onto a grid honouring both `colspan` and `rowspan`
     /// ([`build_grid`]): a `colspan` cell covers the summed width of its columns,
     /// a `rowspan` cell covers the summed height of its rows and reserves those
@@ -2210,9 +2873,35 @@ impl Flow<'_> {
         ancestors: &[&Element],
     ) -> f64 {
         y += style.margin.top;
-        let table_top = y;
         let na = push_ancestor(ancestors, el);
-        let rows = collect_rows(el);
+
+        // `<caption>` renders as a block above the grid (`caption-side: top`,
+        // the default) or below it (`caption-side: bottom`, read off the
+        // caption's computed style — the property inherits from the table).
+        // Previously the caption was silently dropped — `collect_rows` only
+        // walks `tr`/row groups.
+        let mut bottom_captions: Vec<(&Element, Style)> = Vec::new();
+        for n in &el.children {
+            if let Node::Element(cap) = n {
+                if cap.tag == "caption" {
+                    let cstyle = self.style_of(cap, style, &na);
+                    if cstyle.display != Display::None {
+                        let bstyle = Style {
+                            display: Display::Block,
+                            ..cstyle
+                        };
+                        if bstyle.caption_side == super::css::CaptionSide::Bottom {
+                            bottom_captions.push((cap, bstyle));
+                        } else {
+                            y = self.block(cap, &bstyle, style, x, avail_w, y, &na, 0);
+                        }
+                    }
+                }
+            }
+        }
+
+        let table_top = y;
+        let (rows, thead_flags) = collect_rows(el);
 
         // Place every cell on the grid (colspan + rowspan), then resolve column
         // widths and prefix-sum them so a cell is positioned by its start column.
@@ -2352,9 +3041,36 @@ impl Flow<'_> {
             }
         }
 
-        // Recompute the final row tops from the resolved heights.
+        // Recompute the final row tops from the resolved heights. With a
+        // `<thead>`, a body row that would straddle a page boundary is pushed to
+        // the next page top **plus the header height**, reserving the band where
+        // the thead rows are re-stamped (running table header). Tables without a
+        // thead keep the plain accumulation (rows may split across pages, as
+        // before).
+        let thead_n = thead_flags.iter().take_while(|f| **f).count();
+        let header_h: f64 = row_h[..thead_n.min(n_rows)].iter().sum();
+        let content_h = (self.page_h - self.top - self.bottom).max(1.0);
+        // Bottom of the page band containing `yy` (flow space; a band's bottom
+        // coincides with the next band's top).
+        let band_bottom_of = |yy: f64| -> f64 {
+            let k = ((yy - self.top).max(0.0) / content_h).floor();
+            self.top + (k + 1.0) * content_h
+        };
+        let mut header_repeat_tops: Vec<f64> = Vec::new();
         let mut acc_y = table_top;
         for r in 0..n_rows {
+            if thead_n > 0
+                && thead_n < n_rows
+                && r >= thead_n
+                // Only rows that can actually fit under a repeated header are
+                // moved; a row taller than the reserved band stays and splits.
+                && header_h + row_h[r] <= content_h
+                && acc_y + row_h[r] > band_bottom_of(acc_y) + 0.01
+            {
+                let page_top = band_bottom_of(acc_y);
+                header_repeat_tops.push(page_top);
+                acc_y = page_top + header_h;
+            }
             row_top[r] = acc_y;
             acc_y += row_h[r];
         }
@@ -2362,9 +3078,13 @@ impl Flow<'_> {
         // Placement pass: correct each cell vertically (translate from its
         // provisional top to the final one), apply `vertical-align`, then emit
         // the background and per-side borders over the cell's full merged rect.
+        // Thead cells additionally contribute their (positioned) fragments to a
+        // running-header template, re-stamped on every later page of the table.
+        let mut header_template: Vec<Abs> = Vec::new();
         for pl in &placed {
             let (dx, cw) = span_geom(pl.start, pl.col_span);
             let cell_x = x + dx;
+            let deco_lo = self.out.len();
             let top = row_top[pl.row];
             let end_row = (pl.row + pl.row_span).min(n_rows).max(pl.row + 1);
             // Merged-cell height = sum of the rows it spans.
@@ -2392,7 +3112,7 @@ impl Flow<'_> {
             if let Some(fill) = pl.background {
                 self.out.push(Abs {
                     z: 0,
-                    zi: 0,
+                    zk: Vec::new(),
                     frag: Fragment::Rect {
                         x: cell_x,
                         y: top,
@@ -2437,10 +3157,36 @@ impl Flow<'_> {
                 bc,
                 bs,
                 (pl.opacity * pl.border_color_alpha).clamp(0.0, 1.0),
+                [0.0; 4], // table cells have square corners
             );
+
+            // A thead cell's final fragments (translated content + the
+            // decorations just emitted) join the running-header template.
+            if pl.row < thead_n && !header_repeat_tops.is_empty() {
+                header_template.extend(self.out[pl.frag_lo..pl.frag_hi].iter().cloned());
+                let deco_hi = self.out.len();
+                header_template.extend(self.out[deco_lo..deco_hi].iter().cloned());
+            }
         }
 
-        acc_y + style.margin.bottom
+        // Re-stamp the thead rows at the top of every later page the table
+        // spans (the space was reserved when the row tops were laid).
+        for &page_top in &header_repeat_tops {
+            let dy = page_top - table_top;
+            for abs in &header_template {
+                let mut clone = abs.clone();
+                shift_fragment(&mut clone.frag, 0.0, dy);
+                self.out.push(clone);
+            }
+        }
+
+        // `caption-side: bottom` captions land below the grid.
+        let mut end_y = acc_y;
+        for (cap, bstyle) in &bottom_captions {
+            end_y = self.block(cap, bstyle, style, x, avail_w, end_y, &na, 0);
+        }
+
+        end_y + style.margin.bottom
     }
 
     /// Emit a box's background at z=0: the solid `background` colour (when set)
@@ -2469,7 +3215,7 @@ impl Flow<'_> {
         for layer in style.box_shadow_extra.iter().rev() {
             self.out.push(Abs {
                 z: 0,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Rect {
                     x,
                     y,
@@ -2504,7 +3250,7 @@ impl Flow<'_> {
         if style.background.is_some() || shadow.is_some() {
             self.out.push(Abs {
                 z: 0,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Rect {
                     x,
                     y,
@@ -2523,7 +3269,7 @@ impl Flow<'_> {
         if let Some(grad) = &style.background_gradient {
             self.out.push(Abs {
                 z: 0,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Gradient {
                     x,
                     y,
@@ -2556,6 +3302,15 @@ impl Flow<'_> {
     ///   corners with differing/styled per-side borders is rare and has no clean
     ///   rectangular decomposition).
     fn emit_box_decoration(&mut self, style: &Style, x: f64, y: f64, w: f64, h: f64) {
+        // Record the emitted range — including the empty one — so
+        // `stamp_context` always sees the range of the LAST decoration call
+        // (the stamped element's own; a block decorates after its children).
+        let start = self.out.len();
+        self.emit_box_decoration_inner(style, x, y, w, h);
+        self.last_decor = Some((start, self.out.len()));
+    }
+
+    fn emit_box_decoration_inner(&mut self, style: &Style, x: f64, y: f64, w: f64, h: f64) {
         if style.hidden {
             return;
         }
@@ -2600,7 +3355,7 @@ impl Flow<'_> {
             // One rounded rect with both fill and stroke (carrying the shadow).
             self.out.push(Abs {
                 z: 0,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Rect {
                     x,
                     y,
@@ -2631,8 +3386,10 @@ impl Flow<'_> {
         self.push_box_background(x, y, w, h, style, radius, radius_v, shadow);
         if any_border {
             // Per-side borders — solid sides are exact filled rects; styled sides
-            // become dash/dot/double bands. With a radius set this is the
-            // asymmetric/styled best-effort fallback (corners stay square).
+            // become dash/dot/double bands. With a radius set, a styled side is
+            // shortened by its adjoining corner radii and the painter follows
+            // the corner arcs; asymmetric SOLID sides still keep square corners
+            // (the uniform-solid case took the rounded fill+stroke path above).
             self.emit_border_edges(
                 x,
                 y,
@@ -2642,6 +3399,7 @@ impl Flow<'_> {
                 &style.border_color_edges,
                 &style.border_style_edges,
                 (style.opacity * style.border_color_alpha).clamp(0.0, 1.0),
+                radius,
             );
         }
 
@@ -2651,13 +3409,16 @@ impl Flow<'_> {
         if let Some(src) = &style.background_image {
             self.out.push(Abs {
                 z: 0,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Image {
                     x,
                     y,
                     w,
                     h,
                     src: src.clone(),
+                    // A background fills its box; `object-fit` applies to
+                    // replaced elements only.
+                    fit: ObjectFit::Fill,
                 },
             });
         }
@@ -2669,7 +3430,11 @@ impl Flow<'_> {
     /// and colour, the only way to honour `border-bottom: 2pt` without thickening
     /// the other three sides — and is byte-identical to the pre-style behaviour.
     /// A `Dashed`/`Dotted`/`Double` side becomes a [`Fragment::Border`] band the
-    /// paint layer expands into segments / parallel lines.
+    /// paint layer expands into segments / parallel lines. `radius` is the box's
+    /// `border-radius` `[tl, tr, br, bl]` (clamped, circular approximation): a
+    /// styled side adjoining a rounded corner is shortened by that radius and
+    /// carries it on the fragment, so the painter's dashes stop where the arc
+    /// begins and continue along it instead of overshooting the corner.
     #[allow(clippy::too_many_arguments)]
     fn emit_border_edges(
         &mut self,
@@ -2681,13 +3446,14 @@ impl Flow<'_> {
         colors: &[[f64; 3]; 4],
         styles: &[BorderStyle; 4],
         opacity: f64,
+        radius: [f64; 4],
     ) {
         // A `Solid` side: the legacy filled rectangle (corners overlap so the
         // frame joins cleanly — acceptable: same colour, opaque overlap).
         let push_solid = |out: &mut Vec<Abs>, rx: f64, ry: f64, rw: f64, rh: f64, c: [f64; 3]| {
             out.push(Abs {
                 z: 0,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Rect {
                     x: rx,
                     y: ry,
@@ -2704,6 +3470,9 @@ impl Flow<'_> {
             });
         };
         // A styled side: a band the painter turns into dashes / parallel lines.
+        // With a rounded adjoining corner the band is shortened by the corner
+        // radius (the fragment carries the radii so the painter can follow the
+        // arc). A square corner (`r = 0`) emits the exact previous band.
         #[allow(clippy::too_many_arguments)]
         let push_styled = |out: &mut Vec<Abs>,
                            rx: f64,
@@ -2713,10 +3482,18 @@ impl Flow<'_> {
                            c: [f64; 3],
                            horizontal: bool,
                            width: f64,
-                           style: BorderStyle| {
+                           style: BorderStyle,
+                           r_start: f64,
+                           r_end: f64,
+                           far: bool| {
+            let (rx, ry, rw, rh) = if horizontal {
+                (rx + r_start, ry, (rw - r_start - r_end).max(0.01), rh)
+            } else {
+                (rx, ry + r_start, rw, (rh - r_start - r_end).max(0.01))
+            };
             out.push(Abs {
                 z: 0,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Border {
                     x: rx,
                     y: ry,
@@ -2727,6 +3504,9 @@ impl Flow<'_> {
                     color: c,
                     style,
                     opacity,
+                    radius_start: r_start.max(0.0),
+                    radius_end: r_end.max(0.0),
+                    far,
                 },
             });
         };
@@ -2742,7 +3522,9 @@ impl Flow<'_> {
                          horizontal: bool,
                          width: f64,
                          style: BorderStyle,
-                         near: bool| {
+                         near: bool,
+                         r_start: f64,
+                         r_end: f64| {
             match style {
                 BorderStyle::Solid => push_solid(out, rx, ry, rw, rh, c),
                 BorderStyle::Inset | BorderStyle::Outset => {
@@ -2783,15 +3565,33 @@ impl Flow<'_> {
                         push_solid(out, ix, ry, half, rh, ic);
                     }
                 }
-                _ => push_styled(out, rx, ry, rw, rh, c, horizontal, width, style),
+                _ => push_styled(
+                    out, rx, ry, rw, rh, c, horizontal, width, style, r_start, r_end, !near,
+                ),
             }
         };
         let [wt, wr, wb, wl] = widths;
         let [st, sr, sb, sl] = *styles;
+        let [rtl_, rtr, rbr, rbl] = radius;
         // `near` (top + left) selects the dark side for `inset`. TRBL colour
-        // indices: top=0, right=1, bottom=2, left=3.
+        // indices: top=0, right=1, bottom=2, left=3. Corner radii adjoin the
+        // sides as: top ↦ (tl, tr), bottom ↦ (bl, br), left ↦ (tl, bl),
+        // right ↦ (tr, br) — each in the band's start→end order.
         if wt > 0.0 {
-            emit_side(&mut self.out, x, y, w, wt, colors[0], true, wt, st, true);
+            emit_side(
+                &mut self.out,
+                x,
+                y,
+                w,
+                wt,
+                colors[0],
+                true,
+                wt,
+                st,
+                true,
+                rtl_,
+                rtr,
+            );
         }
         if wb > 0.0 {
             emit_side(
@@ -2805,10 +3605,25 @@ impl Flow<'_> {
                 wb,
                 sb,
                 false,
+                rbl,
+                rbr,
             );
         }
         if wl > 0.0 {
-            emit_side(&mut self.out, x, y, wl, h, colors[3], false, wl, sl, true);
+            emit_side(
+                &mut self.out,
+                x,
+                y,
+                wl,
+                h,
+                colors[3],
+                false,
+                wl,
+                sl,
+                true,
+                rtl_,
+                rbl,
+            );
         }
         if wr > 0.0 {
             emit_side(
@@ -2822,18 +3637,25 @@ impl Flow<'_> {
                 wr,
                 sr,
                 false,
+                rtr,
+                rbr,
             );
         }
     }
 
     /// Resolve the table's column widths (length `ncols`) to absolute points
     /// summing to `avail_w`. Declared widths come first from `<col>` elements
-    /// (honouring `span`), else from the first row's per-cell `width`. Columns
-    /// without a declared width split the remaining space equally; if every
+    /// (honouring `span`), else from the first row's per-cell `width`; if every
     /// column is declared the widths are scaled proportionally to fit `avail_w`
-    /// (browser fixed-layout). With nothing declared this yields equal columns.
+    /// (browser fixed-layout). Columns without a declared width are sized to
+    /// their **content** (the CSS 2.1 auto table layout, approximated): the
+    /// space the declared columns leave is distributed proportionally to each
+    /// column's max-content width, floored at its min-content width — so a
+    /// column of long text gets more room and no column drops below its widest
+    /// unbreakable token. Undeclared columns with equal content still split
+    /// equally (proportional shares of equal weights).
     fn resolve_col_widths(
-        &self,
+        &mut self,
         table: &Element,
         style: &Style,
         rows: &[&Element],
@@ -2878,6 +3700,7 @@ impl Flow<'_> {
                 let w = cstyle.width.map(|len| match len {
                     Len::Pt(pt) => pt.max(0.0),
                     Len::Percent(pc) => avail_w * pc / 100.0,
+                    Len::Calc { pt, pct } => (avail_w * pct / 100.0 + pt).max(0.0),
                 });
                 if let Some(total) = w {
                     let per = total / span.max(1) as f64;
@@ -2899,15 +3722,74 @@ impl Flow<'_> {
             // zero/degenerate sum by falling back to equal columns.
             if declared_sum > 0.0 {
                 let scale = avail_w / declared_sum;
-                decl.iter().map(|d| d.unwrap_or(equal) * scale).collect()
-            } else {
-                vec![equal; ncols]
+                return decl.iter().map(|d| d.unwrap_or(equal) * scale).collect();
             }
-        } else {
-            // Undeclared columns share whatever space the declared ones leave.
-            let fill = ((avail_w - declared_sum).max(0.0)) / undeclared as f64;
-            decl.iter().map(|d| d.unwrap_or(fill)).collect()
+            return vec![equal; ncols];
         }
+
+        // Undeclared columns: content-based auto sizing. Measure each column's
+        // min-content (widest unbreakable token — a ~1pt probe wraps everything)
+        // and max-content (nothing wraps — a huge probe) over its single-span
+        // cells; colspan cells don't pin a single column and are skipped.
+        let rest = (avail_w - declared_sum).max(0.0);
+        let fill = rest / undeclared as f64;
+        let (grid, _) = build_grid(rows);
+        let mut min_c = vec![0.0f64; ncols];
+        let mut max_c = vec![0.0f64; ncols];
+        let mut measured = vec![false; ncols];
+        for gc in &grid {
+            if gc.col_span != 1 || gc.col >= ncols || decl[gc.col].is_some() {
+                continue;
+            }
+            let cstyle = self.style_of(gc.el, style, na);
+            max_c[gc.col] = max_c[gc.col]
+                .max(self.measure_intrinsic_width(gc.el, &cstyle, 0.0, 0.0, na, 1.0e6, avail_w));
+            min_c[gc.col] = min_c[gc.col]
+                .max(self.measure_intrinsic_width(gc.el, &cstyle, 0.0, 0.0, na, 1.0, avail_w));
+            measured[gc.col] = true;
+        }
+        // A column with no single-span cell keeps the equal share as its weight.
+        for c in 0..ncols {
+            if decl[c].is_none() && !measured[c] {
+                max_c[c] = fill.max(1.0);
+                min_c[c] = 0.0;
+            }
+        }
+
+        // Distribute `rest` over the undeclared columns proportionally to their
+        // max-content, then floor at min-content: floored columns freeze and the
+        // remainder is re-shared among the rest (bounded rounds). If the floors
+        // alone exceed `rest` the columns keep their min-content (the table
+        // overflows, as CSS does, rather than crushing a word).
+        let mut w: Vec<f64> = vec![0.0; ncols];
+        let mut frozen: Vec<bool> = (0..ncols).map(|c| decl[c].is_some()).collect();
+        for _ in 0..ncols.max(1) {
+            let pool: f64 = (0..ncols)
+                .filter(|&c| !frozen[c])
+                .map(|c| max_c[c].max(0.001))
+                .sum();
+            let left = rest
+                - (0..ncols)
+                    .filter(|&c| frozen[c] && decl[c].is_none())
+                    .map(|c| w[c])
+                    .sum::<f64>();
+            let mut clamped = false;
+            for c in 0..ncols {
+                if frozen[c] {
+                    continue;
+                }
+                w[c] = (left.max(0.0) * max_c[c].max(0.001) / pool).max(0.0);
+                if w[c] < min_c[c] - 0.01 {
+                    w[c] = min_c[c];
+                    frozen[c] = true;
+                    clamped = true;
+                }
+            }
+            if !clamped {
+                break;
+            }
+        }
+        (0..ncols).map(|c| decl[c].unwrap_or(w[c])).collect()
     }
 
     /// A flex container. Supports `flex-direction` (row | column),
@@ -2995,20 +3877,19 @@ impl Flow<'_> {
         y
     }
 
-    /// Partition flex items into lines for `flex-wrap`. Without wrap (or with no
-    /// explicit widths) every item stays on a single line.
+    /// Partition flex items into lines for `flex-wrap`. Without wrap every item
+    /// stays on a single line. The wrap decision uses each item's flex base
+    /// size — `flex-basis`, else `width`, else its **intrinsic max-content
+    /// width** (measured by a throwaway probe), so a row of text-sized items
+    /// still wraps when their natural widths overflow the container.
     fn flex_wrap_lines<'b>(
-        &self,
+        &mut self,
         items: &[&'b Element],
         style: &Style,
         content_w: f64,
         na: &[&Element],
     ) -> Vec<Vec<&'b Element>> {
-        let any_explicit = items.iter().any(|it| {
-            let st = self.style_of(it, style, na);
-            st.flex_basis.is_some() || st.width.is_some()
-        });
-        if !style.flex_wrap || !any_explicit {
+        if !style.flex_wrap {
             return vec![items.to_vec()];
         }
         let gap = style.gap_col;
@@ -3017,11 +3898,14 @@ impl Flow<'_> {
         let mut used = 0.0;
         for it in items {
             let st = self.style_of(it, style, na);
-            // Wrap decision uses the flex base size (basis, else width).
+            // Wrap decision uses the flex base size (basis, else width, else the
+            // measured max-content width — clamped to the line, so a single item
+            // wider than the container still gets a line of its own).
             let w = match st.flex_basis.or(st.width) {
                 Some(Len::Pt(w)) => w.max(0.0),
                 Some(Len::Percent(pc)) => content_w * pc / 100.0,
-                None => 0.0,
+                Some(Len::Calc { pt, pct }) => (content_w * pct / 100.0 + pt).max(0.0),
+                None => self.measure_float_max_content(it, &st, 0.0, 0.0, na, content_w),
             };
             let add = if cur.is_empty() { w } else { w + gap };
             if !cur.is_empty() && used + add > content_w + 0.01 {
@@ -3069,6 +3953,7 @@ impl Flow<'_> {
         let resolve_len = |len: Len| match len {
             Len::Pt(w) => w.max(0.0),
             Len::Percent(pc) => avail * pc / 100.0,
+            Len::Calc { pt, pct } => (avail * pct / 100.0 + pt).max(0.0),
         };
         for it in items {
             let st = self.style_of(it, style, na);
@@ -3245,6 +4130,7 @@ impl Flow<'_> {
             let item_w = match istyle.width {
                 Some(Len::Pt(w)) => w.max(0.0),
                 Some(Len::Percent(pc)) => content_w * pc / 100.0,
+                Some(Len::Calc { pt, pct }) => (content_w * pct / 100.0 + pt).max(0.0),
                 None => content_w - im.left - im.right,
             };
             let (box_w, inner_w) = if cross == AlignItems::Stretch && istyle.width.is_none() {
@@ -3277,6 +4163,12 @@ impl Flow<'_> {
                 Some(Len::Percent(pc)) => {
                     Some(avail_main.map(|a| a * pc / 100.0).unwrap_or(content_h))
                 }
+                Some(Len::Calc { pt, pct }) => Some(
+                    avail_main
+                        .map(|a| a * pct / 100.0 + pt)
+                        .unwrap_or(content_h)
+                        .max(0.0),
+                ),
                 None => istyle.height,
             };
             cols.push(ColItem {
@@ -3401,17 +4293,45 @@ impl Flow<'_> {
         let gap_col = style.gap_col.max(0.0);
         let gap_row = style.gap_row.max(0.0);
 
-        // Resolve per-column widths from the track list (or equal columns when no
-        // track list is present), then the cumulative x of each column's left
-        // edge (including the column gaps that precede it).
-        let col_widths =
-            resolve_track_sizes(&style.grid_template_columns, cols, content_w, gap_col);
-        let col_x: Vec<f64> = cumulative_offsets(content_x, &col_widths, gap_col);
-
         // Assign each item a (row, col) cell + span. Items with an explicit
         // `grid-column`/`grid-row` start line land on that line; the rest
         // auto-flow into the next free cell (left-to-right, top-to-bottom).
+        // (Placement is independent of the column widths, and the widths need it
+        // to size `auto` tracks to their content below.)
         let placement = self.place_grid_items(&items, style, &na, cols);
+
+        // `auto` tracks size to their content (max-content, clamped to the
+        // grid), not to an equal `1fr`-like share. Measure each auto column's
+        // widest single-column item with the intrinsic probe; non-auto track
+        // lists skip the probe entirely (identical output to before).
+        let tracks = &style.grid_template_columns;
+        let has_auto_track = !tracks.is_empty()
+            && (0..cols).any(|i| matches!(tracks.get(i), Some(TrackSize::Auto) | None));
+        let auto_content: Vec<f64> = if has_auto_track {
+            let mut content = vec![0.0f64; cols];
+            for cell in placement.iter().filter(|p| p.col_span == 1) {
+                if !matches!(tracks.get(cell.col), Some(TrackSize::Auto) | None) {
+                    continue;
+                }
+                let it = items[cell.item];
+                let istyle = self.style_of(it, style, &na);
+                let w = self.measure_float_max_content(it, &istyle, 0.0, 0.0, &na, content_w);
+                content[cell.col] = content[cell.col].max(w);
+            }
+            content
+        } else {
+            Vec::new()
+        };
+
+        // Resolve per-column widths from the track list (or equal columns when no
+        // track list is present), then the cumulative x of each column's left
+        // edge (including the column gaps that precede it).
+        let col_widths = if has_auto_track {
+            resolve_track_sizes_content(tracks, cols, content_w, gap_col, &auto_content)
+        } else {
+            resolve_track_sizes(tracks, cols, content_w, gap_col)
+        };
+        let col_x: Vec<f64> = cumulative_offsets(content_x, &col_widths, gap_col);
         let row_count = placement
             .iter()
             .map(|p| p.row + p.row_span)
@@ -3715,11 +4635,14 @@ impl Flow<'_> {
     /// fills each column until adding the next unit would pass the target (then
     /// it moves to the next column, except in the last one which takes the rest).
     ///
-    /// Pagination interaction: columns are emitted in absolute coordinates, so a
-    /// region that overflows a single page is sliced by the y-band paginator like
-    /// any other content (each column simply continues down the next page band).
-    /// True column-then-page balancing across multiple pages is **not** modelled;
-    /// the single-page case (the common newsletter/report block) is exact.
+    /// Pagination interaction: filling is **page-sequential**. Content is split
+    /// into page groups first (greedy: a page holds what its `column_count`
+    /// columns can take between the block's top and the page-band bottom), so
+    /// every column of a page fills before anything lands on the next page —
+    /// column 1 never "continues" onto page 2 while column 2 of page 1 sits
+    /// empty. The **last** page group is height-balanced exactly like the
+    /// single-page case (which therefore keeps its historical behaviour); the
+    /// earlier groups fill each column to the band bottom.
     fn columns(
         &mut self,
         el: &Element,
@@ -3736,15 +4659,13 @@ impl Flow<'_> {
         y += m.top;
         let box_top = y;
         let box_x = x + m.left;
-        let resolve_w = |len: Len| match len {
-            Len::Pt(w) => w,
-            Len::Percent(pc) => avail_w * pc / 100.0,
-        };
+        let resolve_w = |len: Len| len.resolve(avail_w);
         // Box width, matching `block`'s sizing (incl. `box-sizing`/min/max).
         let mut box_w = match style.width {
             Some(Len::Pt(w)) if style.border_box => w,
             Some(Len::Pt(w)) => w + p.left + p.right + b.left + b.right,
             Some(Len::Percent(pc)) => avail_w * pc / 100.0,
+            Some(Len::Calc { pt, pct }) => avail_w * pct / 100.0 + pt,
             None => avail_w - m.left - m.right,
         };
         if let Some(mw) = style.max_width {
@@ -3781,30 +4702,69 @@ impl Flow<'_> {
             self.out.truncate(probe_start);
             heights.push((bottom - content_top).max(0.0));
         }
-        let total: f64 = heights.iter().sum();
-        let target = total / n as f64;
-
-        // ── Place pass: greedily fill columns to the balanced target. Each unit
-        // is re-laid at its column's running `y`; a column advances when the next
-        // unit would push it past the target (never on the last column). ──
-        let mut col = 0usize;
-        let mut col_y = content_top;
-        let mut max_bottom = content_top;
-        for (unit, uh) in units.iter().zip(&heights) {
-            // Move to the next column when this column already holds content and
-            // adding the unit would overshoot the balanced target. Skip degenerate
-            // units (height 0) so they never trigger a premature break.
-            if col + 1 < n
-                && col_y > content_top + 0.05
-                && *uh > 0.0
-                && (col_y - content_top) + *uh > target + 0.05
-            {
-                col += 1;
-                col_y = content_top;
+        // ── Page split: greedily assign units to page groups. Each page offers
+        // `n` columns of `cap` height (the current band's remaining height for
+        // the first page, the full band afterwards); when all `n` columns of a
+        // page are full the NEXT unit opens the next page. A unit taller than a
+        // whole column still goes into a fresh column (and is sliced by the
+        // y-band paginator like any oversized block). ──
+        let content_h = (self.page_h - self.top - self.bottom).max(1.0);
+        let first_band_bottom = {
+            let page = ((content_top - self.top).max(0.0) / content_h) as usize;
+            self.top + (page + 1) as f64 * content_h
+        };
+        // Page groups: unit indices + the group's column-area top + capacity.
+        let mut groups: Vec<(Vec<usize>, f64, f64)> =
+            vec![(Vec::new(), content_top, (first_band_bottom - content_top).max(1.0))];
+        {
+            let (mut col, mut col_y) = (0usize, 0.0_f64);
+            for (i, uh) in heights.iter().enumerate() {
+                while col_y > 0.05 && col_y + uh > groups.last().unwrap().2 + 0.05 {
+                    col += 1;
+                    col_y = 0.0;
+                    if col >= n {
+                        col = 0;
+                        let (_, prev_top, prev_cap) = *groups.last().unwrap();
+                        // The next band starts at the previous band's bottom
+                        // (absolute coordinates keep growing across pages).
+                        groups.push((Vec::new(), prev_top + prev_cap, content_h));
+                    }
+                }
+                groups.last_mut().unwrap().0.push(i);
+                col_y += uh;
             }
-            let bottom = self.lay_unit(unit, style, col_x(col), col_w, col_y, &new_ancestors);
-            col_y = bottom;
-            max_bottom = max_bottom.max(col_y);
+        }
+
+        // ── Place pass, per page group: greedily fill columns to the group's
+        // target. Non-last pages target the full band (columns fill to the page
+        // bottom); the last page balances to `group total / n` — identical to
+        // the historical single-page behaviour when there is only one group.
+        // Degenerate units (height 0) never trigger a premature column break. ──
+        let mut max_bottom = content_top;
+        let last_gi = groups.len() - 1;
+        for (gi, (idxs, group_top, cap)) in groups.iter().enumerate() {
+            let target = if gi == last_gi {
+                idxs.iter().map(|&i| heights[i]).sum::<f64>() / n as f64
+            } else {
+                *cap
+            };
+            let mut col = 0usize;
+            let mut col_y = *group_top;
+            for &i in idxs {
+                let uh = heights[i];
+                if col + 1 < n
+                    && col_y > *group_top + 0.05
+                    && uh > 0.0
+                    && (col_y - *group_top) + uh > target + 0.05
+                {
+                    col += 1;
+                    col_y = *group_top;
+                }
+                let bottom =
+                    self.lay_unit(&units[i], style, col_x(col), col_w, col_y, &new_ancestors);
+                col_y = bottom;
+                max_bottom = max_bottom.max(col_y);
+            }
         }
 
         let mut box_h = style
@@ -3856,7 +4816,7 @@ impl Flow<'_> {
         if istyle.background.is_some() || has_border || has_grad || istyle.box_shadow.is_some() {
             self.out.push(Abs {
                 z: 0,
-                zi: 0,
+                zk: Vec::new(),
                 frag: Fragment::Rect {
                     x,
                     y,
@@ -3881,7 +4841,7 @@ impl Flow<'_> {
             if let Some(grad) = &istyle.background_gradient {
                 self.out.push(Abs {
                     z: 0,
-                    zi: 0,
+                    zk: Vec::new(),
                     frag: Fragment::Gradient {
                         x,
                         y,
@@ -3910,6 +4870,41 @@ fn default_line_height(style: &Style) -> f64 {
 /// so consecutive highlighted words tile into a continuous band. A run without a
 /// background emits nothing, leaving the highlight-free output byte-for-byte
 /// unchanged. `background` is a non-inherited property, so a block ancestor's
+/// Build the placed fragment for an inline SVG box, honouring the image's
+/// `preserveAspectRatio`: `meet` letterboxes the (uniformly scaled) viewBox
+/// inside the CSS box, `slice` covers the box and clips the overflow via a
+/// `Clipped` wrapper, `none` keeps the plain stretch. The painter stretches
+/// the viewBox onto whatever rect the fragment carries, so the adjustment is
+/// purely a matter of the target rect.
+fn svg_fragment(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    image: &SvgImage,
+    par: crate::svg::PreserveAspectRatio,
+) -> Fragment {
+    let ((dx, dy, dw, dh), clip) =
+        crate::svg::place_viewport(par, image.view_box[2], image.view_box[3], x, y, w, h);
+    let svg = Fragment::Svg {
+        x: dx,
+        y: dy,
+        w: dw,
+        h: dh,
+        image: image.clone(),
+    };
+    if clip {
+        Fragment::Clipped {
+            rect: [x, y, w, h],
+            radius: [0.0; 4],
+            radius_v: [0.0; 4],
+            inner: Box::new(svg),
+        }
+    } else {
+        svg
+    }
+}
+
 /// background never lands on a text run here — only the run's own highlight does.
 fn push_run_highlight(out: &mut Vec<Abs>, x: f64, y: f64, word: &Word) {
     let Some(fill) = word.style.background else {
@@ -3918,7 +4913,7 @@ fn push_run_highlight(out: &mut Vec<Abs>, x: f64, y: f64, word: &Word) {
     let h = word.style.font_size * word.style.line_height.max(1.0);
     out.push(Abs {
         z: 0,
-        zi: 0,
+        zk: Vec::new(),
         frag: Fragment::Rect {
             x,
             y,
@@ -3998,6 +4993,85 @@ fn resolve_track_sizes(tracks: &[TrackSize], cols: usize, total: f64, gap: f64) 
         let share = free / cols as f64;
         for s in sizes.iter_mut() {
             *s += share;
+        }
+    }
+    sizes
+}
+
+/// Like [`resolve_track_sizes`], but sizes `auto` tracks to their **content**:
+/// each `auto` track's base is its measured max-content width (`content[i]`,
+/// clamped to the grid's inner width) instead of an equal `1fr`-like share.
+/// Free space then goes to the `fr` tracks; when the list has **no** `fr`
+/// track, the leftover stretches the `auto` tracks equally (the CSS "stretch
+/// auto tracks" step), so an all-`auto` grid still fills its container.
+fn resolve_track_sizes_content(
+    tracks: &[TrackSize],
+    cols: usize,
+    total: f64,
+    gap: f64,
+    content: &[f64],
+) -> Vec<f64> {
+    let cols = cols.max(1);
+    let inner = (total - gap * cols.saturating_sub(1) as f64).max(0.0);
+    if tracks.is_empty() {
+        return vec![inner / cols as f64; cols];
+    }
+    let get = |i: usize| tracks.get(i).cloned().unwrap_or(TrackSize::Auto);
+
+    let mut sizes = vec![0.0f64; cols];
+    let mut fr_weight = vec![0.0f64; cols];
+    let mut is_auto = vec![false; cols];
+    let mut fixed_total = 0.0;
+    let mut total_fr = 0.0;
+    for i in 0..cols {
+        match get(i) {
+            TrackSize::Auto => {
+                // Content-sized: the measured max-content, capped to the grid.
+                sizes[i] = content.get(i).copied().unwrap_or(0.0).min(inner).max(0.0);
+                is_auto[i] = true;
+                fixed_total += sizes[i];
+            }
+            t => {
+                let (base, fr) = track_base_and_fr(&t, inner);
+                sizes[i] = base;
+                fixed_total += base;
+                if fr > 0.0 {
+                    fr_weight[i] = fr;
+                    total_fr += fr;
+                }
+            }
+        }
+    }
+
+    let free = (inner - fixed_total).max(0.0);
+    if total_fr > 0.0 {
+        // Flexible tracks absorb every leftover point (auto tracks stay snug).
+        for i in 0..cols {
+            if fr_weight[i] > 0.0 {
+                let mut add = free * fr_weight[i] / total_fr;
+                if let TrackSize::MinMax(_, max) = get(i) {
+                    if let Some(cap) = track_fixed_height(&max) {
+                        add = add.min((cap - sizes[i]).max(0.0));
+                    }
+                }
+                sizes[i] += add;
+            }
+        }
+    } else if free > 0.0 {
+        // No `fr` track: stretch the auto tracks equally (else every track).
+        let autos = is_auto.iter().filter(|a| **a).count();
+        if autos > 0 {
+            let share = free / autos as f64;
+            for i in 0..cols {
+                if is_auto[i] {
+                    sizes[i] += share;
+                }
+            }
+        } else {
+            let share = free / cols as f64;
+            for s in sizes.iter_mut() {
+                *s += share;
+            }
         }
     }
     sizes
@@ -4136,6 +5210,43 @@ fn collapse_ws(s: &str) -> String {
     out
 }
 
+/// Split a line into alternating non-space / space runs, both kept verbatim,
+/// so `white-space: pre-wrap` text can wrap **between** runs while preserving
+/// every source space (each run becomes its own measured word).
+fn split_space_runs(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_space: Option<bool> = None;
+    for (i, c) in s.char_indices() {
+        let sp = c == ' ' || c == '\t';
+        if in_space != Some(sp) {
+            if i > start {
+                out.push(&s[start..i]);
+            }
+            start = i;
+            in_space = Some(sp);
+        }
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+/// Extra top-down offset aligning a run inside its line box for the
+/// line-relative `vertical-align` values: `top` keeps the (default) top
+/// placement, `middle` centres the run's own line box within the tallest one
+/// on the line, `bottom` sinks it to the line bottom. Baseline / super / sub /
+/// length runs return `0.0`, keeping their placement byte-identical.
+fn inline_valign_delta(style: &Style, line_h: f64) -> f64 {
+    let own = style.font_size * style.line_height.max(1.0);
+    match style.valign {
+        VShift::Middle => ((line_h - own) / 2.0).max(0.0),
+        VShift::Bottom => (line_h - own).max(0.0),
+        _ => 0.0,
+    }
+}
+
 fn push_ancestor<'a>(ancestors: &[&'a Element], el: &'a Element) -> Vec<&'a Element> {
     let mut v = ancestors.to_vec();
     v.push(el);
@@ -4261,21 +5372,26 @@ fn roman_marker(n: usize, upper: bool) -> String {
     }
 }
 
-fn collect_rows(table: &Element) -> Vec<&Element> {
+/// The table's `<tr>` rows in document order, plus a parallel flag marking the
+/// rows that live inside a `<thead>` (so a multi-page table can repeat them as
+/// a running header at the top of each page it spans).
+fn collect_rows(table: &Element) -> (Vec<&Element>, Vec<bool>) {
     let mut rows = Vec::new();
-    fn walk<'a>(el: &'a Element, rows: &mut Vec<&'a Element>) {
+    let mut in_thead = Vec::new();
+    fn walk<'a>(el: &'a Element, thead: bool, rows: &mut Vec<&'a Element>, flags: &mut Vec<bool>) {
         for c in &el.children {
             if let Node::Element(e) = c {
                 if e.tag == "tr" {
                     rows.push(e);
+                    flags.push(thead);
                 } else if matches!(e.tag.as_str(), "thead" | "tbody" | "tfoot") {
-                    walk(e, rows);
+                    walk(e, e.tag == "thead", rows, flags);
                 }
             }
         }
     }
-    walk(table, &mut rows);
-    rows
+    walk(table, false, &mut rows, &mut in_thead);
+    (rows, in_thead)
 }
 
 fn collect_cells(row: &Element) -> Vec<&Element> {
@@ -4456,10 +5572,11 @@ fn parse_table_width(v: &str, avail_w: f64) -> Option<f64> {
 /// Slice the absolute-positioned fragments into pages, splitting rects that
 /// straddle a page boundary so backgrounds/borders stay correct.
 fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<Fragment>> {
-    // Stacking order: by CSS `z-index` first (positioned subtrees lift their
-    // whole range), then backgrounds (z=0) before content (z=1) within a level.
-    // A stable sort keeps insertion (document) order for equal keys.
-    frags.sort_by_key(|a| (a.zi, a.z));
+    // Stacking order: hierarchical CSS stacking contexts first (the path
+    // comparison keeps descendant z-indexes local to their context), then
+    // backgrounds (z=0) before content (z=1) within a level. A stable sort
+    // keeps insertion (document) order for equal keys.
+    frags.sort_by(|a, b| cmp_stack(&a.zk, &b.zk).then(a.z.cmp(&b.z)));
     let content_h = (page_h - top - bottom).max(1.0);
     let mut pages: Vec<Vec<Fragment>> = Vec::new();
 
@@ -4490,7 +5607,14 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                     text,
                 });
             }
-            Fragment::Image { x, y, w, h, src } => {
+            Fragment::Image {
+                x,
+                y,
+                w,
+                h,
+                src,
+                fit,
+            } => {
                 let p = page_of(y);
                 ensure(&mut pages, p);
                 pages[p].push(Fragment::Image {
@@ -4499,6 +5623,7 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                     w,
                     h,
                     src,
+                    fit,
                 });
             }
             Fragment::Svg { x, y, w, h, image } => {
@@ -4564,18 +5689,27 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                 color,
                 style,
                 opacity,
+                radius_start,
+                radius_end,
+                far,
             } => {
                 // Split the side's band across the page bands it spans, exactly
                 // like `Rect`. The painter re-derives the dash run within each
                 // segment, so a tall dashed/dotted side breaks cleanly at a page
-                // boundary; a horizontal side never spans bands.
+                // boundary; a horizontal side never spans bands. When a vertical
+                // band splits, its start-corner radius stays with the first
+                // segment and its end-corner radius with the last (the corner
+                // arcs live at the band's real ends).
                 let mut top = y;
                 let bottom = y + h;
+                let first_top = top;
                 while top < bottom {
                     let p = page_of(top);
                     let band_bottom = top + (p as f64 + 1.0) * content_h;
                     let seg_bottom = bottom.min(band_bottom);
                     ensure(&mut pages, p);
+                    let is_first = top <= first_top;
+                    let is_last = seg_bottom >= bottom - 0.0005;
                     pages[p].push(Fragment::Border {
                         x,
                         y: local_y(top, p),
@@ -4586,6 +5720,17 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                         color,
                         style,
                         opacity,
+                        radius_start: if horizontal || is_first {
+                            radius_start
+                        } else {
+                            0.0
+                        },
+                        radius_end: if horizontal || is_last {
+                            radius_end
+                        } else {
+                            0.0
+                        },
+                        far,
                     });
                     top = seg_bottom + 0.001;
                 }
@@ -4920,7 +6065,11 @@ mod tests {
     fn table_colspan_sums_column_widths() {
         // Equal 3-col grid (180 each). A colspan=2 cell covers cols 0–1 (360),
         // so "Tail" starts at column 2 ⇒ 39 + 360 = 399. Row 2 fixes the grid.
+        // The equal grid is pinned via <colgroup> — undeclared columns are
+        // content-sized since the CSS auto-layout fix; the colspan summing
+        // under test is orthogonal to how the column widths were chosen.
         let layout = run("<table>\
+             <colgroup><col style=\"width:180pt\"><col style=\"width:180pt\"><col style=\"width:180pt\"></colgroup>\
              <tr><td colspan=\"2\">Wide</td><td>Tail</td></tr>\
              <tr><td>a</td><td>b</td><td>c</td></tr></table>");
         let wide = cell_x(&layout, "Wide");
@@ -4963,7 +6112,13 @@ mod tests {
         //
         //   row0: | Span (rowspan 2) | B0 |
         //   row1: |     (reserved)   | C1 |
+        //
+        // Columns are pinned to 270pt each via <colgroup> — undeclared columns
+        // are now sized to their content (CSS auto table layout), so the test
+        // declares the equal grid its position maths assume; the rowspan
+        // occupation mechanics under test are unchanged.
         let layout = run("<table>\
+             <colgroup><col style=\"width:270pt\"><col style=\"width:270pt\"></colgroup>\
              <tr><td rowspan=\"2\">Span</td><td>B0</td></tr>\
              <tr><td>C1</td></tr></table>");
         let span = cell_x(&layout, "Span");
@@ -5000,7 +6155,11 @@ mod tests {
         //   row0: | A (rowspan 2) | B0 |        (B0 → col 1; nothing in col 2)
         //   row1: |  (reserved)   | C1 | D1 |   (C1 → col 1, D1 → col 2)
         // So D1 must sit in column 2 (the third of three equal 180-pt columns).
+        // The equal 180pt grid is pinned via <colgroup> — undeclared columns
+        // are content-sized since the CSS auto-layout fix; the occupation
+        // arithmetic under test is unaffected.
         let layout = run("<table>\
+             <colgroup><col style=\"width:180pt\"><col style=\"width:180pt\"><col style=\"width:180pt\"></colgroup>\
              <tr><td rowspan=\"2\">A</td><td>B0</td></tr>\
              <tr><td>C1</td><td>D1</td></tr></table>");
         let b0 = cell_x(&layout, "B0");
@@ -6708,14 +7867,29 @@ mod tests {
 
     #[test]
     fn bidi_rtl_with_european_numbers_read_ltr() {
-        // European numbers in an RTL line resolve to an LTR sub-level (W/I rules),
-        // so two number tokens keep ascending left-to-right order: x(12) < x(34).
+        // Each number token resolves to an LTR sub-level (W/I rules) and stays
+        // an intact run — its digits are never mirrored. Between the two
+        // tokens, though, sits a real space: under UAX #9 resolved at character
+        // level a space flanked by numbers takes the RTL base level (N1 — EN/AN
+        // act as R), so the two SEPARATE tokens flow right-to-left like any
+        // other RTL words: 12 lands right of 34 (the classic bidi phone-number
+        // ordering, matching browsers). The old word-granularity model dropped
+        // the inter-word spaces from the algorithm, gluing both numbers into
+        // one LTR run — that ordering (12 left of 34) was not spec-correct.
         let layout = run(r#"<p dir="rtl">عرب 12 34 نص</p>"#);
         let n1 = run_x(&layout, "12");
         let n2 = run_x(&layout, "34");
         assert!(
-            n1 < n2,
-            "numbers read left-to-right inside RTL (12={n1}, 34={n2})"
+            n2 < n1,
+            "separate number tokens flow RTL, digits intact (34={n2} left of 12={n1})"
+        );
+        // Both frame words mirror around them: first logical Arabic word
+        // rightmost, last leftmost.
+        let a_first = run_x(&layout, "عرب");
+        let a_last = run_x(&layout, "نص");
+        assert!(
+            a_first > n1 && a_last < n2,
+            "Arabic frames the numbers (first={a_first}, last={a_last})"
         );
     }
 
@@ -7217,6 +8391,971 @@ mod tests {
         assert!(
             (y1 - y0 - 20.0).abs() < 0.5,
             "sticky with room shifts by ~20pt (y0={y0}, y1={y1})"
+        );
+    }
+
+    // ── flex-wrap with intrinsic (auto) item widths ─────────────────────────
+
+    #[test]
+    fn flex_wrap_breaks_intrinsic_width_items_onto_lines() {
+        // Six auto-width text items (~96pt max-content each with the average
+        // measure) inside a 300pt wrap container: their intrinsic widths
+        // overflow the row, so the items must break onto several flex lines —
+        // previously wrap only ever triggered with explicit widths.
+        let items: String = (1..=6)
+            .map(|i| format!("<div>AAAAAAAAAAAAAAA{i}</div>"))
+            .collect();
+        let layout = run(&format!(
+            r#"<div style="display:flex;flex-wrap:wrap;width:300pt">{items}</div>"#
+        ));
+        let y_of = |label: &str| {
+            text_xy(&layout)
+                .into_iter()
+                .find(|(_, _, s)| s == label)
+                .unwrap_or_else(|| panic!("missing {label}"))
+                .1
+        };
+        let y1 = y_of("AAAAAAAAAAAAAAA1");
+        let y6 = y_of("AAAAAAAAAAAAAAA6");
+        assert!(
+            y6 > y1 + 5.0,
+            "intrinsic-width items wrap onto a later line (y1={y1}, y6={y6})"
+        );
+        // And items on the same line stay side by side (not all stacked).
+        let distinct_ys: std::collections::BTreeSet<i64> = (1..=6)
+            .map(|i| (y_of(&format!("AAAAAAAAAAAAAAA{i}")) * 10.0) as i64)
+            .collect();
+        assert!(
+            distinct_ys.len() >= 2 && distinct_ys.len() < 6,
+            "several lines, several items per line ({distinct_ys:?})"
+        );
+    }
+
+    // ── position: fixed repeats on every page ───────────────────────────────
+
+    #[test]
+    fn fixed_banner_repeats_on_every_page() {
+        // A `position: fixed` banner is viewport-attached: in paged output it
+        // must appear on EVERY page of the document, at the same page-local
+        // spot — not only on page 1.
+        let layout = run(&format!(
+            r#"<div style="position:fixed;top:0;left:0">FIXEDBANNER</div>{}"#,
+            "<p>line</p>".repeat(150)
+        ));
+        assert!(
+            layout.pages.len() >= 3,
+            "document spans at least 3 pages ({})",
+            layout.pages.len()
+        );
+        for (pi, page) in layout.pages.iter().enumerate() {
+            let n = page
+                .iter()
+                .filter(|f| matches!(f, Fragment::Text { text, .. } if text == "FIXEDBANNER"))
+                .count();
+            assert!(n >= 1, "fixed banner present on page {pi} (count={n})");
+        }
+        // Same page-local y on page 1 and page 2.
+        let banner_y = |pi: usize| {
+            layout.pages[pi]
+                .iter()
+                .find_map(|f| match f {
+                    Fragment::Text { y, text, .. } if text == "FIXEDBANNER" => Some(*y),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            (banner_y(0) - banner_y(1)).abs() < 0.01,
+            "banner sits at the same page-local y ({} vs {})",
+            banner_y(0),
+            banner_y(1)
+        );
+    }
+
+    // ── <thead> repeats at the top of each page of a broken table ───────────
+
+    #[test]
+    fn thead_repeats_on_each_page_of_a_multipage_table() {
+        let body: String = (0..60)
+            .map(|i| format!("<tr><td>rowa{i}</td><td>rowb{i}</td></tr>"))
+            .collect();
+        let layout = run(&format!(
+            "<table><thead><tr><th>HCOLA</th><th>HCOLB</th></tr></thead><tbody>{body}</tbody></table>"
+        ));
+        assert!(
+            layout.pages.len() >= 2,
+            "table spans pages ({})",
+            layout.pages.len()
+        );
+        for (pi, page) in layout.pages.iter().enumerate() {
+            let has_body_row = page
+                .iter()
+                .any(|f| matches!(f, Fragment::Text { text, .. } if text.starts_with("rowa")));
+            if !has_body_row {
+                continue;
+            }
+            let hdr = page
+                .iter()
+                .filter(|f| matches!(f, Fragment::Text { text, .. } if text == "HCOLA"))
+                .count();
+            assert!(hdr >= 1, "thead header repeated on page {pi}");
+            // The repeated header sits ABOVE every body row on that page.
+            let hdr_y = page
+                .iter()
+                .find_map(|f| match f {
+                    Fragment::Text { y, text, .. } if text == "HCOLA" => Some(*y),
+                    _ => None,
+                })
+                .unwrap();
+            let min_row_y = page
+                .iter()
+                .filter_map(|f| match f {
+                    Fragment::Text { y, text, .. } if text.starts_with("rowa") => Some(*y),
+                    _ => None,
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                hdr_y < min_row_y,
+                "header above the body rows on page {pi} (hdr={hdr_y}, row={min_row_y})"
+            );
+        }
+    }
+
+    // ── table auto layout: undeclared columns size to content ───────────────
+
+    #[test]
+    fn table_undeclared_columns_size_to_content() {
+        // CSS auto table layout: with no declared widths, a column of long text
+        // gets proportionally more room than a tiny one — and nothing overflows
+        // the table band (columns still sum to the available width).
+        let layout = run(
+            "<table><tr><td>averyveryverylongcelltextwithlotsofcontent inside</td><td>ok</td></tr></table>",
+        );
+        let ok_x = cell_x(&layout, "ok");
+        // Equal columns would put "ok" at ~36+270+3=309; content-proportional
+        // sizing pushes it far right (the long column takes most of the 540pt).
+        assert!(
+            ok_x > 36.0 + 400.0,
+            "long-text column got the lion's share (ok at {ok_x})"
+        );
+        assert!(
+            ok_x < 36.0 + 540.0,
+            "the short column still fits inside the table band ({ok_x})"
+        );
+    }
+
+    #[test]
+    fn table_undeclared_columns_floor_at_min_content() {
+        // The long column's max-content dwarfs the short one, but the short
+        // column may not collapse below its widest unbreakable token: its cell
+        // text must still start inside the page band and render.
+        let long = "word ".repeat(80);
+        let layout = run(&format!(
+            "<table><tr><td>{long}</td><td>unbreakabletoken</td></tr></table>"
+        ));
+        let x = cell_x(&layout, "unbreakabletoken");
+        // min-content of the 16-char token ≈ 16×6 + padding ≈ 102pt ⇒ the
+        // column starts no further right than 540-96 side; generously assert it
+        // stays on the page and the token is rendered whole (not clipped away).
+        assert!(
+            x < 36.0 + 540.0 - 90.0,
+            "short column keeps at least its min-content ({x})"
+        );
+    }
+
+    // ── <img> CSS width/height/max-width ────────────────────────────────────
+
+    /// First raster image fragment as `(w, h)`.
+    fn img_size(layout: &Layout) -> (f64, f64) {
+        layout
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Image { w, h, .. } => Some((*w, *h)),
+                _ => None,
+            })
+            .expect("an image fragment")
+    }
+
+    #[test]
+    fn img_css_width_scales_height_by_ratio() {
+        // 400×200 intrinsic, CSS width 100pt ⇒ rendered 100×50 (ratio kept).
+        let layout =
+            run(r#"<p><img src="x.png" width="400" height="200" style="width:100pt"></p>"#);
+        let (w, h) = img_size(&layout);
+        assert!((w - 100.0).abs() < 0.01, "CSS width applied ({w})");
+        assert!((h - 50.0).abs() < 0.01, "height follows the ratio ({h})");
+    }
+
+    #[test]
+    fn img_css_max_width_clamps_and_keeps_ratio() {
+        let layout =
+            run(r#"<p><img src="x.png" width="400" height="200" style="max-width:80pt"></p>"#);
+        let (w, h) = img_size(&layout);
+        assert!((w - 80.0).abs() < 0.01, "max-width clamps ({w})");
+        assert!((h - 40.0).abs() < 0.01, "height follows the clamp ({h})");
+    }
+
+    #[test]
+    fn img_attribute_size_unchanged_without_css() {
+        // No CSS sizing ⇒ the width/height attributes rule, exactly as before.
+        let layout = run(r#"<p><img src="x.png" width="120" height="90"></p>"#);
+        let (w, h) = img_size(&layout);
+        assert!((w - 120.0).abs() < 0.01 && (h - 90.0).abs() < 0.01);
+    }
+
+    // ── parent/child margin collapsing ──────────────────────────────────────
+
+    #[test]
+    fn parent_and_first_child_top_margins_collapse() {
+        // No padding/border between the div's top and its first <p>: the two
+        // top margins collapse to max(10, 20) = 20 ⇒ the text sits at 36+20=56
+        // (not 36+10+20=66), and the div's background hugs the child.
+        let layout = run(
+            r#"<div style="margin-top:10pt;background:#eeeeee"><p style="margin:20pt 0 0 0">TXT</p></div>"#,
+        );
+        let ty = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "TXT")
+            .unwrap()
+            .1;
+        assert!(
+            (ty - 56.0).abs() < 0.5,
+            "collapsed margin = max(10,20) puts the text at ~56 ({ty})"
+        );
+        let bg_y = layout.pages[0]
+            .iter()
+            .find_map(|f| match f {
+                Fragment::Rect {
+                    y, fill: Some(_), ..
+                } => Some(*y),
+                _ => None,
+            })
+            .expect("the div background");
+        assert!(
+            (bg_y - 56.0).abs() < 0.5,
+            "the box top coincides with the child's (bg at {bg_y})"
+        );
+    }
+
+    #[test]
+    fn padding_blocks_parent_child_margin_collapsing() {
+        // 5pt of top padding separates the margins: they stack (10+5+20=35).
+        let layout = run(
+            r#"<div style="margin-top:10pt;padding-top:5pt"><p style="margin:20pt 0 0 0">TXT2</p></div>"#,
+        );
+        let ty = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "TXT2")
+            .unwrap()
+            .1;
+        assert!(
+            (ty - 71.0).abs() < 0.5,
+            "padding keeps both margins (36+10+5+20=71, got {ty})"
+        );
+    }
+
+    #[test]
+    fn parent_and_last_child_bottom_margins_collapse() {
+        // The last child's 20pt bottom margin escapes the (margin-less) div and
+        // collapses with the div's own 0 ⇒ the following block sits exactly
+        // where it would if the DIV itself carried margin-bottom:20pt.
+        let escaped = run(
+            r#"<div style="background:#eeeeee"><p style="margin:0 0 20pt 0">TB</p></div><p style="margin:0">AFTER</p>"#,
+        );
+        let control = run(
+            r#"<div style="background:#eeeeee;margin-bottom:20pt"><p style="margin:0">TB</p></div><p style="margin:0">AFTER</p>"#,
+        );
+        let y_of = |l: &Layout, label: &str| {
+            text_xy(l)
+                .into_iter()
+                .find(|(_, _, s)| s == label)
+                .unwrap()
+                .1
+        };
+        assert!(
+            (y_of(&escaped, "AFTER") - y_of(&control, "AFTER")).abs() < 0.5,
+            "escaped last-child margin ≡ the parent's own bottom margin ({} vs {})",
+            y_of(&escaped, "AFTER"),
+            y_of(&control, "AFTER")
+        );
+    }
+
+    // ── grid `auto` track sizes to content ──────────────────────────────────
+
+    #[test]
+    fn grid_auto_track_hugs_its_content() {
+        // `auto 1fr` with a tiny label: the first column shrinks to the label's
+        // max-content width (~12pt) instead of an equal 1fr-like half, so the
+        // second item starts far left of the 270pt midpoint.
+        let layout = run(
+            r#"<div style="display:grid;grid-template-columns:auto 1fr"><div>ab</div><div>wide</div></div>"#,
+        );
+        let wide_x = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "wide")
+            .unwrap()
+            .0;
+        assert!(
+            wide_x < 36.0 + 60.0,
+            "auto column hugs its ~12pt content; the 1fr item starts near the left ({wide_x})"
+        );
+    }
+
+    // ── <caption> renders above the table ───────────────────────────────────
+
+    #[test]
+    fn table_caption_renders_above_the_grid() {
+        let layout = run("<table><caption>CAPT</caption><tr><td>CellA</td></tr></table>");
+        let y_capt = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "CAPT")
+            .expect("caption text is rendered")
+            .1;
+        let y_cell = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "CellA")
+            .unwrap()
+            .1;
+        assert!(
+            y_capt < y_cell,
+            "caption sits above the first row (caption={y_capt}, cell={y_cell})"
+        );
+    }
+
+    // ── bidi: line-level UAX #9 keeps punctuation on the right side ─────────
+
+    #[test]
+    fn bidi_trailing_punctuation_splits_to_the_base_side() {
+        // RTL base: "שלום, world!". Per UAX #9 resolved at character level, the
+        // comma stays glued to the Hebrew word (both level 1) while `world!`
+        // splits: `world` is an LTR (level-2) run but its `!` resolves to the
+        // RTL base level, so it must land LEFT of `world` — not stay stuck on
+        // its right as the old first-char-per-token model rendered it.
+        let layout = run(r#"<p dir="rtl">שלום, world!</p>"#);
+        let runs = text_runs(&layout);
+        assert!(
+            runs.iter().any(|t| t == "שלום,"),
+            "comma stays attached to the Hebrew word ({runs:?})"
+        );
+        assert!(
+            !runs.iter().any(|t| t == "world!"),
+            "the mixed token splits at its level boundary ({runs:?})"
+        );
+        let x_bang = run_x(&layout, "!");
+        let x_world = run_x(&layout, "world");
+        let x_heb = run_x(&layout, "שלום,");
+        assert!(
+            x_bang < x_world,
+            "the `!` lands on the RTL side of `world` (!={x_bang}, world={x_world})"
+        );
+        assert!(
+            x_world < x_heb,
+            "the Hebrew run stays rightmost (world={x_world}, heb={x_heb})"
+        );
+    }
+
+    // ── dashed border + border-radius: bands stop at the corner arcs ────────
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn dashed_border_with_radius_shortens_bands_and_carries_radii() {
+        let layout = run(
+            r#"<div style="border:2pt dashed #000000;border-radius:8pt;width:100pt;height:40pt"></div>"#,
+        );
+        let bands: Vec<(f64, f64, f64, f64, bool, f64, f64, bool)> = layout
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Border {
+                    x,
+                    y,
+                    w,
+                    h,
+                    horizontal,
+                    radius_start,
+                    radius_end,
+                    far,
+                    ..
+                } => Some((
+                    *x,
+                    *y,
+                    *w,
+                    *h,
+                    *horizontal,
+                    *radius_start,
+                    *radius_end,
+                    *far,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bands.len(), 4, "four styled sides ({bands:?})");
+        // Box: x=36, content 100pt + 2×2pt border ⇒ outer w=104. Top band is
+        // inset by the 8pt corner radius on both ends: x=44, w=88.
+        let top = bands
+            .iter()
+            .find(|b| b.4 && !b.7)
+            .expect("top horizontal band");
+        assert!(
+            (top.0 - 44.0).abs() < 0.01 && (top.2 - 88.0).abs() < 0.01,
+            "top band inset by the corner radius (x={}, w={})",
+            top.0,
+            top.2
+        );
+        assert!(
+            (top.5 - 8.0).abs() < 0.01 && (top.6 - 8.0).abs() < 0.01,
+            "the band carries its corner radii ({top:?})"
+        );
+        // The bottom band is marked `far` so its arcs curve upward.
+        assert!(
+            bands.iter().any(|b| b.4 && b.7),
+            "bottom band flagged far ({bands:?})"
+        );
+        // Square-cornered dashed borders are unchanged: zero radii everywhere.
+        let square =
+            run(r#"<div style="border:2pt dashed #000000;width:100pt;height:40pt"></div>"#);
+        let all_zero = square
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Border {
+                    radius_start,
+                    radius_end,
+                    ..
+                } => Some(*radius_start == 0.0 && *radius_end == 0.0),
+                _ => None,
+            })
+            .all(|z| z);
+        assert!(all_zero, "no radius ⇒ byte-identical square bands");
+    }
+
+    // ── `white-space` / overflow-word / vertical-align / max-height / vw-vh ──
+
+    /// The distinct text-fragment baselines (rounded Y positions) on page 1 —
+    /// i.e. the number of laid-out lines.
+    fn line_ys(layout: &Layout) -> Vec<i64> {
+        let mut ys: Vec<i64> = layout.pages[0]
+            .iter()
+            .filter_map(|f| match f {
+                Fragment::Text { y, .. } => Some((*y * 100.0).round() as i64),
+                _ => None,
+            })
+            .collect();
+        ys.sort_unstable();
+        ys.dedup();
+        ys
+    }
+
+    #[test]
+    fn nowrap_disables_line_breaking() {
+        let long = "word ".repeat(60);
+        let wrapped = run(&format!("<p>{long}</p>"));
+        assert!(line_ys(&wrapped).len() > 1, "normal text wraps");
+        let nowrap = run(&format!("<p style=\"white-space:nowrap\">{long}</p>"));
+        assert_eq!(
+            line_ys(&nowrap).len(),
+            1,
+            "nowrap keeps the run on a single (overflowing) line"
+        );
+    }
+
+    #[test]
+    fn pre_line_collapses_spaces_but_keeps_newlines() {
+        let layout = run("<div style=\"white-space:pre-line\">a    b\nc</div>");
+        assert_eq!(line_ys(&layout).len(), 2, "the newline forces a 2nd line");
+        let texts: Vec<String> = layout.pages[0]
+            .iter()
+            .filter_map(|f| match f {
+                Fragment::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().all(|t| !t.contains("    ")),
+            "space runs collapsed: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn pre_wrap_preserves_spaces_and_still_wraps() {
+        // One very long space-separated line: `pre` keeps it on ONE line
+        // (overflowing); `pre-wrap` wraps it.
+        let long = "word ".repeat(60);
+        let pre = run(&format!("<div style=\"white-space:pre\">{long}</div>"));
+        assert_eq!(line_ys(&pre).len(), 1, "pre never wraps");
+        let prew = run(&format!("<div style=\"white-space:pre-wrap\">{long}</div>"));
+        assert!(line_ys(&prew).len() > 1, "pre-wrap wraps the long line");
+        // And a space RUN survives as its own token (preserved, not collapsed).
+        let spaced = run("<div style=\"white-space:pre-wrap\">a    b</div>");
+        let has_space_run = spaced.pages[0].iter().any(
+            |f| matches!(f, Fragment::Text { text, .. } if text.chars().all(|c| c == ' ') && text.len() >= 4),
+        );
+        assert!(has_space_run, "the 4-space run is kept verbatim");
+    }
+
+    #[test]
+    fn break_word_splits_an_overlong_word() {
+        let giant = "x".repeat(400); // ≫ one line at any measure
+        let plain = run(&format!("<p>{giant}</p>"));
+        assert_eq!(
+            line_ys(&plain).len(),
+            1,
+            "an unbreakable word overflows on one line by default"
+        );
+        let broken = run(&format!(
+            "<p style=\"overflow-wrap:break-word\">{giant}</p>"
+        ));
+        assert!(
+            line_ys(&broken).len() > 1,
+            "break-word wraps the word mid-characters ({} lines)",
+            line_ys(&broken).len()
+        );
+        // `word-break: break-all` behaves the same for the overlong word.
+        let all = run(&format!("<p style=\"word-break:break-all\">{giant}</p>"));
+        assert!(line_ys(&all).len() > 1, "break-all splits too");
+    }
+
+    #[test]
+    fn text_overflow_ellipsis_truncates_nowrap_clipped_text() {
+        let long = "abcdefghij ".repeat(40);
+        let layout = run(&format!(
+            "<div style=\"overflow:hidden;white-space:nowrap;text-overflow:ellipsis\">{long}</div>"
+        ));
+        let texts: Vec<&String> = layout.pages[0]
+            .iter()
+            .filter_map(|f| match f {
+                Fragment::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "single truncated run");
+        assert!(texts[0].ends_with('\u{2026}'), "ends with …: {:?}", texts[0]);
+        // The truncated run fits the content box (page 612 − 2×36 margins).
+        let w = layout.pages[0]
+            .iter()
+            .find_map(|f| match f {
+                Fragment::Text { w, .. } => Some(*w),
+                _ => None,
+            })
+            .unwrap();
+        assert!(w <= 540.0 + 1e-6, "truncated to the line budget: {w}");
+    }
+
+    #[test]
+    fn vertical_align_middle_and_bottom_offset_the_run() {
+        // A big run sets the line box; the small `middle` run sinks halfway,
+        // `bottom` sinks fully, `top` stays at the line top.
+        let html = |va: &str| {
+            format!(
+                "<p style=\"font-size:20pt;line-height:1\">BIG\
+                 <span style=\"font-size:10pt;line-height:1;vertical-align:{va}\">s</span></p>"
+            )
+        };
+        let y_of = |layout: &Layout, needle: &str| -> f64 {
+            layout.pages[0]
+                .iter()
+                .find_map(|f| match f {
+                    Fragment::Text { y, text, .. } if text.contains(needle) => Some(*y),
+                    _ => None,
+                })
+                .expect("run present")
+        };
+        let mid = run(&html("middle"));
+        let (big_y, small_y) = (y_of(&mid, "BIG"), y_of(&mid, "s"));
+        assert!(
+            (small_y - big_y - 5.0).abs() < 1e-6,
+            "middle: (20 − 10) / 2 = 5pt below the line top, got {}",
+            small_y - big_y
+        );
+        let bot = run(&html("bottom"));
+        assert!(
+            (y_of(&bot, "s") - y_of(&bot, "BIG") - 10.0).abs() < 1e-6,
+            "bottom: 20 − 10 = 10pt below the line top"
+        );
+        let top = run(&html("top"));
+        assert!(
+            (y_of(&top, "s") - y_of(&top, "BIG")).abs() < 1e-6,
+            "top: no offset (the default placement)"
+        );
+    }
+
+    #[test]
+    fn max_height_clamps_the_box_height() {
+        let layout = run(
+            "<div style=\"background:#eee;max-height:30pt\">\
+             <p>a</p><p>b</p><p>c</p><p>d</p><p>e</p></div>",
+        );
+        let rect_h = layout.pages[0]
+            .iter()
+            .find_map(|f| match f {
+                Fragment::Rect { h, .. } => Some(*h),
+                _ => None,
+            })
+            .expect("background rect");
+        assert!(
+            (rect_h - 30.0).abs() < 1e-6,
+            "box height clamped to max-height, got {rect_h}"
+        );
+        // Content overflows visibly by default: text fragments still exist
+        // below the clamped box.
+        let text_count = layout.pages[0]
+            .iter()
+            .filter(|f| matches!(f, Fragment::Text { .. }))
+            .count();
+        assert_eq!(text_count, 5, "overflowing content is not culled");
+    }
+
+    #[test]
+    fn transform_origin_moves_the_pivot() {
+        // `scale(2)` about origin O maps a point p to `O + 2(p − O)`, so the
+        // wrapped matrix's translation is exactly `−O` — a direct probe of the
+        // pivot actually used.
+        let matrix_of = |html: &str| -> [f64; 6] {
+            run(html)
+                .pages
+                .iter()
+                .flatten()
+                .find_map(|f| match f {
+                    Fragment::Transformed { matrix, .. } => Some(*matrix),
+                    _ => None,
+                })
+                .expect("a Transformed fragment")
+        };
+        // Default pivot: the border-box centre (x = 36 margin + 540/2 = 306).
+        let centre = matrix_of(r#"<div style="transform:scale(2)">x</div>"#);
+        assert!((centre[4] + 306.0).abs() < 1e-6, "centre pivot: {centre:?}");
+        // `transform-origin: 0 0` pivots on the box's top-left (x = 36).
+        let tl = matrix_of(r#"<div style="transform:scale(2);transform-origin:0 0">x</div>"#);
+        assert!((tl[4] + 36.0).abs() < 1e-6, "top-left pivot: {tl:?}");
+        // The keyword pair in either order lands on the same corner.
+        let kw = matrix_of(
+            r#"<div style="transform:scale(2);transform-origin:top left">x</div>"#,
+        );
+        assert!((kw[4] - tl[4]).abs() < 1e-6 && (kw[5] - tl[5]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn caption_side_bottom_renders_below_the_grid() {
+        let layout = run(
+            "<table style=\"caption-side:bottom\">\
+             <caption>CAPT</caption><tr><td>CellA</td></tr></table>",
+        );
+        let y_capt = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "CAPT")
+            .expect("caption text is rendered")
+            .1;
+        let y_cell = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "CellA")
+            .unwrap()
+            .1;
+        assert!(
+            y_capt > y_cell,
+            "caption sits below the last row (caption={y_capt}, cell={y_cell})"
+        );
+    }
+
+    #[test]
+    fn vh_lengths_use_the_live_page_size_during_layout() {
+        // `margin-top: 50vh` on a 500pt-tall page ⇒ 250pt below the content
+        // top — provable only if the REAL page height reached the cascade.
+        let nodes = parse("<p style=\"margin-top:50vh;margin-bottom:0\">x</p>");
+        let sheet = Stylesheet::new("");
+        let layout = layout_document(&nodes, &sheet, &AverageMeasure, 400.0, 500.0, 0.0);
+        let y = layout.pages[0]
+            .iter()
+            .find_map(|f| match f {
+                Fragment::Text { y, .. } => Some(*y),
+                _ => None,
+            })
+            .expect("text");
+        assert!(
+            (y - 250.0).abs() < 1e-6,
+            "50vh of a 500pt page = 250pt, got {y}"
+        );
+    }
+
+    // ── stacking contexts (CSS 2.1 z-index scoping) ──
+
+    #[test]
+    fn stacking_context_keeps_descendant_z_index_local() {
+        // The classic case: A(z:1) contains X(z:9999); a sibling B(z:2)
+        // follows. X paints above A's own flow content but UNDER B — the
+        // descendant z-index never escapes its context.
+        let layout = run(
+            r#"<div style="position:relative;z-index:1">
+                 <p>InA</p>
+                 <div style="position:relative;z-index:9999"><p>DeepX</p></div>
+               </div>
+               <div style="position:relative;z-index:2"><p>TopB</p></div>"#,
+        );
+        let order: Vec<String> = layout
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let pos = |s: &str| {
+            order
+                .iter()
+                .position(|t| t.contains(s))
+                .unwrap_or_else(|| panic!("{s} missing from {order:?}"))
+        };
+        assert!(
+            pos("InA") < pos("DeepX"),
+            "the z:9999 child paints above its own context's flow ({order:?})"
+        );
+        assert!(
+            pos("DeepX") < pos("TopB"),
+            "…but stays under the parent's z:2 SIBLING context ({order:?})"
+        );
+    }
+
+    #[test]
+    fn negative_z_index_between_grandparent_and_parent_backgrounds() {
+        // G forms the stacking context (positioned, z:1, red bg); P is a plain
+        // in-flow div (green bg); N (z:-1, blue bg). CSS 2.1 Appendix E: the
+        // context's own background first, then negative-z children, then the
+        // in-flow content — so blue sits ABOVE red but UNDER green.
+        let layout = run(
+            r#"<div style="position:relative;z-index:1;background:#ff0000">
+                 <div style="background:#00ff00;height:40pt">
+                   <div style="position:relative;z-index:-1;background:#0000ff;height:10pt">N</div>
+                 </div>
+               </div>"#,
+        );
+        let fills: Vec<[f64; 3]> = layout
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Rect { fill: Some(c), .. } => Some(*c),
+                _ => None,
+            })
+            .collect();
+        let pos = |c: [f64; 3], name: &str| {
+            fills
+                .iter()
+                .position(|f| {
+                    (f[0] - c[0]).abs() < 0.02
+                        && (f[1] - c[1]).abs() < 0.02
+                        && (f[2] - c[2]).abs() < 0.02
+                })
+                .unwrap_or_else(|| panic!("{name} bg missing from {fills:?}"))
+        };
+        let red = pos([1.0, 0.0, 0.0], "grandparent/context");
+        let blue = pos([0.0, 0.0, 1.0], "negative-z child");
+        let green = pos([0.0, 1.0, 0.0], "in-flow parent");
+        assert!(
+            red < blue,
+            "negative z paints above the context's own background ({fills:?})"
+        );
+        assert!(
+            blue < green,
+            "negative z paints under the parent's in-flow background ({fills:?})"
+        );
+    }
+
+    // ── multi-column pagination (page-sequential fill) ──
+
+    #[test]
+    fn multicol_fills_both_page_columns_before_the_next_page() {
+        // Enough paragraphs in a 2-column block to overflow one page: page 1
+        // must fill BOTH its columns down to the page band before anything
+        // lands on page 2 (the old behaviour let column 1 continue onto page 2
+        // while page 1's column 2 sat empty).
+        let mut html = String::from(r#"<div style="column-count:2">"#);
+        for i in 0..120 {
+            html.push_str(&format!("<p>P{i:03}</p>"));
+        }
+        html.push_str("</div>");
+        let layout = run(&html);
+        assert!(
+            layout.pages.len() >= 2,
+            "content spans pages ({})",
+            layout.pages.len()
+        );
+        let boundary = 36.0 + 264.0; // left column's right edge (540pt content, 12pt gutter)
+        let texts_on = |p: usize| -> Vec<(f64, f64)> {
+            layout.pages[p]
+                .iter()
+                .filter_map(|f| match f {
+                    Fragment::Text { x, y, .. } => Some((*x, *y)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let p1 = texts_on(0);
+        let left_bottom = p1
+            .iter()
+            .filter(|(x, _)| *x < boundary)
+            .map(|(_, y)| *y)
+            .fold(0.0_f64, f64::max);
+        let right_bottom = p1
+            .iter()
+            .filter(|(x, _)| *x >= boundary)
+            .map(|(_, y)| *y)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            left_bottom > 600.0,
+            "page-1 left column fills toward the band bottom ({left_bottom})"
+        );
+        assert!(
+            right_bottom > 600.0,
+            "page-1 RIGHT column fills too — before any page-2 content ({right_bottom})"
+        );
+        assert!(
+            !texts_on(1).is_empty(),
+            "the remainder lands on page 2 ({} pages)",
+            layout.pages.len()
+        );
+    }
+
+    // ── writing-mode (rotated-label vertical blocks) ──
+
+    /// The transformed bounding box of a `Transformed` fragment (CSS-space).
+    fn transformed_bbox(matrix: &[f64; 6], inner: &Fragment) -> (f64, f64, f64, f64) {
+        let (x0, y0, x1, y1) = fragment_bbox(inner);
+        let [a, b, c, d, e, f] = *matrix;
+        let pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+        let mut bb = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (px, py) in pts {
+            let tx = a * px + c * py + e;
+            let ty = b * px + d * py + f;
+            bb.0 = bb.0.min(tx);
+            bb.1 = bb.1.min(ty);
+            bb.2 = bb.2.max(tx);
+            bb.3 = bb.3.max(ty);
+        }
+        bb
+    }
+
+    #[test]
+    fn writing_mode_vertical_rl_rotates_text_into_a_tall_narrow_box() {
+        let layout = run(r#"<div style="writing-mode:vertical-rl">VERTICALLABEL</div>"#);
+        let (matrix, inner) = layout
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Transformed { matrix, inner }
+                    if matches!(**inner, Fragment::Text { .. }) =>
+                {
+                    Some((*matrix, (**inner).clone()))
+                }
+                _ => None,
+            })
+            .expect("a rotated text fragment");
+        // +90° (clockwise) rotation: a=0, b=1, c=−1, d=0.
+        assert!(
+            matrix[0].abs() < 1e-9
+                && (matrix[1] - 1.0).abs() < 1e-9
+                && (matrix[2] + 1.0).abs() < 1e-9
+                && matrix[3].abs() < 1e-9,
+            "vertical-rl is the clockwise quarter-turn ({matrix:?})"
+        );
+        // The rotated text occupies a NARROW-and-TALL box (height ≫ width).
+        let (bx0, by0, bx1, by1) = transformed_bbox(&matrix, &inner);
+        let (w, h) = (bx1 - bx0, by1 - by0);
+        assert!(
+            h > w * 2.0,
+            "label box is tall and narrow after rotation (w={w:.1}, h={h:.1})"
+        );
+        // Text content survives extraction.
+        assert!(
+            matches!(&inner, Fragment::Text { text, .. } if text.contains("VERTICALLABEL")),
+            "the label text is present in the rotated fragment"
+        );
+        // Top of the rotated box stays at the flow position (content top).
+        assert!(by0 >= 35.0, "rotated box starts inside the content area ({by0})");
+    }
+
+    #[test]
+    fn writing_mode_vertical_lr_uses_the_opposite_rotation() {
+        let layout = run(r#"<div style="writing-mode:vertical-lr">LABEL</div>"#);
+        let matrix = layout
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Transformed { matrix, inner }
+                    if matches!(**inner, Fragment::Text { .. }) =>
+                {
+                    Some(*matrix)
+                }
+                _ => None,
+            })
+            .expect("a rotated text fragment");
+        // −90° (counter-clockwise): a=0, b=−1, c=1, d=0.
+        assert!(
+            matrix[0].abs() < 1e-9
+                && (matrix[1] + 1.0).abs() < 1e-9
+                && (matrix[2] - 1.0).abs() < 1e-9
+                && matrix[3].abs() < 1e-9,
+            "vertical-lr is the counter-clockwise quarter-turn ({matrix:?})"
+        );
+    }
+
+    // ── inline <svg> preserveAspectRatio ──
+
+    #[test]
+    fn inline_svg_meet_letterboxes_without_distortion() {
+        // A square viewBox into a 200×100 box under the default xMidYMid meet:
+        // the draw rect is the undistorted 100×100 square, centred at +50pt.
+        let layout = run(
+            r##"<svg width="200" height="100" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="#f00"/></svg>"##,
+        );
+        let (x, _y, w, h) = layout
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Svg { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
+                _ => None,
+            })
+            .expect("an svg fragment");
+        assert!(
+            (w - 100.0).abs() < 1.0 && (h - 100.0).abs() < 1.0,
+            "meet keeps the square undistorted ({w}×{h})"
+        );
+        assert!(
+            (x - (36.0 + 50.0)).abs() < 1.5,
+            "xMid centres the square in the 200pt box (x={x})"
+        );
+    }
+
+    #[test]
+    fn inline_svg_slice_covers_and_is_clipped_to_the_viewport() {
+        let layout = run(
+            r##"<svg width="200" height="100" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid slice"><circle cx="50" cy="50" r="40" fill="#f00"/></svg>"##,
+        );
+        let (cw, ch, dw, dh) = layout
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Clipped { rect, inner, .. } => match **inner {
+                    Fragment::Svg { w, h, .. } => Some((rect[2], rect[3], w, h)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a clipped svg fragment");
+        assert!(
+            (cw - 200.0).abs() < 1.0 && (ch - 100.0).abs() < 1.0,
+            "the clip window is the CSS viewport ({cw}×{ch})"
+        );
+        assert!(
+            (dw - 200.0).abs() < 1.0 && (dh - 200.0).abs() < 1.0,
+            "slice scales the square up to cover ({dw}×{dh})"
         );
     }
 }

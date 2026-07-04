@@ -67,7 +67,7 @@ pub fn image_to_model(bytes: &[u8]) -> Option<Document> {
         frame: Some(Rect::new(x, y, draw_w, draw_h)),
         kind: BlockKind::Image(ImageRef {
             resource: hash,
-            alt: None,
+            ..Default::default()
         }),
         ..Block::default()
     };
@@ -75,12 +75,11 @@ pub fn image_to_model(bytes: &[u8]) -> Option<Document> {
     let mut doc = Document {
         sections: vec![Section {
             geometry: geom,
-            header: None,
-            footer: None,
             pages: vec![Page {
                 blocks: vec![block],
                 absolute: true,
             }],
+            ..Default::default()
         }],
         ..Document::default()
     };
@@ -126,12 +125,11 @@ fn flow_document(blocks: Vec<Block>) -> Document {
     Document {
         sections: vec![Section {
             geometry: crate::model::PageGeometry::default(),
-            header: None,
-            footer: None,
             pages: vec![Page {
                 blocks,
                 absolute: false,
             }],
+            ..Default::default()
         }],
         ..Document::default()
     }

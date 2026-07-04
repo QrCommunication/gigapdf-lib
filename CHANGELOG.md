@@ -9,6 +9,84 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.117.0] - 2026-07-04
+
+Exhaustive two-way Office/HTML/PDF fidelity release — the largest single
+fidelity pass to date, spanning the model, both import and export of every
+supported format, the PDF→model reconstruction, and the HTML/CSS engine.
+
+**PDF→model reconstruction.** Inter-run space synthesis fixed (word gaps were
+joined without a space on word-positioned PDFs — "Unlien:" → "Un lien:";
+`to_text` now groups baselines into spaced lines). Partially-tagged PDFs fall
+back to heuristics *per page* instead of dropping untagged content wholesale;
+the tagged path now preserves real run style (size/colour) instead of flat
+12pt black, and recurses into Form XObjects (tagged CERFA templates). Column
+detection no longer turns two-column prose into an interleaved borderless
+table; academic gutters (12–18pt) are found; a rejected table no longer
+destroys reading order; booktabs (horizontal-rule-only) tables are detected;
+borderless-table shading is captured; outer column edges hug real content
+(cells were being silently ejected from the grid). Paragraph grouping gained
+hanging indents, `space_after`, soft/hard break classification, and a
+per-group leading reference that stops loose-leaded paragraphs from exploding
+one-line-per-paragraph (business-plan corpus: 308→197 paragraphs, −36%).
+Lists recognise compound "1.1.2" and "(a)" markers, resumed lists, and
+interleaved notes. Repeated running headers stop being promoted to H1; a
+one-shot cover title no longer demotes the real heading scale. French
+"Page 3 sur 12" footers are recognised (they were duplicated into every
+page's body).
+
+**Model extensions (import + export both directions).** RTL/bidi
+(`ParagraphStyle.direction`, DOCX `w:bidi` / PPTX `a:pPr@rtl` /
+ODF `writing-mode` / RTF `\rtlpar` + a Unicode-script heuristic in recon).
+Typed footnotes (`Inline::FootnoteRef` + `Document.footnotes`, round-tripping
+through DOCX `footnotes.xml`, ODF `text:note`, Markdown `[^id]`, EPUB). Per-cell
+table borders. Image intrinsic size (`wp:extent` — end of the hard-coded 1″×1″
+DOCX export) and `srcRect` crop (baked to pixels at render). Sheet frozen
+panes and text rotation. Gradient + alpha fills on shapes and slide
+backgrounds. First-page / even-odd headers (`w:titlePg`,
+`w:evenAndOddHeaders`). Multi-column geometry (gap, per-column widths,
+separator). Per-level list markers + prefixes. Extended character styles
+(caps, small-caps, double-strike, baseline shift, char scale, kerning).
+Named anchors and non-URI links (`GoToR`, `Named`) preserved instead of
+dropped.
+
+**Import fidelity (Office → model).** DOCX table styles (`w:tblStyle`) and
+character styles (`w:rStyle`) resolved (tables imported without borders now
+carry them; Strong/Emphasis survive); theme fonts (Calibri/Cambria) and
+theme colours with tint/shade. XLSX `Print_Area`, hidden rows/columns, and
+simple conditional formatting. PPTX table styles (`a:tableStyleId`),
+auto-fit font scaling (`normAutofit`), letter-spacing and caps.
+
+**Export fidelity (model → Office).** PDF→XLSX/ODS cells are now typed
+(numbers, percentages, currency — no more everything-as-text). Cell
+hyperlinks, slide backgrounds, and element rotation are emitted; DOCX tables
+keep their geometry (`w:tblLayout fixed`); comments round-trip through DOCX
+and ODT; canonical `w:hyperlink` anchors; ODP rotation (`draw:transform`) and
+ODF tab stops. The DOCX round-trip reaches a fixed point (no more cumulative
+empty-paragraph / anchored-image drift; named-style and header colours
+preserved). Chart data labels (`c:dLbls`) are parsed and rendered as real
+extractable text; chart axis titles render French accents. RTF import
+recovers headers/footers/footnotes/comments/stylesheets; RTF export emits
+`\pict` images.
+
+**HTML/CSS → PDF engine.** `calc()` chained expressions, CSS custom properties
+(`var()`), generated content (`::before`/`::after` + counters), `@page`,
+stacking contexts, multi-column pagination, `writing-mode`, transparent
+gradient stops, `white-space`, `word-break`/`text-overflow`, `vertical-align`,
+`object-fit`, `max-height`, strict `:not()`/`:nth-of-type`, font-family
+fallback lists, ~240 named entities, real `vw`/`vh`, composed opacity,
+flex-wrap without explicit widths, `position:fixed` across pages, repeated
+`<thead>`, content-sized table columns, CSS image dimensions,
+parent/child margin collapsing, `grid` auto tracks, `<caption>`, line-level
+bidi reordering, dashed borders that follow rounded corners, SVG
+`preserveAspectRatio` + `stroke-dasharray`.
+
+**Compat paths.** `pdf_from_model` / SDK `modelToPdf` and legacy OLE2
+`.doc/.xls/.ppt` now draw images and render Unicode (routed through the rich
+model→HTML→PDF renderer — end of WinAnsi "?"). `htmlToPdf` accepts page-size /
+margin / header-footer / landscape options. Office→PDF can emit a tagged
+`/StructTreeRoot` (opt-in). Details in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
+
 ## [0.116.0] - 2026-07-03
 
 Hotfix-grade fidelity release for the JSON-bridged export path: the u64

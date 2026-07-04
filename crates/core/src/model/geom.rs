@@ -44,7 +44,10 @@ impl Default for Margins {
 }
 
 /// A page's resolved size and margins, in points.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Not `Copy`: [`column_widths_pt`](Self::column_widths_pt) is heap-allocated.
+/// Use `.clone()` where a by-value geometry is needed.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PageGeometry {
     pub width: f64,
     pub height: f64,
@@ -53,6 +56,18 @@ pub struct PageGeometry {
     /// default). Detected from the reconstructed block layout so the DOCX/ODT
     /// exporters can emit matching column sections.
     pub column_count: u8,
+    /// Gutter between text columns in points (DOCX `w:cols@w:space`, twips÷20;
+    /// ODF `fo:column-gap`). `None` ⇒ the suite default (Word: 36pt / 720
+    /// twips). Only meaningful when [`column_count`](Self::column_count) > 1.
+    /// Additive: never serialized when unset.
+    pub column_gap_pt: Option<f64>,
+    /// Individual column widths in points (DOCX `w:cols/w:col@w:w`, one entry
+    /// per column) for a non-uniform column layout. `None` ⇒ equal-width
+    /// columns (the `w:cols@w:equalWidth` default). Additive.
+    pub column_widths_pt: Option<Vec<f64>>,
+    /// Draw a vertical separator rule between columns (DOCX `w:cols@w:sep`,
+    /// ODF `style:columns/style:column-sep`). `false` = none (default).
+    pub column_separator: bool,
 }
 
 impl PageGeometry {
@@ -63,6 +78,9 @@ impl PageGeometry {
             height: 297.0 * (72.0 / 25.4),
             margins: Margins::default(),
             column_count: 1,
+            column_gap_pt: None,
+            column_widths_pt: None,
+            column_separator: false,
         }
     }
 }

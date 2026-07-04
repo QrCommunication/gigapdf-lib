@@ -21,13 +21,14 @@ use crate::convert::office::{
 };
 use crate::convert::zip::ZipWriter;
 use crate::convert::PlacedShape;
+use crate::model::sheet::{MergeRange, SheetRow};
 use crate::model::CellVAlign;
 use crate::model::{
     Align, Block, BlockKind, Blockquote, BorderStyle, Cell, CharStyle, CodeBlock, Document,
-    Heading, ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, ParaBorder, Paragraph,
-    Row, Section, Shape, Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
+    Heading, ImageRef, Inline, InlineRun, LineHeight, LinkTarget, List, ListMarker, ParaBorder,
+    Paragraph, Row, Section, Shape, Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table,
+    TextBox, VAlign,
 };
-use crate::model::sheet::{MergeRange, SheetRow};
 use crate::model::{
     CellValue, NamedStyle, PageGeometry, ParagraphStyle, PlaceholderRole, StyleId, StyleTable,
 };
@@ -117,6 +118,19 @@ fn ooxml_core_props(meta: &crate::model::DocMeta) -> String {
             meta.modified
         ));
     }
+    // `cp:lastModifiedBy` / `cp:revision` — the exact inverse of the importer's
+    // core-part reads, so a round-trip keeps who touched the document last and
+    // its revision counter instead of silently dropping them.
+    if !meta.last_modified_by.is_empty() {
+        let mut v = String::new();
+        esc(&meta.last_modified_by, &mut v);
+        body.push_str(&format!("<cp:lastModifiedBy>{v}</cp:lastModifiedBy>"));
+    }
+    if !meta.revision.is_empty() {
+        let mut v = String::new();
+        esc(&meta.revision, &mut v);
+        body.push_str(&format!("<cp:revision>{v}</cp:revision>"));
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
@@ -193,10 +207,22 @@ fn ooxml_image_defaults(exts: &[&str]) -> String {
 }
 
 /// ODF `meta.xml` (`office:document-meta` → `office:meta`, ISO 26300 §3/§4) from
-/// the model metadata. Absent fields are omitted. Mirrors the OOXML core part:
-/// `dc:title` / `dc:creator` / `dc:subject` / `meta:keyword` / `dc:language`.
+/// the model metadata. Absent fields are omitted. Mirrors the OOXML core part
+/// (`dc:title` / `dc:creator` / `dc:subject` / `meta:keyword` / `dc:language`)
+/// plus the ODF-native fields the importer reads back: `dc:description`,
+/// `meta:creation-date`, `dc:date` (modified), `meta:editing-cycles`. The
+/// `meta:generator` **preserves the source document's generator** when the model
+/// carries one (a LibreOffice-authored file keeps saying so across a
+/// round-trip); only a document with no recorded generator is stamped GigaPDF.
 fn odf_meta_xml(meta: &crate::model::DocMeta) -> String {
-    let mut body = format!("<meta:generator>{META_GENERATOR}</meta:generator>");
+    let generator = if meta.generator.is_empty() {
+        META_GENERATOR.to_string()
+    } else {
+        let mut v = String::new();
+        esc(&meta.generator, &mut v);
+        v
+    };
+    let mut body = format!("<meta:generator>{generator}</meta:generator>");
     if let Some(title) = meta.title.as_deref().filter(|s| !s.is_empty()) {
         let mut v = String::new();
         esc(title, &mut v);
@@ -224,6 +250,30 @@ fn odf_meta_xml(meta: &crate::model::DocMeta) -> String {
         let mut v = String::new();
         esc(kw, &mut v);
         body.push_str(&format!("<meta:keyword>{v}</meta:keyword>"));
+    }
+    // The remaining ODF meta fields, the exact inverse of the importer's
+    // `odf_doc_meta`: description → `dc:description`, created →
+    // `meta:creation-date`, modified → `dc:date`, editing_cycles →
+    // `meta:editing-cycles`. All kept verbatim (dates are raw ISO-8601 text).
+    if !meta.description.is_empty() {
+        let mut v = String::new();
+        esc(&meta.description, &mut v);
+        body.push_str(&format!("<dc:description>{v}</dc:description>"));
+    }
+    if !meta.created.is_empty() {
+        let mut v = String::new();
+        esc(&meta.created, &mut v);
+        body.push_str(&format!("<meta:creation-date>{v}</meta:creation-date>"));
+    }
+    if !meta.modified.is_empty() {
+        let mut v = String::new();
+        esc(&meta.modified, &mut v);
+        body.push_str(&format!("<dc:date>{v}</dc:date>"));
+    }
+    if !meta.editing_cycles.is_empty() {
+        let mut v = String::new();
+        esc(&meta.editing_cycles, &mut v);
+        body.push_str(&format!("<meta:editing-cycles>{v}</meta:editing-cycles>"));
     }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -319,8 +369,9 @@ fn odf_named_para_style(id: &StyleId, style: &NamedStyle) -> String {
     }
     out.push('>');
     let pattrs = odf_para_prop_attrs(&style.para);
-    if !pattrs.is_empty() {
-        out.push_str(&format!("<style:paragraph-properties{pattrs}/>"));
+    let ptabs = odf_tab_stops_xml(&style.para);
+    if !pattrs.is_empty() || !ptabs.is_empty() {
+        out.push_str(&odf_paragraph_properties_xml(&pattrs, &ptabs));
     }
     let tattrs = odf_named_text_attrs(&style.char_);
     if !tattrs.is_empty() {
@@ -379,6 +430,12 @@ fn odf_named_text_attrs(style: &CharStyle) -> String {
     if let Some(bg) = style.background {
         p.push_str(&format!(" fo:background-color=\"#{}\"", hex(bg)));
     }
+    // Hidden text → `text:display="none"` (ODF §20.427), the ODT analogue of
+    // DOCX `w:vanish`: the run survives in the file instead of losing its flag.
+    if style.hidden {
+        p.push_str(" text:display=\"none\"");
+    }
+    p.push_str(&odf_text_extras(style));
     p
 }
 
@@ -395,26 +452,51 @@ fn odf_named_text_attrs(style: &CharStyle) -> String {
 /// `header1.xml`/`footer1.xml`.
 pub fn docx_from_model(doc: &Document) -> Vec<u8> {
     let mut zip = ZipWriter::new();
-    let mut ctx = DocxCtx::new(&doc.resources);
+    let mut ctx = DocxCtx::new(&doc.resources, &doc.comments, &doc.footnotes);
 
     // Per-section header/footer parts. Each [`Section`] with a header/footer gets
     // its own `headerN.xml`/`footerN.xml` (1-based by section index) referenced
     // from that section's `w:sectPr`. Rendered up front so any lists *inside* a
     // header/footer register their markers before `numbering.xml` is generated
-    // (their `w:numId` must resolve), matching the body render order.
+    // (their `w:numId` must resolve), matching the body render order. Rendered
+    // with `in_hdrftr` set (run hyperlinks keep the relationship-free field
+    // encoding there) and the owning section's page height for anchored frames.
+    ctx.in_hdrftr = true;
     let sect_hf: Vec<SectionHf> = doc
         .sections
         .iter()
         .enumerate()
         .map(|(i, s)| {
             let n = i + 1;
+            ctx.page_h = s.geometry.height;
             SectionHf {
                 header: s.header.as_ref().map(|h| docx_hdrftr_blocks(h, &mut ctx)),
                 footer: s.footer.as_ref().map(|f| docx_hdrftr_blocks(f, &mut ctx)),
+                // First-/even-page variants (`w:titlePg` / `w:evenAndOddHeaders`).
+                // A blank variant (`Some(vec![])`) renders to an empty inner and
+                // becomes an empty part — Word's "different first page" with a
+                // blank header.
+                header_first: s
+                    .header_first
+                    .as_ref()
+                    .map(|h| docx_hdrftr_blocks(h, &mut ctx)),
+                footer_first: s
+                    .footer_first
+                    .as_ref()
+                    .map(|f| docx_hdrftr_blocks(f, &mut ctx)),
+                header_even: s
+                    .header_even
+                    .as_ref()
+                    .map(|h| docx_hdrftr_blocks(h, &mut ctx)),
+                footer_even: s
+                    .footer_even
+                    .as_ref()
+                    .map(|f| docx_hdrftr_blocks(f, &mut ctx)),
                 number: n,
             }
         })
         .collect();
+    ctx.in_hdrftr = false;
 
     let body = docx_body(doc, &sect_hf, &mut ctx);
 
@@ -429,12 +511,53 @@ pub fn docx_from_model(doc: &Document) -> Vec<u8> {
         .filter(|h| h.footer.is_some())
         .map(|h| h.number)
         .collect();
+    // First-/even-page variant parts: `(part file, relationship id, is_header)`
+    // for the content-types + rels writers (part names `headerF{n}` /
+    // `headerE{n}` / `footerF{n}` / `footerE{n}`, rel ids `rIdHdrF{n}` / …).
+    let mut extra_hf: Vec<(String, String, bool)> = Vec::new();
+    for hf in &sect_hf {
+        let n = hf.number;
+        if hf.header_first.is_some() {
+            extra_hf.push((format!("headerF{n}.xml"), format!("rIdHdrF{n}"), true));
+        }
+        if hf.footer_first.is_some() {
+            extra_hf.push((format!("footerF{n}.xml"), format!("rIdFtrF{n}"), false));
+        }
+        if hf.header_even.is_some() {
+            extra_hf.push((format!("headerE{n}.xml"), format!("rIdHdrE{n}"), true));
+        }
+        if hf.footer_even.is_some() {
+            extra_hf.push((format!("footerE{n}.xml"), format!("rIdFtrE{n}"), false));
+        }
+    }
+    // `w:evenAndOddHeaders` is a document-wide setting: emit `settings.xml`
+    // when any section carries an even-page variant.
+    let has_settings = sect_hf
+        .iter()
+        .any(|h| h.header_even.is_some() || h.footer_even.is_some());
+    // Footnote bodies (`word/footnotes.xml`), rendered before the numbering /
+    // content-type decisions so any list inside a note registers its marker
+    // and the part's presence is known. Only written when at least one anchor
+    // was emitted (a `w:footnoteReference` must resolve both ways).
+    let has_footnotes = ctx.used_footnotes;
+    let footnotes_xml = has_footnotes.then(|| docx_footnotes_xml(&mut ctx));
     let has_num = !ctx.list_markers.is_empty();
+    let has_comments = ctx.used_comments;
 
     let image_exts: Vec<&str> = ctx.images.iter().map(|(_, ext)| *ext).collect();
     zip.add_deflated(
         "[Content_Types].xml",
-        docx_content_types(&image_exts, has_num, &header_nums, &footer_nums).as_bytes(),
+        docx_content_types(
+            &image_exts,
+            has_num,
+            has_comments,
+            &header_nums,
+            &footer_nums,
+            &extra_hf,
+            has_settings,
+            has_footnotes,
+        )
+        .as_bytes(),
     );
     zip.add_deflated(
         "_rels/.rels",
@@ -451,8 +574,31 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
     zip.add_deflated("word/document.xml", body.as_bytes());
     zip.add_deflated(
         "word/_rels/document.xml.rels",
-        docx_rels(&image_exts, has_num, &header_nums, &footer_nums).as_bytes(),
+        docx_rels(
+            &image_exts,
+            has_num,
+            has_comments,
+            &ctx.hyperlinks,
+            &header_nums,
+            &footer_nums,
+            &extra_hf,
+            has_settings,
+            has_footnotes,
+        )
+        .as_bytes(),
     );
+    if let Some(xml) = &footnotes_xml {
+        zip.add_deflated("word/footnotes.xml", xml.as_bytes());
+    }
+    if has_settings {
+        zip.add_deflated(
+            "word/settings.xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+<w:evenAndOddHeaders/></w:settings>"
+                .as_bytes(),
+        );
+    }
     zip.add_deflated(
         "word/styles.xml",
         docx_styles_xml(doc.meta.lang.as_deref(), &doc.styles).as_bytes(),
@@ -461,6 +607,15 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
         zip.add_deflated(
             "word/numbering.xml",
             docx_numbering_xml(&ctx.list_markers).as_bytes(),
+        );
+    }
+    // Review comments: their bodies (`word/comments.xml`), written only when at
+    // least one anchor was emitted (a `w:commentReference` must resolve; an
+    // anchor-less comment list would be invisible anyway).
+    if has_comments {
+        zip.add_deflated(
+            "word/comments.xml",
+            docx_comments_xml(ctx.comments, &ctx.comment_nums).as_bytes(),
         );
     }
     for hf in &sect_hf {
@@ -476,11 +631,38 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
                 docx_hdrftr_xml("ftr", inner).as_bytes(),
             );
         }
+        // Variant parts. A blank variant still writes a valid part with one
+        // empty paragraph (a header/footer part must hold ≥ 1 block).
+        let variants = [
+            (&hf.header_first, "hdr", format!("word/headerF{}.xml", hf.number)),
+            (&hf.footer_first, "ftr", format!("word/footerF{}.xml", hf.number)),
+            (&hf.header_even, "hdr", format!("word/headerE{}.xml", hf.number)),
+            (&hf.footer_even, "ftr", format!("word/footerE{}.xml", hf.number)),
+        ];
+        for (inner, tag, name) in variants {
+            if let Some(inner) = inner {
+                let body = if inner.is_empty() { "<w:p/>" } else { inner };
+                zip.add_deflated(&name, docx_hdrftr_xml(tag, body).as_bytes());
+            }
+        }
     }
     for (i, (bytes, ext)) in ctx.images.iter().enumerate() {
         zip.add_deflated(&format!("word/media/image{}.{ext}", i + 1), bytes);
     }
     zip.finish()
+}
+
+/// One list instance's numbering definition, captured by [`docx_list`] and
+/// consumed by [`docx_numbering_xml`]: the table-wide marker/suffix/start (the
+/// fallback for every depth), the ordinal `prefix` (`"("` for `(a)`-style
+/// templates), and the list's per-depth [`ListLevelStyle`]s (empty ⇒ the
+/// table-wide triple applies to all nine levels, the pre-M2 behaviour).
+struct DocxNumDef {
+    marker: ListMarker,
+    suffix: char,
+    start: u32,
+    prefix: Option<String>,
+    levels: Vec<crate::model::ListLevelStyle>,
 }
 
 /// A section's rendered running header/footer inner XML (`None` when the section
@@ -489,6 +671,13 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
 struct SectionHf {
     header: Option<String>,
     footer: Option<String>,
+    /// Rendered first-page header/footer (`w:titlePg`); `Some("")` = a blank
+    /// variant part.
+    header_first: Option<String>,
+    footer_first: Option<String>,
+    /// Rendered even-page header/footer (`w:evenAndOddHeaders`).
+    header_even: Option<String>,
+    footer_even: Option<String>,
     number: usize,
 }
 
@@ -500,28 +689,126 @@ struct DocxCtx<'a> {
     /// `"jpeg"`), so the media part, relationship target and `[Content_Types]`
     /// `Default` all carry the resource's real format.
     images: Vec<(Vec<u8>, &'static str)>,
-    /// One `(marker, ordinal suffix, start)` per list *instance* emitted; its
-    /// position + 1 is the list's `w:numId`, and the triple drives the generated
-    /// `numbering.xml` format (`w:numFmt`, the `w:lvlText` template's suffix,
-    /// and the level-0 `w:start`).
-    list_markers: Vec<(ListMarker, char, u32)>,
+    /// One definition per list *instance* emitted; its position + 1 is the
+    /// list's `w:numId`, and the definition drives the generated
+    /// `numbering.xml` (`w:numFmt`, the `w:lvlText` template's prefix/suffix,
+    /// the level-0 `w:start`, and — when the list carries them — real
+    /// per-depth level styles).
+    list_markers: Vec<DocxNumDef>,
     /// Next unique drawing/object id.
     obj_id: usize,
     resources: &'a crate::model::ResourceTable,
+    /// The document's review comments; `comment_nums[i]` is comment `i`'s
+    /// numeric DOCX `w:id` (`w:commentReference` requires `ST_DecimalNumber`,
+    /// but a model id is free text — ODT `office:name`s are). An all-digit
+    /// unique model id keeps its own number so a DOCX-sourced comment
+    /// round-trips its id; anything else gets a fresh number above the max.
+    comments: &'a [crate::model::Comment],
+    comment_nums: Vec<u64>,
+    /// Whether any comment anchor was actually emitted (drives the
+    /// `comments.xml` part + its relationship/content-type).
+    used_comments: bool,
+    /// The document's foot-/endnotes; `footnote_nums[i]` is note `i`'s numeric
+    /// DOCX `w:id` (same stable-id scheme as the comments, floored at 1 since
+    /// ids −1/0 belong to the stock separator notes).
+    footnotes: &'a [crate::model::Footnote],
+    footnote_nums: Vec<u64>,
+    /// Whether any footnote anchor was actually emitted (drives the
+    /// `footnotes.xml` part + its relationship/content-type).
+    used_footnotes: bool,
+    /// External hyperlink targets, in allocation order; entry `i` is relationship
+    /// `rIdHl{i+1}` in `document.xml.rels` (`TargetMode="External"`).
+    hyperlinks: Vec<String>,
+    /// Rendering into a header/footer part: those parts have no `.rels` of their
+    /// own here, so run hyperlinks keep the field encoding (`HYPERLINK "url"`)
+    /// instead of a `w:hyperlink r:id` that would dangle, and comment anchors are
+    /// skipped (`comments.xml` is a document-part relationship).
+    in_hdrftr: bool,
+    /// Page height (points) of the section currently being rendered — the flip
+    /// axis turning the model's lower-left frames back into the top-down
+    /// `wp:posOffset` the importer reads (`docx_anchor_frame`'s exact inverse).
+    page_h: f64,
+}
+
+/// Stable numeric ids for a free-text id list: keep unique all-digit model
+/// ids at or above `floor`, then number the rest above the maximum so no two
+/// entries collide. Shared by the comment (`floor = 0`) and footnote
+/// (`floor = 1` — `w:id` 0/-1 are the stock separator notes) numbering.
+fn docx_stable_nums<'i>(ids: impl Iterator<Item = &'i str>, floor: u64) -> Vec<u64> {
+    let mut nums: Vec<Option<u64>> = Vec::new();
+    let mut used: Vec<u64> = Vec::new();
+    for id in ids {
+        let parsed = id
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n >= floor && !used.contains(n));
+        if let Some(n) = parsed {
+            used.push(n);
+        }
+        nums.push(parsed);
+    }
+    let mut next = used.iter().max().map(|m| m + 1).unwrap_or(floor);
+    nums.into_iter()
+        .map(|n| {
+            n.unwrap_or_else(|| {
+                let v = next;
+                next += 1;
+                v
+            })
+        })
+        .collect()
 }
 
 impl<'a> DocxCtx<'a> {
-    fn new(resources: &'a crate::model::ResourceTable) -> Self {
+    fn new(
+        resources: &'a crate::model::ResourceTable,
+        comments: &'a [crate::model::Comment],
+        footnotes: &'a [crate::model::Footnote],
+    ) -> Self {
+        // Stable numeric ids: keep unique all-digit model ids, then number the
+        // rest above the maximum so no two comments/footnotes collide.
+        let comment_nums = docx_stable_nums(comments.iter().map(|c| c.id.as_str()), 0);
+        let footnote_nums = docx_stable_nums(footnotes.iter().map(|f| f.id.as_str()), 1);
         DocxCtx {
             images: Vec::new(),
             list_markers: Vec::new(),
             obj_id: 0,
             resources,
+            comments,
+            comment_nums,
+            used_comments: false,
+            footnotes,
+            footnote_nums,
+            used_footnotes: false,
+            hyperlinks: Vec::new(),
+            in_hdrftr: false,
+            page_h: PageGeometry::default().height,
         }
     }
     fn next_obj(&mut self) -> usize {
         self.obj_id += 1;
         self.obj_id
+    }
+    /// The numeric `w:id` for the comment anchored by `id`, or `None` when no
+    /// such comment exists (a dangling anchor emits nothing).
+    fn comment_num(&self, id: &str) -> Option<u64> {
+        self.comments
+            .iter()
+            .position(|c| c.id == id)
+            .map(|i| self.comment_nums[i])
+    }
+    /// The numeric `w:id` for the footnote anchored by `id`, or `None` when no
+    /// such note exists (a dangling anchor emits nothing).
+    fn footnote_num(&self, id: &str) -> Option<u64> {
+        self.footnotes
+            .iter()
+            .position(|f| f.id == id)
+            .map(|i| self.footnote_nums[i])
+    }
+    /// Register an external hyperlink target, returning its `rIdHl{N}` id.
+    fn add_hyperlink(&mut self, url: &str) -> usize {
+        self.hyperlinks.push(url.to_string());
+        self.hyperlinks.len()
     }
     /// Register image bytes (+ extension), returning the relationship id
     /// (`rId{N}`, 100-based).
@@ -556,27 +843,98 @@ fn docx_body(doc: &Document, sect_hf: &[SectionHf], ctx: &mut DocxCtx) -> String
     // the body content.
     let mut page_no = 0usize;
     let last_idx = doc.sections.len().saturating_sub(1);
+    // Outline destinations (#8): every outline entry becomes a `_Toc…` bookmark
+    // wrapped around its matching heading, so Word has real TOC/cross-reference
+    // destinations. `_Toc` is the canonical Word TOC-anchor namespace **and** a
+    // name the importer deliberately treats as machinery (dropped on re-import),
+    // so the bookmarks add zero round-trip noise. Ids continue after the page
+    // bookmarks' (1-based page numbers) to stay document-unique.
+    let total_pages: usize = doc.sections.iter().map(|s| s.pages.len()).sum();
+    let mut outline_marks = outline_bookmark_marks(&doc.outline, total_pages);
     for (si, section) in doc.sections.iter().enumerate() {
+        ctx.page_h = section.geometry.height;
+        // A trailing *empty* paragraph on a non-final section hosts that
+        // section's `w:sectPr` directly (the shape Word itself writes) instead
+        // of an extra synthesized break paragraph — otherwise each round-trip
+        // grows the document by one empty paragraph per section boundary
+        // (import keeps the sectPr host as an empty paragraph, export then
+        // added a fresh one).
+        let merge_sect_para: Option<&Paragraph> = if si != last_idx {
+            section
+                .pages
+                .last()
+                .and_then(|p| p.blocks.last())
+                .and_then(|b| match &b.kind {
+                    BlockKind::Paragraph(p) if para_has_no_content(p) => Some(p),
+                    _ => None,
+                })
+        } else {
+            None
+        };
+        let page_count = section.pages.len();
+        // Whether the previous page's trailing empty paragraph already carries
+        // the hard page break (see `PageTail::MergePageBreak`).
+        let mut break_merged = false;
         for (pi, page) in section.pages.iter().enumerate() {
             page_no += 1;
             // Insert a hard page break before each page boundary (except the very
             // first page of a section) so content from adjacent PDF pages does
             // not flow together as one continuous stream. This mirrors how the
             // user expects a multi-page PDF to map to a multi-page Word document.
-            if pi > 0 {
+            // When the previous page ended in an empty paragraph, the break rode
+            // *that* paragraph — Word's own shape for an inserted page break —
+            // so no extra paragraph is synthesized (the importer keeps a
+            // break-only paragraph as an empty paragraph: a synthesized one grew
+            // the document by one empty paragraph per page boundary per
+            // round-trip).
+            if pi > 0 && !break_merged {
                 blocks.push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
             }
             blocks.push_str(&format!(
                 "<w:bookmarkStart w:id=\"{page_no}\" w:name=\"page{page_no}\"/>\
 <w:bookmarkEnd w:id=\"{page_no}\"/>"
             ));
-            blocks.push_str(&docx_blocks(&page.blocks, ctx));
+            // Any trailing plain paragraph can host the break (Word's shape:
+            // the break run ends the page's last paragraph); a page ending in
+            // a table/list/image keeps the standalone break paragraph.
+            let last_is_para = page
+                .blocks
+                .last()
+                .is_some_and(|b| matches!(&b.kind, BlockKind::Paragraph(_)));
+            let tail = if merge_sect_para.is_some() && pi + 1 == page_count {
+                PageTail::SkipForSectPr
+            } else if pi + 1 < page_count && last_is_para {
+                PageTail::MergePageBreak
+            } else {
+                PageTail::None
+            };
+            break_merged = matches!(tail, PageTail::MergePageBreak);
+            blocks.push_str(&docx_page_blocks(
+                &page.blocks,
+                page_no - 1,
+                tail,
+                &mut outline_marks,
+                ctx,
+            ));
         }
         if si != last_idx {
-            // Section break: an empty paragraph whose `w:pPr` holds this section's
-            // `w:sectPr` (geometry + its own header/footer refs).
+            // Section break: the section's `w:sectPr` rides the last (empty)
+            // paragraph when one exists — keeping that paragraph's own
+            // formatting — else an otherwise-empty break paragraph.
+            let props = merge_sect_para
+                .map(|p| {
+                    let mut ppr = String::new();
+                    if let Some(id) = style_ref_id(p.style_ref.as_ref()) {
+                        let mut v = String::new();
+                        esc(id, &mut v);
+                        ppr.push_str(&format!("<w:pStyle w:val=\"{v}\"/>"));
+                    }
+                    ppr.push_str(&docx_style_ppr_props(&p.style));
+                    ppr
+                })
+                .unwrap_or_default();
             blocks.push_str(&format!(
-                "<w:p><w:pPr>{}</w:pPr></w:p>",
+                "<w:p><w:pPr>{props}{}</w:pPr></w:p>",
                 docx_sect_pr(section, sect_hf.get(si))
             ));
         }
@@ -605,36 +963,93 @@ xmlns:w10=\"urn:schemas-microsoft-com:office:word\">\
 /// own header/footer references (`rIdHdr{n}` / `rIdFtr{n}`). `hf` is `None` only
 /// for the synthetic empty-document fallback (no header/footer then).
 fn docx_sect_pr(section: &Section, hf: Option<&SectionHf>) -> String {
-    let geom = section.geometry;
-    let header_ref = match hf {
-        Some(h) if h.header.is_some() => {
-            format!(
-                "<w:headerReference w:type=\"default\" r:id=\"rIdHdr{}\"/>",
-                h.number
-            )
+    let geom = &section.geometry;
+    let mut header_ref = String::new();
+    let mut footer_ref = String::new();
+    // `<w:titlePg/>` when the section declares a distinct first page (CT_SectPr
+    // places it after `w:cols`; Word is lenient but keep it post-pgMar).
+    let mut title_pg = "";
+    if let Some(h) = hf {
+        let n = h.number;
+        if h.header.is_some() {
+            header_ref.push_str(&format!(
+                "<w:headerReference w:type=\"default\" r:id=\"rIdHdr{n}\"/>"
+            ));
         }
-        _ => String::new(),
-    };
-    let footer_ref = match hf {
-        Some(h) if h.footer.is_some() => {
-            format!(
-                "<w:footerReference w:type=\"default\" r:id=\"rIdFtr{}\"/>",
-                h.number
-            )
+        if h.header_first.is_some() {
+            header_ref.push_str(&format!(
+                "<w:headerReference w:type=\"first\" r:id=\"rIdHdrF{n}\"/>"
+            ));
         }
-        _ => String::new(),
-    };
+        if h.header_even.is_some() {
+            header_ref.push_str(&format!(
+                "<w:headerReference w:type=\"even\" r:id=\"rIdHdrE{n}\"/>"
+            ));
+        }
+        if h.footer.is_some() {
+            footer_ref.push_str(&format!(
+                "<w:footerReference w:type=\"default\" r:id=\"rIdFtr{n}\"/>"
+            ));
+        }
+        if h.footer_first.is_some() {
+            footer_ref.push_str(&format!(
+                "<w:footerReference w:type=\"first\" r:id=\"rIdFtrF{n}\"/>"
+            ));
+        }
+        if h.footer_even.is_some() {
+            footer_ref.push_str(&format!(
+                "<w:footerReference w:type=\"even\" r:id=\"rIdFtrE{n}\"/>"
+            ));
+        }
+        if h.header_first.is_some() || h.footer_first.is_some() {
+            title_pg = "<w:titlePg/>";
+        }
+    }
     // Multi-column layout: emit `<w:cols>` when the source page has more than
-    // one text column. A `space` of 720 twips (0.5″) approximates the standard
+    // one text column. The model's `column_gap_pt` (when imported) restores the
+    // authored gutter; absent, 720 twips (0.5″) approximates the standard
     // gutter between columns when the source PDF's gutter can't be measured.
+    // Individual `column_widths_pt` re-emit as `<w:col w:w>` children with
+    // `w:equalWidth="0"` (a non-uniform layout), and `column_separator` as
+    // `w:sep="1"` — the symmetric inverse of the importer's `w:cols` read.
     let cols = if geom.column_count > 1 {
-        format!("<w:cols w:num=\"{}\" w:space=\"720\"/>", geom.column_count)
+        let space = twips(geom.column_gap_pt.unwrap_or(36.0).max(0.0));
+        let sep = if geom.column_separator {
+            " w:sep=\"1\""
+        } else {
+            ""
+        };
+        match geom.column_widths_pt.as_ref().filter(|w| !w.is_empty()) {
+            Some(widths) => {
+                let mut inner = String::new();
+                let last = widths.len().saturating_sub(1);
+                for (i, w) in widths.iter().enumerate() {
+                    // Word writes the gutter on every column but the last.
+                    if i == last {
+                        inner.push_str(&format!("<w:col w:w=\"{}\"/>", twips(w.max(0.0))));
+                    } else {
+                        inner.push_str(&format!(
+                            "<w:col w:w=\"{}\" w:space=\"{space}\"/>",
+                            twips(w.max(0.0))
+                        ));
+                    }
+                }
+                format!(
+                    "<w:cols w:num=\"{}\" w:space=\"{space}\"{sep} w:equalWidth=\"0\">{inner}</w:cols>",
+                    geom.column_count
+                )
+            }
+            None => format!(
+                "<w:cols w:num=\"{}\" w:space=\"{space}\"{sep}/>",
+                geom.column_count
+            ),
+        }
     } else {
         String::new()
     };
     format!(
         "<w:sectPr>{header_ref}{footer_ref}{cols}<w:pgSz w:w=\"{w}\" w:h=\"{h}\" w:orient=\"{o}\"/>\
-<w:pgMar w:top=\"{mt}\" w:right=\"{mr}\" w:bottom=\"{mb}\" w:left=\"{ml}\" w:header=\"{mt}\" w:footer=\"{mb}\" w:gutter=\"0\"/></w:sectPr>",
+<w:pgMar w:top=\"{mt}\" w:right=\"{mr}\" w:bottom=\"{mb}\" w:left=\"{ml}\" w:header=\"{mt}\" w:footer=\"{mb}\" w:gutter=\"0\"/>{title_pg}</w:sectPr>",
         w = twips(geom.width),
         h = twips(geom.height),
         o = if geom.height >= geom.width { "portrait" } else { "landscape" },
@@ -650,6 +1065,182 @@ fn docx_blocks(blocks: &[Block], ctx: &mut DocxCtx) -> String {
     let mut out = String::new();
     for b in blocks {
         docx_block(b, ctx, &mut out);
+    }
+    out
+}
+
+/// A pending outline destination (#8): the outline entry's 0-based `page` and
+/// trimmed `title`, the `_Toc…` bookmark `name`/`id` to drop on the matching
+/// heading, and whether it was already placed.
+struct OutlineMark {
+    page: usize,
+    title: String,
+    name: String,
+    id: usize,
+    used: bool,
+}
+
+/// Flatten the outline tree into pending bookmark marks. Names are Word's
+/// canonical `_Toc` + 9-digit form; ids continue after the `total_pages` page
+/// bookmarks so every `w:bookmarkStart w:id` stays document-unique.
+fn outline_bookmark_marks(
+    outline: &[crate::model::OutlineNode],
+    total_pages: usize,
+) -> Vec<OutlineMark> {
+    fn flatten(nodes: &[crate::model::OutlineNode], out: &mut Vec<(usize, String)>) {
+        for n in nodes {
+            let title = n.title.trim().to_string();
+            if !title.is_empty() {
+                out.push((n.page, title));
+            }
+            flatten(&n.children, out);
+        }
+    }
+    let mut flat = Vec::new();
+    flatten(outline, &mut flat);
+    flat.into_iter()
+        .enumerate()
+        .map(|(i, (page, title))| OutlineMark {
+            page,
+            title,
+            name: format!("_Toc{:09}", 100_000_001 + i),
+            id: total_pages + i + 1,
+            used: false,
+        })
+        .collect()
+}
+
+/// Whether a paragraph carries no content at all (no text, no image/break/link/
+/// comment inline) — the shape of a section-break host paragraph.
+fn para_has_no_content(p: &Paragraph) -> bool {
+    p.runs
+        .iter()
+        .all(|r| matches!(r, Inline::Run(ir) if ir.text.is_empty()))
+}
+
+/// The concatenated plain text of a heading (for outline-title matching).
+fn heading_plain_text(h: &Heading) -> String {
+    let mut out = String::new();
+    inlines_plain_text(&h.para.runs, &mut out);
+    out
+}
+
+/// How a page's trailing block is folded into the surrounding structure.
+#[derive(PartialEq)]
+enum PageTail {
+    /// Nothing special: every block renders normally.
+    None,
+    /// The trailing empty paragraph is *not* emitted here — `docx_body`
+    /// re-emits it carrying the section's `w:sectPr`.
+    SkipForSectPr,
+    /// The trailing empty paragraph carries the hard page break to the next
+    /// page (`<w:br w:type="page"/>` as its run) instead of a synthesized
+    /// break-only paragraph following it.
+    MergePageBreak,
+}
+
+/// Serialize one page's top-level blocks, applying the page-scoped fixups the
+/// plain [`docx_blocks`] must not (lists/cells reuse that one):
+///
+/// * **Outline bookmarks** (#8): a heading matching a pending [`OutlineMark`]
+///   (same 0-based page, same trimmed title) is wrapped in the mark's
+///   `w:bookmarkStart`/`End` pair.
+/// * **Anchored-image absorption**: a positioned [`BlockKind::Image`] directly
+///   following a paragraph rides *inside* that paragraph's `<w:p>` (as the
+///   trailing `wp:anchor` run) — the exact inverse of the importer, which lifts
+///   a floating drawing out of its host paragraph. A standalone wrapper `<w:p>`
+///   would re-import as one extra empty paragraph per image per round-trip.
+/// * **Tail folding** ([`PageTail`]): the trailing empty paragraph hosts the
+///   section break or the hard page break instead of a synthesized paragraph.
+fn docx_page_blocks(
+    blocks: &[Block],
+    page_idx: usize,
+    tail: PageTail,
+    marks: &mut [OutlineMark],
+    ctx: &mut DocxCtx,
+) -> String {
+    let mut out = String::new();
+    let end = blocks.len() - usize::from(tail == PageTail::SkipForSectPr);
+    let mut i = 0usize;
+    while i < end {
+        let b = &blocks[i];
+        // Outline destination on a matching heading.
+        let mark: Option<(usize, String)> = match &b.kind {
+            BlockKind::Heading(h) => {
+                let text = heading_plain_text(h);
+                let text = text.trim();
+                marks
+                    .iter_mut()
+                    .find(|m| !m.used && m.page == page_idx && m.title == text)
+                    .map(|m| {
+                        m.used = true;
+                        (m.id, m.name.clone())
+                    })
+            }
+            _ => None,
+        };
+        if let Some((id, name)) = &mark {
+            out.push_str(&format!(
+                "<w:bookmarkStart w:id=\"{id}\" w:name=\"{name}\"/>"
+            ));
+        }
+        match &b.kind {
+            BlockKind::Paragraph(p) => {
+                // Absorb the run of anchored images that immediately follows.
+                let mut extra = String::new();
+                let mut consumed = 0usize;
+                while i + 1 + consumed < end {
+                    match &blocks[i + 1 + consumed].kind {
+                        BlockKind::Image(img) if blocks[i + 1 + consumed].frame.is_some() => {
+                            extra.push_str(&docx_anchored_image(
+                                img,
+                                blocks[i + 1 + consumed].frame.unwrap_or_default(),
+                                ctx,
+                            ));
+                            consumed += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                // The page's trailing paragraph carries the hard break to the
+                // next page (see `PageTail::MergePageBreak`). The importer
+                // reads `<w:br w:type="page"/>` as a **LineBreak run** plus
+                // the page split, so the break *replaces* the paragraph's
+                // trailing line break when it has one — export∘import is then
+                // the identity on the runs instead of growing one line break
+                // per round-trip cycle.
+                if tail == PageTail::MergePageBreak && i + consumed + 1 == end {
+                    extra.push_str("<w:r><w:br w:type=\"page\"/></w:r>");
+                    let mut host = p.clone();
+                    if matches!(host.runs.last(), Some(Inline::LineBreak)) {
+                        host.runs.pop();
+                    }
+                    out.push_str(&docx_para_extra(
+                        &host,
+                        style_ref_id(host.style_ref.as_ref()),
+                        0,
+                        0,
+                        &extra,
+                        ctx,
+                    ));
+                } else {
+                    out.push_str(&docx_para_extra(
+                        p,
+                        style_ref_id(p.style_ref.as_ref()),
+                        0,
+                        0,
+                        &extra,
+                        ctx,
+                    ));
+                }
+                i += consumed;
+            }
+            _ => docx_block(b, ctx, &mut out),
+        }
+        if let Some((id, _)) = &mark {
+            out.push_str(&format!("<w:bookmarkEnd w:id=\"{id}\"/>"));
+        }
+        i += 1;
     }
     out
 }
@@ -724,6 +1315,66 @@ fn style_ref_id(style_ref: Option<&StyleId>) -> Option<&str> {
     style_ref.map(|id| id.0.as_str()).filter(|s| !s.is_empty())
 }
 
+/// Re-flow a paragraph's **soft** line breaks for reflowable exports: a break
+/// classified soft (`ParagraphStyle::soft_breaks[k] == true` — a word-wrap
+/// consequence of the source layout, not an authored break) becomes a plain
+/// space, so Word/Markdown re-flow the text natively instead of freezing the
+/// PDF's line grid. Guards (statu quo otherwise): `soft_breaks` must be
+/// non-empty, aligned with the paragraph's `LineBreak` count (links included,
+/// in flow order), and classify at least one break as soft. Hard breaks keep
+/// their `LineBreak`. The space appends onto the preceding run when possible
+/// so it inherits that run's style. Returns `None` when nothing changes.
+fn reflow_soft_breaks(para: &Paragraph) -> Option<Vec<Inline>> {
+    fn count_breaks(runs: &[Inline]) -> usize {
+        runs.iter()
+            .map(|r| match r {
+                Inline::LineBreak => 1,
+                Inline::Link { children, .. } => count_breaks(children),
+                _ => 0,
+            })
+            .sum()
+    }
+    fn rewrite(runs: &[Inline], soft: &[bool], k: &mut usize) -> Vec<Inline> {
+        let mut out: Vec<Inline> = Vec::with_capacity(runs.len());
+        for r in runs {
+            match r {
+                Inline::LineBreak => {
+                    let is_soft = soft.get(*k).copied().unwrap_or(false);
+                    *k += 1;
+                    if is_soft {
+                        match out.last_mut() {
+                            Some(Inline::Run(prev)) => prev.text.push(' '),
+                            _ => out.push(Inline::Run(InlineRun {
+                                text: " ".to_string(),
+                                style: CharStyle::default(),
+                                source_index: None,
+                            })),
+                        }
+                    } else {
+                        out.push(Inline::LineBreak);
+                    }
+                }
+                Inline::Link { href, children } => out.push(Inline::Link {
+                    href: href.clone(),
+                    children: rewrite(children, soft, k),
+                }),
+                other => out.push(other.clone()),
+            }
+        }
+        out
+    }
+
+    let soft = &para.style.soft_breaks;
+    if soft.is_empty() || !soft.iter().any(|b| *b) {
+        return None;
+    }
+    if count_breaks(&para.runs) != soft.len() {
+        return None; // stale classification — keep every break (statu quo)
+    }
+    let mut k = 0usize;
+    Some(rewrite(&para.runs, soft, &mut k))
+}
+
 /// One paragraph. `style_id` (e.g. `Some("Heading1")`) emits a `w:pStyle`;
 /// `num_id` > 0 wires the paragraph into list numbering at `level`.
 fn docx_para(para: &Paragraph, style_id: Option<&str>, num_level: u8, ctx: &mut DocxCtx) -> String {
@@ -735,6 +1386,20 @@ fn docx_para_numbered(
     style_id: Option<&str>,
     num_id: usize,
     num_level: u8,
+    ctx: &mut DocxCtx,
+) -> String {
+    docx_para_extra(para, style_id, num_id, num_level, "", ctx)
+}
+
+/// [`docx_para_numbered`] plus raw trailing run XML (`extra`) appended after the
+/// paragraph's own runs — the carrier for anchored drawings absorbed into their
+/// host paragraph by [`docx_page_blocks`].
+fn docx_para_extra(
+    para: &Paragraph,
+    style_id: Option<&str>,
+    num_id: usize,
+    num_level: u8,
+    extra: &str,
     ctx: &mut DocxCtx,
 ) -> String {
     let mut ppr = String::from("<w:pPr>");
@@ -754,8 +1419,13 @@ fn docx_para_numbered(
     ppr.push_str("</w:pPr>");
 
     let mut runs = String::new();
-    docx_runs(&para.runs, ctx, &mut runs);
-    format!("<w:p>{ppr}{runs}</w:p>")
+    // Soft line breaks (reconstruction word-wraps) re-flow as spaces so Word
+    // paginates natively; hard breaks stay `<w:br/>`. See `reflow_soft_breaks`.
+    match reflow_soft_breaks(para) {
+        Some(reflowed) => docx_runs(&reflowed, ctx, &mut runs),
+        None => docx_runs(&para.runs, ctx, &mut runs),
+    }
+    format!("<w:p>{ppr}{runs}{extra}</w:p>")
 }
 
 fn docx_jc(align: Align) -> Option<&'static str> {
@@ -806,11 +1476,22 @@ fn docx_runs(runs: &[Inline], ctx: &mut DocxCtx, out: &mut String) {
             Inline::LineBreak => out.push_str("<w:r><w:br/></w:r>"),
             Inline::Image(img) => out.push_str(&docx_inline_image(img, ctx)),
             Inline::Link { href, children } => {
-                // Render link children as runs wrapped in a hyperlink field. An
-                // external URL → `HYPERLINK "url"`; an internal page jump →
-                // `HYPERLINK \l "page{N}"`, resolving to the `w:bookmarkStart`
-                // named `page{N}` that `docx_body` drops at each page boundary.
+                // An external URL → the canonical `<w:hyperlink r:id="…">`
+                // (ECMA-376 §17.16.22) backed by a `TargetMode="External"`
+                // relationship — what Word itself writes, so link styling /
+                // editing behave natively. Inside a header/footer part (which
+                // has no rels part here) the relationship-free `HYPERLINK "url"`
+                // field encoding is kept so the r:id cannot dangle. An internal
+                // page jump stays a `HYPERLINK \l "page{N}"` field, resolving to
+                // the `w:bookmarkStart` named `page{N}` that `docx_body` drops
+                // at each page boundary.
                 match href {
+                    LinkTarget::Url(url) if !url.is_empty() && !ctx.in_hdrftr => {
+                        let n = ctx.add_hyperlink(url);
+                        out.push_str(&format!("<w:hyperlink r:id=\"rIdHl{n}\">"));
+                        docx_runs(children, ctx, out);
+                        out.push_str("</w:hyperlink>");
+                    }
                     LinkTarget::Url(url) if !url.is_empty() => {
                         let mut esc_url = String::new();
                         esc(url, &mut esc_url);
@@ -832,15 +1513,88 @@ fn docx_runs(runs: &[Inline], ctx: &mut DocxCtx, out: &mut String) {
                         docx_runs(children, ctx, out);
                         out.push_str("<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>");
                     }
+                    // A named in-document anchor: the canonical `w:hyperlink
+                    // w:anchor` (ECMA-376 §17.16.22 — a bookmark jump, no
+                    // relationship needed, so it works in header/footer parts
+                    // too). The importer reads this exact shape back into
+                    // `LinkTarget::Anchor` (resolved to its bookmark's page
+                    // when one exists).
+                    LinkTarget::Anchor(a) if !a.is_empty() => {
+                        let mut esc_a = String::new();
+                        esc(a, &mut esc_a);
+                        out.push_str(&format!("<w:hyperlink w:anchor=\"{esc_a}\">"));
+                        docx_runs(children, ctx, out);
+                        out.push_str("</w:hyperlink>");
+                    }
                     _ => docx_runs(children, ctx, out),
                 }
             }
-            // A comment anchor carries no body and is not re-emitted: the DOCX
-            // writer produces no `word/comments.xml`, so a `w:commentReference`
-            // would dangle. Comments degrade gracefully (dropped on export).
-            Inline::CommentRef { .. } => {}
+            // A comment anchor: `w:commentRangeStart`/`End` + the
+            // `w:commentReference` run (ECMA-376 §17.13.4), whose numeric id
+            // joins the matching body in `word/comments.xml`. A dangling anchor
+            // (no comment with that id) emits nothing; header/footer parts skip
+            // anchors too (the comments relationship belongs to document.xml).
+            Inline::CommentRef { id } => {
+                if !ctx.in_hdrftr {
+                    if let Some(n) = ctx.comment_num(id) {
+                        ctx.used_comments = true;
+                        out.push_str(&format!(
+                            "<w:commentRangeStart w:id=\"{n}\"/>\
+<w:commentRangeEnd w:id=\"{n}\"/>\
+<w:r><w:commentReference w:id=\"{n}\"/></w:r>"
+                        ));
+                    }
+                }
+            }
+            // A footnote anchor: the superscript `w:footnoteReference` run
+            // (ECMA-376 §17.11.14), whose numeric id joins the matching body in
+            // `word/footnotes.xml`. A dangling anchor (no note with that id)
+            // emits nothing; header/footer/footnote parts skip anchors too (the
+            // footnotes relationship belongs to document.xml, and Word forbids
+            // notes inside notes).
+            Inline::FootnoteRef { id } => {
+                if !ctx.in_hdrftr {
+                    if let Some(n) = ctx.footnote_num(id) {
+                        ctx.used_footnotes = true;
+                        out.push_str(&format!(
+                            "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/>\
+<w:vertAlign w:val=\"superscript\"/></w:rPr><w:footnoteReference w:id=\"{n}\"/></w:r>"
+                        ));
+                    }
+                }
+            }
         }
     }
+}
+
+/// The `<w:caps/>`/`<w:smallCaps/>`/`<w:position/>`/`<w:w/>`/`<w:kern/>` run
+/// properties shared by the direct (`docx_rpr`) and named-style
+/// (`docx_named_rpr`) writers — the inverse of the importer's captures.
+/// `w:position` and `w:kern` are half-points (pt × 2), `w:w` a percentage.
+fn docx_rpr_extras(style: &CharStyle) -> String {
+    let mut p = String::new();
+    if style.caps {
+        p.push_str("<w:caps/>");
+    }
+    if style.small_caps {
+        p.push_str("<w:smallCaps/>");
+    }
+    if let Some(v) = style.baseline_shift_pt.filter(|v| *v != 0.0) {
+        p.push_str(&format!(
+            "<w:position w:val=\"{}\"/>",
+            (v * 2.0).round() as i64
+        ));
+    }
+    if let Some(v) = style.char_scale_pct.filter(|v| *v > 0.0 && *v != 100.0) {
+        p.push_str(&format!("<w:w w:val=\"{}\"/>", v.round() as i64));
+    }
+    if let Some(v) = style.kern_min_pt.filter(|v| *v > 0.0) {
+        p.push_str(&format!(
+            "<w:kern w:val=\"{}\"/>",
+            (v * 2.0).round().max(1.0) as i64
+        ));
+    }
+    p
 }
 
 /// `<w:rPr>` from a [`CharStyle`].
@@ -859,10 +1613,16 @@ fn docx_rpr(style: &CharStyle) -> String {
     if style.italic {
         p.push_str("<w:i/>");
     }
+    p.push_str(&docx_rpr_extras(style));
     if style.underline {
         p.push_str("<w:u w:val=\"single\"/>");
     }
-    if style.strike {
+    // A double strike-through supersedes the single one (OOXML forbids both
+    // `w:strike` and `w:dstrike` on the same run; the importer sets `strike`
+    // alongside `dstrike` only as the degraded-consumer fallback).
+    if style.dstrike {
+        p.push_str("<w:dstrike/>");
+    } else if style.strike {
         p.push_str("<w:strike/>");
     }
     match style.vertical_align {
@@ -905,7 +1665,13 @@ fn docx_rpr(style: &CharStyle) -> String {
 /// Emit a [`List`] as a sequence of numbered paragraphs (one `w:numId` for the
 /// whole list). Nested block content inside an item keeps its own numbering.
 fn docx_list(list: &List, ctx: &mut DocxCtx, out: &mut String) {
-    ctx.list_markers.push((list.marker, list.suffix(), list.start.max(1)));
+    ctx.list_markers.push(DocxNumDef {
+        marker: list.marker,
+        suffix: list.suffix(),
+        start: list.start.max(1),
+        prefix: list.marker_prefix.clone(),
+        levels: list.levels.clone(),
+    });
     let num_id = ctx.list_markers.len();
     for item in &list.items {
         for (i, b) in item.blocks.iter().enumerate() {
@@ -1005,8 +1771,18 @@ fn docx_table(table: &Table, ctx: &mut DocxCtx) -> String {
         rows.push_str("</w:tr>");
     }
 
+    // When the model carries real column widths, pin the layout: without
+    // `w:tblLayout w:type="fixed"` Word re-runs its autofit algorithm and
+    // discards the reconstructed `tblGrid` widths. (CT_TblPrBase child order:
+    // `w:tblW` … `w:tblBorders` … `w:tblLayout`.) A width-less table keeps the
+    // autofit default.
+    let layout = if table.col_widths.iter().any(|w| *w > 0.0) {
+        "<w:tblLayout w:type=\"fixed\"/>"
+    } else {
+        ""
+    };
     format!(
-        "<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/>{borders}</w:tblPr>{grid}{rows}</w:tbl>\
+        "<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/>{borders}{layout}</w:tblPr>{grid}{rows}</w:tbl>\
 <w:p/>",
         borders = docx_tbl_borders(table),
     )
@@ -1039,6 +1815,28 @@ fn docx_cell(cell: &Cell, span: usize, vmerge_restart: bool, ctx: &mut DocxCtx) 
     }
     if vmerge_restart {
         tcpr.push_str("<w:vMerge w:val=\"restart\"/>");
+    }
+    // Per-cell borders (`w:tcBorders`, CT_TcBorders child order top → left →
+    // bottom → right; the model array is `[top, right, bottom, left]`). Under
+    // a declared per-cell regime an unset side emits `w:val="nil"` — an
+    // explicit "no line here" so Word doesn't fall back to the table default.
+    // Emitted before `w:shd` (CT_TcPrBase order: tcBorders precedes shd).
+    if cell.has_borders() {
+        let mut sides = String::new();
+        for (side, idx) in [("top", 0usize), ("left", 3), ("bottom", 2), ("right", 1)] {
+            match &cell.borders[idx] {
+                Some(b) => {
+                    let sz = (b.width_pt * 8.0).round().max(2.0) as i64;
+                    sides.push_str(&format!(
+                        "<w:{side} w:val=\"{}\" w:sz=\"{sz}\" w:space=\"0\" w:color=\"{}\"/>",
+                        docx_border_val(&b.style),
+                        hex(b.color)
+                    ));
+                }
+                None => sides.push_str(&format!("<w:{side} w:val=\"nil\"/>")),
+            }
+        }
+        tcpr.push_str(&format!("<w:tcBorders>{sides}</w:tcBorders>"));
     }
     if let Some(shade) = cell.shading {
         tcpr.push_str(&format!(
@@ -1125,27 +1923,44 @@ fn docx_slides(slides: &SlideBlock, ctx: &mut DocxCtx, out: &mut String) {
 /// floats at its page coordinates via `wp:anchor`, sized to its real frame — a
 /// logo or figure keeps its place instead of collapsing into the text flow at a
 /// default extent. A frameless image (a flow import) stays a `wp:inline`.
-fn docx_image_para(
-    img: &ImageRef,
-    frame: Option<crate::model::Rect>,
-    ctx: &mut DocxCtx,
-) -> String {
+fn docx_image_para(img: &ImageRef, frame: Option<crate::model::Rect>, ctx: &mut DocxCtx) -> String {
     match frame {
         Some(r) => format!("<w:p>{}</w:p>", docx_anchored_image(img, r, ctx)),
         None => format!("<w:p>{}</w:p>", docx_inline_image(img, ctx)),
     }
 }
 
+/// The picture crop as a DrawingML `<a:srcRect>` (thousandths of a percent per
+/// side), or `""` when the image is uncropped — the symmetric inverse of the
+/// importer's `parse_src_rect`.
+fn docx_src_rect(crop: Option<[f64; 4]>) -> String {
+    match crop {
+        Some([l, t, r, b]) if [l, t, r, b].iter().any(|v| *v != 0.0) => {
+            let f = |v: f64| (v.clamp(0.0, 1.0) * 100_000.0).round() as i64;
+            format!(
+                "<a:srcRect l=\"{}\" t=\"{}\" r=\"{}\" b=\"{}\"/>",
+                f(l),
+                f(t),
+                f(r),
+                f(b)
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 /// The shared `<a:graphic>` picture payload of both the inline and the anchored
 /// drawing (ECMA-376 `pic:pic` referencing an already-registered `rId`).
-fn docx_pic_graphic(id: usize, rid: usize, cx: i64, cy: i64) -> String {
+/// `src_rect` is the pre-rendered `<a:srcRect/>` crop (or `""`); CT_BlipFill
+/// child order is `a:blip`, `a:srcRect?`, then the fill mode (`a:stretch`).
+fn docx_pic_graphic(id: usize, rid: usize, cx: i64, cy: i64, src_rect: &str) -> String {
     format!(
         "<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
 <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
 <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
 <pic:nvPicPr><pic:cNvPr id=\"{id}\" name=\"img{id}\"/><pic:cNvPicPr/></pic:nvPicPr>\
 <pic:blipFill><a:blip xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:embed=\"rId{rid}\"/>\
-<a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
+{src_rect}<a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
 <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
 <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"
     )
@@ -1159,11 +1974,18 @@ fn docx_inline_image(img: &ImageRef, ctx: &mut DocxCtx) -> String {
     };
     let id = ctx.next_obj();
     let rid = ctx.add_image(bytes, ext);
-    // A 1"-square default extent; reflowable output sizes to the page anyway.
-    let (cx, cy) = (emu(96.0), emu(96.0));
+    // The authored display size (`ImageRef::size_pt`, from the source's own
+    // `wp:extent`/`svg:width`) when known — a flow image round-trips at its
+    // real size instead of the historical 1"-square default (kept as the
+    // fallback; reflowable output sizes to the page anyway).
+    let (w_pt, h_pt) = match img.size_pt {
+        Some((w, h)) if w > 0.0 && h > 0.0 => (w, h),
+        _ => (96.0, 96.0),
+    };
+    let (cx, cy) = (emu(w_pt), emu(h_pt));
     let mut alt = String::new();
     esc(img.alt.as_deref().unwrap_or(""), &mut alt);
-    let graphic = docx_pic_graphic(id, rid, cx, cy);
+    let graphic = docx_pic_graphic(id, rid, cx, cy, &docx_src_rect(img.crop));
     format!(
         "<w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
 <wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
@@ -1172,13 +1994,18 @@ fn docx_inline_image(img: &ImageRef, ctx: &mut DocxCtx) -> String {
     )
 }
 
-/// A floating picture anchored at its model frame (top-down page points →
-/// `wp:posOffset` EMU from the page edges), sized to the frame. `behindDoc` is
-/// `0` (the picture was painted with the page content, not as a watermark) and
-/// the wrap is `wp:wrapNone`: the source PDF laid its text without any notion
-/// of wrapping, so reserving wrap bands around each picture (`wrapSquare`)
-/// would push the prose into pages the source never had — an image-rich page
-/// must keep its own pagination.
+/// A floating picture anchored at its model frame, sized to the frame. The
+/// model rectangle is **lower-left origin** (PDF convention); OOXML's
+/// `wp:posOffset` measures from the **top-left** page corner, so the vertical
+/// offset is flipped about the current section's page height — the exact
+/// inverse of the importer's `docx_anchor_frame` (`y_model = page_h − (y_top +
+/// h)` ⇔ `y_top = page_h − (y_model + h)`). Emitting `r.y` raw made every
+/// anchored frame drift on each round-trip (e.g. y 625.9 → 144 on A4).
+/// `behindDoc` is `0` (the picture was painted with the page content, not as a
+/// watermark) and the wrap is `wp:wrapNone`: the source PDF laid its text
+/// without any notion of wrapping, so reserving wrap bands around each picture
+/// (`wrapSquare`) would push the prose into pages the source never had — an
+/// image-rich page must keep its own pagination.
 fn docx_anchored_image(img: &ImageRef, r: crate::model::Rect, ctx: &mut DocxCtx) -> String {
     let (bytes, ext) = match ctx.resolve_image(img.resource) {
         Some(b) if !b.0.is_empty() => b,
@@ -1187,10 +2014,11 @@ fn docx_anchored_image(img: &ImageRef, r: crate::model::Rect, ctx: &mut DocxCtx)
     let id = ctx.next_obj();
     let rid = ctx.add_image(bytes, ext);
     let (cx, cy) = (emu(r.w.max(1.0)), emu(r.h.max(1.0)));
-    let (x, y) = (emu(r.x.max(0.0)), emu(r.y.max(0.0)));
+    let y_top = ctx.page_h - (r.y + r.h);
+    let (x, y) = (emu(r.x.max(0.0)), emu(y_top.max(0.0)));
     let mut alt = String::new();
     esc(img.alt.as_deref().unwrap_or(""), &mut alt);
-    let graphic = docx_pic_graphic(id, rid, cx, cy);
+    let graphic = docx_pic_graphic(id, rid, cx, cy, &docx_src_rect(img.crop));
     format!(
         "<w:r><w:drawing><wp:anchor distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" \
 simplePos=\"0\" relativeHeight=\"{id}\" behindDoc=\"0\" locked=\"0\" layoutInCell=\"1\" \
@@ -1270,7 +2098,9 @@ fn parse_page_number_text(text: &str) -> Option<Vec<PageNumTok>> {
         }
     }
     let is_page_word = |s: &str| s.eq_ignore_ascii_case("page");
-    let is_sep = |s: &str| matches!(s, "/" | "-") || ["of", "sur", "de"].contains(&s.to_ascii_lowercase().as_str());
+    let is_sep = |s: &str| {
+        matches!(s, "/" | "-") || ["of", "sur", "de"].contains(&s.to_ascii_lowercase().as_str())
+    };
     match toks.as_slice() {
         // `Page N`
         [w, n] if is_page_word(w) && is_int(n) => {
@@ -1368,11 +2198,94 @@ xmlns:w10=\"urn:schemas-microsoft-com:office:word\">{inner}</w:{tag}>"
     )
 }
 
+/// `word/comments.xml` (ECMA-376 §17.13.4): one `w:comment` per model
+/// [`Comment`](crate::model::Comment), its `w:id` the numeric id from `nums`
+/// (matching the `w:commentReference` anchors), `w:author`/`w:date` verbatim
+/// when present, and the flattened text as a single `w:p` — the same one-line
+/// shape the importer produces (it joins comment paragraphs with a space), so
+/// a comment round-trips byte-identical.
+/// `word/footnotes.xml`: the two stock separator notes Word expects
+/// (`w:id="-1"`/`"0"`) plus one `<w:footnote w:id="N">` per model
+/// [`Footnote`](crate::model::Footnote), ids matching the
+/// `w:footnoteReference` anchors. Each body paragraph carries the
+/// `FootnoteText` style; the first opens with the auto-number `w:footnoteRef`
+/// run (the note's own call marker), Word's stock shape. Bodies render with
+/// `in_hdrftr` set: footnotes.xml has no rels part here, so run hyperlinks
+/// keep the relationship-free field encoding and nested anchors are skipped.
+fn docx_footnotes_xml(ctx: &mut DocxCtx) -> String {
+    let mut notes = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<w:footnotes xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\">\
+<w:footnote w:type=\"separator\" w:id=\"-1\"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>\
+<w:footnote w:type=\"continuationSeparator\" w:id=\"0\"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>",
+    );
+    let was_hdrftr = ctx.in_hdrftr;
+    ctx.in_hdrftr = true;
+    for i in 0..ctx.footnotes.len() {
+        let n = ctx.footnote_nums[i];
+        let blocks = ctx.footnotes[i].blocks.clone();
+        let mut inner = docx_blocks(&blocks, ctx);
+        if inner.is_empty() {
+            inner.push_str("<w:p/>");
+        }
+        // Open the first paragraph with the auto-number `w:footnoteRef` call
+        // marker (Word's stock note shape): spliced right after the first
+        // paragraph's `w:pPr` so the paragraph properties stay first-and-only.
+        let marker_run = "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/>\
+<w:vertAlign w:val=\"superscript\"/></w:rPr><w:footnoteRef/></w:r>\
+<w:r><w:t xml:space=\"preserve\"> </w:t></w:r>";
+        if let Some(pos) = inner.find("</w:pPr>") {
+            inner.insert_str(pos + "</w:pPr>".len(), marker_run);
+        } else if inner.starts_with("<w:p/>") {
+            inner = format!("<w:p>{marker_run}</w:p>{}", &inner["<w:p/>".len()..]);
+        } else if let Some(rest) = inner.strip_prefix("<w:p>") {
+            inner = format!("<w:p>{marker_run}{rest}");
+        }
+        notes.push_str(&format!("<w:footnote w:id=\"{n}\">{inner}</w:footnote>"));
+    }
+    ctx.in_hdrftr = was_hdrftr;
+    notes.push_str("</w:footnotes>");
+    notes
+}
+
+fn docx_comments_xml(comments: &[crate::model::Comment], nums: &[u64]) -> String {
+    let mut body = String::new();
+    for (c, n) in comments.iter().zip(nums) {
+        let mut attrs = format!(" w:id=\"{n}\"");
+        if !c.author.is_empty() {
+            let mut v = String::new();
+            esc(&c.author, &mut v);
+            attrs.push_str(&format!(" w:author=\"{v}\""));
+        }
+        if !c.date.is_empty() {
+            let mut v = String::new();
+            esc(&c.date, &mut v);
+            attrs.push_str(&format!(" w:date=\"{v}\""));
+        }
+        let mut t = String::new();
+        esc(&c.text, &mut t);
+        body.push_str(&format!(
+            "<w:comment{attrs}><w:p><w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p></w:comment>"
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{body}</w:comments>"
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // one flat writer per package part list
 fn docx_content_types(
     image_exts: &[&str],
     num: bool,
+    comments: bool,
     header_nums: &[usize],
     footer_nums: &[usize],
+    extra_hf: &[(String, String, bool)],
+    settings: bool,
+    footnotes: bool,
 ) -> String {
     let png = ooxml_image_defaults(image_exts);
     let mut overrides = String::from(
@@ -1387,6 +2300,12 @@ ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.sty
 ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>",
         );
     }
+    if comments {
+        overrides.push_str(
+            "<Override PartName=\"/word/comments.xml\" \
+ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml\"/>",
+        );
+    }
     for n in header_nums {
         overrides.push_str(&format!(
             "<Override PartName=\"/word/header{n}.xml\" \
@@ -1399,6 +2318,26 @@ ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.hea
 ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>",
         ));
     }
+    // First-/even-page header/footer variant parts.
+    for (part, _rel, is_header) in extra_hf {
+        let kind = if *is_header { "header" } else { "footer" };
+        overrides.push_str(&format!(
+            "<Override PartName=\"/word/{part}\" \
+ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml\"/>",
+        ));
+    }
+    if settings {
+        overrides.push_str(
+            "<Override PartName=\"/word/settings.xml\" \
+ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>",
+        );
+    }
+    if footnotes {
+        overrides.push_str(
+            "<Override PartName=\"/word/footnotes.xml\" \
+ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml\"/>",
+        );
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
@@ -1407,11 +2346,17 @@ ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.foo
     )
 }
 
+#[allow(clippy::too_many_arguments)] // one flat writer per package part list
 fn docx_rels(
     image_exts: &[&str],
     num: bool,
+    comments: bool,
+    hyperlinks: &[String],
     header_nums: &[usize],
     footer_nums: &[usize],
+    extra_hf: &[(String, String, bool)],
+    settings: bool,
+    footnotes: bool,
 ) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -1422,6 +2367,23 @@ fn docx_rels(
         s.push_str(
             "<Relationship Id=\"rIdNum\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>",
         );
+    }
+    if comments {
+        s.push_str(
+            "<Relationship Id=\"rIdComments\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"comments.xml\"/>",
+        );
+    }
+    // One `TargetMode="External"` relationship per body hyperlink, ids
+    // `rIdHl{n}` matching the `<w:hyperlink r:id>` emitted by `docx_runs`.
+    for (i, url) in hyperlinks.iter().enumerate() {
+        let mut u = String::new();
+        esc(url, &mut u);
+        s.push_str(&format!(
+            "<Relationship Id=\"rIdHl{}\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" \
+Target=\"{u}\" TargetMode=\"External\"/>",
+            i + 1
+        ));
     }
     // One relationship per section header/footer part, ids `rIdHdr{n}`/`rIdFtr{n}`
     // matching the `w:headerReference`/`w:footerReference` in each `w:sectPr`.
@@ -1434,6 +2396,25 @@ fn docx_rels(
         s.push_str(&format!(
             "<Relationship Id=\"rIdFtr{n}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer{n}.xml\"/>",
         ));
+    }
+    // First-/even-page variant parts (`rIdHdrF{n}`/`rIdHdrE{n}`/`rIdFtrF{n}`/
+    // `rIdFtrE{n}` → `headerF{n}.xml`/…), matching the typed
+    // `w:headerReference`/`w:footerReference` in each `w:sectPr`.
+    for (part, rel, is_header) in extra_hf {
+        let kind = if *is_header { "header" } else { "footer" };
+        s.push_str(&format!(
+            "<Relationship Id=\"{rel}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}\" Target=\"{part}\"/>",
+        ));
+    }
+    if settings {
+        s.push_str(
+            "<Relationship Id=\"rIdSettings\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings\" Target=\"settings.xml\"/>",
+        );
+    }
+    if footnotes {
+        s.push_str(
+            "<Relationship Id=\"rIdFootnotes\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes\" Target=\"footnotes.xml\"/>",
+        );
     }
     for (i, ext) in image_exts.iter().enumerate() {
         s.push_str(&format!(
@@ -1475,19 +2456,59 @@ fn docx_styles_xml(lang: Option<&str>, styles: &StyleTable) -> String {
         }
         None => String::new(),
     };
+    // A modeled style reusing a reserved id is **merged into** the built-in
+    // slot (its own `w:pPr`/`w:rPr` deltas on the built-in scaffolding) rather
+    // than dropped: skipping it silently lost e.g. a source document's coloured
+    // `Heading1` (its `w:color` came back null after one round-trip). The
+    // heading scaffolding (`w:keepNext` + `w:outlineLvl`, the level's default
+    // size when the modeled style pins none) is kept so headings stay headings.
+    let named = |id: &str| styles.named.get(&StyleId(id.to_string()));
+    let normal_rpr = named("Normal")
+        .map(|st| docx_named_rpr(&st.char_))
+        .filter(|r| !r.is_empty())
+        .map(|r| format!("<w:rPr>{r}</w:rPr>"))
+        .unwrap_or_default();
+    let normal_ppr = named("Normal")
+        .map(|st| docx_style_ppr_props(&st.para))
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("<w:pPr>{p}</w:pPr>"))
+        .unwrap_or_default();
     let mut s = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{defaults}\
-<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/></w:style>",
+<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/>{normal_ppr}{normal_rpr}</w:style>",
     );
     let sizes = [32, 26, 24, 22, 20, 18]; // half-points: H1=16pt … H6=9pt
     for (i, sz) in sizes.iter().enumerate() {
         let lvl = i + 1;
+        let modeled = named(&format!("Heading{lvl}"));
+        let ppr = modeled
+            .map(|st| docx_style_ppr_props(&st.para))
+            .unwrap_or_default();
+        let rpr = match modeled {
+            Some(st) => {
+                let mut r = docx_named_rpr(&st.char_);
+                if st.char_.size_pt <= 0.0 {
+                    // Keep the level's built-in size when the style pins none.
+                    r.push_str(&format!("<w:sz w:val=\"{sz}\"/>"));
+                }
+                r
+            }
+            None => format!("<w:b/><w:sz w:val=\"{sz}\"/>"),
+        };
+        // `w:outlineLvl` closes the pPr (it sits at the tail of CT_PPrBase);
+        // the built-in `w:keepNext` yields to a modeled one to avoid a
+        // duplicate element.
+        let keep = if ppr.contains("<w:keepNext/>") {
+            ""
+        } else {
+            "<w:keepNext/>"
+        };
         s.push_str(&format!(
             "<w:style w:type=\"paragraph\" w:styleId=\"Heading{lvl}\">\
 <w:name w:val=\"heading {lvl}\"/><w:basedOn w:val=\"Normal\"/>\
-<w:pPr><w:keepNext/><w:outlineLvl w:val=\"{ol}\"/></w:pPr>\
-<w:rPr><w:b/><w:sz w:val=\"{sz}\"/></w:rPr></w:style>",
+<w:pPr>{keep}{ppr}<w:outlineLvl w:val=\"{ol}\"/></w:pPr>\
+<w:rPr>{rpr}</w:rPr></w:style>",
             ol = i,
         ));
     }
@@ -1589,6 +2610,17 @@ fn docx_style_ppr_props(ps: &ParagraphStyle) -> String {
     if ps.keep_together {
         out.push_str("<w:keepLines/>");
     }
+    // Authored page break before the paragraph (`w:pageBreakBefore`) — the
+    // inverse of the importer's capture, so the intent survives a round trip.
+    if ps.page_break_before {
+        out.push_str("<w:pageBreakBefore/>");
+    }
+    // Right-to-left paragraph flow (`w:bidi`) — the inverse of the importer's
+    // `w:pPr/w:bidi` capture. Only emitted for an explicit RTL direction, so
+    // LTR documents stay byte-identical.
+    if ps.direction == Some(crate::model::Direction::Rtl) {
+        out.push_str("<w:bidi/>");
+    }
     // Tab stops → `<w:tabs>` with one `<w:tab>` per TabStop.
     if !ps.tab_stops.is_empty() {
         let mut tabs = String::new();
@@ -1615,8 +2647,12 @@ fn docx_style_ppr_props(ps: &ParagraphStyle) -> String {
 /// matching the table-border convention.
 fn docx_p_bdr(borders: &[Option<ParaBorder>; 4]) -> String {
     let mut out = String::new();
-    for (i, side) in ["top", "left", "bottom", "right"].iter().enumerate() {
-        if let Some(b) = &borders[i] {
+    // The model's border array is `[top, right, bottom, left]`; CT_PBdr child
+    // order is top, left, bottom, right — map explicitly. (An earlier version
+    // enumerated the sides in emission order against the model indices, which
+    // swapped the left and right borders on export.)
+    for (side, idx) in [("top", 0), ("left", 3), ("bottom", 2), ("right", 1)] {
+        if let Some(b) = &borders[idx] {
             let sz = (b.width_pt * 8.0).round().max(2.0) as i64;
             out.push_str(&format!(
                 "<w:{side} w:val=\"{}\" w:sz=\"{sz}\" w:space=\"0\" w:color=\"{}\"/>",
@@ -1658,10 +2694,13 @@ fn docx_named_rpr(style: &CharStyle) -> String {
     if style.italic {
         p.push_str("<w:i/>");
     }
+    p.push_str(&docx_rpr_extras(style));
     if style.underline {
         p.push_str("<w:u w:val=\"single\"/>");
     }
-    if style.strike {
+    if style.dstrike {
+        p.push_str("<w:dstrike/>");
+    } else if style.strike {
         p.push_str("<w:strike/>");
     }
     match style.vertical_align {
@@ -1693,19 +2732,47 @@ fn docx_named_rpr(style: &CharStyle) -> String {
 /// paragraphs). Every level of a given list shares that list's format (bullet
 /// char or ordinal style + suffix); the list's `start` seeds level 0's
 /// `w:start` (deeper levels restart at 1).
-fn docx_numbering_xml(markers: &[(ListMarker, char, u32)]) -> String {
+fn docx_numbering_xml(markers: &[DocxNumDef]) -> String {
     let mut abstracts = String::new();
     let mut nums = String::new();
-    for (i, (marker, suffix, start)) in markers.iter().enumerate() {
+    for (i, def) in markers.iter().enumerate() {
         let n = i + 1;
-        let (num_fmt, lvl_text_tmpl, bullet_font) = docx_list_format(*marker, *suffix);
+        let prefix = def.prefix.as_deref().unwrap_or("");
         let mut lvls = String::new();
-        for lvl in 0..9 {
+        for lvl in 0..9usize {
+            // Per-depth style when the list carries real multi-level
+            // definitions (`List::levels`, from a DOCX `numbering.xml` /
+            // ODF list-style import); the table-wide triple otherwise —
+            // level-less lists emit exactly the pre-M2 shape.
+            let (marker, suffix, lvl_start) = match def.levels.get(lvl) {
+                Some(ls) => (
+                    ls.marker,
+                    ls.suffix.unwrap_or('.'),
+                    if ls.is_ordered() { ls.start.max(1) } else { 1 },
+                ),
+                None => (
+                    def.marker,
+                    def.suffix,
+                    if lvl == 0 { def.start } else { 1 },
+                ),
+            };
+            let (num_fmt, lvl_text_tmpl, bullet_font) = docx_list_format(marker, suffix);
             let indent = twips(18.0 + 18.0 * lvl as f64);
-            let lvl_start = if lvl == 0 { *start } else { 1 };
-            // `%N` placeholders are 1-based on the level for ordered lists; the
-            // template is constant (the bullet char) for bullet lists.
-            let lvl_text = lvl_text_tmpl.replace("%N", &format!("%{}", lvl + 1));
+            // `%N` placeholders are 1-based on the level for ordered lists
+            // (the ordinal `prefix` — a `"("` for `(a)`-style templates —
+            // opens the text); the template is constant (the bullet char)
+            // for bullet lists.
+            let lvl_text = match marker {
+                ListMarker::Bullet(_) => lvl_text_tmpl,
+                _ => {
+                    let mut esc_p = String::new();
+                    esc(prefix, &mut esc_p);
+                    format!(
+                        "{esc_p}{}",
+                        lvl_text_tmpl.replace("%N", &format!("%{}", lvl + 1))
+                    )
+                }
+            };
             lvls.push_str(&format!(
                 "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"{lvl_start}\"/><w:numFmt w:val=\"{num_fmt}\"/>\
 <w:lvlText w:val=\"{lvl_text}\"/><w:lvlJc w:val=\"left\"/>\
@@ -1767,9 +2834,11 @@ pub fn xlsx_from_model(doc: &Document) -> Vec<u8> {
     let mut zip = ZipWriter::new();
 
     // Build the styles table: index 0 is the default; further indices carry a
-    // numFmt and/or fill. Cells reference a style index via `s="N"`.
+    // numFmt and/or fill. Cells reference a style index via `s="N"`. Each
+    // worksheet also reports its external hyperlink targets, which become the
+    // sheet's own `.rels` part.
     let mut styler = XlsxStyler::new();
-    let sheet_xmls: Vec<String> = sheets
+    let sheet_xmls: Vec<(String, Vec<String>)> = sheets
         .iter()
         .map(|s| xlsx_sheet_from_model(s, &mut styler))
         .collect();
@@ -1805,8 +2874,15 @@ Target=\"xl/workbook.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
     if sheet_xmls.is_empty() {
         zip.add_deflated("xl/worksheets/sheet1.xml", xlsx_empty_sheet().as_bytes());
     } else {
-        for (i, xml) in sheet_xmls.iter().enumerate() {
+        for (i, (xml, ext_links)) in sheet_xmls.iter().enumerate() {
             zip.add_deflated(&format!("xl/worksheets/sheet{}.xml", i + 1), xml.as_bytes());
+            // External hyperlink targets live in the worksheet's own rels part.
+            if !ext_links.is_empty() {
+                zip.add_deflated(
+                    &format!("xl/worksheets/_rels/sheet{}.xml.rels", i + 1),
+                    xlsx_sheet_rels(ext_links).as_bytes(),
+                );
+            }
         }
     }
     zip.finish()
@@ -1835,11 +2911,19 @@ struct XlsxAlign {
     /// `None` ⇒ the OOXML default (bottom; no vertical attribute emitted).
     vertical: Option<CellVAlign>,
     wrap: bool,
+    /// Text rotation in the model's signed degrees CCW; emitted as
+    /// `@textRotation` (`0..=90` up, `91..=180` = `90 + |deg|` down — the
+    /// exact inverse of the importer's `xlsx_text_rotation`). `None` ⇒
+    /// horizontal (no attribute).
+    rotation_deg: Option<i32>,
 }
 
 impl XlsxAlign {
     fn is_default(self) -> bool {
-        self.horizontal.is_none() && self.vertical.is_none() && !self.wrap
+        self.horizontal.is_none()
+            && self.vertical.is_none()
+            && !self.wrap
+            && self.rotation_deg.is_none()
     }
 }
 
@@ -1862,11 +2946,20 @@ struct XlsxStyler {
     fills: Vec<String>,
     /// Distinct fonts; index 0 is the default Calibri 11.
     fonts: Vec<XlsxFont>,
-    /// Distinct borders (the model's single all-edge border per cell); index 0
-    /// is the empty/no-border border.
-    borders: Vec<BorderStyle>,
+    /// Distinct borders; index 0 is the empty/no-border border. Each record is
+    /// the model's single all-edge border and/or a diagonal line.
+    borders: Vec<XlsxBorderRec>,
     /// Style records keyed by their full tuple → cellXfs index.
     xfs: Vec<XlsxXf>,
+}
+
+/// One `<border>` record: the all-edge border (the model's single per-cell
+/// [`BorderStyle`]) plus an optional diagonal line
+/// ([`model::DiagonalBorder`](crate::model::DiagonalBorder)).
+#[derive(Clone, PartialEq, Default)]
+struct XlsxBorderRec {
+    edges: Option<BorderStyle>,
+    diagonal: Option<crate::model::DiagonalBorder>,
 }
 
 impl XlsxStyler {
@@ -1884,7 +2977,7 @@ impl XlsxStyler {
                 strike: false,
                 color: String::new(),
             }],
-            borders: vec![BorderStyle::default()],
+            borders: vec![XlsxBorderRec::default()],
             xfs: vec![XlsxXf {
                 num_fmt_id: 0,
                 fill_idx: 0,
@@ -1958,19 +3051,25 @@ impl XlsxStyler {
         self.fonts.len() - 1
     }
 
-    /// Resolve (or create) the borderId for an optional cell border. Returns 0
-    /// (no border) for `None` or a zero-width border.
-    fn border_id(&mut self, border: Option<BorderStyle>) -> usize {
-        match border {
-            Some(b) if b.width > 0.0 => {
-                if let Some(i) = self.borders.iter().position(|x| *x == b) {
-                    return i;
-                }
-                self.borders.push(b);
-                self.borders.len() - 1
-            }
-            _ => 0,
+    /// Resolve (or create) the borderId for an optional cell border and/or
+    /// diagonal line. Returns 0 (no border) when neither draws anything.
+    fn border_id(
+        &mut self,
+        border: Option<BorderStyle>,
+        diagonal: Option<crate::model::DiagonalBorder>,
+    ) -> usize {
+        let rec = XlsxBorderRec {
+            edges: border.filter(|b| b.width > 0.0),
+            diagonal: diagonal.filter(|d| (d.up || d.down) && d.border.width > 0.0),
+        };
+        if rec.edges.is_none() && rec.diagonal.is_none() {
+            return 0;
         }
+        if let Some(i) = self.borders.iter().position(|x| *x == rec) {
+            return i;
+        }
+        self.borders.push(rec);
+        self.borders.len() - 1
     }
 
     /// Resolve a `cellXfs` index for a sheet cell's full styling.
@@ -1978,11 +3077,12 @@ impl XlsxStyler {
         let num_fmt_id = self.num_fmt_id(cell.number_format.as_deref());
         let fill_idx = self.fill_id(cell.fill);
         let font_idx = self.font_id(&cell.style);
-        let border_idx = self.border_id(cell.border);
+        let border_idx = self.border_id(cell.border, cell.diagonal);
         let align = XlsxAlign {
             horizontal: cell.align,
             vertical: cell.vertical_align,
             wrap: cell.wrap,
+            rotation_deg: cell.rotation_deg.filter(|d| (-90..=90).contains(d) && *d != 0),
         };
         if num_fmt_id == 0
             && fill_idx == 0
@@ -2064,22 +3164,37 @@ impl XlsxStyler {
         let fill_count = 2 + self.fills.len();
 
         // Borders: index 0 is the empty border; the rest are the model's single
-        // all-edge style applied to every side.
+        // all-edge style applied to every side, plus any diagonal line
+        // (`@diagonalUp`/`@diagonalDown` + a styled `<diagonal>` edge).
         let mut borders = String::new();
-        for (i, b) in self.borders.iter().enumerate() {
+        for (i, rec) in self.borders.iter().enumerate() {
             if i == 0 {
                 borders.push_str("<border><left/><right/><top/><bottom/><diagonal/></border>");
             } else {
-                let style = xlsx_border_style(b.width);
-                let color = format!("<color rgb=\"FF{}\"/>", hex(b.color));
-                let edge = format!("<{{e}} style=\"{style}\">{color}</{{e}}>");
-                let side = |e: &str| edge.replace("{e}", e);
+                let mut attrs = String::new();
+                if let Some(d) = &rec.diagonal {
+                    if d.up {
+                        attrs.push_str(" diagonalUp=\"1\"");
+                    }
+                    if d.down {
+                        attrs.push_str(" diagonalDown=\"1\"");
+                    }
+                }
+                let side = |e: &str, b: Option<&BorderStyle>| match b {
+                    Some(b) => format!(
+                        "<{e} style=\"{}\"><color rgb=\"FF{}\"/></{e}>",
+                        xlsx_border_style(b.width),
+                        hex(b.color)
+                    ),
+                    None => format!("<{e}/>"),
+                };
                 borders.push_str(&format!(
-                    "<border>{}{}{}{}<diagonal/></border>",
-                    side("left"),
-                    side("right"),
-                    side("top"),
-                    side("bottom"),
+                    "<border{attrs}>{}{}{}{}{}</border>",
+                    side("left", rec.edges.as_ref()),
+                    side("right", rec.edges.as_ref()),
+                    side("top", rec.edges.as_ref()),
+                    side("bottom", rec.edges.as_ref()),
+                    side("diagonal", rec.diagonal.as_ref().map(|d| &d.border)),
                 ));
             }
         }
@@ -2119,6 +3234,13 @@ impl XlsxStyler {
                 }
                 if xf.align.wrap {
                     a.push_str(" wrapText=\"1\"");
+                }
+                if let Some(deg) = xf.align.rotation_deg {
+                    // Model signed degrees CCW → XLSX convention: `0..=90`
+                    // slants up, `90 + |deg|` slants down (inverse of the
+                    // importer's `xlsx_text_rotation`).
+                    let v = if deg >= 0 { deg } else { 90 - deg };
+                    a.push_str(&format!(" textRotation=\"{v}\""));
                 }
                 a.push_str("/>");
                 (" applyAlignment=\"1\"".to_string(), a)
@@ -2211,8 +3333,15 @@ fn xlsx_border_style(width: f64) -> &'static str {
     }
 }
 
-fn xlsx_sheet_from_model(sheet: &Sheet, styler: &mut XlsxStyler) -> String {
+/// The worksheet XML plus the sheet's **external** hyperlink targets in `rId`
+/// order (`rId1`…), which the caller turns into the worksheet's `.rels` part.
+fn xlsx_sheet_from_model(sheet: &Sheet, styler: &mut XlsxStyler) -> (String, Vec<String>) {
     let mut data = String::new();
+    // Cell hyperlinks: `(cell ref, target)` collected while walking the grid,
+    // emitted as a `<hyperlinks>` block after `<mergeCells>` (CT_Worksheet
+    // order). External URLs resolve via the worksheet rels (`r:id`);
+    // in-workbook `#Sheet!A1` targets use the `location` attribute.
+    let mut links: Vec<(String, String)> = Vec::new();
     for (r, row) in sheet.rows.iter().enumerate() {
         let mut cells = String::new();
         for (c, cell) in row.cells.iter().enumerate() {
@@ -2223,6 +3352,9 @@ fn xlsx_sheet_from_model(sheet: &Sheet, styler: &mut XlsxStyler) -> String {
                 String::new()
             };
             let r_ref = format!("{}{}", col_letter(c), r + 1);
+            if let Some(target) = cell.hyperlink.as_deref().filter(|t| !t.is_empty()) {
+                links.push((r_ref.clone(), target.to_string()));
+            }
             // The formula (`<f>`) precedes the cached `<v>` in the `<c>` (ECMA-376
             // §18.3.1.4). The model strips the leading `=`, but tolerate a stray
             // one. A formula forces an explicit `<v>` value cell (never the
@@ -2301,12 +3433,94 @@ fn xlsx_sheet_from_model(sheet: &Sheet, styler: &mut XlsxStyler) -> String {
         m
     };
 
+    // `<hyperlinks>` sits after `<mergeCells>` (CT_Worksheet child order).
+    let mut ext_targets: Vec<String> = Vec::new();
+    let hyperlinks = if links.is_empty() {
+        String::new()
+    } else {
+        let mut h = String::from("<hyperlinks>");
+        for (r_ref, target) in links {
+            if let Some(location) = target.strip_prefix('#') {
+                let mut loc = String::new();
+                esc(location, &mut loc);
+                h.push_str(&format!("<hyperlink ref=\"{r_ref}\" location=\"{loc}\"/>"));
+            } else {
+                ext_targets.push(target);
+                h.push_str(&format!(
+                    "<hyperlink ref=\"{r_ref}\" r:id=\"rId{}\"/>",
+                    ext_targets.len()
+                ));
+            }
+        }
+        h.push_str("</hyperlinks>");
+        h
+    };
+    // Declare the relationships namespace only when an `r:id` is present, so a
+    // link-free worksheet stays byte-identical to the previous output.
+    let r_ns = if ext_targets.is_empty() {
+        ""
+    } else {
+        " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\""
+    };
+
+    // Frozen panes: `<sheetViews>` precedes `<cols>`/`<sheetData>`
+    // (CT_Worksheet child order). The pane's `topLeftCell` is the first
+    // unfrozen cell, `activePane` the quadrant that scrolls — the exact shape
+    // Excel writes for View → Freeze Panes. A freeze-less sheet emits nothing
+    // (byte-identical output to before).
+    let sheet_views = match sheet.freeze {
+        Some((rows, cols_f)) if rows > 0 || cols_f > 0 => {
+            let top_left = format!("{}{}", col_letter(cols_f as usize), rows + 1);
+            let active = match (rows > 0, cols_f > 0) {
+                (true, true) => "bottomRight",
+                (true, false) => "bottomLeft",
+                _ => "topRight",
+            };
+            let mut pane = String::new();
+            if cols_f > 0 {
+                pane.push_str(&format!(" xSplit=\"{cols_f}\""));
+            }
+            if rows > 0 {
+                pane.push_str(&format!(" ySplit=\"{rows}\""));
+            }
+            format!(
+                "<sheetViews><sheetView workbookViewId=\"0\">\
+<pane{pane} topLeftCell=\"{top_left}\" activePane=\"{active}\" state=\"frozen\"/>\
+</sheetView></sheetViews>"
+            )
+        }
+        _ => String::new(),
+    };
+
     let cols = xlsx_cols_xml(&sheet.col_widths);
-    format!(
+    let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
-{cols}<sheetData>{data}</sheetData>{merges}</worksheet>"
-    )
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"{r_ns}>\
+{sheet_views}{cols}<sheetData>{data}</sheetData>{merges}{hyperlinks}</worksheet>"
+    );
+    (xml, ext_targets)
+}
+
+/// The worksheet-level `.rels` part declaring each external hyperlink target
+/// (`TargetMode="External"`), `rId1`… matching [`xlsx_sheet_from_model`]'s
+/// allocation order.
+fn xlsx_sheet_rels(ext_targets: &[String]) -> String {
+    let mut s = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+    );
+    for (i, target) in ext_targets.iter().enumerate() {
+        let mut t = String::new();
+        esc(target, &mut t);
+        s.push_str(&format!(
+            "<Relationship Id=\"rId{}\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" \
+Target=\"{t}\" TargetMode=\"External\"/>",
+            i + 1
+        ));
+    }
+    s.push_str("</Relationships>");
+    s
 }
 
 /// `<cols>` block from per-column point widths (converted to Excel character
@@ -2411,11 +3625,10 @@ Target=\"worksheets/sheet{n}.xml\"/>",
 pub fn pptx_from_model(doc: &Document) -> Vec<u8> {
     use crate::convert::office::{PPTX_LAYOUT, PPTX_MASTER, PPTX_THEME};
 
-    let model_slides = collect_slides(doc);
-    let (sw, sh) = model_slides
-        .first()
-        .map(|s| (s.geometry.width, s.geometry.height))
-        .unwrap_or((960.0, 540.0));
+    // One deck size: the majority slide size, deviant slides scaled onto it
+    // (PPTX has a single `p:sldSz` — see `normalize_slide_sizes`).
+    let mut model_slides = collect_slides(doc);
+    let (sw, sh) = normalize_slide_sizes(&mut model_slides);
 
     let mut zip = ZipWriter::new();
     // Each embedded image: bytes + its package-native extension (`"png"`,
@@ -2617,6 +3830,110 @@ impl<'a> PptxRunCtx<'a> {
     }
 }
 
+/// The `p:ph` `type`/`idx` attributes for a placeholder role. `Title` /
+/// `Subtitle` / `Body` map to their canonical tokens; an [`PlaceholderRole::
+/// Other`] keeps its **real** role instead of being squashed to `body`: a token
+/// already in OOXML's `ST_PlaceholderType` set (ECMA-376 §19.7.10 — `ftr`,
+/// `dt`, `sldNum`, `ctrTitle`, …) passes through verbatim, the ODF class
+/// tokens the ODP importer preserves (`footer`, `page-number`, `date-time`, …)
+/// map to their OOXML equivalent, and only a token with no PPTX counterpart
+/// falls back to `body`. The importer reads the token straight back into
+/// `Other(token)`, so a footer placeholder stays a footer across a round-trip.
+fn pptx_ph_type(role: &PlaceholderRole) -> (&'static str, String) {
+    const VALID: [&str; 16] = [
+        "title", "body", "ctrTitle", "subTitle", "dt", "sldNum", "ftr", "hdr", "obj", "chart",
+        "tbl", "clipArt", "dgm", "media", "sldImg", "pic",
+    ];
+    let ty: &'static str = match role {
+        PlaceholderRole::Title => "title",
+        PlaceholderRole::Subtitle => "subTitle",
+        PlaceholderRole::Body => "body",
+        PlaceholderRole::Other(token) => {
+            let token = token.trim();
+            match VALID.iter().find(|v| **v == token) {
+                Some(v) => v,
+                // ODF presentation classes → their OOXML placeholder type.
+                None => match token {
+                    "footer" => "ftr",
+                    "header" => "hdr",
+                    "page-number" => "sldNum",
+                    "date-time" => "dt",
+                    "picture" | "graphic" => "pic",
+                    "object" => "obj",
+                    "chart" => "chart",
+                    "table" => "tbl",
+                    "subtitle" => "subTitle",
+                    "outline" | "text" => "body",
+                    _ => "body",
+                },
+            }
+        }
+    };
+    let idx = if matches!(ty, "title" | "ctrTitle") {
+        String::new()
+    } else {
+        " idx=\"1\"".to_string()
+    };
+    (ty, idx)
+}
+
+/// Emit the tables and run pictures hoisted out of **one** just-emitted slide
+/// shape, immediately after it — keeping the model's block order (= DrawingML
+/// paint order) instead of stacking every hoist at the top of the z-stack
+/// after all text shapes (#7). `tbl_n`/`pic_n` are slide-wide counters driving
+/// the default stacking offsets of frameless hoists.
+#[allow(clippy::too_many_arguments)]
+fn pptx_flush_hoisted(
+    tables: Vec<Table>,
+    mut pics: Vec<RunPic>,
+    slide: &Slide,
+    doc: &Document,
+    media: &mut Vec<(Vec<u8>, &'static str)>,
+    rels: &mut PptxSlideRels,
+    slide_count: usize,
+    id: &mut usize,
+    tbl_n: &mut usize,
+    pic_n: &mut usize,
+    tree: &mut String,
+) {
+    // Hoisted body tables: real `a:tbl` graphicFrames. They have no model frame
+    // (they came from a flowing body), so stack them down the slide with a
+    // sensible default box spanning the slide width. Emitted before this
+    // shape's run-image hoists so pictures inside a table cell are collected.
+    for table in &tables {
+        let r = crate::model::Rect::new(
+            0.0,
+            8.0 + 220.0 * *tbl_n as f64,
+            slide.geometry.width.max(1.0),
+            200.0,
+        );
+        let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
+        tree.push_str(&pptx_table_frame(table, r, *id, &mut rctx));
+        pics.append(&mut rctx.pending_pics);
+        *id += 1;
+        *tbl_n += 1;
+    }
+    // Hoisted run images as standalone pictures (DrawingML run images are not
+    // expressible; they become real `p:pic` shapes referencing the same media +
+    // relationship). Stacked at a default 96pt box near the top-left.
+    for pic in &pics {
+        let x = emu(8.0 + 8.0 * *pic_n as f64);
+        let y = emu(8.0 + 8.0 * *pic_n as f64);
+        let side = emu(96.0);
+        let mut alt = String::new();
+        esc(&pic.alt, &mut alt);
+        tree.push_str(&format!(
+            "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"img{id}\" descr=\"{alt}\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>\
+<p:blipFill><a:blip r:embed=\"rId{rid}\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>\
+<p:spPr><a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{side}\" cy=\"{side}\"/></a:xfrm>\
+<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr></p:pic>",
+            rid = pic.rid,
+        ));
+        *id += 1;
+        *pic_n += 1;
+    }
+}
+
 fn pptx_slide_from_model(
     slide: &Slide,
     doc: &Document,
@@ -2627,48 +3944,57 @@ fn pptx_slide_from_model(
     let mut tree = String::new();
     let mut id = 2usize;
 
-    // Run images encountered inside placeholder/shape/table text are hoisted to
-    // standalone `p:pic` shapes appended after the text shapes (DrawingML runs
-    // cannot embed a picture). Collected across all run contexts on this slide.
-    let mut hoisted: Vec<RunPic> = Vec::new();
-    // Tables reached via a placeholder/text-box body (e.g. the page-fallback)
-    // cannot live inside a DrawingML text body, so they are hoisted to sibling
-    // `p:graphicFrame`s emitted after the text shapes (#2).
-    let mut hoisted_tables: Vec<Table> = Vec::new();
+    // Run images inside a shape's text are hoisted to standalone `p:pic`s and
+    // body tables to sibling `p:graphicFrame`s (DrawingML text bodies can hold
+    // neither) — but each hoist is flushed **right after its source shape**, so
+    // the sp-tree keeps the model's block order = paint order (#7). Slide-wide
+    // counters keep the frameless hoists' default stacking offsets distinct.
+    let mut tbl_n = 0usize;
+    let mut pic_n = 0usize;
 
-    // Placeholders first (title/body), positioned by their frame when present.
+    // Placeholders first (title/body/…), positioned by their frame when present.
     for ph in &slide.placeholders {
-        let (ph_type, ph_idx) = match &ph.role {
-            PlaceholderRole::Title => ("title", String::new()),
-            PlaceholderRole::Subtitle => ("subTitle", " idx=\"1\"".to_string()),
-            PlaceholderRole::Body => ("body", " idx=\"1\"".to_string()),
-            PlaceholderRole::Other(_) => ("body", " idx=\"1\"".to_string()),
-        };
-        let frame = pptx_xfrm(ph.block.frame, slide.geometry.width, slide.geometry.height);
-        let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
+        let (ph_type, ph_idx) = pptx_ph_type(&ph.role);
+        let frame = pptx_xfrm(ph.block.frame, ph.block.rotation);
         // Preserve real list/heading structure (and hoist tables) instead of
         // flattening the body to plain paragraphs (#2). `pptx_collect_body`
         // unwraps a TextBox (the page-fallback body) into its child blocks.
-        let mut built = pptx_struct_body(std::slice::from_ref(&ph.block), &mut rctx);
-        hoisted.append(&mut rctx.pending_pics);
-        hoisted_tables.append(&mut built.tables);
-        let body = built.into_txbody();
+        let (body, tables, pics) = {
+            let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
+            let mut built = pptx_struct_body(std::slice::from_ref(&ph.block), &mut rctx);
+            let tables = std::mem::take(&mut built.tables);
+            let pics = std::mem::take(&mut rctx.pending_pics);
+            (built.into_txbody(), tables, pics)
+        };
         tree.push_str(&format!(
             "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"ph{id}\"/><p:cNvSpPr/>\
 <p:nvPr><p:ph type=\"{ph_type}\"{ph_idx}/></p:nvPr></p:nvSpPr>\
 <p:spPr>{frame}</p:spPr>{body}</p:sp>"
         ));
         id += 1;
+        pptx_flush_hoisted(
+            tables,
+            pics,
+            slide,
+            doc,
+            media,
+            rels,
+            slide_count,
+            &mut id,
+            &mut tbl_n,
+            &mut pic_n,
+            &mut tree,
+        );
     }
 
-    // Free-floating shapes (text boxes / images / shapes).
+    // Free-floating shapes (text boxes / images / shapes), in model order.
     for sh in &slide.shapes {
         match &sh.kind {
             BlockKind::Image(img) => {
                 if let Some((bytes, ext)) = doc_image(doc, img.resource) {
                     media.push((bytes, ext));
                     let rid = rels.add_image(media.len() - 1);
-                    let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
+                    let frame = pptx_xfrm(sh.frame, sh.rotation);
                     tree.push_str(&format!(
                         "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"img{id}\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>\
 <p:blipFill><a:blip r:embed=\"rId{rid}\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>\
@@ -2684,11 +4010,22 @@ fn pptx_slide_from_model(
                 } else {
                     dml_cust_geom(&placed, placed.width, placed.height)
                 };
-                let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
+                let frame = pptx_xfrm(sh.frame, sh.rotation);
+                // A full gradient primes over the flat solid fill; a drop
+                // shadow appends as `a:effectLst` (CT_ShapeProperties order:
+                // fill, ln, effectLst).
+                let fill = match &shape.fill_gradient {
+                    Some(g) if g.stops.len() >= 2 => pptx_grad_fill_xml(g),
+                    _ => dml_fill(&placed),
+                };
+                let effects = shape
+                    .shadow
+                    .as_ref()
+                    .map(pptx_effect_lst_xml)
+                    .unwrap_or_default();
                 tree.push_str(&format!(
                     "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"s{id}\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>\
-<p:spPr>{frame}{geom}{fill}{ln}</p:spPr><p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>",
-                    fill = dml_fill(&placed),
+<p:spPr>{frame}{geom}{fill}{ln}{effects}</p:spPr><p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>",
                     ln = dml_line(&placed),
                 ));
                 id += 1;
@@ -2703,88 +4040,165 @@ fn pptx_slide_from_model(
                     slide.geometry.width,
                     slide.geometry.height,
                 ));
-                let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
-                tree.push_str(&pptx_table_frame(table, r, id, &mut rctx));
-                hoisted.append(&mut rctx.pending_pics);
+                let pics = {
+                    let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
+                    tree.push_str(&pptx_table_frame(table, r, id, &mut rctx));
+                    std::mem::take(&mut rctx.pending_pics)
+                };
                 id += 1;
+                pptx_flush_hoisted(
+                    Vec::new(),
+                    pics,
+                    slide,
+                    doc,
+                    media,
+                    rels,
+                    slide_count,
+                    &mut id,
+                    &mut tbl_n,
+                    &mut pic_n,
+                    &mut tree,
+                );
             }
             _ => {
-                let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
-                let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
+                let frame = pptx_xfrm(sh.frame, sh.rotation);
                 // Preserve list/heading structure (and hoist any nested table)
                 // for a free text box too (#2).
-                let mut built = pptx_struct_body(std::slice::from_ref(sh), &mut rctx);
-                hoisted.append(&mut rctx.pending_pics);
-                hoisted_tables.append(&mut built.tables);
-                let body = built.into_txbody();
+                let (body, tables, pics) = {
+                    let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
+                    let mut built = pptx_struct_body(std::slice::from_ref(sh), &mut rctx);
+                    let tables = std::mem::take(&mut built.tables);
+                    let pics = std::mem::take(&mut rctx.pending_pics);
+                    (built.into_txbody(), tables, pics)
+                };
                 tree.push_str(&format!(
                     "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"t{id}\"/><p:cNvSpPr txBox=\"1\"/><p:nvPr/></p:nvSpPr>\
 <p:spPr>{frame}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>{body}</p:sp>"
                 ));
                 id += 1;
+                pptx_flush_hoisted(
+                    tables,
+                    pics,
+                    slide,
+                    doc,
+                    media,
+                    rels,
+                    slide_count,
+                    &mut id,
+                    &mut tbl_n,
+                    &mut pic_n,
+                    &mut tree,
+                );
             }
         }
     }
 
-    // Emit the hoisted body tables as real `a:tbl` graphicFrames (#2). They have
-    // no model frame (they came from a flowing body), so stack them down the
-    // slide with a sensible default box spanning the slide width. Done before the
-    // run-image hoists so any pictures inside a table cell are still collected.
-    for (i, table) in hoisted_tables.iter().enumerate() {
-        let r = crate::model::Rect::new(
-            0.0,
-            8.0 + 220.0 * i as f64,
-            slide.geometry.width.max(1.0),
-            200.0,
-        );
-        let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
-        tree.push_str(&pptx_table_frame(table, r, id, &mut rctx));
-        hoisted.append(&mut rctx.pending_pics);
-        id += 1;
+    // The slide background (`p:bg` MUST precede `p:spTree` in `p:cSld`):
+    // the full gradient when the model carries one, else a solid fill from
+    // [`Slide::background`]. The importer reads both shapes back
+    // (`p:bg/p:bgPr/a:gradFill|a:solidFill`), so backgrounds round-trip
+    // instead of silently vanishing on every re-export.
+    let bg = match (&slide.background_gradient, slide.background) {
+        (Some(g), _) if g.stops.len() >= 2 => Some(format!(
+            "<p:bg><p:bgPr>{}<a:effectLst/></p:bgPr></p:bg>",
+            pptx_grad_fill_xml(g)
+        )),
+        (_, Some(rgb)) => Some(format!(
+            "<p:bg><p:bgPr><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill>\
+<a:effectLst/></p:bgPr></p:bg>",
+            hex(rgb)
+        )),
+        _ => None,
     }
-
-    // Emit the hoisted run images as standalone pictures (DrawingML run images
-    // are not expressible; they become real `p:pic` shapes referencing the same
-    // media + relationship). Stacked at a default 96pt box near the top-left.
-    for (i, pic) in hoisted.iter().enumerate() {
-        let x = emu(8.0 + 8.0 * i as f64);
-        let y = emu(8.0 + 8.0 * i as f64);
-        let side = emu(96.0);
-        let mut alt = String::new();
-        esc(&pic.alt, &mut alt);
-        tree.push_str(&format!(
-            "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"img{id}\" descr=\"{alt}\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>\
-<p:blipFill><a:blip r:embed=\"rId{rid}\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>\
-<p:spPr><a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{side}\" cy=\"{side}\"/></a:xfrm>\
-<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr></p:pic>",
-            rid = pic.rid,
-        ));
-        id += 1;
-    }
+    .unwrap_or_default();
 
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <p:sld xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
 xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
 xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\">\
-<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>\
+<p:cSld>{bg}<p:spTree><p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>\
 <p:grpSpPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/>\
 <a:chOff x=\"0\" y=\"0\"/><a:chExt cx=\"0\" cy=\"0\"/></a:xfrm></p:grpSpPr>{tree}</p:spTree></p:cSld></p:sld>"
     )
 }
 
+/// A model [`Gradient`](crate::model::Gradient) as a DrawingML `<a:gradFill>`
+/// (stop list + linear angle) — the exact inverse of the importer's capture in
+/// `pptx_parse_sp_pr`/`pptx_bg_color`. A stop's `alpha < 1` emits the
+/// `<a:alpha>` child (thousandths of a percent).
+fn pptx_grad_fill_xml(g: &crate::model::Gradient) -> String {
+    let mut stops = String::new();
+    for s in &g.stops {
+        let alpha = if s.alpha < 1.0 {
+            format!(
+                "<a:alpha val=\"{}\"/>",
+                (s.alpha.clamp(0.0, 1.0) * 100_000.0).round() as i64
+            )
+        } else {
+            String::new()
+        };
+        stops.push_str(&format!(
+            "<a:gs pos=\"{}\"><a:srgbClr val=\"{}\">{alpha}</a:srgbClr></a:gs>",
+            (s.pos.clamp(0.0, 1.0) * 100_000.0).round() as i64,
+            hex(s.color)
+        ));
+    }
+    let ang = (g.angle_deg.rem_euclid(360.0) * 60_000.0).round() as i64;
+    format!("<a:gradFill><a:gsLst>{stops}</a:gsLst><a:lin ang=\"{ang}\" scaled=\"1\"/></a:gradFill>")
+}
+
+/// A model [`Shadow`](crate::model::Shadow) as a DrawingML
+/// `<a:effectLst><a:outerShdw…>` — the inverse of the importer's capture
+/// (`dist`/`dir` recomposed from the model's `dx/dy` screen offsets).
+fn pptx_effect_lst_xml(s: &crate::model::Shadow) -> String {
+    let dist = emu(s.dx_pt.hypot(s.dy_pt));
+    let dir = (s.dy_pt.atan2(s.dx_pt).to_degrees().rem_euclid(360.0) * 60_000.0).round() as i64;
+    let alpha = if s.alpha < 1.0 {
+        format!(
+            "<a:alpha val=\"{}\"/>",
+            (s.alpha.clamp(0.0, 1.0) * 100_000.0).round() as i64
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<a:effectLst><a:outerShdw blurRad=\"{}\" dist=\"{dist}\" dir=\"{dir}\">\
+<a:srgbClr val=\"{}\">{alpha}</a:srgbClr></a:outerShdw></a:effectLst>",
+        emu(s.blur_pt.max(0.0)),
+        hex(s.color)
+    )
+}
+
 /// `<a:xfrm>` from an optional model frame; absent ⇒ omit (the layout positions
-/// the placeholder). Model rectangles are top-down points already.
-fn pptx_xfrm(frame: Option<crate::model::Rect>, _w: f64, _h: f64) -> String {
+/// the placeholder). Model rectangles are top-down points already. A non-zero
+/// block [`Rotation`](crate::model::Rotation) (CCW degrees) becomes the OOXML
+/// `@rot` attribute (clockwise 60000ths of a degree) — the exact inverse of the
+/// importer's `xfrm_to_frame`, so a rotated element no longer comes out
+/// straight on re-export.
+fn pptx_xfrm(frame: Option<crate::model::Rect>, rotation: crate::model::Rotation) -> String {
     match frame {
         Some(r) => format!(
-            "<a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>",
+            "<a:xfrm{rot}><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>",
+            rot = pptx_rot_attr(rotation),
             x = emu(r.x),
             y = emu(r.y),
             cx = emu(r.w.max(1.0)),
             cy = emu(r.h.max(1.0)),
         ),
         None => String::new(),
+    }
+}
+
+/// The OOXML `rot="…"` attribute (with a leading space) for a model rotation:
+/// CCW degrees → clockwise 60000ths, normalized to `[0, 360)`. Empty for zero.
+fn pptx_rot_attr(rotation: crate::model::Rotation) -> String {
+    let cw = (-rotation.degrees()).rem_euclid(360.0);
+    let units = (cw * 60_000.0).round() as i64;
+    if units == 0 || units == 21_600_000 {
+        String::new()
+    } else {
+        format!(" rot=\"{units}\"")
     }
 }
 
@@ -3084,12 +4498,21 @@ fn pptx_table_frame(
         rows.push_str("</a:tr>");
     }
 
+    // `firstRow="1"` (a styled header row) is driven by the model's
+    // `Row::is_header`, not hardcoded: a headerless table must not grow a fake
+    // styled header (and `bandRow` banding has no model source, so it is not
+    // claimed either). The importer maps `firstRow` back to `is_header`.
+    let tbl_pr = if table.rows.first().is_some_and(|r| r.is_header) {
+        "<a:tblPr firstRow=\"1\"/>"
+    } else {
+        "<a:tblPr/>"
+    };
     format!(
         "<p:graphicFrame><p:nvGraphicFramePr>\
 <p:cNvPr id=\"{id}\" name=\"tbl{id}\"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>\
 <p:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></p:xfrm>\
 <a:graphic><a:graphicData uri=\"{uri}\">\
-<a:tbl><a:tblPr firstRow=\"1\" bandRow=\"1\"/>{grid}{rows}</a:tbl>\
+<a:tbl>{tbl_pr}{grid}{rows}</a:tbl>\
 </a:graphicData></a:graphic></p:graphicFrame>",
         x = emu(frame.x),
         y = emu(frame.y),
@@ -3110,7 +4533,7 @@ fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize, ctx: &mut PptxRunCtx)
     if rspan > 1 {
         attrs.push_str(&format!(" rowSpan=\"{rspan}\""));
     }
-    let body = dml_text_body(&blocks_to_paras(&cell.blocks), ctx);
+    let body = dml_text_body(&pptx_cell_paras(&cell.blocks), ctx);
     // `a:tcPr@anchor` carries the cell's vertical alignment (`t`/`ctr`/`b`).
     let anchor = match cell.vertical_align {
         Some(va) => format!(" anchor=\"{}\"", pptx_cell_anchor(va)),
@@ -3124,6 +4547,60 @@ fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize, ctx: &mut PptxRunCtx)
         None => format!("<a:tcPr{anchor}/>"),
     };
     format!("<a:tc{attrs}>{body}{tcpr}</a:tc>")
+}
+
+/// Flatten a DrawingML table cell's blocks to paragraphs. Unlike the generic
+/// [`blocks_to_paras`], a **nested table** — which DrawingML cannot express
+/// inside an `<a:tc>` (an `a:txBody` holds only text paragraphs) — is rendered
+/// as *structured text lines*: one paragraph per nested-table row, its cells'
+/// plain text joined by tab separators (header rows bold). Degraded fidelity,
+/// but the sub-table stays readable as rows instead of every nested cell
+/// silently collapsing into a run-on sequence of unrelated paragraphs.
+fn pptx_cell_paras(blocks: &[Block]) -> Vec<Paragraph> {
+    fn walk(block: &Block, out: &mut Vec<Paragraph>) {
+        match &block.kind {
+            BlockKind::Table(nested) => {
+                for row in &nested.rows {
+                    let line = row
+                        .cells
+                        .iter()
+                        .map(cell_plain_text)
+                        .collect::<Vec<_>>()
+                        .join("\t");
+                    let mut p = plain_para(&line);
+                    if row.is_header {
+                        if let Some(Inline::Run(r)) = p.runs.first_mut() {
+                            r.style.bold = true;
+                        }
+                    }
+                    out.push(p);
+                }
+            }
+            BlockKind::TextBox(tb) => {
+                for b in &tb.blocks {
+                    walk(b, out);
+                }
+            }
+            BlockKind::Blockquote(bq) => {
+                for b in &bq.blocks {
+                    walk(b, out);
+                }
+            }
+            BlockKind::List(list) => {
+                for item in &list.items {
+                    for b in &item.blocks {
+                        walk(b, out);
+                    }
+                }
+            }
+            _ => collect_paras(block, out),
+        }
+    }
+    let mut out = Vec::new();
+    for b in blocks {
+        walk(b, &mut out);
+    }
+    out
 }
 
 /// A model paragraph → a DrawingML `<a:p>` with a `<a:pPr>` carrying alignment
@@ -3148,6 +4625,11 @@ fn pptx_paragraph_opt(
     let mut attrs = String::new();
     if let Some((_, level)) = bullet {
         attrs.push_str(&format!(" lvl=\"{}\"", level.min(8)));
+    }
+    // Right-to-left paragraph flow (`a:pPr@rtl="1"`) — the inverse of the
+    // importer's capture; LTR paragraphs emit nothing (byte-identical).
+    if ps.direction == Some(crate::model::Direction::Rtl) {
+        attrs.push_str(" rtl=\"1\"");
     }
     // `marL` = left indent, `marR` = right indent, `indent` = first-line/hanging
     // (signed) — all in EMU (ECMA-376 §21.1.2.2.7). `algn` is the horizontal
@@ -3306,8 +4788,27 @@ fn pptx_runs(runs: &[Inline], ctx: &mut PptxRunCtx, out: &mut String) {
                 }
                 _ => pptx_runs(children, ctx, out),
             },
-            // A comment anchor has no DrawingML representation; dropped on export.
+            // DEFERRED: PPTX review comments need a whole part family of their
+            // own (`ppt/commentAuthors.xml` + per-slide `ppt/comments/
+            // commentN.xml`, each with authors registry, rels and content
+            // types) and anchor by slide *position*, not by a run marker — a
+            // disproportionate build for a run-level anchor. DOCX/ODT emit real
+            // comments; here the anchor stays a clean no-op (no dangling ids).
             Inline::CommentRef { .. } => {}
+            // PPTX has no footnote part; the anchor degrades to a visible
+            // superscript ordinal run (the note's 1-based position) so the
+            // call marker survives on the slide instead of vanishing. The
+            // note *bodies* have no natural PPTX home and are not emitted
+            // (documented lossy — DOCX/ODT carry them in full).
+            Inline::FootnoteRef { id } => {
+                if let Some(pos) = ctx.doc.footnotes.iter().position(|f| f.id == *id) {
+                    out.push_str(&format!(
+                        "<a:r><a:rPr lang=\"en-US\" baseline=\"30000\"/>\
+<a:t>{}</a:t></a:r>",
+                        pos + 1
+                    ));
+                }
+            }
         }
     }
 }
@@ -3352,6 +4853,17 @@ fn pptx_rpr(style: &CharStyle, link: Option<PptxHlink>) -> String {
         "lang=\"en-US\" sz=\"{}\"",
         (run_size(style) * 100.0).round().max(100.0) as i64
     );
+    // Letter spacing → `spc` (ECMA-376 §21.1.2.3.9, hundredths of a point) —
+    // the PPTX analogue of DOCX `w:spacing w:val` / CSS `letter-spacing`.
+    if style.letter_spacing_pt != 0.0 {
+        attrs.push_str(&format!(
+            " spc=\"{}\"",
+            (style.letter_spacing_pt * 100.0).round() as i64
+        ));
+    }
+    // NOTE: `CharStyle.hidden` has no DrawingML counterpart (there is no
+    // per-run vanish in `CT_TextCharacterProperties`); the run stays visible
+    // rather than being silently omitted — visible text beats lost text.
     if style.bold {
         attrs.push_str(" b=\"1\"");
     }
@@ -3361,18 +4873,45 @@ fn pptx_rpr(style: &CharStyle, link: Option<PptxHlink>) -> String {
     if style.underline {
         attrs.push_str(" u=\"sng\"");
     }
-    if style.strike {
+    // A double strike (`strike="dblStrike"`) supersedes the single one — the
+    // importer sets `strike` alongside `dstrike` only as a degraded fallback.
+    if style.dstrike {
+        attrs.push_str(" strike=\"dblStrike\"");
+    } else if style.strike {
         attrs.push_str(" strike=\"sngStrike\"");
+    }
+    // All-/small-capitals → `cap="all"`/`cap="small"` (the inverse of the
+    // importer's `a:rPr@cap` capture).
+    if style.caps {
+        attrs.push_str(" cap=\"all\"");
+    } else if style.small_caps {
+        attrs.push_str(" cap=\"small\"");
+    }
+    // Minimum kerning size → `kern` (hundredths of a point).
+    if let Some(v) = style.kern_min_pt.filter(|v| *v > 0.0) {
+        attrs.push_str(&format!(" kern=\"{}\"", (v * 100.0).round() as i64));
     }
     // Run superscript/subscript → `a:rPr@baseline` (ECMA-376 §21.1.2.3.9), the
     // PPTX analogue of DOCX `w:vertAlign` and ODF `style:text-position`. The value
     // is a percentage of the line in 1000ths; PowerPoint's defaults are +30% for
     // superscript and -25% for subscript, so 30000 / -25000 mirror the importer's
-    // `baseline > 0` / `< 0` → `VAlign::Super` / `Sub`.
+    // `baseline > 0` / `< 0` → `VAlign::Super` / `Sub`. A point-precise
+    // `baseline_shift_pt` (only meaningful on an otherwise-baseline run)
+    // converts to the same percent-of-font-size scale.
     match style.vertical_align {
         VAlign::Super => attrs.push_str(" baseline=\"30000\""),
         VAlign::Sub => attrs.push_str(" baseline=\"-25000\""),
-        VAlign::Baseline => {}
+        VAlign::Baseline => {
+            if let Some(shift) = style.baseline_shift_pt.filter(|v| *v != 0.0) {
+                let size = run_size(style);
+                if size > 0.0 {
+                    attrs.push_str(&format!(
+                        " baseline=\"{}\"",
+                        (shift / size * 100_000.0).round() as i64
+                    ));
+                }
+            }
+        }
     }
     let mut inner = String::new();
     if let Some(c) = visible_color(style) {
@@ -3617,11 +5156,11 @@ fn odt_master_names(m: usize) -> (String, String) {
 fn odt_section_plan(doc: &Document) -> OdtSectionPlan {
     // De-duplicate masters by (geometry, header, footer). `Section` is `PartialEq`
     // so the triple comparison is exact; we keep one representative per unique key.
-    type MasterKey<'a> = (PageGeometry, &'a Option<Vec<Block>>, &'a Option<Vec<Block>>);
+    type MasterKey<'a> = (&'a PageGeometry, &'a Option<Vec<Block>>, &'a Option<Vec<Block>>);
     let mut keys: Vec<MasterKey> = Vec::new();
     let mut section_master = Vec::with_capacity(doc.sections.len());
     for s in &doc.sections {
-        let key = (s.geometry, &s.header, &s.footer);
+        let key = (&s.geometry, &s.header, &s.footer);
         let idx = keys.iter().position(|k| *k == key).unwrap_or_else(|| {
             keys.push(key);
             keys.len() - 1
@@ -3679,7 +5218,7 @@ fn odt_section_styles(
             .iter()
             .position(|&idx| idx == m)
             .and_then(|si| doc.sections.get(si));
-        let geom = section.map(|s| s.geometry).unwrap_or_default();
+        let geom = section.map(|s| s.geometry.clone()).unwrap_or_default();
         let (master_name, layout_name) = odt_master_names(m);
 
         page_layouts.push_str(&odf_page_layout(&layout_name, geom));
@@ -3754,7 +5293,7 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
     let mut zip = ZipWriter::new();
     zip.add_stored("mimetype", b"application/vnd.oasis.opendocument.text");
 
-    let mut ctx = OdfCtx::new(&doc.resources);
+    let mut ctx = OdfCtx::new(&doc.resources, &doc.comments).with_footnotes(&doc.footnotes);
 
     // Per-section page setup (#2): ODF has no `w:sectPr`; a page (geometry +
     // running header/footer) change is driven by a paragraph style carrying
@@ -3770,8 +5309,13 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
 
     // Now render the master pages: their header/footer markup + styles/images go
     // into `hf_ctx` (styles.xml), and the master-switch paragraph styles into
-    // `ctx.auto` (content.xml). Header/footer pictures continue the body's count.
-    let mut hf_ctx = OdfCtx::new(&doc.resources);
+    // `ctx.auto` (content.xml). Header/footer pictures continue the body's
+    // count, and header/footer automatic styles carry the `HF` name prefix so
+    // they can never collide with content.xml's (the importer merges both
+    // parts' style maps, content.xml winning — a colliding name lost the
+    // header run's real formatting, e.g. its colour).
+    let mut hf_ctx = OdfCtx::new(&doc.resources, &doc.comments);
+    hf_ctx.prefix = "HF";
     hf_ctx.image_base = ctx.images.len();
     let (page_layouts, master_styles) = odt_section_styles(doc, &plan, &mut ctx, &mut hf_ctx);
 
@@ -3877,27 +5421,30 @@ office:version=\"1.3\">{default_styles}</office:document-styles>"
 /// Serialize a [`Document`]'s slides to an OpenDocument Presentation (`.odp`):
 /// one `<draw:page>` per slide, each placeholder/shape a positioned frame.
 pub fn odp_from_model(doc: &Document) -> Vec<u8> {
-    let slides = collect_slides(doc);
-    let (pw, ph) = slides
-        .first()
-        .map(|s| (s.geometry.width, s.geometry.height))
-        .unwrap_or((960.0, 540.0));
+    // Same single-page-layout constraint as PPTX's `p:sldSz`: keep the
+    // majority slide size and scale deviant slides onto it.
+    let mut slides = collect_slides(doc);
+    let (pw, ph) = normalize_slide_sizes(&mut slides);
     let mut zip = ZipWriter::new();
     zip.add_stored(
         "mimetype",
         b"application/vnd.oasis.opendocument.presentation",
     );
 
-    let mut ctx = OdfCtx::new(&doc.resources);
+    let mut ctx = OdfCtx::new(&doc.resources, &doc.comments);
     let body = odp_body(&slides, doc, &mut ctx);
 
     zip.add_deflated(
         "content.xml",
         odp_model_content(&ctx.auto, &body).as_bytes(),
     );
+    let styles_block = odf_styles_with_gradients(
+        odf_default_lang_styles(&doc.meta),
+        &odp_gradient_defs(&ctx.gradients),
+    );
     zip.add_deflated(
         "styles.xml",
-        odp_styles_xml_model(pw, ph, &odf_default_lang_styles(&doc.meta)).as_bytes(),
+        odp_styles_xml_model(pw, ph, &styles_block).as_bytes(),
     );
     zip.add_deflated("meta.xml", odf_meta_xml(&doc.meta).as_bytes());
     let image_exts: Vec<&str> = ctx.images.iter().map(|(_, ext)| *ext).collect();
@@ -3924,23 +5471,69 @@ struct OdfCtx<'a> {
     /// does not collide with the body's images. Default `0`.
     image_base: usize,
     style_id: usize,
+    /// Prefix for every automatic-style name this context mints (`""` for the
+    /// body). The header/footer context uses `"HF"`: its styles land in
+    /// **styles.xml** while the body's land in content.xml, and the importer
+    /// merges both parts' automatic styles into one name-keyed map with
+    /// content.xml winning — a header span named `T0` was silently resolved
+    /// against the body's unrelated `T0`, losing e.g. the header run's colour.
+    prefix: &'static str,
+    /// The document's review comments, so an [`Inline::CommentRef`] can re-emit
+    /// its `office:annotation` at the anchor point.
+    comments: &'a [crate::model::Comment],
+    /// The document's foot-/endnotes, so an [`Inline::FootnoteRef`] can re-emit
+    /// its `<text:note>` at the anchor point (see [`OdfCtx::with_footnotes`];
+    /// empty for contexts that never see note anchors).
+    footnotes: &'a [crate::model::Footnote],
     resources: &'a crate::model::ResourceTable,
+    /// Linear gradients referenced by graphic / drawing-page styles minted by
+    /// this context. Each becomes a named `<draw:gradient>` definition in the
+    /// document's `<office:styles>` (`Gradient1`…, deduplicated by value).
+    gradients: Vec<crate::model::Gradient>,
 }
 
 impl<'a> OdfCtx<'a> {
-    fn new(resources: &'a crate::model::ResourceTable) -> Self {
+    fn new(
+        resources: &'a crate::model::ResourceTable,
+        comments: &'a [crate::model::Comment],
+    ) -> Self {
         OdfCtx {
             auto: String::new(),
             images: Vec::new(),
             image_base: 0,
             style_id: 0,
+            prefix: "",
+            comments,
+            footnotes: &[],
             resources,
+            gradients: Vec::new(),
         }
+    }
+
+    /// Attach the document's foot-/endnotes so an [`Inline::FootnoteRef`] can
+    /// re-emit its `<text:note>` at the anchor point.
+    fn with_footnotes(mut self, footnotes: &'a [crate::model::Footnote]) -> Self {
+        self.footnotes = footnotes;
+        self
     }
     fn next_style(&mut self) -> usize {
         let id = self.style_id;
         self.style_id += 1;
         id
+    }
+
+    /// Register a gradient (deduplicated by value) and return the
+    /// `<draw:gradient draw:name>` it will be defined under.
+    fn gradient_name(&mut self, g: &crate::model::Gradient) -> String {
+        let idx = self
+            .gradients
+            .iter()
+            .position(|x| x == g)
+            .unwrap_or_else(|| {
+                self.gradients.push(g.clone());
+                self.gradients.len() - 1
+            });
+        format!("Gradient{}", idx + 1)
     }
     /// Resolve an image blob by resource key, returning its bytes and the
     /// package-native extension derived from the resource's format tag.
@@ -4035,7 +5628,7 @@ fn odt_block(block: &Block, ctx: &mut OdfCtx, out: &mut String) {
 /// verbatim layout survives.
 fn odt_code(cb: &CodeBlock, ctx: &mut OdfCtx) -> String {
     let pid = ctx.next_style();
-    let pname = format!("Code{pid}");
+    let pname = format!("{}Code{pid}", ctx.prefix);
     ctx.auto.push_str(&format!(
         "<style:style style:name=\"{pname}\" style:family=\"paragraph\">\
 <style:paragraph-properties fo:background-color=\"#f2f2f2\" \
@@ -4044,7 +5637,7 @@ fo:border=\"0.5pt solid #cccccc\" fo:padding=\"3pt\"/>\
 style:font-family-generic=\"modern\" fo:font-size=\"10pt\"/></style:style>"
     ));
     let sid = ctx.next_style();
-    let sname = format!("CodeT{sid}");
+    let sname = format!("{}CodeT{sid}", ctx.prefix);
     ctx.auto.push_str(&format!(
         "<style:style style:name=\"{sname}\" style:family=\"text\">\
 <style:text-properties style:font-name=\"Courier New\" fo:font-family=\"'Courier New'\" \
@@ -4065,7 +5658,7 @@ style:font-family-generic=\"modern\" fo:font-size=\"10pt\"/></style:style>"
 /// A horizontal rule → an empty paragraph carrying only a bottom border.
 fn odt_hr(ctx: &mut OdfCtx) -> String {
     let pid = ctx.next_style();
-    let pname = format!("Hr{pid}");
+    let pname = format!("{}Hr{pid}", ctx.prefix);
     ctx.auto.push_str(&format!(
         "<style:style style:name=\"{pname}\" style:family=\"paragraph\">\
 <style:paragraph-properties fo:border-bottom=\"0.5pt solid #999999\" \
@@ -4091,27 +5684,30 @@ fn odt_paragraph(para: &Paragraph, tag: &str, extra: Option<&str>, ctx: &mut Odf
     let style_name = match style_ref_id(para.style_ref.as_ref()) {
         Some(named) => {
             let direct = odf_para_prop_attrs(&para.style);
-            if direct.is_empty() {
+            let tabs = odf_tab_stops_xml(&para.style);
+            if direct.is_empty() && tabs.is_empty() {
                 // Reference the named style directly — no automatic style needed.
                 let mut n = String::new();
                 esc(named, &mut n);
                 n
             } else {
-                // Automatic style inheriting the named style, carrying overrides.
+                // Automatic style inheriting the named style, carrying overrides
+                // (attribute deltas and/or explicit tab stops).
                 let pid = ctx.next_style();
-                let auto_name = format!("P{pid}");
+                let auto_name = format!("{}P{pid}", ctx.prefix);
                 let mut parent = String::new();
                 esc(named, &mut parent);
                 ctx.auto.push_str(&format!(
                     "<style:style style:name=\"{auto_name}\" style:family=\"paragraph\" \
-style:parent-style-name=\"{parent}\"><style:paragraph-properties{direct}/></style:style>"
+style:parent-style-name=\"{parent}\">{props}</style:style>",
+                    props = odf_paragraph_properties_xml(&direct, &tabs)
                 ));
                 auto_name
             }
         }
         None => {
             let pid = ctx.next_style();
-            let auto_name = format!("P{pid}");
+            let auto_name = format!("{}P{pid}", ctx.prefix);
             ctx.auto.push_str(&odf_para_style(&auto_name, para));
             auto_name
         }
@@ -4128,7 +5724,7 @@ fn odt_runs(runs: &[Inline], ctx: &mut OdfCtx, out: &mut String) {
                     continue;
                 }
                 let sid = ctx.next_style();
-                let sname = format!("T{sid}");
+                let sname = format!("{}T{sid}", ctx.prefix);
                 ctx.auto.push_str(&odf_span_style(&sname, &run.style));
                 out.push_str(&format!("<text:span text:style-name=\"{sname}\">"));
                 for part in run.text.split_inclusive('\t') {
@@ -4164,6 +5760,20 @@ fn odt_runs(runs: &[Inline], ctx: &mut OdfCtx, out: &mut String) {
                     }
                     LinkTarget::Page(p) => Some(format!("#page{}", p + 1)),
                     LinkTarget::Url(_) => None,
+                    // A named in-document anchor → `xlink:href="#name"`. Note
+                    // an unresolved anchor has no known target position in the
+                    // model, so no `text:bookmark` is minted for it here — the
+                    // fragment link degrades gracefully in readers when the
+                    // name resolves to nothing (an anchor that *did* resolve
+                    // was already rewritten to `LinkTarget::Page` at import).
+                    LinkTarget::Anchor(a) if !a.is_empty() => {
+                        let mut n = String::new();
+                        esc(a, &mut n);
+                        Some(format!("#{n}"))
+                    }
+                    // A raw action summary has no ODF target: children render
+                    // un-linked (same as an empty URL).
+                    LinkTarget::Anchor(_) | LinkTarget::Other(_) => None,
                 };
                 if let Some(href) = target {
                     out.push_str(&format!(
@@ -4175,16 +5785,68 @@ fn odt_runs(runs: &[Inline], ctx: &mut OdfCtx, out: &mut String) {
                     odt_runs(children, ctx, out);
                 }
             }
-            // A comment anchor is not re-emitted (no `office:annotation` body is
-            // written on export); comments degrade gracefully.
-            Inline::CommentRef { .. } => {}
+            // A comment anchor: re-emit the full `office:annotation` (ISO 26300
+            // §14.1) at the anchor point — `office:name` carries the model id
+            // verbatim (the importer's anchor key), `dc:creator`/`dc:date` the
+            // author/date, and the flattened text one `text:p` (the importer
+            // joins body paragraphs with a space, so one line round-trips
+            // byte-identical). A dangling anchor (no matching comment) emits
+            // nothing.
+            Inline::CommentRef { id } => {
+                if let Some(c) = ctx.comments.iter().find(|c| c.id == *id) {
+                    let mut name = String::new();
+                    esc(&c.id, &mut name);
+                    out.push_str(&format!("<office:annotation office:name=\"{name}\">"));
+                    if !c.author.is_empty() {
+                        out.push_str("<dc:creator>");
+                        esc(&c.author, out);
+                        out.push_str("</dc:creator>");
+                    }
+                    if !c.date.is_empty() {
+                        out.push_str("<dc:date>");
+                        esc(&c.date, out);
+                        out.push_str("</dc:date>");
+                    }
+                    out.push_str("<text:p>");
+                    esc(&c.text, out);
+                    out.push_str("</text:p></office:annotation>");
+                }
+            }
+            // A footnote anchor: the full `<text:note text:note-class=
+            // "footnote">` (ISO 26300 §6.3) — its citation is the note's
+            // 1-based ordinal and its body the note's paragraphs, rendered
+            // with the shared paragraph writer so styling survives. The ODT
+            // importer reads this exact shape back (`text:note` →
+            // `Document::footnotes` + an `Inline::FootnoteRef`), so notes
+            // round-trip. A dangling anchor emits nothing.
+            Inline::FootnoteRef { id } => {
+                let Some(pos) = ctx.footnotes.iter().position(|f| f.id == *id) else {
+                    continue;
+                };
+                let ordinal = pos + 1;
+                let blocks = ctx.footnotes[pos].blocks.clone();
+                let mut note_id = String::new();
+                esc(id, &mut note_id);
+                let mut body = String::new();
+                for para in blocks_to_paras(&blocks) {
+                    body.push_str(&odt_paragraph(&para, "p", None, ctx));
+                }
+                if body.is_empty() {
+                    body.push_str("<text:p/>");
+                }
+                out.push_str(&format!(
+                    "<text:note text:id=\"ftn{note_id}\" text:note-class=\"footnote\">\
+<text:note-citation>{ordinal}</text:note-citation>\
+<text:note-body>{body}</text:note-body></text:note>"
+                ));
+            }
         }
     }
 }
 
 fn odt_list(list: &List, ctx: &mut OdfCtx) -> String {
     let sid = ctx.next_style();
-    let sname = format!("L{sid}");
+    let sname = format!("{}L{sid}", ctx.prefix);
     ctx.auto.push_str(&odf_list_style(&sname, list));
 
     // Honour `ListItem.level` (0-based) by nesting `<text:list>`s. ODF nests an
@@ -4265,7 +5927,7 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
     let cols = table_col_count(table).max(1);
     let widths = docx_col_widths(table, cols);
     let tid = ctx.next_style();
-    let tname = format!("Tbl{tid}");
+    let tname = format!("{}Tbl{tid}", ctx.prefix);
     // Table + per-column styles.
     ctx.auto.push_str(&format!(
         "<style:style style:name=\"{tname}\" style:family=\"table\">\
@@ -4320,7 +5982,7 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
         let row_style = match row.height {
             Some(h) if h > 0.0 => {
                 let rsid = ctx.next_style();
-                let rsn = format!("Tr{rsid}");
+                let rsn = format!("{}Tr{rsid}", ctx.prefix);
                 ctx.auto.push_str(&format!(
                     "<style:style style:name=\"{rsn}\" style:family=\"table-row\">\
 <style:table-row-properties style:row-height=\"{hh}pt\" style:min-row-height=\"{hh}pt\"/></style:style>",
@@ -4359,7 +6021,7 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
                 String::new()
             } else {
                 let csid = ctx.next_style();
-                let csn = format!("Tc{csid}");
+                let csn = format!("{}Tc{csid}", ctx.prefix);
                 ctx.auto.push_str(&format!(
                     "<style:style style:name=\"{csn}\" style:family=\"table-cell\">\
 <style:table-cell-properties{tc_props}/></style:style>"
@@ -4431,7 +6093,7 @@ fn odt_shape_para(block: &Block, shape: &Shape, ctx: &mut OdfCtx) -> String {
     };
     let placed = shape_to_placed(shape);
     let sid = ctx.next_style();
-    let sname = format!("Sh{sid}");
+    let sname = format!("{}Sh{sid}", ctx.prefix);
     ctx.auto.push_str(&odf_shape_style(&sname, &placed));
     let draw = if shape_is_rect(&placed) {
         format!(
@@ -4473,6 +6135,7 @@ xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
 xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
 xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" \
 xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\" \
+xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
 xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
 <office:automatic-styles>{frame_style}{auto}</office:automatic-styles>\
 <office:body><office:text>{body}</office:text></office:body></office:document-content>"
@@ -4509,6 +6172,7 @@ xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
 xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
 xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\" \
 xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
 xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" office:version=\"1.3\">\
 <office:automatic-styles>{frame_style}{hf_auto}{page_layouts}</office:automatic-styles>{default_styles}\
 <office:master-styles>{master_styles}</office:master-styles></office:document-styles>"
@@ -4580,7 +6244,74 @@ fn odf_para_prop_attrs(ps: &ParagraphStyle) -> String {
     if ps.keep_together {
         props.push_str(" fo:keep-together=\"always\"");
     }
+    // Authored page break before the paragraph (the ODF mirror of the DOCX
+    // `w:pageBreakBefore` emission; inverse of the importer's capture).
+    if ps.page_break_before {
+        props.push_str(" fo:break-before=\"page\"");
+    }
+    // Right-to-left paragraph flow (`style:writing-mode="rl-tb"`) — the ODF
+    // mirror of `w:bidi`; the importer's `odf_writing_mode` reads it back.
+    if ps.direction == Some(crate::model::Direction::Rtl) {
+        props.push_str(" style:writing-mode=\"rl-tb\"");
+    }
     props
+}
+
+/// The `<style:tab-stops>` child of `<style:paragraph-properties>`: one
+/// `<style:tab-stop>` per model [`crate::model::TabStop`] with its position in
+/// points (this file's ODF length convention), its alignment (`style:type`,
+/// omitted for the default `left`; `Decimal` maps to ODF's `char` type aligned
+/// on `.` — ODF has no `decimal` token), and its leader as
+/// `style:leader-style` + `style:leader-text`. Empty when the paragraph has no
+/// explicit tab stops — the ODF mirror of the DOCX `<w:tabs>` emission.
+fn odf_tab_stops_xml(ps: &ParagraphStyle) -> String {
+    if ps.tab_stops.is_empty() {
+        return String::new();
+    }
+    let mut stops = String::new();
+    for ts in &ps.tab_stops {
+        stops.push_str(&format!(
+            "<style:tab-stop style:position=\"{}pt\"",
+            num(ts.pos_pt)
+        ));
+        match ts.align {
+            crate::model::TabAlign::Left => {}
+            crate::model::TabAlign::Center => stops.push_str(" style:type=\"center\""),
+            crate::model::TabAlign::Right => stops.push_str(" style:type=\"right\""),
+            crate::model::TabAlign::Decimal => {
+                stops.push_str(" style:type=\"char\" style:char=\".\"");
+            }
+        }
+        if ts.leader != '\0' {
+            // `.`/`·` read as a dotted rule, `-` as dashes, `_` (and anything
+            // else) as a solid line; the literal character rides along in
+            // `style:leader-text` so viewers that honour it reproduce it.
+            let style = match ts.leader {
+                '-' => "dash",
+                '.' | '\u{b7}' => "dotted",
+                _ => "solid",
+            };
+            let mut text = String::new();
+            esc(&ts.leader.to_string(), &mut text);
+            stops.push_str(&format!(
+                " style:leader-style=\"{style}\" style:leader-text=\"{text}\""
+            ));
+        }
+        stops.push_str("/>");
+    }
+    format!("<style:tab-stops>{stops}</style:tab-stops>")
+}
+
+/// Wrap already-rendered paragraph-property attributes and an optional
+/// `<style:tab-stops>` child into the full `<style:paragraph-properties>`
+/// element. Tab stops are child *elements*, not attributes (ODF §17.8), so the
+/// shell only self-closes when there are none.
+fn odf_paragraph_properties_xml(attrs: &str, tabs: &str) -> String {
+    if tabs.is_empty() {
+        format!("<style:paragraph-properties{attrs}/>")
+    } else {
+        format!("<style:paragraph-properties{attrs}>{tabs}</style:paragraph-properties>")
+    }
 }
 
 /// Normalises a model border-style string to the CSS/XSL-FO token an ODF
@@ -4595,16 +6326,62 @@ fn odf_border_style(style: &str) -> &str {
 
 /// ODF automatic `<style:style family="paragraph">` from a model paragraph
 /// style. The `<style:paragraph-properties>` shell is always emitted (matching
-/// the historical output) even when fully default.
+/// the historical output) even when fully default; explicit tab stops become
+/// its `<style:tab-stops>` child element.
 fn odf_para_style(name: &str, para: &Paragraph) -> String {
     let attrs = odf_para_prop_attrs(&para.style);
+    let tabs = odf_tab_stops_xml(&para.style);
     format!(
-        "<style:style style:name=\"{name}\" style:family=\"paragraph\">\
-<style:paragraph-properties{attrs}/></style:style>"
+        "<style:style style:name=\"{name}\" style:family=\"paragraph\">{}</style:style>",
+        odf_paragraph_properties_xml(&attrs, &tabs)
     )
 }
 
 /// ODF `<style:style family="text">` from a model char style.
+/// The ODF text-property attributes for the M2 [`CharStyle`] extensions —
+/// `fo:text-transform:uppercase` (caps), `fo:font-variant:small-caps`,
+/// `style:text-line-through-type="double"` (double strike),
+/// `style:text-position` from a point-precise baseline shift (skipped when a
+/// categorical super/sub already owns the attribute or the run size is
+/// unknown), `style:text-scale` (horizontal scaling) and
+/// `style:letter-kerning` (ODF kerning is boolean — the threshold degrades).
+/// Shared by [`odf_span_style`], [`odf_named_text_attrs`] and the ODS font
+/// path so all three stay in lock-step.
+fn odf_text_extras(style: &CharStyle) -> String {
+    let mut p = String::new();
+    if style.caps {
+        p.push_str(" fo:text-transform=\"uppercase\"");
+    }
+    if style.small_caps {
+        p.push_str(" fo:font-variant=\"small-caps\"");
+    }
+    if style.dstrike {
+        if !style.strike {
+            // The double type needs an active line-through style to render.
+            p.push_str(" style:text-line-through-style=\"solid\"");
+        }
+        p.push_str(" style:text-line-through-type=\"double\"");
+    }
+    if style.vertical_align == VAlign::Baseline {
+        if let Some(shift) = style.baseline_shift_pt.filter(|v| *v != 0.0) {
+            let size = run_size(style);
+            if size > 0.0 {
+                p.push_str(&format!(
+                    " style:text-position=\"{}% 100%\"",
+                    num((shift / size * 100.0 * 10.0).round() / 10.0)
+                ));
+            }
+        }
+    }
+    if let Some(v) = style.char_scale_pct.filter(|v| *v > 0.0 && *v != 100.0) {
+        p.push_str(&format!(" style:text-scale=\"{}%\"", v.round() as i64));
+    }
+    if style.kern_min_pt.filter(|v| *v > 0.0).is_some() {
+        p.push_str(" style:letter-kerning=\"true\"");
+    }
+    p
+}
+
 fn odf_span_style(name: &str, style: &CharStyle) -> String {
     let generic = match style.generic {
         crate::convert::style::Generic::Sans => "swiss",
@@ -4654,6 +6431,13 @@ fn odf_span_style(name: &str, style: &CharStyle) -> String {
     if let Some(bg) = style.background {
         p.push_str(&format!(" fo:background-color=\"#{}\"", hex(bg)));
     }
+    // Hidden text → `text:display="none"` (ODF §20.427), the ODT analogue of
+    // DOCX `w:vanish` — previously emitted for DOCX only, so a hidden run lost
+    // its flag through ODT.
+    if style.hidden {
+        p.push_str(" text:display=\"none\"");
+    }
+    p.push_str(&odf_text_extras(style));
     p.push_str("/>");
     format!("<style:style style:name=\"{name}\" style:family=\"text\">{p}</style:style>")
 }
@@ -4663,25 +6447,44 @@ fn odf_span_style(name: &str, style: &CharStyle) -> String {
 /// `.` by default, `)` for `1)`-style sources) so it round-trips.
 fn odf_list_style(name: &str, list: &List) -> String {
     let mut levels = String::new();
-    let mut suffix = String::new();
-    esc(&list.suffix().to_string(), &mut suffix);
+    let mut prefix = String::new();
+    esc(list.marker_prefix.as_deref().unwrap_or(""), &mut prefix);
+    let prefix_attr = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!(" style:num-prefix=\"{prefix}\"")
+    };
     for lvl in 1..=9u32 {
-        if list.ordered {
-            let fmt = match list.marker {
+        // Per-depth style when the list carries real multi-level definitions
+        // (`List::levels`, entry `lvl − 1`); the table-wide marker/suffix
+        // otherwise — level-less lists emit exactly the pre-M2 shape.
+        let level_style = list.levels.get(lvl as usize - 1);
+        let (marker, suffix_ch, ordered) = match level_style {
+            Some(ls) => (ls.marker, ls.suffix.unwrap_or('.'), ls.is_ordered()),
+            None => (list.marker, list.suffix(), list.ordered),
+        };
+        if ordered {
+            let fmt = match marker {
                 ListMarker::LowerAlpha => "a",
                 ListMarker::UpperAlpha => "A",
                 ListMarker::LowerRoman => "i",
                 ListMarker::UpperRoman => "I",
                 _ => "1",
             };
+            let start_attr = match level_style.filter(|ls| ls.start > 1) {
+                Some(ls) => format!(" text:start-value=\"{}\"", ls.start),
+                None => String::new(),
+            };
+            let mut suffix = String::new();
+            esc(&suffix_ch.to_string(), &mut suffix);
             levels.push_str(&format!(
-                "<text:list-level-style-number text:level=\"{lvl}\" style:num-suffix=\"{suffix}\" style:num-format=\"{fmt}\">\
+                "<text:list-level-style-number text:level=\"{lvl}\"{prefix_attr} style:num-suffix=\"{suffix}\" style:num-format=\"{fmt}\"{start_attr}>\
 <style:list-level-properties text:space-before=\"{sb}pt\" text:min-label-width=\"18pt\"/>\
 </text:list-level-style-number>",
                 sb = 18 * (lvl - 1),
             ));
         } else {
-            let bullet = match list.marker {
+            let bullet = match marker {
                 ListMarker::Bullet(c) => c,
                 _ => '•',
             };
@@ -5113,23 +6916,36 @@ fn ods_cell_from_model(
         None => String::new(),
     };
     let attrs = format!("{style_attr}{span_attr}{formula_attr}");
+    // A cell hyperlink wraps the display text in a `text:a` (ODF §6.1.8); the
+    // in-workbook `#Sheet!A1` form keeps its `#` in `xlink:href` verbatim.
+    let link = |disp: String| -> String {
+        match cell.hyperlink.as_deref().filter(|t| !t.is_empty()) {
+            Some(target) => {
+                let mut href = String::new();
+                esc(target, &mut href);
+                format!("<text:a xlink:type=\"simple\" xlink:href=\"{href}\">{disp}</text:a>")
+            }
+            None => disp,
+        }
+    };
     match &cell.value {
         CellValue::Empty => format!("<table:table-cell{attrs}/>"),
         CellValue::Number(n) => format!(
             "<table:table-cell{attrs} office:value-type=\"float\" office:value=\"{v}\"><text:p>{disp}</text:p></table:table-cell>",
             v = num(*n),
-            disp = num(*n),
+            disp = link(num(*n)),
         ),
         CellValue::Bool(b) => format!(
             "<table:table-cell{attrs} office:value-type=\"boolean\" office:boolean-value=\"{bv}\"><text:p>{disp}</text:p></table:table-cell>",
             bv = if *b { "true" } else { "false" },
-            disp = if *b { "TRUE" } else { "FALSE" },
+            disp = link(if *b { "TRUE" } else { "FALSE" }.to_string()),
         ),
         CellValue::Text(t) => {
             let mut esc_t = String::new();
             esc(t, &mut esc_t);
             format!(
-                "<table:table-cell{attrs} office:value-type=\"string\"><text:p>{esc_t}</text:p></table:table-cell>"
+                "<table:table-cell{attrs} office:value-type=\"string\"><text:p>{disp}</text:p></table:table-cell>",
+                disp = link(esc_t),
             )
         }
     }
@@ -5143,7 +6959,8 @@ xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" \
 xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
 xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" \
 xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" \
-xmlns:number=\"urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0\" office:version=\"1.3\">\
+xmlns:number=\"urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0\" \
+xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
 <office:automatic-styles>{data_styles}{auto}</office:automatic-styles>\
 <office:body><office:spreadsheet>{body}</office:spreadsheet></office:body></office:document-content>"
     )
@@ -5157,13 +6974,45 @@ fn odp_body(slides: &[Slide], doc: &Document, ctx: &mut OdfCtx) -> String {
         body.push_str("<draw:page draw:master-page-name=\"Default\"/>");
     }
     for (i, slide) in slides.iter().enumerate() {
+        // A slide with a background fill gets its own drawing-page auto-style
+        // (`draw:fill="solid"` + the colour); the shared `dp1` (fill none) is
+        // the default. The importer resolves `draw:style-name` through the
+        // drawing-page style map back to [`Slide::background`], so backgrounds
+        // round-trip.
+        let page_style = match (&slide.background_gradient, slide.background) {
+            // A full gradient page fill primes over the flat colour: the
+            // drawing-page style references a named `<draw:gradient>` (defined
+            // in styles.xml's `office:styles` by `odp_gradient_defs`).
+            (Some(g), _) if g.stops.len() >= 2 => {
+                let grad = ctx.gradient_name(g);
+                let sid = ctx.next_style();
+                let name = format!("{}dpBg{sid}", ctx.prefix);
+                ctx.auto.push_str(&format!(
+                    "<style:style style:name=\"{name}\" style:family=\"drawing-page\">\
+<style:drawing-page-properties draw:fill=\"gradient\" draw:fill-gradient-name=\"{grad}\"/>\
+</style:style>"
+                ));
+                name
+            }
+            (_, Some(rgb)) => {
+                let sid = ctx.next_style();
+                let name = format!("{}dpBg{sid}", ctx.prefix);
+                ctx.auto.push_str(&format!(
+                    "<style:style style:name=\"{name}\" style:family=\"drawing-page\">\
+<style:drawing-page-properties draw:fill=\"solid\" draw:fill-color=\"#{}\"/></style:style>",
+                    hex(rgb)
+                ));
+                name
+            }
+            _ => "dp1".to_string(),
+        };
         // `draw:name="page{N}"` is the jump target for an internal
         // `LinkTarget::Page` (`text:a xlink:href="#page{N}"`, emitted by the shared
         // `odt_runs`). The 1-based slide index matches the `#page{N}` anchor the
         // ODT export uses, so the same model link resolves in both ODF presentations
         // and text documents.
         body.push_str(&format!(
-            "<draw:page draw:name=\"page{}\" draw:style-name=\"dp1\" draw:master-page-name=\"Default\">",
+            "<draw:page draw:name=\"page{}\" draw:style-name=\"{page_style}\" draw:master-page-name=\"Default\">",
             i + 1
         ));
         for ph in &slide.placeholders {
@@ -5188,7 +7037,7 @@ fn odp_body(slides: &[Slide], doc: &Document, ctx: &mut OdfCtx) -> String {
 /// frame geometry uses the conventional ODF notes box on a portrait notes page.
 fn odp_notes(notes: &[Block], ctx: &mut OdfCtx, out: &mut String) {
     let sid = ctx.next_style();
-    let sname = format!("Nt{sid}");
+    let sname = format!("{}Nt{sid}", ctx.prefix);
     ctx.auto.push_str(&format!(
         "<style:style style:name=\"{sname}\" style:family=\"graphic\">\
 <style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\" \
@@ -5227,6 +7076,45 @@ fn odp_presentation_class(role: &PlaceholderRole) -> String {
     }
 }
 
+/// The positioning attributes of a slide element (`draw:frame` / `draw:rect` /
+/// `draw:path`): plain `svg:x`/`svg:y` for an unrotated block, or — when the
+/// block carries a rotation — a LibreOffice-style
+/// `draw:transform="rotate(<rad>) translate(<x> <y>)"` **replacing** them (a
+/// transformed frame drops `svg:x`/`svg:y`, exactly as Impress writes it).
+/// `svg:width`/`svg:height` are always kept: the importer requires them to
+/// place a transform-only frame.
+///
+/// This is the exact inverse of the importer pair `odp_frame_box_xf` +
+/// `odp_transform_rotation` (office_import): the angle is the model's CCW
+/// degrees converted to **radians** (ODF §19.228 — radians, counter-clockwise),
+/// emitted at full `f64` precision so arbitrary angles survive the round trip,
+/// and the translate carries the frame's **lower-left** corner — the `svg:y`
+/// origin plus the emitted height (the importer reads `top = ty - h`).
+fn odp_pos_attrs(r: crate::model::Rect, rotation: crate::model::Rotation) -> String {
+    let w = r.w.max(1.0);
+    let h = r.h.max(1.0);
+    let deg = rotation.degrees().rem_euclid(360.0);
+    if deg == 0.0 {
+        format!(
+            "svg:x=\"{}pt\" svg:y=\"{}pt\" svg:width=\"{}pt\" svg:height=\"{}pt\"",
+            num(r.x),
+            num(r.y),
+            num(w),
+            num(h)
+        )
+    } else {
+        format!(
+            "draw:transform=\"rotate({rad}) translate({x}pt {y}pt)\" \
+svg:width=\"{w}pt\" svg:height=\"{h}pt\"",
+            rad = deg.to_radians(),
+            x = num(r.x),
+            y = num(r.y + h),
+            w = num(w),
+            h = num(h),
+        )
+    }
+}
+
 fn odp_frame(
     block: &Block,
     role: Option<&PlaceholderRole>,
@@ -5261,39 +7149,48 @@ fn odp_frame(
             ctx.images.push((bytes, ext));
             let n = ctx.images.len();
             out.push_str(&format!(
-                "<draw:frame draw:style-name=\"frI\" draw:layer=\"layout\"{pres} \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">\
+                "<draw:frame draw:style-name=\"frI\" draw:layer=\"layout\"{pres} {pos}>\
 <draw:image xlink:href=\"Pictures/img{n}.{ext}\" xlink:type=\"simple\" xlink:show=\"embed\" \
 xlink:actuate=\"onLoad\"/></draw:frame>",
-                x = num(r.x),
-                y = num(r.y),
-                w = num(r.w.max(1.0)),
-                h = num(r.h.max(1.0)),
+                pos = odp_pos_attrs(r, block.rotation),
             ));
         }
         BlockKind::Shape(shape) => {
             let placed = shape_to_placed(shape);
             let sid = ctx.next_style();
-            let sname = format!("Sh{sid}");
-            ctx.auto.push_str(&odf_shape_style(&sname, &placed));
+            let sname = format!("{}Sh{sid}", ctx.prefix);
+            match &shape.fill_gradient {
+                // A full gradient fill: a graphic style referencing the named
+                // `<draw:gradient>` (stroke settings mirror odf_shape_style).
+                Some(g) if g.stops.len() >= 2 => {
+                    let grad = ctx.gradient_name(g);
+                    let stroke = match placed.stroke {
+                        Some(rgb) => format!(
+                            "draw:stroke=\"solid\" svg:stroke-color=\"#{}\" \
+svg:stroke-width=\"{}pt\"",
+                            hex(rgb),
+                            num(placed.stroke_width.max(0.5))
+                        ),
+                        None => "draw:stroke=\"none\"".to_string(),
+                    };
+                    ctx.auto.push_str(&format!(
+                        "<style:style style:name=\"{sname}\" style:family=\"graphic\">\
+<style:graphic-properties draw:fill=\"gradient\" draw:fill-gradient-name=\"{grad}\" \
+{stroke}/></style:style>"
+                    ));
+                }
+                _ => ctx.auto.push_str(&odf_shape_style(&sname, &placed)),
+            }
             if shape_is_rect(&placed) {
                 out.push_str(&format!(
-                    "<draw:rect draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>",
-                    x = num(r.x),
-                    y = num(r.y),
-                    w = num(r.w.max(1.0)),
-                    h = num(r.h.max(1.0)),
+                    "<draw:rect draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} {pos}/>",
+                    pos = odp_pos_attrs(r, block.rotation),
                 ));
             } else {
                 out.push_str(&format!(
-                    "<draw:path draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\" \
+                    "<draw:path draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} {pos} \
 svg:viewBox=\"0 0 {vw} {vh}\" svg:d=\"{d}\"/>",
-                    x = num(r.x),
-                    y = num(r.y),
-                    w = num(r.w.max(1.0)),
-                    h = num(r.h.max(1.0)),
+                    pos = odp_pos_attrs(r, block.rotation),
                     vw = num(r.w.max(1.0)),
                     vh = num(r.h.max(1.0)),
                     d = odf_path_d(&placed.segments),
@@ -5307,12 +7204,8 @@ svg:viewBox=\"0 0 {vw} {vh}\" svg:d=\"{d}\"/>",
             // `ctx.auto`); we only wrap it in the positioned frame here.
             let table_xml = odt_table(table, ctx);
             out.push_str(&format!(
-                "<draw:frame draw:layer=\"layout\"{pres} \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">{table_xml}</draw:frame>",
-                x = num(r.x),
-                y = num(r.y),
-                w = num(r.w.max(1.0)),
-                h = num(r.h.max(1.0)),
+                "<draw:frame draw:layer=\"layout\"{pres} {pos}>{table_xml}</draw:frame>",
+                pos = odp_pos_attrs(r, block.rotation),
             ));
         }
         _ => {
@@ -5327,7 +7220,7 @@ svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">{table_
 
             if !content.is_empty() {
                 let sid = ctx.next_style();
-                let sname = format!("Tx{sid}");
+                let sname = format!("{}Tx{sid}", ctx.prefix);
                 ctx.auto.push_str(&format!(
                     "<style:style style:name=\"{sname}\" style:family=\"graphic\">\
 <style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\" \
@@ -5336,11 +7229,8 @@ draw:textarea-vertical-align=\"top\"/></style:style>"
                 ));
                 out.push_str(&format!(
                     "<draw:frame draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"><draw:text-box>{content}</draw:text-box></draw:frame>",
-                    x = num(r.x),
-                    y = num(r.y),
-                    w = num(r.w.max(1.0)),
-                    h = num(r.h.max(1.0)),
+{pos}><draw:text-box>{content}</draw:text-box></draw:frame>",
+                    pos = odp_pos_attrs(r, block.rotation),
                 ));
             }
 
@@ -5350,11 +7240,11 @@ svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"><draw:t
                 let ty = r.y + 8.0 + 220.0 * i as f64;
                 let table_xml = odt_table(table, ctx);
                 out.push_str(&format!(
-                    "<draw:frame draw:layer=\"layout\"{pres} \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"200pt\">{table_xml}</draw:frame>",
-                    x = num(r.x),
-                    y = num(ty),
-                    w = num(r.w.max(1.0)),
+                    "<draw:frame draw:layer=\"layout\"{pres} {pos}>{table_xml}</draw:frame>",
+                    pos = odp_pos_attrs(
+                        crate::model::Rect::new(r.x, ty, r.w.max(1.0), 200.0),
+                        block.rotation
+                    ),
                 ));
             }
         }
@@ -5403,10 +7293,48 @@ xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
 xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" \
 xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\" \
 xmlns:presentation=\"urn:oasis:names:tc:opendocument:xmlns:presentation:1.0\" \
+xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
 xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
 <office:automatic-styles>{base}{auto}</office:automatic-styles>\
 <office:body><office:presentation>{body}</office:presentation></office:body></office:document-content>"
     )
+}
+
+/// The `<draw:gradient>` definitions for every gradient a context registered
+/// (ODF models a linear gradient as a two-colour axis: the first and last
+/// stops survive; intermediate stops collapse — documented lossy). The angle
+/// converts from the model's DrawingML convention (degrees clockwise from +X,
+/// `0` = left→right) to ODF's decidegrees counter-clockwise with `0` =
+/// bottom→top: `odf = (270 − deg) mod 360`.
+fn odp_gradient_defs(gradients: &[crate::model::Gradient]) -> String {
+    let mut out = String::new();
+    for (i, g) in gradients.iter().enumerate() {
+        let (Some(first), Some(last)) = (g.stops.first(), g.stops.last()) else {
+            continue;
+        };
+        let decideg = (((270.0 - g.angle_deg).rem_euclid(360.0)) * 10.0).round() as i64;
+        out.push_str(&format!(
+            "<draw:gradient draw:name=\"Gradient{}\" draw:style=\"linear\" \
+draw:start-color=\"#{}\" draw:end-color=\"#{}\" draw:start-intensity=\"100%\" \
+draw:end-intensity=\"100%\" draw:angle=\"{decideg}\" draw:border=\"0%\"/>",
+            i + 1,
+            hex(first.color),
+            hex(last.color)
+        ));
+    }
+    out
+}
+
+/// Merge gradient definitions into an existing `<office:styles>` block (or
+/// mint one) so `odp_styles_xml_model`'s `default_styles` slot carries both.
+fn odf_styles_with_gradients(default_styles: String, gradient_defs: &str) -> String {
+    if gradient_defs.is_empty() {
+        return default_styles;
+    }
+    match default_styles.strip_prefix("<office:styles>") {
+        Some(rest) => format!("<office:styles>{gradient_defs}{rest}"),
+        None => format!("<office:styles>{gradient_defs}</office:styles>"),
+    }
 }
 
 fn odp_styles_xml_model(pw: f64, ph: f64, default_styles: &str) -> String {
@@ -5508,7 +7436,20 @@ fn sheet_rows_from_block(block: &Block, sheet: &mut Sheet) {
                         ..SheetCell::default()
                     };
                     if !text.is_empty() {
-                        sc.value = CellValue::Text(text);
+                        if row.is_header {
+                            // A header label is metadata, not data: keep it as
+                            // text even when it looks numeric (CSV-import rule).
+                            sc.value = CellValue::Text(text);
+                        } else {
+                            // Type the cell — number / bool / ISO date /
+                            // localized number ("1 234,50", "15,50 %") — instead
+                            // of forcing everything to text, so the native
+                            // writers emit real `Number`/`Bool` cells and
+                            // number formats.
+                            let (value, number_format) = typed_sheet_value(&text);
+                            sc.value = value;
+                            sc.number_format = number_format;
+                        }
                     }
                     if row.is_header {
                         sc.style.bold = true;
@@ -5600,6 +7541,207 @@ fn sheet_rows_from_block(block: &Block, sheet: &mut Sheet) {
     }
 }
 
+/// Infer a typed [`CellValue`] (plus optional `number_format`) for one
+/// Table→Sheet bridge cell.
+///
+/// Two layers, both conservative (anything ambiguous stays text):
+///
+/// 1. the strict CSV-import core ([`csv_import::infer_cell`]): booleans, ISO
+///    dates (→ serial + date format) and bare `f64` tokens (`1234.5`);
+/// 2. locale-aware numeric forms a reconstructed PDF table actually contains:
+///    grouped thousands with a decimal comma or dot (`1 234,50`, `1,234.50`,
+///    `1.234,50`), a plain decimal comma (`15,5`), percentages (`15,50 %`) and
+///    currency-tagged amounts (`1 234,50 €`, `$1,234.50`) — typed as numbers
+///    with the matching spreadsheet `number_format` so the visual shape
+///    survives.
+///
+/// Any letter in the token (an address like `12 rue X`) keeps it text.
+fn typed_sheet_value(text: &str) -> (CellValue, Option<String>) {
+    let trimmed = text.trim();
+    let (value, fmt) = crate::convert::csv_import::infer_cell(trimmed);
+    if !matches!(value, CellValue::Text(_)) {
+        return (value, fmt);
+    }
+    if let Some((n, fmt)) = parse_localized_number(trimmed) {
+        return (CellValue::Number(n), fmt);
+    }
+    (value, fmt)
+}
+
+/// Parse a locale-formatted numeric token — grouped thousands, decimal comma,
+/// percent, currency symbol — to `(value, number_format)`. `None` when the
+/// token is not confidently numeric (any letter, malformed grouping, ambiguous
+/// `1,234`, leading-zero code, over-long digit run ⇒ text).
+fn parse_localized_number(s: &str) -> Option<(f64, Option<String>)> {
+    // A trailing `%` (with optional space, incl. NBSP) marks a percentage.
+    let (body, percent) = match s.strip_suffix('%') {
+        Some(rest) => (rest.trim_end_matches([' ', '\u{a0}', '\u{202f}']), true),
+        None => (s, false),
+    };
+    // A currency symbol at either end (only when not a percentage).
+    let (body, currency) = if percent {
+        (body, None)
+    } else {
+        strip_currency_symbol(body)
+    };
+    let (normalized, grouped, decimals) = match normalize_grouped_number(body) {
+        Some(t) => t,
+        // A plain (unlocalized) body is still meaningful when a % or currency
+        // tag was stripped ("50%", "$1200", "12.5 €").
+        None if percent || currency.is_some() => {
+            let decimals = body.rsplit_once('.').map_or(0, |(_, f)| f.len());
+            (body.to_string(), false, decimals)
+        }
+        None => return None,
+    };
+    // Delegate the final guards (leading zero, digit cap, exponent shape) to
+    // the shared strict parser.
+    let n = crate::convert::csv_import::parse_number(&normalized)?;
+    if percent {
+        let fmt = if decimals > 0 { "0.00%" } else { "0%" };
+        return Some((n / 100.0, Some(fmt.to_string())));
+    }
+    if let Some((symbol, suffix)) = currency {
+        let digits = if decimals > 0 { "#,##0.00" } else { "#,##0" };
+        let fmt = if suffix {
+            format!("{digits}\" {symbol}\"")
+        } else {
+            format!("\"{symbol}\"{digits}")
+        };
+        return Some((n, Some(fmt)));
+    }
+    if grouped {
+        let fmt = if decimals > 0 { "#,##0.00" } else { "#,##0" };
+        return Some((n, Some(fmt.to_string())));
+    }
+    Some((n, None))
+}
+
+/// Strip a currency symbol (€, $, £) off either end of the token, returning the
+/// remaining text plus `Some((symbol, is_suffix))` when one was found.
+fn strip_currency_symbol(s: &str) -> (&str, Option<(char, bool)>) {
+    const SYMBOLS: [char; 3] = ['€', '$', '£'];
+    for sym in SYMBOLS {
+        if let Some(rest) = s.strip_suffix(sym) {
+            let rest = rest.trim_end_matches([' ', '\u{a0}', '\u{202f}']);
+            return (rest, Some((sym, true)));
+        }
+        if let Some(rest) = s.strip_prefix(sym) {
+            let rest = rest.trim_start_matches([' ', '\u{a0}', '\u{202f}']);
+            return (rest, Some((sym, false)));
+        }
+    }
+    (s, None)
+}
+
+/// Normalize a locale-formatted numeric token to a plain `digits[.digits]`
+/// string [`csv_import::parse_number`] accepts. Returns `(normalized,
+/// had_grouping, fraction_digit_count)`, or `None` when the token is not a
+/// clean localized number:
+///
+/// - space-like separators (space, NBSP, narrow NBSP, thin space) are always
+///   thousands grouping (`1 234`, `12 345 678,90`); groups must be exactly 3
+///   digits (first 1–3);
+/// - with both `.` and `,` present, the **last** one is the decimal separator
+///   and the other groups thousands (`1,234.50` and `1.234,50` both work);
+/// - a single `,` is a decimal comma (`15,50`) unless exactly 3 digits follow
+///   (`1,234` is ambiguous between en-grouping and fr-decimal ⇒ text);
+/// - a repeated single separator is grouping (`1,234,567`);
+/// - a lone `.` is left to the strict core (plain `f64` syntax) ⇒ `None` here.
+fn normalize_grouped_number(s: &str) -> Option<(String, bool, usize)> {
+    let s = s.trim();
+    let (sign, digits_part) = match s.strip_prefix(['+', '-']) {
+        Some(rest) => (&s[..1], rest),
+        None => ("", s),
+    };
+    // Tokenize into digit runs and single separators; anything else ⇒ not a number.
+    let mut runs: Vec<&str> = Vec::new();
+    let mut seps: Vec<char> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    let mut last_was_sep = true; // also rejects a leading separator
+    for (i, ch) in digits_part.char_indices() {
+        if ch.is_ascii_digit() {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+            last_was_sep = false;
+        } else if matches!(ch, ' ' | '\u{a0}' | '\u{202f}' | '\u{2009}' | '.' | ',') {
+            if last_was_sep {
+                return None; // doubled/leading separator
+            }
+            let start = run_start.take()?;
+            runs.push(&digits_part[start..i]);
+            seps.push(if ch == '.' || ch == ',' { ch } else { ' ' });
+            last_was_sep = true;
+        } else {
+            return None; // letters / other punctuation ⇒ text
+        }
+    }
+    if last_was_sep {
+        return None; // trailing separator
+    }
+    if let Some(start) = run_start {
+        runs.push(&digits_part[start..]);
+    }
+    if seps.is_empty() {
+        return None; // plain token — the strict core already judged it
+    }
+
+    // Decide which trailing separator (if any) is the decimal point.
+    let last_sep = *seps.last().expect("at least one separator");
+    let kinds: std::collections::BTreeSet<char> = seps.iter().copied().collect();
+    let last_run_len = runs.last().map_or(0, |r| r.len());
+    let decimal = match last_sep {
+        ' ' => false, // space never marks decimals
+        '.' | ',' => {
+            if kinds.len() > 1 {
+                // Mixed separators: the last, distinct one is the decimal.
+                seps.iter().filter(|c| **c == last_sep).count() == 1
+            } else if seps.len() > 1 {
+                false // repeated same separator ⇒ all grouping (1,234,567)
+            } else if last_sep == ',' {
+                if last_run_len == 3 {
+                    // "1,234" is ambiguous — en-grouped 1234 vs fr-decimal
+                    // 1.234 — so it conservatively stays text.
+                    return None;
+                }
+                true // "15,50" / "3,14159" — an unambiguous decimal comma
+            } else {
+                // A single dot is plain f64 syntax — the strict core's call.
+                return None;
+            }
+        }
+        _ => false,
+    };
+
+    // Split off the fraction, then validate the grouping shape.
+    let (int_runs, frac): (&[&str], &str) = if decimal {
+        (&runs[..runs.len() - 1], runs[runs.len() - 1])
+    } else {
+        (&runs[..], "")
+    };
+    if int_runs.is_empty() || int_runs[0].is_empty() || int_runs[0].len() > 3 {
+        return None;
+    }
+    if int_runs[1..].iter().any(|r| r.len() != 3) {
+        return None; // malformed grouping ("12 34", "1,23.4")
+    }
+    let grouped = int_runs.len() > 1;
+    if !grouped && !decimal {
+        return None; // nothing localized about it after all
+    }
+    let mut normalized = String::with_capacity(s.len());
+    normalized.push_str(sign);
+    for r in int_runs {
+        normalized.push_str(r);
+    }
+    if decimal && !frac.is_empty() {
+        normalized.push('.');
+        normalized.push_str(frac);
+    }
+    Some((normalized, grouped, if decimal { frac.len() } else { 0 }))
+}
+
 /// Append a single-cell text row (skipping empty text); `bold` marks headings.
 fn push_sheet_text_row(sheet: &mut Sheet, text: String, bold: bool) {
     if text.trim().is_empty() {
@@ -5663,15 +7805,104 @@ fn collect_slides(doc: &Document) -> Vec<Slide> {
                 }]
             };
             out.push(Slide {
-                geometry: section.geometry,
+                geometry: section.geometry.clone(),
                 shapes,
                 placeholders,
-                notes: None,
-                background: None,
+                ..Default::default()
             });
         }
     }
     out
+}
+
+/// Normalize a deck to **one** slide size (PPTX has a single `p:sldSz`; the
+/// model ODP export mirrors it with a single page layout): the size kept is the
+/// **majority** size across the deck — not the first slide's, which let one
+/// odd-sized cover dictate the geometry of every other slide. Slides whose
+/// geometry deviates are scaled proportionally onto the majority box
+/// (positions *and* sizes × the per-axis ratio, shape paths included so ODP
+/// `svg:viewBox`-relative geometry stays consistent), so their content keeps
+/// its relative layout instead of overflowing or huddling in a corner. A deck
+/// whose slides all share one size — the normal case — is returned unchanged.
+/// Returns the deck size (the majority, or the 960×540 default when empty).
+fn normalize_slide_sizes(slides: &mut [Slide]) -> (f64, f64) {
+    let Some(first) = slides.first() else {
+        return (960.0, 540.0);
+    };
+    let first_size = (first.geometry.width, first.geometry.height);
+    if slides
+        .iter()
+        .all(|s| (s.geometry.width, s.geometry.height) == first_size)
+    {
+        return first_size;
+    }
+    // Majority size (ties resolved toward the earliest size encountered):
+    // quantized to 1/100 pt so float noise does not split a size class.
+    // One class = (quantized key, representative size, occurrence count).
+    type SizeClass = ((i64, i64), (f64, f64), usize);
+    let key = |w: f64, h: f64| ((w * 100.0).round() as i64, (h * 100.0).round() as i64);
+    let mut classes: Vec<SizeClass> = Vec::new();
+    for s in slides.iter() {
+        let k = key(s.geometry.width, s.geometry.height);
+        match classes.iter_mut().find(|(ck, _, _)| *ck == k) {
+            Some((_, _, n)) => *n += 1,
+            None => classes.push((k, (s.geometry.width, s.geometry.height), 1)),
+        }
+    }
+    let (maj_key, (mw, mh), _) = classes
+        .iter()
+        .max_by_key(|(_, _, n)| *n)
+        .copied()
+        .expect("non-empty deck");
+    for s in slides.iter_mut() {
+        if key(s.geometry.width, s.geometry.height) == maj_key {
+            continue;
+        }
+        let (sw, sh) = (s.geometry.width, s.geometry.height);
+        if sw > 0.0 && sh > 0.0 {
+            let (rx, ry) = (mw / sw, mh / sh);
+            for ph in &mut s.placeholders {
+                scale_slide_block(&mut ph.block, rx, ry);
+            }
+            for sh_block in &mut s.shapes {
+                scale_slide_block(sh_block, rx, ry);
+            }
+        }
+        s.geometry.width = mw;
+        s.geometry.height = mh;
+    }
+    (mw, mh)
+}
+
+/// Scale one slide block onto a resized slide: its placement frame by
+/// `(rx, ry)`, and — for a vector [`Shape`] — its path segments too (the ODP
+/// writer derives `svg:viewBox`/`svg:d` from them relative to the frame).
+fn scale_slide_block(block: &mut Block, rx: f64, ry: f64) {
+    if let Some(f) = &mut block.frame {
+        f.x *= rx;
+        f.y *= ry;
+        f.w *= rx;
+        f.h *= ry;
+    }
+    if let BlockKind::Shape(shape) = &mut block.kind {
+        for seg in &mut shape.segments {
+            match seg {
+                PathSeg::Move(x, y) | PathSeg::Line(x, y) => {
+                    *x *= rx;
+                    *y *= ry;
+                }
+                PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                    *x1 *= rx;
+                    *y1 *= ry;
+                    *x2 *= rx;
+                    *y2 *= ry;
+                    *x3 *= rx;
+                    *y3 *= ry;
+                }
+                PathSeg::Close => {}
+            }
+        }
+    }
 }
 
 /// Adapt one positioned page block into a slide shape. The reconstruction
@@ -5707,10 +7938,18 @@ fn strip_left_indent(block: &Block, dx: f64) -> Block {
             }
         }
         BlockKind::TextBox(tb) => {
-            tb.blocks = tb.blocks.iter().map(|ib| strip_left_indent(ib, dx)).collect();
+            tb.blocks = tb
+                .blocks
+                .iter()
+                .map(|ib| strip_left_indent(ib, dx))
+                .collect();
         }
         BlockKind::Blockquote(bq) => {
-            bq.blocks = bq.blocks.iter().map(|ib| strip_left_indent(ib, dx)).collect();
+            bq.blocks = bq
+                .blocks
+                .iter()
+                .map(|ib| strip_left_indent(ib, dx))
+                .collect();
         }
         // Code/rule/table/image/shape/sheet/slide keep their own geometry.
         _ => {}
@@ -5998,7 +8237,7 @@ pub fn markdown_from_model(doc: &Document) -> String {
     let mut out = String::new();
     md_front_matter(&doc.meta, &mut out);
 
-    let w = MdWriter::new(&doc.resources);
+    let w = MdWriter::new(&doc.resources, &doc.footnotes);
 
     // Header → body pages (rule-separated) → footer, mirroring the other
     // model walkers' top-to-bottom traversal.
@@ -6021,19 +8260,64 @@ pub fn markdown_from_model(doc: &Document) -> String {
         w.blocks(footer, &mut out);
     }
 
+    // Footnote definitions: one trailing GFM `[^label]: body` per note (their
+    // in-flow `[^label]` call markers were emitted by `inline`). Continuation
+    // paragraphs indent four spaces, per the GFM footnote convention.
+    if !doc.footnotes.is_empty() {
+        out.push('\n');
+        for note in &doc.footnotes {
+            let mut body: Vec<String> = Vec::new();
+            for para in blocks_to_paras(&note.blocks) {
+                let text = w.inlines(&para.runs);
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    body.push(trimmed.to_string());
+                }
+            }
+            out.push_str(&format!(
+                "[^{}]: {}\n",
+                md_footnote_label(&note.id),
+                body.join("\n    ")
+            ));
+        }
+    }
+
     // Collapse any run of >2 blank lines and guarantee a single trailing newline.
     md_tidy(out)
 }
 
+/// A model footnote id as a GFM footnote label: GFM labels cannot contain
+/// whitespace or brackets, so those characters map to `-` (ids are typically
+/// already short tokens — DOCX numeric ids come through unchanged).
+fn md_footnote_label(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_whitespace() || matches!(c, '[' | ']' | '^') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Threads the resource table through the walk so image references can resolve
-/// their stored format tag (→ filename extension).
+/// their stored format tag (→ filename extension), and the document's
+/// footnotes so `[^label]` call markers only emit for resolvable notes.
 struct MdWriter<'a> {
     resources: &'a crate::model::ResourceTable,
+    footnotes: &'a [crate::model::Footnote],
 }
 
 impl<'a> MdWriter<'a> {
-    fn new(resources: &'a crate::model::ResourceTable) -> Self {
-        MdWriter { resources }
+    fn new(
+        resources: &'a crate::model::ResourceTable,
+        footnotes: &'a [crate::model::Footnote],
+    ) -> Self {
+        MdWriter {
+            resources,
+            footnotes,
+        }
     }
 
     /// A flat block list, each block separated by one blank line.
@@ -6139,7 +8423,13 @@ impl<'a> MdWriter<'a> {
     }
 
     fn paragraph(&self, p: &Paragraph, out: &mut String) {
-        let text = self.inlines(&p.runs);
+        // Soft line breaks re-flow as spaces (a Markdown consumer re-wraps
+        // freely); hard breaks keep the two-space `  \n` form. Same guard as
+        // the DOCX path — see `reflow_soft_breaks`.
+        let text = match reflow_soft_breaks(p) {
+            Some(reflowed) => self.inlines(&reflowed),
+            None => self.inlines(&p.runs),
+        };
         let trimmed = text.trim_matches(|c| c == ' ' || c == '\t');
         if trimmed.is_empty() {
             return; // an empty paragraph contributes no Markdown
@@ -6343,6 +8633,9 @@ impl<'a> MdWriter<'a> {
                     match href {
                         LinkTarget::Url(u) => md_escape(u),
                         LinkTarget::Page(p) => format!("page {}", p + 1),
+                        // TODO(M2): richer degenerate labels for the typed targets.
+                        LinkTarget::Anchor(a) => md_escape(a),
+                        LinkTarget::Other(o) => md_escape(o),
                     }
                 } else {
                     text
@@ -6363,10 +8656,31 @@ impl<'a> MdWriter<'a> {
                     }
                     // Empty URL: emit the label as plain text.
                     LinkTarget::Url(_) => out.push_str(&label),
+                    // A named in-document anchor → a `[label](#name)` fragment
+                    // link (the Markdown convention the importer's
+                    // `link_destination` reads back as an anchor target).
+                    LinkTarget::Anchor(a) if !a.is_empty() => {
+                        out.push('[');
+                        out.push_str(&label);
+                        out.push_str("](#");
+                        out.push_str(&md_link_dest(a));
+                        out.push(')');
+                    }
+                    // An empty anchor / raw action summary degrades to the
+                    // plain label (no portable Markdown target).
+                    LinkTarget::Anchor(_) | LinkTarget::Other(_) => out.push_str(&label),
                 }
             }
             // Markdown has no comment syntax; a comment anchor emits nothing.
             Inline::CommentRef { .. } => {}
+            // A footnote anchor → the GFM `[^id]` call marker; the matching
+            // `[^id]: body` definitions are appended once at the end of the
+            // document by `markdown_from_model` (see `md_footnote_defs`).
+            Inline::FootnoteRef { id } => {
+                if self.footnotes.iter().any(|f| f.id == *id) {
+                    out.push_str(&format!("[^{}]", md_footnote_label(id)));
+                }
+            }
         }
     }
 
@@ -6793,6 +9107,8 @@ fn inlines_plain_text(runs: &[Inline], out: &mut String) {
             Inline::LineBreak => out.push(' '),
             Inline::Image(_) => {}
             Inline::CommentRef { .. } => {}
+            // A note anchor has no text of its own (body in `Document::footnotes`).
+            Inline::FootnoteRef { .. } => {}
         }
     }
 }
@@ -7142,12 +9458,60 @@ fn epub_chapter_xhtml(
         xhtml_blocks(footer, doc, &mut body, &mut toc);
         body.push_str("</footer>");
     }
+    // Chapter-local notes section: the bodies of every footnote referenced in
+    // this chapter (their in-flow `<sup>` call markers link down here).
+    let mut referenced: Vec<String> = Vec::new();
+    for page in &section.pages {
+        collect_footnote_refs(&page.blocks, &mut referenced);
+    }
+    xhtml_footnotes(&referenced, doc, &mut body, &mut toc);
     if body.is_empty() {
         body.push_str("<h1>");
         esc(title, &mut body);
         body.push_str("</h1>");
     }
     (epub_xhtml_doc(&lang, title, &body), toc.headings)
+}
+
+/// Collect (in document order, first occurrence only) the ids of every
+/// [`Inline::FootnoteRef`] under `blocks` — recursing through nested block
+/// containers and link children — so a chapter can render exactly the notes
+/// it references.
+fn collect_footnote_refs(blocks: &[Block], out: &mut Vec<String>) {
+    fn inlines(runs: &[Inline], out: &mut Vec<String>) {
+        for r in runs {
+            match r {
+                Inline::FootnoteRef { id } => {
+                    if !out.contains(id) {
+                        out.push(id.clone());
+                    }
+                }
+                Inline::Link { children, .. } => inlines(children, out),
+                _ => {}
+            }
+        }
+    }
+    for b in blocks {
+        match &b.kind {
+            BlockKind::Paragraph(p) => inlines(&p.runs, out),
+            BlockKind::Heading(h) => inlines(&h.para.runs, out),
+            BlockKind::List(l) => {
+                for item in &l.items {
+                    collect_footnote_refs(&item.blocks, out);
+                }
+            }
+            BlockKind::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        collect_footnote_refs(&cell.blocks, out);
+                    }
+                }
+            }
+            BlockKind::TextBox(tb) => collect_footnote_refs(&tb.blocks, out),
+            BlockKind::Blockquote(bq) => collect_footnote_refs(&bq.blocks, out),
+            _ => {}
+        }
+    }
 }
 
 // ───────────────────────── model → strict XHTML (EPUB) ──────────────────────
@@ -7262,6 +9626,12 @@ fn xhtml_inlines(runs: &[Inline], doc: &Document, out: &mut String) {
                 let target = match href {
                     LinkTarget::Url(u) => u.clone(),
                     LinkTarget::Page(p) => format!("#page{p}"),
+                    // The fragment form is the natural XHTML lowering for a
+                    // named anchor.
+                    LinkTarget::Anchor(a) => format!("#{a}"),
+                    // An action summary has no XHTML target — empty href
+                    // degrades like an empty URL.
+                    LinkTarget::Other(_) => String::new(),
                 };
                 out.push_str("<a href=\"");
                 esc(&target, out);
@@ -7271,8 +9641,50 @@ fn xhtml_inlines(runs: &[Inline], doc: &Document, out: &mut String) {
             }
             // A comment anchor with no body emits nothing in this XHTML path.
             Inline::CommentRef { .. } => {}
+            // A footnote anchor: the superscript call marker (the note's
+            // 1-based ordinal) linking to the chapter-local notes section
+            // appended by `xhtml_footnotes` — parity with
+            // `convert::web::html_from_model`. Dangling anchors emit nothing.
+            Inline::FootnoteRef { id } => {
+                if let Some(pos) = doc.footnotes.iter().position(|f| f.id == *id) {
+                    let mut frag = String::new();
+                    esc(id, &mut frag);
+                    out.push_str(&format!(
+                        "<sup class=\"fn-ref\" id=\"fnr-{frag}\">\
+<a href=\"#fnt-{frag}\">{}</a></sup>",
+                        pos + 1
+                    ));
+                }
+            }
         }
     }
+}
+
+/// The chapter's notes `<aside>` — one entry per referenced footnote (its
+/// ordinal, body blocks and a back-link to the in-flow call marker),
+/// mirroring `convert::web::html_from_model`'s notes section. Emits nothing
+/// when the chapter references no note.
+fn xhtml_footnotes(
+    referenced: &[String],
+    doc: &Document,
+    out: &mut String,
+    toc: &mut EpubToc,
+) {
+    if referenced.is_empty() {
+        return;
+    }
+    out.push_str("<aside class=\"footnotes\" epub:type=\"footnotes\"><ol>");
+    for id in referenced {
+        let Some(note) = doc.footnotes.iter().find(|f| f.id == *id) else {
+            continue;
+        };
+        let mut frag = String::new();
+        esc(id, &mut frag);
+        out.push_str(&format!("<li id=\"fnt-{frag}\">"));
+        xhtml_blocks(&note.blocks, doc, out, toc);
+        out.push_str(&format!(" <a href=\"#fnr-{frag}\">\u{21a9}</a></li>"));
+    }
+    out.push_str("</ol></aside>");
 }
 
 /// Inline CSS for a [`CharStyle`] (the result is XML-escaped by the caller when
@@ -7298,14 +9710,32 @@ fn xhtml_char_css(style: &CharStyle) -> String {
     if style.underline {
         decos.push("underline");
     }
-    if style.strike {
+    if style.strike || style.dstrike {
         decos.push("line-through");
     }
     if !decos.is_empty() {
         css.push_str(&format!(";text-decoration:{}", decos.join(" ")));
+        // A double strike keeps `line-through` (broad reader support) and
+        // adds the style refinement for renderers that honour it.
+        if style.dstrike {
+            css.push_str(";text-decoration-style:double");
+        }
     }
     if let Some(c) = visible_color(style) {
         css.push_str(&format!(";color:#{c}"));
+    }
+    // M2 CharStyle extensions — display-time transforms and metrics.
+    if style.caps {
+        css.push_str(";text-transform:uppercase");
+    }
+    if style.small_caps {
+        css.push_str(";font-variant:small-caps");
+    }
+    if let Some(v) = style.baseline_shift_pt.filter(|v| *v != 0.0) {
+        css.push_str(&format!(";vertical-align:{}pt", num(v)));
+    }
+    if style.letter_spacing_pt != 0.0 {
+        css.push_str(&format!(";letter-spacing:{}pt", num(style.letter_spacing_pt)));
     }
     css.trim_start_matches(';').to_string()
 }
@@ -7945,6 +10375,86 @@ mod tests {
         assert!(styles.contains("w:styleId=\"Heading1\""));
     }
 
+    /// A table cell whose paragraph carries an [`Inline::LineBreak`] (the line
+    /// structure `recon::tables` emits between a cell's physical lines, fix a4)
+    /// exports as an **in-cell** break: DOCX renders `<w:br/>` inside the
+    /// cell's single `<w:p>`, ODT `<text:line-break/>` inside its single
+    /// `<text:p>` — a line break WITHIN the cell, never a second paragraph.
+    #[test]
+    fn cell_linebreak_exports_as_an_in_cell_break_not_a_new_paragraph() {
+        let cell_para = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![run("ligne un"), Inline::LineBreak, run("ligne deux")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![Row {
+                    cells: vec![Cell {
+                        blocks: vec![cell_para],
+                        ..Default::default()
+                    }],
+                    height: None,
+                    is_header: false,
+                }],
+                col_widths: vec![200.0],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![table],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // DOCX: one paragraph in the cell, the break between the two lines.
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        let tc_start = xml.find("<w:tc>").expect("cell present");
+        let tc_end = xml.find("</w:tc>").expect("cell closed");
+        let tc = &xml[tc_start..tc_end];
+        assert_eq!(
+            tc.matches("<w:br/>").count(),
+            1,
+            "the LineBreak is an in-cell <w:br/>: {tc}"
+        );
+        let paras_in_cell = tc.matches("<w:p>").count() + tc.matches("<w:p ").count();
+        assert_eq!(paras_in_cell, 1, "ONE paragraph in the cell, not two: {tc}");
+        let (a, br, b) = (
+            tc.find("ligne un").expect("first line text"),
+            tc.find("<w:br/>").expect("break"),
+            tc.find("ligne deux").expect("second line text"),
+        );
+        assert!(a < br && br < b, "break sits between the two lines");
+
+        // ODT: same semantics — one <text:p>, an in-cell <text:line-break/>.
+        let bytes = odt_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        let tc_start = content.find("<table:table-cell").expect("odt cell present");
+        let tc_end = content
+            .find("</table:table-cell>")
+            .expect("odt cell closed");
+        let tc = &content[tc_start..tc_end];
+        assert_eq!(
+            tc.matches("<text:line-break/>").count(),
+            1,
+            "the LineBreak is an in-cell <text:line-break/>: {tc}"
+        );
+        assert_eq!(
+            tc.matches("<text:p").count(),
+            1,
+            "ONE ODT paragraph in the cell: {tc}"
+        );
+    }
+
     /// A document carrying a named style table (`"Body"` derived from `"Normal"`,
     /// with centred alignment + bold + an explicit size) and a single paragraph
     /// referencing it via `style_ref`.
@@ -8102,6 +10612,7 @@ mod tests {
                 blocks: vec![para("section one body")],
                 absolute: false,
             }],
+            ..Default::default()
         };
         let sec2 = Section {
             geometry: PageGeometry {
@@ -8117,6 +10628,7 @@ mod tests {
                 blocks: vec![para("section two body")],
                 absolute: false,
             }],
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![sec1, sec2],
@@ -8309,6 +10821,7 @@ mod tests {
             }],
             notes: None,
             background: None,
+            ..Default::default()
         };
         Document {
             sections: vec![Section {
@@ -8518,6 +11031,7 @@ mod tests {
                                     c1: 1,
                                 }],
                                 col_widths: Vec::new(),
+                                ..Default::default()
                             }],
                         }),
                         ..Default::default()
@@ -8563,9 +11077,20 @@ mod tests {
         let bytes = xlsx_from_model(&sample_doc());
         assert_eq!(&bytes[..2], b"PK");
         let workbook = String::from_utf8(entry(&bytes, "xl/workbook.xml").unwrap()).unwrap();
-        assert!(workbook.contains("Page 1"), "per-page sheet name: {workbook}");
+        assert!(
+            workbook.contains("Page 1"),
+            "per-page sheet name: {workbook}"
+        );
         let sheet = String::from_utf8(entry(&bytes, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
-        for probe in ["Title", "A paragraph.", "first", "second", "spanning", "a", "b"] {
+        for probe in [
+            "Title",
+            "A paragraph.",
+            "first",
+            "second",
+            "spanning",
+            "a",
+            "b",
+        ] {
             assert!(sheet.contains(probe), "sheet carries {probe:?}: {sheet}");
         }
         // The bullet marker prefixes each synthesized list row.
@@ -8613,6 +11138,7 @@ mod tests {
                                 rows: vec![row],
                                 merges: Vec::new(),
                                 col_widths: Vec::new(),
+                                ..Default::default()
                             }],
                         }),
                         ..Default::default()
@@ -8844,6 +11370,7 @@ mod tests {
             placeholders: Vec::new(),
             notes: None,
             background: None,
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![Section {
@@ -8891,6 +11418,7 @@ mod tests {
             }],
             notes: None,
             background: None,
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![Section {
@@ -8933,6 +11461,7 @@ mod tests {
                 }],
                 notes: None,
                 background: None,
+                ..Default::default()
             })
             .collect();
         Document {
@@ -9192,6 +11721,7 @@ style:family=\"paragraph\""
                                 }],
                                 merges: Vec::new(),
                                 col_widths: Vec::new(),
+                                ..Default::default()
                             }],
                         }),
                         ..Default::default()
@@ -9237,6 +11767,7 @@ style:family=\"paragraph\""
             }],
             notes: None,
             background: None,
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![Section {
@@ -9277,6 +11808,7 @@ style:family=\"paragraph\""
             }],
             notes: Some(vec![para(notes_text)]),
             background: None,
+            ..Default::default()
         };
         Document {
             sections: vec![Section {
@@ -9420,6 +11952,7 @@ style:family=\"paragraph\""
             placeholders: Vec::new(),
             notes: None,
             background: None,
+            ..Default::default()
         };
         Document {
             sections: vec![Section {
@@ -9668,6 +12201,7 @@ style:family=\"paragraph\""
             ],
             notes: None,
             background: None,
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![Section {
@@ -9809,6 +12343,7 @@ style:family=\"paragraph\""
                 c1: 1,
             }],
             col_widths: Vec::new(),
+            ..Default::default()
         };
         let bytes = ods_from_model(&sheet_doc(sheet));
         let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
@@ -9850,6 +12385,7 @@ style:family=\"paragraph\""
                 c1: 0,
             }],
             col_widths: Vec::new(),
+            ..Default::default()
         };
         let bytes = ods_from_model(&sheet_doc(sheet));
         let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
@@ -9889,6 +12425,7 @@ style:family=\"paragraph\""
             }],
             merges: Vec::new(),
             col_widths: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -9966,6 +12503,7 @@ style:family=\"paragraph\""
                 c1: 1,
             }],
             col_widths: Vec::new(),
+            ..Default::default()
         };
         let xlsx = xlsx_from_model(&sheet_doc(sheet));
         let zip = read_zip(&xlsx);
@@ -10003,6 +12541,7 @@ style:family=\"paragraph\""
             }],
             merges: Vec::new(),
             col_widths: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -10237,6 +12776,7 @@ style:family=\"paragraph\""
                 blocks: vec![para("portrait one")],
                 absolute: false,
             }],
+            ..Default::default()
         };
         let sec2 = Section {
             geometry: PageGeometry {
@@ -10252,6 +12792,7 @@ style:family=\"paragraph\""
                 blocks: vec![para("landscape two")],
                 absolute: false,
             }],
+            ..Default::default()
         };
         let doc = Document {
             sections: vec![sec1, sec2],
@@ -10352,6 +12893,7 @@ style:print-orientation=\"landscape\""
             }],
             merges: Vec::new(),
             col_widths: Vec::new(),
+            ..Default::default()
         };
         let xlsx = xlsx_from_model(&sheet_doc(plain.clone()));
         let styles = String::from_utf8(entry(&xlsx, "xl/styles.xml").unwrap()).unwrap();
@@ -10401,6 +12943,7 @@ style:print-orientation=\"landscape\""
             }],
             merges: Vec::new(),
             col_widths: vec![140.0, 0.0, 70.0],
+            ..Default::default()
         };
         let xlsx = xlsx_from_model(&sheet_doc(sheet));
         let ws = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
@@ -10434,6 +12977,7 @@ style:print-orientation=\"landscape\""
             }],
             merges: Vec::new(),
             col_widths: Vec::new(),
+            ..Default::default()
         };
         let xlsx = xlsx_from_model(&sheet_doc(sheet));
         let ws = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
@@ -10458,6 +13002,7 @@ style:print-orientation=\"landscape\""
             }],
             merges: Vec::new(),
             col_widths: vec![85.0394, 141.7323],
+            ..Default::default()
         };
         let ods = ods_from_model(&sheet_doc(sheet));
         let content = String::from_utf8(entry(&ods, "content.xml").unwrap()).unwrap();
@@ -10497,6 +13042,7 @@ style:print-orientation=\"landscape\""
             }],
             merges: Vec::new(),
             col_widths: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -10816,6 +13362,7 @@ style:print-orientation=\"landscape\""
                 runs: vec![Inline::Image(ImageRef {
                     resource: 7,
                     alt: Some("a logo".to_string()),
+                    ..Default::default()
                 })],
                 ..Default::default()
             }),
@@ -10877,6 +13424,7 @@ style:print-orientation=\"landscape\""
             stroke: Some([0.0, 0.0, 1.0]),
             stroke_width: 2.0,
             dash: Vec::new(),
+            ..Default::default()
         };
         let doc = md_doc(vec![Block {
             kind: BlockKind::Shape(shape),
@@ -11049,6 +13597,7 @@ style:print-orientation=\"landscape\""
             kind: BlockKind::Image(ImageRef {
                 resource: 9,
                 alt: Some("photo".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -11290,6 +13839,7 @@ style:print-orientation=\"landscape\""
             stroke: Some([0.0, 0.0, 1.0]),
             stroke_width: 2.0,
             dash: Vec::new(),
+            ..Default::default()
         };
         let md = markdown_from_model(&md_doc(vec![Block {
             kind: BlockKind::Shape(shape),
@@ -11332,6 +13882,7 @@ style:print-orientation=\"landscape\""
         let img = Inline::Image(ImageRef {
             resource: 5,
             alt: Some("alt".to_string()),
+            ..Default::default()
         });
         let mut doc = md_doc(vec![md_para(vec![
             url_link,
@@ -11742,6 +14293,7 @@ style:print-orientation=\"landscape\""
             }],
             merges: Vec::new(),
             col_widths: Vec::new(),
+            ..Default::default()
         });
         doc.meta = meta_doc().meta;
         doc
@@ -11765,6 +14317,7 @@ style:print-orientation=\"landscape\""
             }],
             notes: None,
             background: None,
+            ..Default::default()
         };
         Document {
             meta: meta_doc().meta,
@@ -11986,6 +14539,7 @@ style:print-orientation=\"landscape\""
             }],
             notes: None,
             background: None,
+            ..Default::default()
         };
         Document {
             sections: vec![Section {
@@ -12074,6 +14628,7 @@ style:print-orientation=\"landscape\""
                     Inline::Image(ImageRef {
                         resource: 42,
                         alt: Some("logo".to_string()),
+                        ..Default::default()
                     }),
                     run(" after"),
                 ],
@@ -12349,6 +14904,7 @@ style:print-orientation=\"landscape\""
             }],
             merges: Vec::new(),
             col_widths: Vec::new(),
+            ..Default::default()
         };
 
         // XLSX: `<u/>` and `<strike/>` in the cell's `<font>` record.
@@ -12387,6 +14943,7 @@ style:print-orientation=\"landscape\""
             stroke: None,
             stroke_width: 0.0,
             dash: Vec::new(),
+            ..Default::default()
         };
         let block = Block {
             frame: Some(crate::model::Rect::new(72.0, 144.0, 100.0, 50.0)),
@@ -12503,6 +15060,7 @@ style:print-orientation=\"landscape\""
                 stroke: Some([0.0, 0.0, 0.0]),
                 stroke_width: 0.75,
                 dash: Vec::new(),
+                ..Default::default()
             }),
             ..Default::default()
         }
@@ -12611,7 +15169,15 @@ style:print-orientation=\"landscape\""
     #[test]
     fn page_number_caption_parser_is_conservative() {
         // Recognized shapes…
-        for ok in ["Page 3", "Page 1 / 2", "page 2 sur 10", "Page 4 of 9", "3 / 12", "3/12", "- 7 -"] {
+        for ok in [
+            "Page 3",
+            "Page 1 / 2",
+            "page 2 sur 10",
+            "Page 4 of 9",
+            "3 / 12",
+            "3/12",
+            "- 7 -",
+        ] {
             assert!(
                 parse_page_number_text(ok).is_some(),
                 "`{ok}` is a page-number caption"
@@ -12642,6 +15208,7 @@ style:print-orientation=\"landscape\""
         let mut doc = image_doc("png");
         doc.sections[0].pages[0].blocks[0].frame =
             Some(crate::model::Rect::new(56.7, 700.0, 112.6, 85.1));
+        let page_h = doc.sections[0].geometry.height;
         let bytes = docx_from_model(&doc);
         let files = read_zip(&bytes);
         let xml = String::from_utf8(files.get("word/document.xml").unwrap().clone()).unwrap();
@@ -12650,12 +15217,22 @@ style:print-orientation=\"landscape\""
             xml.contains(&format!("<wp:posOffset>{}</wp:posOffset>", emu(56.7))),
             "X offset in EMU from the frame: {xml}"
         );
+        // The model frame is lower-left origin; `wp:posOffset` measures from the
+        // top-left page corner, so Y is flipped about the page height — the
+        // exact inverse of the importer's `docx_anchor_frame`.
         assert!(
-            xml.contains(&format!("<wp:posOffset>{}</wp:posOffset>", emu(700.0))),
-            "Y offset in EMU from the frame: {xml}"
+            xml.contains(&format!(
+                "<wp:posOffset>{}</wp:posOffset>",
+                emu(page_h - (700.0 + 85.1))
+            )),
+            "Y offset in EMU is the top-flipped frame Y: {xml}"
         );
         assert!(
-            xml.contains(&format!("<wp:extent cx=\"{}\" cy=\"{}\"/>", emu(112.6), emu(85.1))),
+            xml.contains(&format!(
+                "<wp:extent cx=\"{}\" cy=\"{}\"/>",
+                emu(112.6),
+                emu(85.1)
+            )),
             "extent = the frame size: {xml}"
         );
         assert!(
@@ -12692,6 +15269,7 @@ style:print-orientation=\"landscape\""
             kind: BlockKind::Image(ImageRef {
                 resource: 9,
                 alt: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -12725,11 +15303,19 @@ style:print-orientation=\"landscape\""
         );
         assert!(slide.contains("<p:pic>"), "framed image → p:pic: {slide}");
         assert!(
-            slide.contains(&format!("<a:off x=\"{}\" y=\"{}\"/>", emu(100.0), emu(50.0))),
+            slide.contains(&format!(
+                "<a:off x=\"{}\" y=\"{}\"/>",
+                emu(100.0),
+                emu(50.0)
+            )),
             "picture offset from its frame: {slide}"
         );
         assert!(
-            slide.contains(&format!("<a:off x=\"{}\" y=\"{}\"/>", emu(72.0), emu(300.0))),
+            slide.contains(&format!(
+                "<a:off x=\"{}\" y=\"{}\"/>",
+                emu(72.0),
+                emu(300.0)
+            )),
             "text box offset from its frame: {slide}"
         );
         assert!(slide.contains("hello slide"), "the prose survives: {slide}");
@@ -12755,6 +15341,2428 @@ style:print-orientation=\"landscape\""
         assert!(
             slide.contains("<p:ph type=\"body\""),
             "frameless blocks keep the Body placeholder: {slide}"
+        );
+    }
+
+    // ── audit fidelity wave 1: typed cells, backgrounds, hyperlinks, rot, tables ──
+
+    #[test]
+    fn typed_sheet_value_covers_locale_forms() {
+        // Strict core (shared with the CSV importer): bare numbers/booleans.
+        assert_eq!(
+            typed_sheet_value("1234.5"),
+            (CellValue::Number(1234.5), None)
+        );
+        assert_eq!(typed_sheet_value("TRUE"), (CellValue::Bool(true), None));
+        // French grouped thousands + decimal comma.
+        let (v, f) = typed_sheet_value("1 234,50");
+        assert_eq!(v, CellValue::Number(1234.5));
+        assert_eq!(f.as_deref(), Some("#,##0.00"));
+        // NBSP grouping (what a PDF reconstruction actually extracts).
+        let (v, _) = typed_sheet_value("1\u{a0}234,50");
+        assert_eq!(v, CellValue::Number(1234.5));
+        // English and German grouped forms.
+        assert_eq!(
+            typed_sheet_value("1,234.50").0,
+            CellValue::Number(1234.5),
+            "en grouping + dot decimal"
+        );
+        assert_eq!(
+            typed_sheet_value("1.234,50").0,
+            CellValue::Number(1234.5),
+            "de grouping + comma decimal"
+        );
+        assert_eq!(
+            typed_sheet_value("1 234 567").0,
+            CellValue::Number(1_234_567.0)
+        );
+        // Percentages: value scaled, percent number format attached.
+        let (v, f) = typed_sheet_value("15,50 %");
+        assert_eq!(v, CellValue::Number(15.5 / 100.0));
+        assert_eq!(f.as_deref(), Some("0.00%"));
+        let (v, f) = typed_sheet_value("50%");
+        assert_eq!(v, CellValue::Number(0.5));
+        assert_eq!(f.as_deref(), Some("0%"));
+        // Currency-tagged amounts keep their symbol in the number format.
+        let (v, f) = typed_sheet_value("1 234,50 €");
+        assert_eq!(v, CellValue::Number(1234.5));
+        assert_eq!(f.as_deref(), Some("#,##0.00\" €\""));
+        let (v, f) = typed_sheet_value("$1,234.50");
+        assert_eq!(v, CellValue::Number(1234.5));
+        assert_eq!(f.as_deref(), Some("\"$\"#,##0.00"));
+        // Plain decimal comma.
+        assert_eq!(typed_sheet_value("15,5").0, CellValue::Number(15.5));
+        // Conservative refusals — everything ambiguous stays text.
+        assert_eq!(
+            typed_sheet_value("abc"),
+            (CellValue::Text("abc".to_string()), None)
+        );
+        assert_eq!(
+            typed_sheet_value("12 rue X"),
+            (CellValue::Text("12 rue X".to_string()), None),
+            "an address starts with a number but contains letters"
+        );
+        assert_eq!(
+            typed_sheet_value("1,234").0,
+            CellValue::Text("1,234".to_string()),
+            "ambiguous en-grouping vs fr-decimal stays text"
+        );
+        assert_eq!(
+            typed_sheet_value("01234").0,
+            CellValue::Text("01234".to_string()),
+            "leading-zero code stays text"
+        );
+        assert_eq!(
+            typed_sheet_value("12 34").0,
+            CellValue::Text("12 34".to_string()),
+            "malformed grouping stays text"
+        );
+        assert_eq!(
+            typed_sheet_value("+1-555-0100").0,
+            CellValue::Text("+1-555-0100".to_string()),
+            "phone-like token stays text"
+        );
+    }
+
+    #[test]
+    fn table_to_sheet_bridge_types_numbers_not_text() {
+        // A prose-page table (the PDF-reconstruction shape) exported to XLSX
+        // must carry typed Number cells — previously EVERY cell came out as
+        // text. Headers keep their labels verbatim (even numeric-looking ones).
+        let mk = |t: &str| Cell {
+            blocks: vec![para(t)],
+            ..Default::default()
+        };
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![
+                    Row {
+                        cells: vec![mk("Montant"), mk("2024")],
+                        height: None,
+                        is_header: true,
+                    },
+                    Row {
+                        cells: vec![mk("1 234,50"), mk("15,50 %")],
+                        height: None,
+                        is_header: false,
+                    },
+                    Row {
+                        cells: vec![mk("abc"), mk("12 rue X")],
+                        height: None,
+                        is_header: false,
+                    },
+                ],
+                col_widths: vec![120.0, 120.0],
+                border: BorderStyle::default(),
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![table],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let xlsx = xlsx_from_model(&doc);
+        let xml = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains("<v>1234.5</v>"),
+            "the amount is a real number cell, not inlineStr: {xml}"
+        );
+        let styles = String::from_utf8(entry(&xlsx, "xl/styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("#,##0.00") && styles.contains("0.00%"),
+            "locale number formats registered: {styles}"
+        );
+
+        // Round trip: the typed values survive the XLSX importer.
+        let model = crate::convert::office_import::xlsx_to_model(&read_zip(&xlsx));
+        let sheets = collect_sheets(&model);
+        assert_eq!(sheets.len(), 1);
+        let s = &sheets[0];
+        assert_eq!(
+            s.rows[0].cells[1].value,
+            CellValue::Text("2024".to_string()),
+            "numeric-looking header label stays text"
+        );
+        assert_eq!(s.rows[1].cells[0].value, CellValue::Number(1234.5));
+        assert_eq!(s.rows[1].cells[1].value, CellValue::Number(15.5 / 100.0));
+        assert_eq!(s.rows[2].cells[0].value, CellValue::Text("abc".to_string()));
+        assert_eq!(
+            s.rows[2].cells[1].value,
+            CellValue::Text("12 rue X".to_string()),
+            "an address stays text"
+        );
+    }
+
+    /// A one-slide deck with the given background and free shapes.
+    fn bg_slide_doc(background: Option<[f64; 3]>, shapes: Vec<Block>) -> Document {
+        use crate::model::{Slide, SlideBlock};
+        let slide = Slide {
+            geometry: crate::model::PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: crate::model::Margins::uniform(0.0),
+                ..Default::default()
+            },
+            shapes,
+            placeholders: Vec::new(),
+            notes: None,
+            background,
+            ..Default::default()
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A framed one-paragraph free shape.
+    fn framed_para(text: &str) -> Block {
+        Block {
+            frame: Some(crate::model::Rect::new(60.0, 60.0, 400.0, 60.0)),
+            ..para(text)
+        }
+    }
+
+    #[test]
+    fn slide_background_round_trips_pptx() {
+        // 22 background-bearing slides came back with 0 after a PPTX round trip:
+        // the exporter never emitted `p:bg`. It now does, as the exact shape the
+        // importer reads (`p:bg/p:bgPr/a:solidFill`).
+        let doc = bg_slide_doc(Some([1.0, 0.0, 0.0]), vec![framed_para("on red")]);
+        let bytes = pptx_from_model(&doc);
+        let slide = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            slide.contains("<p:bg><p:bgPr><a:solidFill><a:srgbClr val=\"FF0000\"/>"),
+            "solid slide background emitted before p:spTree: {slide}"
+        );
+        assert!(
+            slide.find("<p:bg>").unwrap() < slide.find("<p:spTree>").unwrap(),
+            "p:bg precedes p:spTree (CT_CommonSlideData order)"
+        );
+
+        let model = crate::convert::office_import::pptx_to_model(&read_zip(&bytes));
+        let slides = collect_slides(&model);
+        assert_eq!(slides.len(), 1);
+        let bg = slides[0]
+            .background
+            .expect("background survives round trip");
+        assert!(
+            bg.iter()
+                .zip([1.0, 0.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 0.01),
+            "red background round-trips, got {bg:?}"
+        );
+        // A background-less slide emits no p:bg at all.
+        let plain = pptx_from_model(&bg_slide_doc(None, vec![framed_para("plain")]));
+        let slide = String::from_utf8(entry(&plain, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(!slide.contains("<p:bg>"), "no fake background: {slide}");
+    }
+
+    #[test]
+    fn slide_background_round_trips_odp() {
+        let doc = bg_slide_doc(Some([0.0, 0.0, 1.0]), vec![framed_para("on blue")]);
+        let bytes = odp_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("draw:fill=\"solid\"")
+                && content.contains("draw:fill-color=\"#0000FF\""),
+            "drawing-page style carries the solid fill: {content}"
+        );
+        assert!(
+            content.contains("draw:style-name=\"dpBg0\""),
+            "the page references its background style: {content}"
+        );
+
+        let model = crate::convert::office_import::odp_to_model(&read_zip(&bytes));
+        let slides = collect_slides(&model);
+        assert_eq!(slides.len(), 1);
+        let bg = slides[0]
+            .background
+            .expect("background survives round trip");
+        assert!(
+            bg.iter()
+                .zip([0.0, 0.0, 1.0])
+                .all(|(a, b)| (a - b).abs() < 0.01),
+            "blue background round-trips, got {bg:?}"
+        );
+    }
+
+    /// A one-row sheet with an external and an in-workbook cell hyperlink.
+    fn hyperlink_sheet() -> Sheet {
+        Sheet {
+            name: "Links".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![
+                    SheetCell {
+                        value: CellValue::Text("site".to_string()),
+                        hyperlink: Some("https://example.com/".to_string()),
+                        ..Default::default()
+                    },
+                    SheetCell {
+                        value: CellValue::Text("jump".to_string()),
+                        hyperlink: Some("#Sheet1!A1".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cell_hyperlink_round_trips_xlsx() {
+        // `SheetCell::hyperlink` was set by the importer but never read by the
+        // writer — links silently vanished on every re-export.
+        let bytes = xlsx_from_model(&sheet_doc(hyperlink_sheet()));
+        let sheet_xml =
+            String::from_utf8(entry(&bytes, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(
+            sheet_xml.contains("<hyperlinks><hyperlink ref=\"A1\" r:id=\"rId1\"/>"),
+            "external link goes through the rels: {sheet_xml}"
+        );
+        assert!(
+            sheet_xml.contains("<hyperlink ref=\"B1\" location=\"Sheet1!A1\"/>"),
+            "in-workbook link uses @location: {sheet_xml}"
+        );
+        let rels = String::from_utf8(
+            entry(&bytes, "xl/worksheets/_rels/sheet1.xml.rels").expect("worksheet rels part"),
+        )
+        .unwrap();
+        assert!(
+            rels.contains("Target=\"https://example.com/\" TargetMode=\"External\""),
+            "external target declared in the sheet rels: {rels}"
+        );
+
+        let model = crate::convert::office_import::xlsx_to_model(&read_zip(&bytes));
+        let sheets = collect_sheets(&model);
+        assert_eq!(
+            sheets[0].rows[0].cells[0].hyperlink.as_deref(),
+            Some("https://example.com/"),
+            "external hyperlink survives the round trip"
+        );
+        assert_eq!(
+            sheets[0].rows[0].cells[1].hyperlink.as_deref(),
+            Some("#Sheet1!A1"),
+            "in-workbook hyperlink survives the round trip"
+        );
+        // A link-free export stays rels-less and r:id-less.
+        let plain = xlsx_from_model(&sheet_doc(Sheet {
+            name: "P".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("x".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        assert!(
+            entry(&plain, "xl/worksheets/_rels/sheet1.xml.rels").is_none(),
+            "no rels part without links"
+        );
+        let plain_xml =
+            String::from_utf8(entry(&plain, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(!plain_xml.contains("<hyperlinks>"));
+    }
+
+    #[test]
+    fn cell_hyperlink_round_trips_ods() {
+        let bytes = ods_from_model(&sheet_doc(hyperlink_sheet()));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains(
+                "<text:a xlink:type=\"simple\" xlink:href=\"https://example.com/\">site</text:a>"
+            ),
+            "cell text wrapped in a text:a: {content}"
+        );
+
+        let model = crate::convert::office_import::ods_to_model(&read_zip(&bytes));
+        let sheets = collect_sheets(&model);
+        assert_eq!(
+            sheets[0].rows[0].cells[0].hyperlink.as_deref(),
+            Some("https://example.com/"),
+            "external hyperlink survives the ODS round trip"
+        );
+        assert_eq!(
+            sheets[0].rows[0].cells[1].hyperlink.as_deref(),
+            Some("#Sheet1!A1"),
+            "in-workbook hyperlink survives the ODS round trip"
+        );
+        assert_eq!(
+            sheets[0].rows[0].cells[0].value,
+            CellValue::Text("site".to_string()),
+            "the link display text stays the cell value"
+        );
+    }
+
+    #[test]
+    fn pptx_rot_attr_maps_model_ccw_to_ooxml_cw() {
+        use crate::model::Rotation;
+        assert_eq!(pptx_rot_attr(Rotation::D0), "");
+        // Model CCW 45° = OOXML CW 315° = 18 900 000 (60000ths).
+        assert_eq!(pptx_rot_attr(Rotation::Deg(45.0)), " rot=\"18900000\"");
+        assert_eq!(pptx_rot_attr(Rotation::D90), " rot=\"16200000\"");
+        assert_eq!(pptx_rot_attr(Rotation::D270), " rot=\"5400000\"");
+        assert_eq!(pptx_rot_attr(Rotation::Deg(360.0)), "", "full turn = none");
+    }
+
+    #[test]
+    fn rotated_shape_round_trips_pptx() {
+        // The importer reads `a:xfrm@rot` but the exporter never wrote it: every
+        // rotated element came out straight. A 45°-CCW free text box now emits
+        // `rot="18900000"` and comes back at 45°.
+        let shape = Block {
+            frame: Some(crate::model::Rect::new(100.0, 100.0, 300.0, 60.0)),
+            rotation: crate::model::Rotation::Deg(45.0),
+            ..para("tilted")
+        };
+        let doc = bg_slide_doc(None, vec![shape]);
+        let bytes = pptx_from_model(&doc);
+        let slide = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            slide.contains("<a:xfrm rot=\"18900000\">"),
+            "rotation emitted on the shape transform: {slide}"
+        );
+
+        let model = crate::convert::office_import::pptx_to_model(&read_zip(&bytes));
+        let slides = collect_slides(&model);
+        let rotated = slides[0]
+            .shapes
+            .iter()
+            .find(|b| b.rotation != crate::model::Rotation::D0)
+            .expect("the rotated shape survives");
+        assert!(
+            (rotated.rotation.degrees() - 45.0).abs() < 1e-6,
+            "45° CCW round-trips, got {:?}",
+            rotated.rotation
+        );
+    }
+
+    #[test]
+    fn odp_pos_attrs_rotation_variants() {
+        use crate::model::{Rect, Rotation};
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        // Unrotated: the plain svg cluster, byte-identical to the historical
+        // output (no draw:transform anywhere near it).
+        assert_eq!(
+            odp_pos_attrs(r, Rotation::D0),
+            "svg:x=\"10pt\" svg:y=\"20pt\" svg:width=\"100pt\" svg:height=\"50pt\""
+        );
+        assert_eq!(
+            odp_pos_attrs(r, Rotation::Deg(360.0)),
+            odp_pos_attrs(r, Rotation::D0),
+            "a full turn is no rotation"
+        );
+        // Rotated: LibreOffice-style transform — CCW radians + the lower-left
+        // corner (svg:y + emitted height) — replacing svg:x/svg:y, with the
+        // size attributes kept.
+        let d90 = odp_pos_attrs(r, Rotation::D90);
+        let want = format!(
+            "draw:transform=\"rotate({}) translate(10pt 70pt)\"",
+            (90.0f64).to_radians()
+        );
+        assert!(d90.starts_with(&want), "quarter turn transform: {d90}");
+        assert!(
+            !d90.contains("svg:x="),
+            "transform replaces svg:x/svg:y: {d90}"
+        );
+        assert!(
+            d90.ends_with("svg:width=\"100pt\" svg:height=\"50pt\""),
+            "size attributes stay: {d90}"
+        );
+    }
+
+    #[test]
+    fn odp_rotated_frame_emits_draw_transform_and_round_trips() {
+        // `Block.rotation` reached PPTX (`rot=`) but never ODP: every rotated
+        // element opened straight in Impress. A rotated frame now carries
+        // `draw:transform="rotate(<rad>) translate(<x> <y>)"` — ODF §19.228
+        // radians, counter-clockwise, translate at the frame's lower-left
+        // corner — and loses `svg:x`/`svg:y` to it, while the unrotated twin
+        // keeps the plain svg attributes and no transform at all.
+        let tilted = Block {
+            frame: Some(crate::model::Rect::new(100.0, 100.0, 300.0, 60.0)),
+            rotation: crate::model::Rotation::Deg(45.0),
+            ..para("tilted")
+        };
+        let straight = Block {
+            frame: Some(crate::model::Rect::new(100.0, 100.0, 300.0, 60.0)),
+            ..para("straight")
+        };
+        let bytes = odp_from_model(&bg_slide_doc(None, vec![tilted, straight]));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+
+        // translate = (x, y + h): the lower-left corner, the exact inverse of
+        // the importer's `top = ty - h` (odp_frame_box_xf).
+        let xf = format!(
+            "draw:transform=\"rotate({}) translate(100pt 160pt)\"",
+            (45.0f64).to_radians()
+        );
+        assert!(content.contains(&xf), "rotate+translate emitted: {content}");
+        assert_eq!(
+            content.matches("draw:transform").count(),
+            1,
+            "no transform on the unrotated frame: {content}"
+        );
+        assert!(
+            content.contains("svg:x=\"100pt\" svg:y=\"100pt\""),
+            "the unrotated frame keeps svg:x/svg:y: {content}"
+        );
+
+        // Round trip through the ODP importer: the angle folds back into the
+        // model, and the transform-positioned frame lands exactly where the
+        // svg-positioned twin does.
+        let back =
+            crate::convert::office_import::odp_to_model(&crate::convert::zip::read_zip(&bytes));
+        let slides = collect_slides(&back);
+        let s0 = slides.first().expect("one slide round-trips");
+        let rot = s0
+            .shapes
+            .iter()
+            .find(|b| b.rotation != crate::model::Rotation::D0)
+            .expect("the rotated shape survives");
+        assert!(
+            (rot.rotation.degrees() - 45.0).abs() < 1e-6,
+            "45° CCW round-trips, got {:?}",
+            rot.rotation
+        );
+        let plain = s0
+            .shapes
+            .iter()
+            .find(|b| b.rotation == crate::model::Rotation::D0)
+            .expect("the straight shape survives");
+        let (rf, pf) = (rot.frame.expect("frame"), plain.frame.expect("frame"));
+        for (got, want, what) in [
+            (rf.x, pf.x, "x"),
+            (rf.y, pf.y, "y"),
+            (rf.w, pf.w, "w"),
+            (rf.h, pf.h, "h"),
+        ] {
+            assert!(
+                (got - want).abs() < 1e-3,
+                "{what}: transform-positioned frame ({got}) must match the \
+svg-positioned twin ({want})"
+            );
+        }
+    }
+
+    #[test]
+    fn odt_tab_stops_emit_style_tab_stops_element() {
+        // `ParagraphStyle.tab_stops` reached DOCX (`<w:tabs>`) but never ODF:
+        // ODT dropped every explicit tab stop. They now land as a
+        // `<style:tab-stops>` *child element* of the automatic style's
+        // paragraph-properties (tab stops are elements, not attributes, so the
+        // shell no longer self-closes). The ODF importer does not read
+        // `style:tab-stops` yet (deferred to the ODF-import wave), so this pins
+        // the emitted shape.
+        const CM: f64 = 28.346_456_7; // 1 cm in pt — positions follow this file's pt convention
+        let tabbed = Paragraph {
+            runs: vec![run("name\t42")],
+            style: ParagraphStyle {
+                tab_stops: vec![
+                    crate::model::TabStop {
+                        pos_pt: 2.0 * CM,
+                        align: crate::model::TabAlign::Left,
+                        leader: '\0',
+                    },
+                    crate::model::TabStop {
+                        pos_pt: 10.0 * CM,
+                        align: crate::model::TabAlign::Right,
+                        leader: '.',
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bytes = odt_from_model(&doc_with(Block {
+            kind: BlockKind::Paragraph(tabbed),
+            ..Default::default()
+        }));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        let want = format!(
+            "<style:paragraph-properties><style:tab-stops>\
+<style:tab-stop style:position=\"{}pt\"/>\
+<style:tab-stop style:position=\"{}pt\" style:type=\"right\" \
+style:leader-style=\"dotted\" style:leader-text=\".\"/>\
+</style:tab-stops></style:paragraph-properties>",
+            num(2.0 * CM),
+            num(10.0 * CM)
+        );
+        assert!(
+            content.contains(&want),
+            "both stops inside the paragraph-properties body: {content}"
+        );
+
+        // A paragraph without explicit stops keeps the self-closing shell.
+        let plain = odt_from_model(&doc_with(para("plain")));
+        let plain_xml = String::from_utf8(entry(&plain, "content.xml").unwrap()).unwrap();
+        assert!(
+            !plain_xml.contains("<style:tab-stops>"),
+            "no stops → no tab-stops element: {plain_xml}"
+        );
+    }
+
+    #[test]
+    fn odt_tab_stops_only_override_forces_automatic_style() {
+        // A paragraph whose ONLY direct formatting is its tab stops used to
+        // take the "no direct formatting" shortcut — referencing the named
+        // style directly and silently dropping the stops. It now gets an
+        // automatic style inheriting the named style, carrying the
+        // `<style:tab-stops>`; and a *named* style's own tab stops reach
+        // `styles.xml` too (Decimal maps to ODF's `char` type on `.`).
+        let tabbed = Paragraph {
+            runs: vec![run("x\ty")],
+            style_ref: Some(StyleId("Body".to_string())),
+            style: ParagraphStyle {
+                tab_stops: vec![crate::model::TabStop {
+                    pos_pt: 72.0,
+                    align: crate::model::TabAlign::Center,
+                    leader: '\0',
+                }],
+                ..Default::default()
+            },
+        };
+        let mut doc = doc_with(Block {
+            kind: BlockKind::Paragraph(tabbed),
+            ..Default::default()
+        });
+        doc.styles
+            .named
+            .insert(StyleId("Body".to_string()), NamedStyle::default());
+        doc.styles.named.insert(
+            StyleId("Fig".to_string()),
+            NamedStyle {
+                para: ParagraphStyle {
+                    tab_stops: vec![crate::model::TabStop {
+                        pos_pt: 100.0,
+                        align: crate::model::TabAlign::Decimal,
+                        leader: '\0',
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let bytes = odt_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains(
+                "style:parent-style-name=\"Body\"><style:paragraph-properties>\
+<style:tab-stops><style:tab-stop style:position=\"72pt\" style:type=\"center\"/>\
+</style:tab-stops></style:paragraph-properties>"
+            ),
+            "tab-stop-only override forces an inheriting automatic style: {content}"
+        );
+        let styles_xml = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
+        assert!(
+            styles_xml.contains(
+                "<style:tab-stops><style:tab-stop style:position=\"100pt\" \
+style:type=\"char\" style:char=\".\"/></style:tab-stops>"
+            ),
+            "named-style tab stops reach styles.xml: {styles_xml}"
+        );
+    }
+
+    #[test]
+    fn docx_table_with_known_widths_pins_fixed_layout() {
+        // With real column widths, Word must not re-autofit the grid: the
+        // exporter pins `w:tblLayout w:type="fixed"`.
+        let bytes = docx_from_model(&sample_doc()); // sample table has col_widths
+        let doc_xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            doc_xml.contains("<w:tblLayout w:type=\"fixed\"/>"),
+            "known widths pin the fixed layout: {doc_xml}"
+        );
+        // A width-less table keeps Word's autofit (no tblLayout).
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![Row {
+                    cells: vec![Cell {
+                        blocks: vec![para("a")],
+                        ..Default::default()
+                    }],
+                    height: None,
+                    is_header: false,
+                }],
+                col_widths: Vec::new(),
+                border: BorderStyle::default(),
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![table],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc);
+        let doc_xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            !doc_xml.contains("<w:tblLayout"),
+            "width-less table keeps autofit: {doc_xml}"
+        );
+    }
+
+    /// A framed slide table whose first row is (or is not) a header.
+    fn slide_table(first_row_header: bool) -> Block {
+        let mk = |t: &str| Cell {
+            blocks: vec![para(t)],
+            ..Default::default()
+        };
+        Block {
+            frame: Some(crate::model::Rect::new(50.0, 50.0, 600.0, 200.0)),
+            kind: BlockKind::Table(Table {
+                rows: vec![
+                    Row {
+                        cells: vec![mk("head")],
+                        height: None,
+                        is_header: first_row_header,
+                    },
+                    Row {
+                        cells: vec![mk("body")],
+                        height: None,
+                        is_header: false,
+                    },
+                ],
+                col_widths: vec![300.0],
+                border: BorderStyle::default(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pptx_table_first_row_follows_row_is_header() {
+        // `firstRow="1" bandRow="1"` was hardcoded on every table: a headerless
+        // table grew a fake styled header and banding no model data asked for.
+        let with_header = pptx_from_model(&bg_slide_doc(None, vec![slide_table(true)]));
+        let slide =
+            String::from_utf8(entry(&with_header, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            slide.contains("<a:tblPr firstRow=\"1\"/>"),
+            "header row → firstRow=1: {slide}"
+        );
+        assert!(!slide.contains("bandRow"), "no unsourced banding: {slide}");
+        // Round trip: `is_header` survives.
+        let model = crate::convert::office_import::pptx_to_model(&read_zip(&with_header));
+        let slides = collect_slides(&model);
+        let table = slides[0]
+            .shapes
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("table survives");
+        assert!(table.rows[0].is_header, "first row is a header again");
+        assert!(!table.rows[1].is_header);
+
+        let headerless = pptx_from_model(&bg_slide_doc(None, vec![slide_table(false)]));
+        let slide =
+            String::from_utf8(entry(&headerless, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            slide.contains("<a:tblPr/>"),
+            "no header row → bare tblPr: {slide}"
+        );
+        let model = crate::convert::office_import::pptx_to_model(&read_zip(&headerless));
+        let slides = collect_slides(&model);
+        let table = slides[0]
+            .shapes
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("table survives");
+        assert!(
+            !table.rows[0].is_header,
+            "no fake header on a headerless table"
+        );
+    }
+
+    // ───────────────────── export-wave E1 fixes ─────────────────────
+
+    /// #1 (DOCX): a review comment is really exported — `word/comments.xml`
+    /// body, `w:commentRangeStart/End` + `w:commentReference` anchor, the
+    /// relationship and content-type — and comes back anchored on re-import.
+    #[test]
+    fn docx_comment_round_trips_with_anchor() {
+        let mut doc = sample_doc();
+        doc.comments = vec![crate::model::Comment {
+            id: "7".to_string(),
+            author: "Reviewer".to_string(),
+            date: "2026-07-01T10:00:00Z".to_string(),
+            text: "Needs a source".to_string(),
+        }];
+        if let BlockKind::Paragraph(p) = &mut doc.sections[0].pages[0].blocks[1].kind {
+            p.runs.push(Inline::CommentRef {
+                id: "7".to_string(),
+            });
+        }
+
+        let bytes = docx_from_model(&doc);
+        let body = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            body.contains("<w:commentRangeStart w:id=\"7\"/>")
+                && body.contains("<w:commentRangeEnd w:id=\"7\"/>")
+                && body.contains("<w:commentReference w:id=\"7\"/>"),
+            "anchor emitted with the (numeric) model id: {body}"
+        );
+        let comments = String::from_utf8(entry(&bytes, "word/comments.xml").unwrap()).unwrap();
+        assert!(
+            comments.contains("w:id=\"7\"")
+                && comments.contains("w:author=\"Reviewer\"")
+                && comments.contains("w:date=\"2026-07-01T10:00:00Z\"")
+                && comments.contains("Needs a source"),
+            "comment body written: {comments}"
+        );
+        let ct = String::from_utf8(entry(&bytes, "[Content_Types].xml").unwrap()).unwrap();
+        assert!(ct.contains("/word/comments.xml"), "content type: {ct}");
+        let rels =
+            String::from_utf8(entry(&bytes, "word/_rels/document.xml.rels").unwrap()).unwrap();
+        assert!(rels.contains("Target=\"comments.xml\""), "rel: {rels}");
+
+        let back = crate::convert::office_import::office_to_model(&bytes).expect("reimport");
+        assert_eq!(back.comments.len(), 1, "comment body survives");
+        assert_eq!(back.comments[0].author, "Reviewer");
+        assert_eq!(back.comments[0].text, "Needs a source");
+        let anchored = back.sections.iter().any(|s| {
+            s.pages.iter().any(|pg| {
+                pg.blocks.iter().any(|b| match &b.kind {
+                    BlockKind::Paragraph(p) => p
+                        .runs
+                        .iter()
+                        .any(|r| matches!(r, Inline::CommentRef { id } if id == "7")),
+                    _ => false,
+                })
+            })
+        });
+        assert!(anchored, "the anchor survives in the run flow");
+    }
+
+    /// #1 (ODT): the same comment becomes an `office:annotation` at its anchor
+    /// point (id via `office:name`, author/date/text) and round-trips.
+    #[test]
+    fn odt_comment_round_trips_as_annotation() {
+        let mut doc = sample_doc();
+        doc.comments = vec![crate::model::Comment {
+            id: "noteA".to_string(),
+            author: "Alice".to_string(),
+            date: "2026-07-01T09:00:00".to_string(),
+            text: "Check this".to_string(),
+        }];
+        if let BlockKind::Paragraph(p) = &mut doc.sections[0].pages[0].blocks[1].kind {
+            p.runs.push(Inline::CommentRef {
+                id: "noteA".to_string(),
+            });
+        }
+
+        let bytes = odt_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("<office:annotation office:name=\"noteA\">")
+                && content.contains("<dc:creator>Alice</dc:creator>")
+                && content.contains("<dc:date>2026-07-01T09:00:00</dc:date>")
+                && content.contains("<text:p>Check this</text:p>"),
+            "annotation emitted at the anchor: {content}"
+        );
+
+        let back = crate::convert::office_import::office_to_model(&bytes).expect("reimport");
+        assert_eq!(back.comments.len(), 1);
+        assert_eq!(back.comments[0].id, "noteA", "office:name keeps the id");
+        assert_eq!(back.comments[0].author, "Alice");
+        assert_eq!(back.comments[0].text, "Check this");
+        let anchored = back.sections.iter().any(|s| {
+            s.pages.iter().any(|pg| {
+                pg.blocks.iter().any(|b| match &b.kind {
+                    BlockKind::Paragraph(p) => p
+                        .runs
+                        .iter()
+                        .any(|r| matches!(r, Inline::CommentRef { id } if id == "noteA")),
+                    _ => false,
+                })
+            })
+        });
+        assert!(anchored, "the anchor survives in the run flow");
+    }
+
+    /// #2: a `PlaceholderRole::Other` with a real OOXML placeholder type (or a
+    /// preserved ODF class with an OOXML equivalent) keeps that role in
+    /// `p:ph type=` instead of being squashed to `body`, and round-trips.
+    #[test]
+    fn pptx_other_placeholder_role_round_trips() {
+        let mk = |text: &str, role: PlaceholderRole, y: f64| crate::model::Placeholder {
+            role,
+            block: Block {
+                frame: Some(crate::model::Rect::new(40.0, y, 400.0, 40.0)),
+                ..para(text)
+            },
+        };
+        let slide = Slide {
+            geometry: PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                ..Default::default()
+            },
+            shapes: vec![],
+            placeholders: vec![
+                mk("The Title", PlaceholderRole::Title, 20.0),
+                mk(
+                    "Confidential",
+                    PlaceholderRole::Other("ftr".to_string()),
+                    480.0,
+                ),
+                mk("3", PlaceholderRole::Other("sldNum".to_string()), 500.0),
+                // A preserved ODF class token maps to its OOXML equivalent.
+                mk(
+                    "2026",
+                    PlaceholderRole::Other("date-time".to_string()),
+                    510.0,
+                ),
+                // A token with no PPTX counterpart still degrades to body.
+                mk("misc", PlaceholderRole::Other("weird".to_string()), 520.0),
+            ],
+            notes: None,
+            background: None,
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let bytes = pptx_from_model(&doc);
+        let slide_xml = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        for ty in ["title", "ftr", "sldNum", "dt"] {
+            assert!(
+                slide_xml.contains(&format!("<p:ph type=\"{ty}\"")),
+                "type {ty} preserved: {slide_xml}"
+            );
+        }
+        assert_eq!(
+            slide_xml.matches("<p:ph type=\"body\"").count(),
+            1,
+            "only the unmappable token degrades to body: {slide_xml}"
+        );
+
+        let back = crate::convert::office_import::pptx_to_model(&read_zip(&bytes));
+        let slides = collect_slides(&back);
+        let roles: Vec<PlaceholderRole> = slides[0]
+            .placeholders
+            .iter()
+            .map(|p| p.role.clone())
+            .collect();
+        assert!(
+            roles.contains(&PlaceholderRole::Other("ftr".to_string())),
+            "footer placeholder stays a footer: {roles:?}"
+        );
+        assert!(
+            roles.contains(&PlaceholderRole::Other("sldNum".to_string())),
+            "slide-number placeholder preserved: {roles:?}"
+        );
+    }
+
+    /// #3: run letter spacing is emitted as `a:rPr@spc` (centipoints).
+    #[test]
+    fn pptx_letter_spacing_emitted_as_spc() {
+        let mut doc = sample_doc();
+        if let BlockKind::Paragraph(p) = &mut doc.sections[0].pages[0].blocks[1].kind {
+            if let Some(Inline::Run(r)) = p.runs.first_mut() {
+                r.style.letter_spacing_pt = 1.2;
+            }
+        }
+        let bytes = pptx_from_model(&doc);
+        let slide_xml = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            slide_xml.contains(" spc=\"120\""),
+            "1.2pt letter spacing → spc=120: {slide_xml}"
+        );
+    }
+
+    /// #4: a hidden run carries `text:display="none"` in its ODT text style
+    /// (the `w:vanish` analogue — previously DOCX-only).
+    #[test]
+    fn odt_hidden_run_emits_text_display_none() {
+        let mut doc = sample_doc();
+        if let BlockKind::Paragraph(p) = &mut doc.sections[0].pages[0].blocks[1].kind {
+            if let Some(Inline::Run(r)) = p.runs.first_mut() {
+                r.style.hidden = true;
+            }
+        }
+        let bytes = odt_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains(" text:display=\"none\""),
+            "hidden run flagged in its span style: {content}"
+        );
+    }
+
+    /// #5: a table nested inside a DrawingML cell — inexpressible in PPTX —
+    /// renders as one tab-separated text line per nested row instead of
+    /// flattening every nested cell into disconnected paragraphs.
+    #[test]
+    fn pptx_nested_table_renders_rows_as_text_lines() {
+        let nested = Table {
+            rows: vec![
+                Row {
+                    cells: vec![
+                        Cell {
+                            blocks: vec![para("h1")],
+                            ..Default::default()
+                        },
+                        Cell {
+                            blocks: vec![para("h2")],
+                            ..Default::default()
+                        },
+                    ],
+                    height: None,
+                    is_header: true,
+                },
+                Row {
+                    cells: vec![
+                        Cell {
+                            blocks: vec![para("a")],
+                            ..Default::default()
+                        },
+                        Cell {
+                            blocks: vec![para("b")],
+                            ..Default::default()
+                        },
+                    ],
+                    height: None,
+                    is_header: false,
+                },
+            ],
+            col_widths: vec![50.0, 50.0],
+            border: Default::default(),
+        };
+        let outer = Table {
+            rows: vec![Row {
+                cells: vec![Cell {
+                    blocks: vec![
+                        para("intro"),
+                        Block {
+                            kind: BlockKind::Table(nested),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                height: None,
+                is_header: false,
+            }],
+            col_widths: vec![200.0],
+            border: Default::default(),
+        };
+        let slide = Slide {
+            geometry: PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                ..Default::default()
+            },
+            shapes: vec![Block {
+                frame: Some(crate::model::Rect::new(10.0, 10.0, 400.0, 200.0)),
+                kind: BlockKind::Table(outer),
+                ..Default::default()
+            }],
+            placeholders: vec![],
+            notes: None,
+            background: None,
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = pptx_from_model(&doc);
+        let slide_xml = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            slide_xml.contains("<a:t>h1\th2</a:t>") && slide_xml.contains("<a:t>a\tb</a:t>"),
+            "nested rows become tab-joined lines: {slide_xml}"
+        );
+    }
+
+    /// #6: heterogeneous slide sizes — the single `p:sldSz` is the **majority**
+    /// size (not the first slide's) and a deviant slide's content is scaled
+    /// proportionally onto it. A homogeneous deck is untouched.
+    #[test]
+    fn pptx_deviant_slide_scales_to_majority_size() {
+        let mk_slide = |w: f64, h: f64, frame: crate::model::Rect| Slide {
+            geometry: PageGeometry {
+                width: w,
+                height: h,
+                ..Default::default()
+            },
+            shapes: vec![Block {
+                frame: Some(frame),
+                ..para("content")
+            }],
+            placeholders: vec![],
+            notes: None,
+            background: None,
+            ..Default::default()
+        };
+        // The deviant HALF-size slide comes first: the old first-slide rule
+        // would have shrunk the whole deck to 480×270.
+        let slides = vec![
+            mk_slide(
+                480.0,
+                270.0,
+                crate::model::Rect::new(10.0, 10.0, 100.0, 50.0),
+            ),
+            mk_slide(
+                960.0,
+                540.0,
+                crate::model::Rect::new(40.0, 40.0, 200.0, 80.0),
+            ),
+            mk_slide(
+                960.0,
+                540.0,
+                crate::model::Rect::new(40.0, 40.0, 200.0, 80.0),
+            ),
+        ];
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock { slides }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = pptx_from_model(&doc);
+        let pres = String::from_utf8(entry(&bytes, "ppt/presentation.xml").unwrap()).unwrap();
+        assert!(
+            pres.contains(&format!(
+                "<p:sldSz cx=\"{}\" cy=\"{}\"/>",
+                emu(960.0),
+                emu(540.0)
+            )),
+            "sldSz is the majority size: {pres}"
+        );
+        let s1 = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            s1.contains(&format!(
+                "<a:off x=\"{}\" y=\"{}\"/><a:ext cx=\"{}\" cy=\"{}\"/>",
+                emu(20.0),
+                emu(20.0),
+                emu(200.0),
+                emu(100.0)
+            )),
+            "deviant slide content scaled ×2 onto the majority box: {s1}"
+        );
+        // ODP mirrors the same normalization in its single page layout.
+        let odp = odp_from_model(&doc);
+        let styles = String::from_utf8(entry(&odp, "styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("fo:page-width=\"960pt\"")
+                && styles.contains("fo:page-height=\"540pt\""),
+            "ODP page layout uses the majority size: {styles}"
+        );
+    }
+
+    /// #7: a table hoisted out of a text-shape body is emitted right after its
+    /// source shape, before later model shapes — sp-tree order = paint order.
+    #[test]
+    fn pptx_hoisted_table_keeps_model_paint_order() {
+        let boxed_table = Block {
+            frame: Some(crate::model::Rect::new(10.0, 10.0, 400.0, 200.0)),
+            kind: BlockKind::TextBox(TextBox {
+                blocks: vec![
+                    para("intro"),
+                    Block {
+                        kind: BlockKind::Table(Table {
+                            rows: vec![Row {
+                                cells: vec![Cell {
+                                    blocks: vec![para("cell")],
+                                    ..Default::default()
+                                }],
+                                height: None,
+                                is_header: false,
+                            }],
+                            col_widths: vec![100.0],
+                            border: Default::default(),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let later = Block {
+            frame: Some(crate::model::Rect::new(10.0, 300.0, 400.0, 40.0)),
+            ..para("AFTER")
+        };
+        let slide = Slide {
+            geometry: PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                ..Default::default()
+            },
+            shapes: vec![boxed_table, later],
+            placeholders: vec![],
+            notes: None,
+            background: None,
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = pptx_from_model(&doc);
+        let slide_xml = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        let tbl_at = slide_xml.find("<a:tbl>").expect("hoisted table emitted");
+        let after_at = slide_xml.find("AFTER").expect("later shape emitted");
+        assert!(
+            tbl_at < after_at,
+            "hoisted table precedes the later model shape (paint order): {slide_xml}"
+        );
+    }
+
+    /// #8: outline entries become Word-canonical `_Toc…` destination bookmarks
+    /// wrapped around their matching headings (and only those).
+    #[test]
+    fn docx_outline_becomes_toc_bookmarks_on_headings() {
+        let heading = |level: u8, text: &str| Block {
+            kind: BlockKind::Heading(Heading {
+                level,
+                para: Paragraph {
+                    runs: vec![run(text)],
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![
+                    Page {
+                        blocks: vec![heading(1, "One"), para("body"), heading(2, "Two")],
+                        absolute: false,
+                    },
+                    Page {
+                        blocks: vec![heading(1, "Three")],
+                        absolute: false,
+                    },
+                ],
+                ..Default::default()
+            }],
+            outline: vec![
+                crate::model::OutlineNode {
+                    title: "One".to_string(),
+                    page: 0,
+                    children: vec![crate::model::OutlineNode {
+                        title: "Two".to_string(),
+                        page: 0,
+                        children: vec![],
+                    }],
+                },
+                crate::model::OutlineNode {
+                    title: "Three".to_string(),
+                    page: 1,
+                    children: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert_eq!(
+            xml.matches("w:name=\"_Toc").count(),
+            3,
+            "one _Toc bookmark per outline entry: {xml}"
+        );
+        // Each bookmarkStart sits immediately before its heading's paragraph.
+        for title in ["One", "Two", "Three"] {
+            let at = xml.find(&format!(">{title}</w:t>")).expect("heading text");
+            let before = &xml[..at];
+            let bm = before
+                .rfind("w:name=\"_Toc")
+                .expect("bookmark before heading");
+            assert!(
+                !before[bm..].contains("</w:p>"),
+                "no other paragraph between the _Toc bookmark and heading {title}"
+            );
+        }
+    }
+
+    /// #9: `cp:lastModifiedBy`/`cp:revision` reach `docProps/core.xml` and come
+    /// back; ODF `meta.xml` preserves the source generator and re-emits the
+    /// description / dates / editing-cycles the importer reads.
+    #[test]
+    fn meta_round_trips_core_and_odf_fields() {
+        let mut doc = sample_doc();
+        doc.meta.title = Some("Spec".to_string());
+        doc.meta.last_modified_by = "Editor Name".to_string();
+        doc.meta.revision = "12".to_string();
+        doc.meta.generator = "Writer/1.0".to_string();
+        doc.meta.editing_cycles = "3".to_string();
+        doc.meta.description = "An abstract".to_string();
+        doc.meta.created = "2019-12-31T23:59:59".to_string();
+        doc.meta.modified = "2020-01-02T03:04:05".to_string();
+
+        let bytes = docx_from_model(&doc);
+        let core = String::from_utf8(entry(&bytes, "docProps/core.xml").unwrap()).unwrap();
+        assert!(
+            core.contains("<cp:lastModifiedBy>Editor Name</cp:lastModifiedBy>")
+                && core.contains("<cp:revision>12</cp:revision>"),
+            "core props carried: {core}"
+        );
+        let back = crate::convert::office_import::office_to_model(&bytes).expect("docx reimport");
+        assert_eq!(back.meta.last_modified_by, "Editor Name");
+        assert_eq!(back.meta.revision, "12");
+
+        let odt = odt_from_model(&doc);
+        let meta = String::from_utf8(entry(&odt, "meta.xml").unwrap()).unwrap();
+        assert!(
+            meta.contains("<meta:generator>Writer/1.0</meta:generator>"),
+            "source generator preserved (not stamped GigaPDF): {meta}"
+        );
+        assert!(
+            meta.contains("<meta:editing-cycles>3</meta:editing-cycles>")
+                && meta.contains("<dc:description>An abstract</dc:description>")
+                && meta.contains("<meta:creation-date>2019-12-31T23:59:59</meta:creation-date>")
+                && meta.contains("<dc:date>2020-01-02T03:04:05</dc:date>"),
+            "ODF meta fields emitted: {meta}"
+        );
+        let back = crate::convert::office_import::office_to_model(&odt).expect("odt reimport");
+        assert_eq!(back.meta.generator, "Writer/1.0");
+        assert_eq!(back.meta.editing_cycles, "3");
+        assert_eq!(back.meta.description, "An abstract");
+        // A document with no recorded generator is stamped GigaPDF.
+        let mut anon = sample_doc();
+        anon.meta.generator = String::new();
+        let meta = String::from_utf8(entry(&odt_from_model(&anon), "meta.xml").unwrap()).unwrap();
+        assert!(meta.contains("<meta:generator>GigaPDF</meta:generator>"));
+    }
+
+    /// #10: an external body hyperlink is the canonical `<w:hyperlink r:id>` +
+    /// `TargetMode="External"` relationship, and survives a round-trip.
+    #[test]
+    fn docx_external_hyperlink_uses_canonical_w_hyperlink() {
+        let mut doc = sample_doc();
+        if let BlockKind::Paragraph(p) = &mut doc.sections[0].pages[0].blocks[1].kind {
+            p.runs.push(Inline::Link {
+                href: LinkTarget::Url("https://example.com/a?b=1&c=2".to_string()),
+                children: vec![run("click")],
+            });
+        }
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains("<w:hyperlink r:id=\"rIdHl1\">"),
+            "canonical hyperlink element: {xml}"
+        );
+        assert!(
+            !xml.contains("HYPERLINK \"https://example.com"),
+            "no field encoding for the body link: {xml}"
+        );
+        let rels =
+            String::from_utf8(entry(&bytes, "word/_rels/document.xml.rels").unwrap()).unwrap();
+        assert!(
+            rels.contains(
+                "Id=\"rIdHl1\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" \
+Target=\"https://example.com/a?b=1&amp;c=2\" TargetMode=\"External\""
+            ),
+            "external relationship written: {rels}"
+        );
+        let back = crate::convert::office_import::office_to_model(&bytes).expect("reimport");
+        let mut found = false;
+        for s in &back.sections {
+            for pg in &s.pages {
+                for b in &pg.blocks {
+                    if let BlockKind::Paragraph(p) = &b.kind {
+                        for r in &p.runs {
+                            if let Inline::Link { href, .. } = r {
+                                if matches!(href, LinkTarget::Url(u) if u == "https://example.com/a?b=1&c=2")
+                                {
+                                    found = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found, "the URL survives the round-trip");
+    }
+
+    /// #11a: no empty-paragraph growth — the section break rides the trailing
+    /// empty paragraph, and an anchored image rides its preceding paragraph
+    /// (the importer's floating-drawing lift then reproduces the model 1:1).
+    #[test]
+    fn docx_section_break_rides_trailing_empty_paragraph() {
+        let doc = Document {
+            sections: vec![
+                Section {
+                    pages: vec![Page {
+                        blocks: vec![
+                            para("first section"),
+                            Block {
+                                kind: BlockKind::Paragraph(Paragraph::default()),
+                                ..Default::default()
+                            },
+                        ],
+                        absolute: false,
+                    }],
+                    ..Default::default()
+                },
+                Section {
+                    pages: vec![Page {
+                        blocks: vec![para("second section")],
+                        absolute: false,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let xml =
+            String::from_utf8(entry(&docx_from_model(&doc), "word/document.xml").unwrap()).unwrap();
+        assert_eq!(
+            xml.matches("<w:p>").count(),
+            3,
+            "content ×2 + the sectPr host — no extra break paragraph: {xml}"
+        );
+        assert!(
+            xml.contains("<w:p><w:pPr><w:sectPr>"),
+            "the trailing empty paragraph hosts the sectPr: {xml}"
+        );
+    }
+
+    /// #11a (images) + #11b (symmetry): the anchored drawing is absorbed into
+    /// its preceding paragraph's `<w:p>` and its frame survives a full
+    /// round-trip unchanged (no ½-flip drift of the Y offset).
+    #[test]
+    fn docx_anchored_image_rides_host_paragraph_and_frame_round_trips() {
+        let mut doc = image_doc("png");
+        doc.sections[0].pages[0].blocks[0].frame =
+            Some(crate::model::Rect::new(360.0, 625.9, 72.0, 72.0));
+        doc.sections[0].pages[0]
+            .blocks
+            .insert(0, para("host paragraph"));
+
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert_eq!(
+            xml.matches("<w:p>").count(),
+            1,
+            "one paragraph hosts both the text and the anchor: {xml}"
+        );
+        assert!(
+            xml.contains("host paragraph") && xml.contains("<wp:anchor "),
+            "text + anchored drawing in the same paragraph: {xml}"
+        );
+
+        let back = crate::convert::office_import::office_to_model(&bytes).expect("reimport");
+        let frame = back
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(_) => b.frame,
+                _ => None,
+            })
+            .expect("image survives");
+        assert!(
+            (frame.y - 625.9).abs() < 0.5,
+            "frame Y is stable across the round-trip (was drifting to ~144): {frame:?}"
+        );
+        assert!((frame.x - 360.0).abs() < 0.5, "frame X stable: {frame:?}");
+    }
+
+    /// #11c: a modeled style reusing a reserved id (`Heading1`) merges into the
+    /// built-in slot — its colour survives instead of being dropped.
+    #[test]
+    fn docx_reserved_heading_style_keeps_its_color() {
+        let mut doc = sample_doc();
+        doc.styles.named.insert(
+            StyleId("Heading1".to_string()),
+            NamedStyle {
+                char_: CharStyle {
+                    color: Some([1.0, 0.0, 0.0]),
+                    bold: true,
+                    size_pt: 16.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let bytes = docx_from_model(&doc);
+        let styles = String::from_utf8(entry(&bytes, "word/styles.xml").unwrap()).unwrap();
+        assert_eq!(
+            styles.matches("w:styleId=\"Heading1\"").count(),
+            1,
+            "exactly one Heading1 definition: {styles}"
+        );
+        let h1 = styles
+            .split("w:styleId=\"Heading1\"")
+            .nth(1)
+            .unwrap()
+            .split("</w:style>")
+            .next()
+            .unwrap();
+        assert!(
+            h1.contains("<w:color w:val=\"FF0000\"/>"),
+            "the modeled colour reaches the reserved style: {h1}"
+        );
+        assert!(
+            h1.contains("<w:outlineLvl w:val=\"0\"/>"),
+            "the heading scaffolding is kept: {h1}"
+        );
+        let back = crate::convert::office_import::office_to_model(&bytes).expect("reimport");
+        let h1 = back
+            .styles
+            .named
+            .get(&StyleId("Heading1".to_string()))
+            .expect("Heading1 present");
+        assert_eq!(h1.char_.color, Some([1.0, 0.0, 0.0]), "colour round-trips");
+    }
+
+    /// #11d: header/footer automatic styles carry the `HF` prefix, so the
+    /// importer's merged style map can no longer resolve a header span against
+    /// an unrelated body style of the same name — the header colour survives.
+    #[test]
+    fn odt_header_run_color_survives_via_prefixed_styles() {
+        let mut doc = sample_doc();
+        doc.sections[0].header = Some(vec![Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: "RUNNING HEADER".to_string(),
+                    style: CharStyle {
+                        color: Some([1.0, 0.0, 0.0]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        let bytes = odt_from_model(&doc);
+        let styles = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("style:name=\"HFT0\"") && styles.contains("fo:color=\"#FF0000\""),
+            "prefixed header span style with its colour in styles.xml: {styles}"
+        );
+        assert!(
+            !content.contains("\"HFT0\""),
+            "the prefixed name cannot collide with content.xml: shared names were \
+resolved against the body's styles"
+        );
+        let back = crate::convert::office_import::office_to_model(&bytes).expect("reimport");
+        let header = back.sections[0].header.as_ref().expect("header survives");
+        let color = header.iter().find_map(|b| match &b.kind {
+            BlockKind::Paragraph(p) => p.runs.iter().find_map(|r| match r {
+                Inline::Run(ir) if ir.text.contains("RUNNING") => ir.style.color,
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(
+            color,
+            Some([1.0, 0.0, 0.0]),
+            "header run colour round-trips"
+        );
+    }
+
+    // ── M2: deferred emissions + model extensions ────────────────────────────
+
+    /// A one-paragraph document whose paragraph carries the given style.
+    fn doc_with_para_style(style: ParagraphStyle, text: &str) -> Document {
+        doc_with(Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                style,
+                runs: vec![run(text)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn m2_docx_direction_page_break_round_trip() {
+        let doc = doc_with_para_style(
+            ParagraphStyle {
+                direction: Some(crate::model::Direction::Rtl),
+                page_break_before: true,
+                ..Default::default()
+            },
+            "שלום",
+        );
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(xml.contains("<w:bidi/>"), "w:bidi emitted: {xml}");
+        assert!(
+            xml.contains("<w:pageBreakBefore/>"),
+            "w:pageBreakBefore emitted"
+        );
+        let back =
+            crate::convert::office_import::docx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let para = back
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) if p.runs.iter().any(|r| matches!(r, Inline::Run(ir) if ir.text.contains("שלום"))) => {
+                    Some(p)
+                }
+                _ => None,
+            })
+            .expect("paragraph survives");
+        assert_eq!(
+            para.style.direction,
+            Some(crate::model::Direction::Rtl),
+            "direction round-trips"
+        );
+        assert!(para.style.page_break_before, "page break intent round-trips");
+    }
+
+    #[test]
+    fn m2_docx_char_style_extras_round_trip() {
+        let styled = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: "Extras".to_string(),
+                    style: CharStyle {
+                        caps: true,
+                        small_caps: false,
+                        dstrike: true,
+                        strike: true, // degraded-fallback pairing
+                        baseline_shift_pt: Some(3.0),
+                        char_scale_pct: Some(150.0),
+                        kern_min_pt: Some(14.0),
+                        size_pt: 12.0,
+                        ..Default::default()
+                    },
+                    source_index: None,
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc_with(styled));
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(xml.contains("<w:caps/>"), "caps: {xml}");
+        assert!(xml.contains("<w:dstrike/>"), "dstrike");
+        assert!(
+            !xml.contains("<w:strike/>"),
+            "single strike suppressed under dstrike"
+        );
+        assert!(xml.contains("<w:position w:val=\"6\"/>"), "position 3pt→6");
+        assert!(xml.contains("<w:w w:val=\"150\"/>"), "char scale 150%");
+        assert!(xml.contains("<w:kern w:val=\"28\"/>"), "kern 14pt→28");
+        // Round-trip through the DOCX importer.
+        let back =
+            crate::convert::office_import::docx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let style = back
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => p.runs.iter().find_map(|r| match r {
+                    Inline::Run(ir) if ir.text.contains("Extras") => Some(ir.style.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("styled run survives");
+        assert!(style.caps, "caps round-trips");
+        assert!(style.dstrike, "dstrike round-trips");
+        assert_eq!(style.baseline_shift_pt, Some(3.0), "position round-trips");
+        assert_eq!(style.char_scale_pct, Some(150.0), "scale round-trips");
+        assert_eq!(style.kern_min_pt, Some(14.0), "kern round-trips");
+    }
+
+    #[test]
+    fn m2_docx_anchor_link_round_trip() {
+        let link = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Link {
+                    href: LinkTarget::Anchor("target1".to_string()),
+                    children: vec![run("jump")],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc_with(link));
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains("<w:hyperlink w:anchor=\"target1\">"),
+            "typed anchor hyperlink emitted: {xml}"
+        );
+        let back =
+            crate::convert::office_import::docx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let survives = back
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .any(|b| match &b.kind {
+                BlockKind::Paragraph(p) => p.runs.iter().any(|r| {
+                    matches!(r, Inline::Link { href: LinkTarget::Anchor(a), .. } if a == "target1")
+                }),
+                _ => None::<()>.is_some(),
+            });
+        assert!(survives, "anchor target survives the round trip");
+    }
+
+    #[test]
+    fn m2_docx_footnotes_part_and_round_trip() {
+        let mut doc = doc_with(Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![
+                    run("body"),
+                    Inline::FootnoteRef {
+                        id: "7".to_string(),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        doc.footnotes.push(crate::model::Footnote {
+            id: "7".to_string(),
+            blocks: vec![para("the note body")],
+        });
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains("<w:footnoteReference w:id=\"7\"/>"),
+            "anchor keeps its numeric id: {xml}"
+        );
+        let notes = String::from_utf8(entry(&bytes, "word/footnotes.xml").unwrap()).unwrap();
+        assert!(notes.contains("w:type=\"separator\""), "stock separators");
+        assert!(
+            notes.contains("<w:footnote w:id=\"7\">"),
+            "note body part: {notes}"
+        );
+        assert!(notes.contains("the note body"));
+        let types = String::from_utf8(entry(&bytes, "[Content_Types].xml").unwrap()).unwrap();
+        assert!(types.contains("/word/footnotes.xml"), "content type");
+        let rels =
+            String::from_utf8(entry(&bytes, "word/_rels/document.xml.rels").unwrap()).unwrap();
+        assert!(rels.contains("Target=\"footnotes.xml\""), "relationship");
+        // Round-trip: the importer folds footnotes back into the model.
+        let back =
+            crate::convert::office_import::docx_to_model(&crate::convert::zip::read_zip(&bytes));
+        assert_eq!(back.footnotes.len(), 1, "one footnote survives");
+        let mut note_text = String::new();
+        for b in &back.footnotes[0].blocks {
+            if let BlockKind::Paragraph(p) = &b.kind {
+                inlines_plain_text(&p.runs, &mut note_text);
+            }
+        }
+        assert!(
+            note_text.contains("the note body"),
+            "note body survives: {note_text:?}"
+        );
+    }
+
+    #[test]
+    fn m2_docx_soft_breaks_reflow_as_spaces() {
+        let styled = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                style: ParagraphStyle {
+                    // break 0 soft (word wrap), break 1 hard (authored).
+                    soft_breaks: vec![true, false],
+                    ..Default::default()
+                },
+                runs: vec![
+                    run("one"),
+                    Inline::LineBreak,
+                    run("two"),
+                    Inline::LineBreak,
+                    run("three"),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc_with(styled));
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert_eq!(
+            xml.matches("<w:br/>").count(),
+            1,
+            "only the hard break stays a w:br: {xml}"
+        );
+        assert!(
+            xml.contains("one ") || xml.contains(">one</w:t>"),
+            "soft break became a space"
+        );
+        // Misaligned classification ⇒ statu quo (both breaks stay hard).
+        let stale = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                style: ParagraphStyle {
+                    soft_breaks: vec![true], // 1 entry for 2 breaks
+                    ..Default::default()
+                },
+                runs: vec![
+                    run("a"),
+                    Inline::LineBreak,
+                    run("b"),
+                    Inline::LineBreak,
+                    run("c"),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc_with(stale));
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert_eq!(xml.matches("<w:br/>").count(), 2, "stale guard holds");
+    }
+
+    #[test]
+    fn m2_docx_numbering_levels_and_prefix() {
+        use crate::model::ListLevelStyle;
+        let list = Block {
+            kind: BlockKind::List(List {
+                ordered: true,
+                marker: ListMarker::Decimal,
+                items: vec![
+                    ListItem {
+                        blocks: vec![para("first")],
+                        level: 0,
+                    },
+                    ListItem {
+                        blocks: vec![para("second")],
+                        level: 1,
+                    },
+                ],
+                start: 1,
+                marker_prefix: Some("(".to_string()),
+                levels: vec![
+                    ListLevelStyle {
+                        marker: ListMarker::Decimal,
+                        suffix: Some('.'),
+                        start: 1,
+                    },
+                    ListLevelStyle {
+                        marker: ListMarker::LowerAlpha,
+                        suffix: Some(')'),
+                        start: 1,
+                    },
+                ],
+                ..List::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc_with(list));
+        let numbering = String::from_utf8(entry(&bytes, "word/numbering.xml").unwrap()).unwrap();
+        assert!(
+            numbering.contains("<w:lvlText w:val=\"(%1.\"/>"),
+            "level 0 keeps decimal + prefix: {numbering}"
+        );
+        assert!(
+            numbering.contains("<w:numFmt w:val=\"lowerLetter\"/>")
+                && numbering.contains("<w:lvlText w:val=\"(%2)\"/>"),
+            "level 1 is lowerLetter with its own suffix"
+        );
+    }
+
+    #[test]
+    fn m2_docx_title_page_and_even_headers() {
+        let mut doc = doc_with(para("body"));
+        {
+            let section = &mut doc.sections[0];
+            section.header = Some(vec![para("default header")]);
+            section.header_first = Some(vec![]); // blank first-page header
+            section.footer_even = Some(vec![para("even footer")]);
+        }
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(xml.contains("<w:titlePg/>"), "titlePg emitted: {xml}");
+        assert!(
+            xml.contains("w:type=\"first\" r:id=\"rIdHdrF1\""),
+            "first header reference"
+        );
+        assert!(
+            xml.contains("w:type=\"even\" r:id=\"rIdFtrE1\""),
+            "even footer reference"
+        );
+        let first = String::from_utf8(entry(&bytes, "word/headerF1.xml").unwrap()).unwrap();
+        assert!(first.contains("<w:p/>"), "blank first header part: {first}");
+        let even = String::from_utf8(entry(&bytes, "word/footerE1.xml").unwrap()).unwrap();
+        assert!(even.contains("even footer"));
+        let settings = String::from_utf8(entry(&bytes, "word/settings.xml").unwrap()).unwrap();
+        assert!(settings.contains("<w:evenAndOddHeaders/>"), "settings part");
+        // Round-trip through the importer's variant capture.
+        let back =
+            crate::convert::office_import::docx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let section = &back.sections[0];
+        assert_eq!(
+            section.header_first,
+            Some(vec![]),
+            "blank first-page header survives as Some(vec![])"
+        );
+        let mut even_text = String::new();
+        for b in section.footer_even.as_ref().expect("even footer survives") {
+            if let BlockKind::Paragraph(p) = &b.kind {
+                inlines_plain_text(&p.runs, &mut even_text);
+            }
+        }
+        assert!(even_text.contains("even footer"));
+    }
+
+    #[test]
+    fn m2_docx_cell_borders_round_trip() {
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![Row {
+                    cells: vec![Cell {
+                        blocks: vec![para("x")],
+                        borders: [
+                            Some(ParaBorder {
+                                width_pt: 1.5,
+                                style: "dashed".to_string(),
+                                color: [1.0, 0.0, 0.0],
+                            }),
+                            None,
+                            None,
+                            Some(ParaBorder {
+                                width_pt: 0.75,
+                                style: "solid".to_string(),
+                                color: [0.0, 0.0, 1.0],
+                            }),
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc_with(table));
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains("<w:tcBorders><w:top w:val=\"dashed\" w:sz=\"12\""),
+            "top side dashed 1.5pt: {xml}"
+        );
+        assert!(
+            xml.contains("<w:right w:val=\"nil\"/>") && xml.contains("<w:bottom w:val=\"nil\"/>"),
+            "unset sides are explicit nil"
+        );
+        let back =
+            crate::convert::office_import::docx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let cell = back
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => t.rows.first().and_then(|r| r.cells.first()).cloned(),
+                _ => None,
+            })
+            .expect("table cell survives");
+        let top = cell.borders[0].as_ref().expect("top border survives");
+        assert_eq!(top.style, "dashed");
+        assert_eq!(top.color, [1.0, 0.0, 0.0]);
+        assert!(cell.borders[1].is_none(), "nil right stays None");
+        let left = cell.borders[3].as_ref().expect("left border survives");
+        assert_eq!(left.color, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn m2_docx_inline_image_size_and_crop() {
+        let mut doc = doc_with(Block {
+            kind: BlockKind::Image(ImageRef {
+                resource: 1,
+                size_pt: Some((144.0, 72.0)),
+                crop: Some([0.1, 0.0, 0.25, 0.0]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        doc.resources.images.insert(
+            1,
+            crate::model::ImageResource {
+                bytes: crate::raster::png::encode_png(1, 1, &[255, 0, 0, 255]),
+                format: "png".to_string(),
+            },
+        );
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains(&format!("<wp:extent cx=\"{}\" cy=\"{}\"/>", emu(144.0), emu(72.0))),
+            "authored size drives wp:extent: {xml}"
+        );
+        assert!(
+            xml.contains("<a:srcRect l=\"10000\" t=\"0\" r=\"25000\" b=\"0\"/>"),
+            "crop emits a:srcRect"
+        );
+        // Round-trip via the DOCX importer (an inline image comes back as an
+        // `Inline::Image` inside its host paragraph).
+        let back =
+            crate::convert::office_import::docx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let img = back
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(i) => Some(i.clone()),
+                BlockKind::Paragraph(p) => p.runs.iter().find_map(|r| match r {
+                    Inline::Image(i) => Some(i.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("image survives");
+        let (w, h) = img.size_pt.expect("size survives");
+        assert!((w - 144.0).abs() < 0.1 && (h - 72.0).abs() < 0.1);
+        assert_eq!(img.crop, Some([0.1, 0.0, 0.25, 0.0]), "crop survives");
+    }
+
+    #[test]
+    fn m2_xlsx_freeze_rotation_diagonal_round_trip() {
+        use crate::model::DiagonalBorder;
+        let sheet = Sheet {
+            name: "S1".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("t".to_string()),
+                    rotation_deg: Some(-45),
+                    diagonal: Some(DiagonalBorder {
+                        up: true,
+                        down: false,
+                        border: BorderStyle {
+                            width: 1.0,
+                            color: [1.0, 0.0, 0.0],
+                        },
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            freeze: Some((2, 1)),
+            ..Default::default()
+        };
+        let doc = doc_with(Block {
+            kind: BlockKind::Sheet(SheetBlock {
+                sheets: vec![sheet],
+            }),
+            ..Default::default()
+        });
+        let bytes = xlsx_from_model(&doc);
+        let ws = String::from_utf8(entry(&bytes, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(
+            ws.contains("<pane xSplit=\"1\" ySplit=\"2\" topLeftCell=\"B3\" \
+activePane=\"bottomRight\" state=\"frozen\"/>"),
+            "frozen pane emitted: {ws}"
+        );
+        let styles = String::from_utf8(entry(&bytes, "xl/styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("textRotation=\"135\""),
+            "-45° → 135 (90 + 45): {styles}"
+        );
+        assert!(
+            styles.contains("diagonalUp=\"1\"") && styles.contains("<diagonal style="),
+            "diagonal border emitted"
+        );
+        // Round-trip through the XLSX importer.
+        let model =
+            crate::convert::office_import::xlsx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let sheet = model
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Sheet(sb) => sb.sheets.first().cloned(),
+                _ => None,
+            })
+            .expect("sheet survives");
+        assert_eq!(sheet.freeze, Some((2, 1)), "freeze round-trips");
+        let cell = &sheet.rows[0].cells[0];
+        assert_eq!(cell.rotation_deg, Some(-45), "rotation round-trips");
+        let diag = cell.diagonal.expect("diagonal round-trips");
+        assert!(diag.up && !diag.down);
+    }
+
+    #[test]
+    fn m2_pptx_gradient_shadow_rtl_round_trip() {
+        use crate::model::{Gradient, GradientStop, Shadow};
+        let shape = Block {
+            frame: Some(crate::model::Rect::new(10.0, 10.0, 100.0, 50.0)),
+            kind: BlockKind::Shape(Shape {
+                segments: vec![
+                    PathSeg::Move(0.0, 0.0),
+                    PathSeg::Line(100.0, 0.0),
+                    PathSeg::Line(100.0, 50.0),
+                    PathSeg::Close,
+                ],
+                fill: Some([1.0, 0.0, 0.0]),
+                fill_gradient: Some(Gradient {
+                    stops: vec![
+                        GradientStop {
+                            pos: 0.0,
+                            color: [1.0, 0.0, 0.0],
+                            alpha: 1.0,
+                        },
+                        GradientStop {
+                            pos: 1.0,
+                            color: [0.0, 0.0, 1.0],
+                            alpha: 0.5,
+                        },
+                    ],
+                    angle_deg: 90.0,
+                }),
+                shadow: Some(Shadow {
+                    dx_pt: 3.0,
+                    dy_pt: 4.0,
+                    blur_pt: 2.0,
+                    color: [0.0, 0.0, 0.0],
+                    alpha: 0.4,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut slide = Slide {
+            shapes: vec![shape],
+            ..Default::default()
+        };
+        slide.background_gradient = Some(crate::model::Gradient {
+            stops: vec![
+                crate::model::GradientStop {
+                    pos: 0.0,
+                    color: [0.9, 0.9, 0.9],
+                    alpha: 1.0,
+                },
+                crate::model::GradientStop {
+                    pos: 1.0,
+                    color: [0.1, 0.1, 0.1],
+                    alpha: 1.0,
+                },
+            ],
+            angle_deg: 45.0,
+        });
+        let doc = doc_with(Block {
+            kind: BlockKind::Slide(SlideBlock {
+                slides: vec![slide],
+            }),
+            ..Default::default()
+        });
+        let bytes = pptx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains("<a:gradFill><a:gsLst><a:gs pos=\"0\">"),
+            "shape gradient stops: {xml}"
+        );
+        assert!(
+            xml.contains("<a:lin ang=\"5400000\" scaled=\"1\"/>"),
+            "90° → 5400000"
+        );
+        assert!(
+            xml.contains("<a:outerShdw blurRad=\"25400\" dist=\"63500\""),
+            "shadow blur 2pt / dist 5pt in EMU"
+        );
+        assert!(
+            xml.contains("<p:bg><p:bgPr><a:gradFill>"),
+            "background gradient primes over the solid fill"
+        );
+        // Round-trip through the PPTX importer.
+        let back =
+            crate::convert::office_import::pptx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let slide = back
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Slide(sb) => sb.slides.first().cloned(),
+                _ => None,
+            })
+            .expect("slide survives");
+        let bg = slide.background_gradient.expect("bg gradient survives");
+        assert_eq!(bg.stops.len(), 2);
+        assert!((bg.angle_deg - 45.0).abs() < 0.01);
+        let shape_grad = slide
+            .shapes
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Shape(s) => s.fill_gradient.clone(),
+                _ => None,
+            })
+            .expect("shape gradient survives");
+        assert_eq!(shape_grad.stops.len(), 2);
+        assert!((shape_grad.stops[1].alpha - 0.5).abs() < 0.01, "stop alpha");
+        let shape_shadow = slide
+            .shapes
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Shape(s) => s.shadow,
+                _ => None,
+            })
+            .expect("shadow survives");
+        assert!((shape_shadow.dx_pt - 3.0).abs() < 0.05, "dx: {shape_shadow:?}");
+        assert!((shape_shadow.dy_pt - 4.0).abs() < 0.05, "dy");
+        assert!((shape_shadow.alpha - 0.4).abs() < 0.01, "alpha");
+    }
+
+    #[test]
+    fn m2_odt_footnote_round_trip_and_anchor_link() {
+        let mut doc = doc_with(Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![
+                    run("body"),
+                    Inline::FootnoteRef {
+                        id: "n1".to_string(),
+                    },
+                    Inline::Link {
+                        href: LinkTarget::Anchor("dest".to_string()),
+                        children: vec![run("jump")],
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        doc.footnotes.push(crate::model::Footnote {
+            id: "n1".to_string(),
+            blocks: vec![para("odt note body")],
+        });
+        let bytes = odt_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("<text:note text:id=\"ftnn1\" text:note-class=\"footnote\">"),
+            "text:note emitted: {content}"
+        );
+        assert!(content.contains("<text:note-citation>1</text:note-citation>"));
+        assert!(content.contains("odt note body"));
+        assert!(
+            content.contains("xlink:href=\"#dest\""),
+            "anchor fragment link"
+        );
+        // Round-trip: the ODT importer reads text:note back.
+        let back =
+            crate::convert::office_import::odt_to_model(&crate::convert::zip::read_zip(&bytes));
+        assert_eq!(back.footnotes.len(), 1, "footnote survives the round trip");
+    }
+
+    #[test]
+    fn m2_odt_char_extras_and_odp_gradient() {
+        // ODT: caps/small-caps/scale attributes on the span style.
+        let styled = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: "Caps".to_string(),
+                    style: CharStyle {
+                        caps: true,
+                        char_scale_pct: Some(200.0),
+                        size_pt: 10.0,
+                        ..Default::default()
+                    },
+                    source_index: None,
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = odt_from_model(&doc_with(styled));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("fo:text-transform=\"uppercase\""),
+            "caps: {content}"
+        );
+        assert!(content.contains("style:text-scale=\"200%\""), "text scale");
+
+        // ODP: a gradient page background registers a draw:gradient definition.
+        let slide = Slide {
+            background_gradient: Some(crate::model::Gradient {
+                stops: vec![
+                    crate::model::GradientStop {
+                        pos: 0.0,
+                        color: [1.0, 0.0, 0.0],
+                        alpha: 1.0,
+                    },
+                    crate::model::GradientStop {
+                        pos: 1.0,
+                        color: [0.0, 0.0, 1.0],
+                        alpha: 1.0,
+                    },
+                ],
+                angle_deg: 0.0, // left→right
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with(Block {
+            kind: BlockKind::Slide(SlideBlock {
+                slides: vec![slide],
+            }),
+            ..Default::default()
+        });
+        let bytes = odp_from_model(&doc);
+        let styles = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("<draw:gradient draw:name=\"Gradient1\" draw:style=\"linear\" \
+draw:start-color=\"#FF0000\" draw:end-color=\"#0000FF\""),
+            "gradient definition in office:styles: {styles}"
+        );
+        assert!(
+            styles.contains("draw:angle=\"2700\""),
+            "0° (L→R) → ODF 270.0 decideg"
+        );
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("draw:fill=\"gradient\" draw:fill-gradient-name=\"Gradient1\""),
+            "drawing-page style references the gradient: {content}"
+        );
+        // Round-trip: the ODP importer resolves the gradient back.
+        let back =
+            crate::convert::office_import::odp_to_model(&crate::convert::zip::read_zip(&bytes));
+        let slide = back
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Slide(sb) => sb.slides.first().cloned(),
+                _ => None,
+            })
+            .expect("slide survives");
+        let g = slide.background_gradient.expect("gradient survives");
+        assert_eq!(g.stops.first().map(|s| s.color), Some([1.0, 0.0, 0.0]));
+        assert_eq!(g.stops.last().map(|s| s.color), Some([0.0, 0.0, 1.0]));
+        assert!((g.angle_deg - 0.0).abs() < 0.01, "angle round-trips");
+    }
+
+    #[test]
+    fn m2_markdown_footnotes_anchor_and_soft_breaks() {
+        let mut doc = doc_with(Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                style: ParagraphStyle {
+                    soft_breaks: vec![true],
+                    ..Default::default()
+                },
+                runs: vec![
+                    run("soft"),
+                    Inline::LineBreak,
+                    run("wrap"),
+                    Inline::FootnoteRef {
+                        id: "a".to_string(),
+                    },
+                    Inline::Link {
+                        href: LinkTarget::Anchor("sec-2".to_string()),
+                        children: vec![run("go")],
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        doc.footnotes.push(crate::model::Footnote {
+            id: "a".to_string(),
+            blocks: vec![para("md note")],
+        });
+        let md = markdown_from_model(&doc);
+        assert!(md.contains("soft wrap"), "soft break re-flows: {md}");
+        assert!(!md.contains("  \n"), "no hard break left");
+        assert!(md.contains("[^a]"), "call marker");
+        assert!(md.contains("[^a]: md note"), "definition list");
+        assert!(md.contains("[go](#sec-2)"), "anchor fragment link");
+    }
+
+    #[test]
+    fn m2_docx_cols_gap_widths_separator_round_trip() {
+        let mut doc = doc_with(para("multi column"));
+        {
+            let geom = &mut doc.sections[0].geometry;
+            geom.column_count = 2;
+            geom.column_gap_pt = Some(24.0);
+            geom.column_widths_pt = Some(vec![200.0, 100.0]);
+            geom.column_separator = true;
+        }
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains("<w:cols w:num=\"2\" w:space=\"480\" w:sep=\"1\" w:equalWidth=\"0\">"),
+            "cols attributes: {xml}"
+        );
+        assert!(
+            xml.contains("<w:col w:w=\"4000\" w:space=\"480\"/><w:col w:w=\"2000\"/>"),
+            "individual column widths (gutter on all but last)"
+        );
+        let back =
+            crate::convert::office_import::docx_to_model(&crate::convert::zip::read_zip(&bytes));
+        let geom = &back.sections[0].geometry;
+        assert_eq!(geom.column_count, 2);
+        assert_eq!(geom.column_gap_pt, Some(24.0), "gap round-trips");
+        assert!(geom.column_separator, "separator round-trips");
+        assert_eq!(
+            geom.column_widths_pt,
+            Some(vec![200.0, 100.0]),
+            "widths round-trip"
         );
     }
 }

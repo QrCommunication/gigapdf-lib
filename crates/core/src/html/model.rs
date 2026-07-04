@@ -33,12 +33,11 @@ pub fn to_model(nodes: &[Node], sheet: &Stylesheet) -> Document {
     Document {
         sections: vec![Section {
             geometry: crate::model::PageGeometry::default(),
-            header: None,
-            footer: None,
             pages: vec![Page {
                 blocks,
                 absolute: false,
             }],
+            ..Default::default()
         }],
         ..Document::default()
     }
@@ -226,7 +225,7 @@ fn emit_list(el: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Elem
         marker,
         items,
         start,
-        marker_suffix: None,
+        ..List::default()
     }))
 }
 
@@ -440,6 +439,7 @@ fn table_cell(td: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Ele
             crate::html::css::VAlign::Middle => Some(crate::model::CellVAlign::Middle),
             crate::html::css::VAlign::Bottom => Some(crate::model::CellVAlign::Bottom),
         },
+        ..Default::default()
     }
 }
 
@@ -517,6 +517,7 @@ fn image_inline(el: &Element) -> Option<Inline> {
     Some(Inline::Image(crate::model::ImageRef {
         resource: fnv1a(src.as_bytes()),
         alt: el.attr("alt").map(|s| s.to_string()),
+        ..Default::default()
     }))
 }
 
@@ -598,6 +599,10 @@ fn char_style(style: &Style) -> CharStyle {
         },
         letter_spacing_pt: style.letter_spacing,
         hidden: style.hidden || style.display == Display::None,
+        // Additive display-transform / metrics fields (caps, small_caps,
+        // dstrike, baseline shift, char scale, kerning) default off — the HTML
+        // importer's computed Style has no counterparts for them yet.
+        ..CharStyle::default()
     }
 }
 

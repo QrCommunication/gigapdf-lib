@@ -21,8 +21,8 @@ use super::lines::ReconLine;
 use super::{median, ruling_orientation, run_char_style, runs_rotation, IdGen, ReconRun, Ruling};
 use crate::content::vector::VectorPath;
 use crate::model::{
-    geom::Rotation, Align, Block, BlockKind, BorderStyle, Cell, Paragraph, ParagraphStyle, Rect,
-    Row, Table,
+    geom::Rotation, Align, Block, BlockKind, BorderStyle, Cell, ParaBorder, Paragraph,
+    ParagraphStyle, Rect, Row, Table,
 };
 
 /// A table the planner found: its grid edges (PDF user space), the line indices
@@ -282,6 +282,11 @@ fn plan_upright(
 ) -> TablePlan {
     let mut plan = TablePlan::default();
 
+    // Rules and filled background rectangles are collected once; the fills feed
+    // BOTH the ruled planner (shaded header/zebra detection) and — fix V3b-6 —
+    // the borderless fallback, whose tables used to lose their backgrounds.
+    let (h_rules, v_rules, fills) = collect_rulings(vpaths, ignore_paths);
+
     // A ruled candidate is only accepted if it looks like a real *data* table
     // and not a **form** layout (dense rules that merely separate fields). When
     // rejected, its lines are left free so they flow back to the normal prose
@@ -290,7 +295,7 @@ fn plan_upright(
     // page each come back as their own grid (the rules are segmented into vertical
     // bands first), so each is gated and kept independently — neither is lost to a
     // fused englobing grid.
-    for t in plan_ruled_all(lines, vpaths, ignore_paths) {
+    for t in plan_ruled_all(lines, &h_rules, &v_rules, &fills) {
         if passes_table_sanity(&t, lines) {
             plan.tables.push(t);
         }
@@ -304,7 +309,7 @@ fn plan_upright(
         .flat_map(|t| t.covered_lines.iter().copied())
         .collect();
     let free: Vec<usize> = (0..lines.len()).filter(|i| !claimed.contains(i)).collect();
-    for t in plan_borderless_all(lines, &free) {
+    for t in plan_borderless_all(lines, &free, &fills) {
         if passes_table_sanity(&t, lines) {
             plan.tables.push(t);
         }
@@ -350,8 +355,11 @@ fn plan_rotated(
     // Plan in projected space exactly as upright. The returned tables index
     // `proj_lines`; we keep those projected tables so we can both (a) compute the
     // free set for the borderless pass and (b) finalise each into a rotated table.
+    // Fills are collected from the projected paths so their rects line up with
+    // the (also-logical) grid edges.
+    let (h_rules, v_rules, fills) = collect_rulings(&proj_paths, ignore_paths);
     let mut ruled: Vec<PlannedTable> = Vec::new();
-    for t in plan_ruled_all(&proj_lines, &proj_paths, ignore_paths) {
+    for t in plan_ruled_all(&proj_lines, &h_rules, &v_rules, &fills) {
         if passes_table_sanity(&t, &proj_lines) {
             ruled.push(t);
         }
@@ -364,7 +372,7 @@ fn plan_rotated(
         .filter(|i| !claimed.contains(i))
         .collect();
     let mut borderless: Vec<PlannedTable> = Vec::new();
-    for t in plan_borderless_all(&proj_lines, &free) {
+    for t in plan_borderless_all(&proj_lines, &free, &fills) {
         if passes_table_sanity(&t, &proj_lines) {
             borderless.push(t);
         }
@@ -852,6 +860,12 @@ pub fn build_table(
     }
 
     let mut rows: Vec<Row> = Vec::with_capacity(n_rows);
+    // Per emitted cell, whether each of its `[top, right, bottom, left]` edges
+    // is actually **drawn** by a rule segment (span-wide probes, same
+    // [`RULE_COVER`] threshold as the merge inference). Collected only for
+    // ruled tables with segments; drives the per-cell border fill below when
+    // the rule work turns out heterogeneous.
+    let mut edge_flags: Vec<[bool; 4]> = Vec::new();
     // Per-row header signals, collected while building so the leading row can be
     // judged against the body once all rows exist:
     //   `any_text`   — the row has at least one non-empty cell,
@@ -910,6 +924,17 @@ pub fn build_table(
             // alignment.
             let align = table.col_align.get(c).copied().unwrap_or(Align::Left);
             let blocks = cell_paragraphs(cell_lines, align, ids);
+            // Probe the emitted cell's own edges (span-wide) so heterogeneous
+            // rule work — a totals row with only a top rule, a boxed header on
+            // an otherwise open grid — can be preserved per cell below.
+            if infer_spans {
+                edge_flags.push([
+                    hrule_present(table, table.rows[r], c, c + cspan),
+                    vrule_present(table, table.cols[c + cspan], r, r + rspan),
+                    hrule_present(table, table.rows[r + rspan], c, c + cspan),
+                    vrule_present(table, table.cols[c], r, r + rspan),
+                ]);
+            }
             cells.push(make_cell(blocks, cspan as u16, rspan as u16, shading));
         }
         row_sig.push(sig);
@@ -943,6 +968,31 @@ pub fn build_table(
         if first.any_text && (bold_header || size_header || shaded_header) {
             if let Some(first_row) = rows.first_mut() {
                 first_row.is_header = true;
+            }
+        }
+    }
+
+    // Heterogeneous rule work → per-cell borders. When every emitted cell has
+    // all four edges drawn (the common fully-ruled grid) the single table-wide
+    // border stays the whole story — byte-identical output. But when some
+    // edges are deliberately absent (a totals row ruled only on top, a boxed
+    // header over an open body), fill [`Cell::borders`] per cell: a drawn edge
+    // becomes a 1pt solid side, an undrawn one an explicit `None` under the
+    // cell's own regime. The table-wide border is kept as-is (the flat
+    // fallback for consumers that ignore per-cell borders). Conservative: only
+    // ruled tables with segments ever collect `edge_flags`.
+    if !edge_flags.is_empty() && edge_flags.iter().any(|f| f.iter().any(|on| !on)) {
+        let mut flags = edge_flags.iter();
+        for row in &mut rows {
+            for cell in &mut row.cells {
+                let Some(f) = flags.next() else { break };
+                cell.borders = f.map(|on| {
+                    on.then(|| ParaBorder {
+                        width_pt: 1.0,
+                        style: "solid".to_string(),
+                        color: [0.0, 0.0, 0.0],
+                    })
+                });
             }
         }
     }
@@ -1127,20 +1177,18 @@ fn absorb_span(
 ///
 /// Lines are read top→bottom; a new paragraph opens where the **blank space**
 /// between two lines exceeds [`CELL_PARA_GAP_RATIO`] of the line height (a clear
-/// inter-paragraph void, not ordinary wrap leading). Within one paragraph the
-/// lines are joined with a single space — exactly the legacy behaviour for a
-/// wrapped cell, so a single-paragraph cell is byte-identical to before. An empty
-/// cell yields **one** empty paragraph so its `blocks[0]` stays a paragraph (the
-/// shape every exporter and the editor expect).
+/// inter-paragraph void, not ordinary wrap leading). Within one paragraph each
+/// physical line is its own run, separated by [`Inline::LineBreak`] — the same
+/// line structure prose paragraphs and list continuations carry, so a consumer
+/// (the editor's line model, the DOCX/ODT exporters' in-cell `<w:br/>` /
+/// `<text:line-break/>`) can tell the cell's lines apart instead of receiving
+/// them flattened into one space-joined run. A single-line paragraph is
+/// byte-identical to before. An empty cell yields **one** empty paragraph so
+/// its `blocks[0]` stays a paragraph (the shape every exporter and the editor
+/// expect).
 fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> Vec<Block> {
     if lines.is_empty() {
-        return vec![cell_paragraph_block(
-            String::new(),
-            None,
-            Vec::new(),
-            align,
-            ids,
-        )];
+        return vec![cell_paragraph_block(Vec::new(), align, ids)];
     }
     // Top→bottom (descending top edge) for deterministic reading order.
     lines.sort_by(|a, b| {
@@ -1150,9 +1198,7 @@ fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> V
     });
 
     let mut blocks: Vec<Block> = Vec::new();
-    let mut text = String::new();
-    let mut style: Option<crate::model::CharStyle> = None;
-    let mut src: Vec<usize> = Vec::new();
+    let mut para: Vec<&CellLine> = Vec::new();
     let mut prev: Option<&CellLine> = None;
     for line in &lines {
         let new_para = match prev {
@@ -1163,27 +1209,13 @@ fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> V
             }
             None => false,
         };
-        if new_para && !text.is_empty() {
-            blocks.push(cell_paragraph_block(
-                std::mem::take(&mut text),
-                style.take(),
-                std::mem::take(&mut src),
-                align,
-                ids,
-            ));
+        if new_para && !para.is_empty() {
+            blocks.push(cell_paragraph_block(std::mem::take(&mut para), align, ids));
         }
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(&line.text);
-        if style.is_none() {
-            style = line.style.clone();
-        }
-        // Every line's runs stay addressable in the joined cell run.
-        src.extend(line.src.iter().copied());
+        para.push(line);
         prev = Some(line);
     }
-    blocks.push(cell_paragraph_block(text, style, src, align, ids));
+    blocks.push(cell_paragraph_block(para, align, ids));
     blocks
 }
 
@@ -1193,26 +1225,26 @@ fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> V
 /// stays one paragraph; a real blank-line break (≈ a full line of space) splits.
 const CELL_PARA_GAP_RATIO: f64 = 0.6;
 
-/// One paragraph [`Block`] for a cell: `text` as a single run (empty ⇒ no runs,
-/// so an empty cell's paragraph has empty runs), carrying the paragraph's
-/// representative `style`/`source_index` and the column `align`.
-fn cell_paragraph_block(
-    text: String,
-    style: Option<crate::model::CharStyle>,
-    source_indices: Vec<usize>,
-    align: Align,
-    ids: &mut IdGen,
-) -> Block {
+/// One paragraph [`Block`] for a cell: each physical line as its own run (its
+/// own style + source ordinals), separated by [`Inline::LineBreak`] so the
+/// line structure survives into the model (an empty `lines` ⇒ no runs, so an
+/// empty cell's paragraph has empty runs). Carries the column `align`.
+fn cell_paragraph_block(lines: Vec<&CellLine>, align: Align, ids: &mut IdGen) -> Block {
     use crate::model::{Inline, InlineRun};
-    let runs = if text.is_empty() {
-        Vec::new()
-    } else {
-        vec![Inline::Run(InlineRun {
-            text,
-            style: style.unwrap_or_default(),
-            source_index: (!source_indices.is_empty()).then_some(source_indices),
-        })]
-    };
+    let mut runs: Vec<Inline> = Vec::new();
+    for line in lines {
+        if line.text.is_empty() {
+            continue;
+        }
+        if !runs.is_empty() {
+            runs.push(Inline::LineBreak);
+        }
+        runs.push(Inline::Run(InlineRun {
+            text: line.text.clone(),
+            style: line.style.clone().unwrap_or_default(),
+            source_index: (!line.src.is_empty()).then(|| line.src.clone()),
+        }));
+    }
     Block {
         id: ids.mint(),
         frame: None,
@@ -1238,7 +1270,7 @@ fn make_cell(blocks: Vec<Block>, col_span: u16, row_span: u16, shading: Option<[
         col_span: col_span.max(1),
         row_span: row_span.max(1),
         shading,
-        vertical_align: None,
+        ..Default::default()
     }
 }
 
@@ -1362,23 +1394,18 @@ struct RuleBand {
 /// ([`BAND_MIN_GAP`]) keeps slivers from over-splitting.
 const BAND_MIN_GAP: f64 = 6.0;
 
-/// Plan **all** ruled tables on the page. Rules are first segmented into vertical
-/// connected components (bands separated by a rule-free gap); each band that
-/// still has ≥ 2 column edges and ≥ 2 row edges becomes its own [`PlannedTable`].
-/// Replaces the previous single-grid planner so two tables stacked on one page are
-/// no longer fused into one englobing grid (which the sanity gate then dropped,
-/// losing both).
-fn plan_ruled_all(
-    lines: &[ReconLine],
+/// Collect the page's ruling segments and filled background rectangles from its
+/// painted paths. Filled backgrounds (header tints, zebra rows) are captured
+/// alongside the rules so both the ruled planner and — fix V3b-6 — the
+/// borderless fallback can shade cells and flag a shaded header. In
+/// `plan_rotated` the paths are already projected into the logical frame, so
+/// everything lines up with the (also-logical) grid edges.
+fn collect_rulings(
     vpaths: &[VectorPath],
     ignore_paths: &BTreeSet<usize>,
-) -> Vec<PlannedTable> {
+) -> (Vec<HSeg>, Vec<VSeg>, Vec<Shade>) {
     let mut h_rules: Vec<HSeg> = Vec::new();
     let mut v_rules: Vec<VSeg> = Vec::new();
-    // Filled background rectangles (header tints, zebra rows) captured alongside
-    // the rules so [`build_ruled_band`] can shade cells and flag a shaded header
-    // (gap #75, sub-item 2). In `plan_rotated` the paths are already projected into
-    // the logical frame, so these line up with the (also-logical) grid edges.
     let mut fills: Vec<Shade> = Vec::new();
 
     for vp in vpaths {
@@ -1409,11 +1436,35 @@ fn plan_ruled_all(
             }
         }
     }
-    if h_rules.len() < 2 || v_rules.len() < 2 {
+    (h_rules, v_rules, fills)
+}
+
+/// Plan **all** ruled tables on the page. Rules are first segmented into vertical
+/// connected components (bands separated by a rule-free gap); each band that
+/// still has ≥ 2 column edges and ≥ 2 row edges becomes its own [`PlannedTable`].
+/// Replaces the previous single-grid planner so two tables stacked on one page are
+/// no longer fused into one englobing grid (which the sanity gate then dropped,
+/// losing both).
+///
+/// Fix V3b-5: a page with horizontal rules but **fewer than two vertical
+/// rules** is no longer a dead end. Scientific *booktabs* tables draw 2–3
+/// full-width horizontal rules and **no** verticals; they route to
+/// [`plan_hrule_only_tables`], which scopes the borderless column/row inference
+/// to the text framed by matching rules.
+fn plan_ruled_all(
+    lines: &[ReconLine],
+    h_rules: &[HSeg],
+    v_rules: &[VSeg],
+    fills: &[Shade],
+) -> Vec<PlannedTable> {
+    if h_rules.len() < 2 {
         return Vec::new();
     }
+    if v_rules.len() < 2 {
+        return plan_hrule_only_tables(lines, h_rules, fills);
+    }
 
-    let bands = segment_rule_bands(&h_rules, &v_rules);
+    let bands = segment_rule_bands(h_rules, v_rules);
 
     let mut out: Vec<PlannedTable> = Vec::new();
     for band in &bands {
@@ -1441,6 +1492,154 @@ fn plan_ruled_all(
         if let Some(t) = build_ruled_band(lines, &band_h, &band_v, &band_fills) {
             out.push(t);
         }
+    }
+    out
+}
+
+// ── booktabs-style tables: horizontal rules only (fix V3b-5) ─────────────────
+
+/// Two horizontal rules belong to the same **frame group** when their X extents
+/// match within this tolerance — booktabs top/mid/bottom rules are drawn at the
+/// exact same span, whereas a form's scattered field underlines are not.
+const BOOKTABS_X_TOL: f64 = 6.0;
+
+/// The frame rules must cover at least this fraction of the framed text's width.
+/// Booktabs rules run the full table width; a field underline covers only its
+/// own input box, far less than the label + field row around it.
+const BOOKTABS_RULE_TEXT_COVER: f64 = 0.8;
+
+/// The framed text must fill at least this fraction of the rule band's height.
+/// A booktabs frame hugs its content; two page-decoration rules (a letterhead
+/// top rule + a footer rule) enclose far more whitespace than text, and the
+/// content between them is left to the ordinary borderless pass instead (which
+/// does not consume the decoration rules).
+const BOOKTABS_TEXT_FILL_MIN: f64 = 0.5;
+
+/// Plan tables framed by **horizontal rules only** — the scientific *booktabs*
+/// convention: 2–3 full-width horizontal rules (top rule, optional mid rule
+/// under the header, bottom rule) and **no vertical rules at all**. The old
+/// planner demanded ≥ 2 verticals, so these tables fell through to the
+/// unscoped borderless heuristic or to nothing.
+///
+/// Matching rules (same X extent) are grouped into a frame; the text between
+/// the frame's top and bottom rules, horizontally inside the rules' span, gets
+/// the borderless column/row inference ([`build_borderless_region`]) — columns
+/// from the runs' x-clusters, rows from the baselines — plus the frame's exact
+/// outer edges, and the table claims the rule paths so they are not re-emitted
+/// as stray shapes. All the usual gates still apply (≥ 2 columns, ≥ 2 rows with
+/// a real inter-cell gutter, then [`passes_table_sanity`] in the caller), so a
+/// run of prose between two section rules is not promoted.
+fn plan_hrule_only_tables(
+    lines: &[ReconLine],
+    h_rules: &[HSeg],
+    fills: &[Shade],
+) -> Vec<PlannedTable> {
+    // Group the rules by shared X extent (the booktabs frame signature).
+    let mut groups: Vec<Vec<HSeg>> = Vec::new();
+    'seg: for &s in h_rules {
+        for g in &mut groups {
+            if (g[0].x0 - s.x0).abs() <= BOOKTABS_X_TOL && (g[0].x1 - s.x1).abs() <= BOOKTABS_X_TOL
+            {
+                g.push(s);
+                continue 'seg;
+            }
+        }
+        groups.push(vec![s]);
+    }
+
+    let mut out: Vec<PlannedTable> = Vec::new();
+    let mut claimed_lines: BTreeSet<usize> = BTreeSet::new();
+    for g in &groups {
+        if g.len() < 2 {
+            continue;
+        }
+        let y_top = g.iter().map(|s| s.y).fold(f64::NEG_INFINITY, f64::max);
+        let y_bot = g.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
+        if y_top - y_bot <= EDGE_TOL {
+            continue; // coincident strokes, not a frame.
+        }
+        let x_lo = g.iter().map(|s| s.x0).fold(f64::INFINITY, f64::min);
+        let x_hi = g.iter().map(|s| s.x1).fold(f64::NEG_INFINITY, f64::max);
+
+        // The lines the frame encloses: centre between the outer rules, X extent
+        // inside the rules' span. A caption above the top rule stays out.
+        let scoped: Vec<usize> = (0..lines.len())
+            .filter(|&i| {
+                let l = &lines[i];
+                let cy = l.center_y();
+                cy < y_top
+                    && cy > y_bot
+                    && l.x >= x_lo - EDGE_TOL
+                    && l.x + l.w <= x_hi + EDGE_TOL
+                    && !claimed_lines.contains(&i)
+            })
+            .collect();
+        if scoped.len() < 2 {
+            continue;
+        }
+
+        // The rules must span the framed text and hug it vertically.
+        let t_lo = scoped
+            .iter()
+            .map(|&i| lines[i].x)
+            .fold(f64::INFINITY, f64::min);
+        let t_hi = scoped
+            .iter()
+            .map(|&i| lines[i].x + lines[i].w)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if (x_hi - x_lo) < (t_hi - t_lo).max(1.0) * BOOKTABS_RULE_TEXT_COVER {
+            continue;
+        }
+        let cy_lo = scoped
+            .iter()
+            .map(|&i| lines[i].center_y())
+            .fold(f64::INFINITY, f64::min);
+        let cy_hi = scoped
+            .iter()
+            .map(|&i| lines[i].center_y())
+            .fold(f64::NEG_INFINITY, f64::max);
+        if (cy_hi - cy_lo) < (y_top - y_bot) * BOOKTABS_TEXT_FILL_MIN {
+            continue;
+        }
+
+        // Borderless column/row inference over the framed lines (top→bottom).
+        let mut heights: Vec<f64> = scoped
+            .iter()
+            .flat_map(|&i| lines[i].runs.iter().map(|r| r.h.max(1.0)))
+            .collect();
+        let h_med = median(&mut heights, 10.0);
+        let col_gap = (h_med * 2.0).max(16.0);
+        let mut region = scoped.clone();
+        region.sort_by(|&a, &b| {
+            lines[b]
+                .center_y()
+                .partial_cmp(&lines[a].center_y())
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        let Some(mut table) = build_borderless_region(lines, &region, h_med, col_gap, fills)
+        else {
+            continue;
+        };
+
+        // Frame-true outer edges (the drawn rules bound the table exactly), and
+        // the rules are consumed so the page does not re-emit them as shapes.
+        // Every scoped run centre lies inside the frame by construction, so
+        // widening the outer edges never drops a run from its cell.
+        if let Some(first) = table.rows.first_mut() {
+            *first = first.max(y_top);
+        }
+        if let Some(last) = table.rows.last_mut() {
+            *last = last.min(y_bot);
+        }
+        if let Some(first) = table.cols.first_mut() {
+            *first = first.min(x_lo);
+        }
+        if let Some(last) = table.cols.last_mut() {
+            *last = last.max(x_hi);
+        }
+        table.used_paths.extend(g.iter().map(|s| s.path));
+        claimed_lines.extend(table.covered_lines.iter().copied());
+        out.push(table);
     }
     out
 }
@@ -1653,18 +1852,58 @@ fn cluster_edges(values: impl Iterator<Item = f64>) -> Vec<f64> {
 
 /// Estimate the abscissa of a numeric run's **decimal separator** (the decimal
 /// tab a financial column aligns on), or `None` when the run is not a decimal
-/// value. This is the R10 refinement of R8: amounts with *different* decimal
-/// counts (`1,5` / `12,00` / `3,75`) share neither a right edge nor a left edge
-/// but DO share the X of their `,` (or `.`). Returns the X of the last decimal
-/// separator so `1.234,00` aligns on its `,`, not on a thousands `.`.
+/// value. Convenience wrapper over [`decimal_sep_x_at`] that picks the advance
+/// model from the run's own font (fix V3b-8): the position is no longer always
+/// computed with hard-coded Helvetica widths — a monospaced run (Courier &
+/// friends, where the separator advances a full digit width, not half of one)
+/// uses uniform advances instead. See [`run_uses_mono_advances`].
+fn decimal_sep_x(run: &ReconRun) -> Option<f64> {
+    decimal_sep_x_at(&run.text, run.x, run.w, run_uses_mono_advances(run))
+}
+
+/// Whether a run's glyph advances should be modelled as **monospaced** (every
+/// glyph the same width) rather than tabular-proportional (digits wide, the
+/// separators half a digit — the near-universal tabular-numeral geometry of
+/// Helvetica, Times, Arial, …).
 ///
-/// The position is approximated proportionally from the run's box: a run spans
-/// `[x, x + w]`, so the separator at character offset `k` of an `n`-character
-/// string sits at roughly `x + w * (k / n)`. This assumes near-monospaced digit
-/// advance, which holds well enough for clustering (a tolerance absorbs the
-/// drift). `text` is trimmed first so leading currency/sign/space don't bias the
-/// ratio — the trimmed offsets are mapped back onto the original box width.
-fn decimal_sep_x(text: &str, x: f64, w: f64) -> Option<f64> {
+/// Two independent signals, either suffices:
+/// 1. the font family names a monospaced face (`Courier`, `…Mono`, subset
+///    prefixes included);
+/// 2. the run's **measured width** agrees with the monospace prediction
+///    (`0.6 em` per glyph) clearly better than with the proportional one, *and*
+///    is close to it in absolute terms — so a synthetic/degenerate box (a width
+///    wildly inconsistent with the font size) never flips the model.
+fn run_uses_mono_advances(run: &ReconRun) -> bool {
+    let family = run.style.family.to_ascii_lowercase();
+    if family.contains("courier") || family.contains("mono") {
+        return true;
+    }
+    if run.size <= 0.0 || run.w <= 0.0 {
+        return false;
+    }
+    let trimmed = run.text.trim();
+    let n = trimmed.chars().count();
+    if n == 0 {
+        return false;
+    }
+    let prop_units: f64 = trimmed.chars().map(char_advance).sum();
+    let prop_w = run.size * prop_units / 1000.0;
+    let mono_w = run.size * 0.6 * n as f64;
+    let (prop_err, mono_err) = ((run.w - prop_w).abs(), (run.w - mono_w).abs());
+    // Trust the mono reading only when it explains the measured width well
+    // (within 10 %) and the proportional model does not.
+    mono_err < mono_w * 0.10 && prop_err > prop_w * 0.10 && mono_err < prop_err
+}
+
+/// Locate the decimal separator inside the trimmed `text` of a run box
+/// `[x, x + w]`. This is the R10 refinement of R8: amounts with *different*
+/// decimal counts (`1,5` / `12,00` / `3,75`) share neither a right edge nor a
+/// left edge but DO share the X of their `,` (or `.`). Returns the X of the
+/// last decimal separator so `1.234,00` aligns on its `,`, not on a thousands
+/// `.`. `mono` selects the advance model (see [`run_uses_mono_advances`]);
+/// `text` is trimmed first so leading currency/sign/space don't bias the ratio —
+/// the trimmed offsets are mapped back onto the original box width.
+fn decimal_sep_x_at(text: &str, x: f64, w: f64, mono: bool) -> Option<f64> {
     if w <= 0.0 {
         return None;
     }
@@ -1716,28 +1955,32 @@ fn decimal_sep_x(text: &str, x: f64, w: f64) -> Option<f64> {
     }
     let sep_idx = sep_idx?;
     // Place X at the *centre of the separator's own advance* over the run's total
-    // advance, weighting every glyph by [`char_advance`] (per-glyph advances, gap
-    // #75 sub-item 3). A uniform `(sep_idx + 0.5) / n` split assumes monospaced
-    // glyphs and drifts on a proportional face (the narrow `,`/`.` counts the same
-    // as a wide digit); summing real advances tracks the ink. Mapped onto the
-    // original box `[x, x + w]` over the trimmed advances (leading trimmed chars
-    // shift the text right but the proportional centre stays stable).
-    let total: f64 = chars.iter().map(|&c| char_advance(c)).sum();
+    // advance, weighting every glyph by the chosen model (per-glyph advances, gap
+    // #75 sub-item 3; model per font, fix V3b-8). On a proportional face the
+    // narrow `,`/`.` advances half a digit ([`char_advance`]); on a monospaced
+    // face every glyph advances the same, so the weights are uniform. Mapped onto
+    // the original box `[x, x + w]` over the trimmed advances (leading trimmed
+    // chars shift the text right but the proportional centre stays stable).
+    let advance = |c: char| if mono { 600.0 } else { char_advance(c) };
+    let total: f64 = chars.iter().map(|&c| advance(c)).sum();
     if total <= 0.0 {
         return None;
     }
-    let before: f64 = chars[..sep_idx].iter().map(|&c| char_advance(c)).sum();
-    let ratio = (before + char_advance(chars[sep_idx]) / 2.0) / total;
+    let before: f64 = chars[..sep_idx].iter().map(|&c| advance(c)).sum();
+    let ratio = (before + advance(chars[sep_idx]) / 2.0) / total;
     Some(x + w * ratio)
 }
 
-/// Approximate per-glyph advance width in Helvetica-style 1000-unit em metrics,
-/// used by [`decimal_sep_x`] to locate a decimal separator inside a run box far
-/// more accurately than a uniform `1 / n` split. Digits are wide (556) while the
-/// decimal/thousands separators and spaces are narrow (278); the absolute scale
-/// cancels in the ratio, so only the *relative* widths matter. An unknown glyph
-/// falls back to a digit-like advance so a stray currency/sign glyph never skews
-/// the estimate toward zero.
+/// Approximate per-glyph advance width in **tabular-numeral** 1000-unit em
+/// metrics — the geometry virtually every proportional text face shares for
+/// figures (digits all one width, the separators about half of it; Helvetica
+/// 556/278, Times 500/250, Arial 556/278 — the *ratios* coincide even though
+/// the absolute widths differ, and only the ratios survive into the position
+/// estimate). Used by [`decimal_sep_x_at`] to locate a decimal separator inside
+/// a run box far more accurately than a uniform `1 / n` split; a monospaced run
+/// bypasses this table for uniform advances (fix V3b-8, see
+/// [`run_uses_mono_advances`]). An unknown glyph falls back to a digit-like
+/// advance so a stray currency/sign glyph never skews the estimate toward zero.
 fn char_advance(c: char) -> f64 {
     match c {
         '0'..='9' => 556.0,
@@ -2111,7 +2354,14 @@ fn line_has_gutter(line: &ReconLine, gutter_min: f64) -> bool {
 /// own grid with **region-local**, alignment-aware columns (see [`detect_columns`]),
 /// so two stacked lists with different column layouts are not fused into one
 /// englobing grid (which the sanity gate could then drop, losing both).
-fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable> {
+/// `fills` are the page's filled background rectangles — fix V3b-6: a borderless
+/// table backed by tints (zebra stripes, a shaded header) now carries them as
+/// cell shadings instead of dropping them.
+fn plan_borderless_all(
+    lines: &[ReconLine],
+    free: &[usize],
+    fills: &[Shade],
+) -> Vec<PlannedTable> {
     if free.len() < 2 {
         return Vec::new();
     }
@@ -2125,7 +2375,7 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
     let mut heights: Vec<f64> = Vec::new();
     for &i in free {
         for r in &lines[i].runs {
-            edges.push((r.x, r.x + r.w, decimal_sep_x(&r.text, r.x, r.w)));
+            edges.push((r.x, r.x + r.w, decimal_sep_x(r)));
             heights.push(r.h.max(1.0));
         }
     }
@@ -2147,7 +2397,7 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
     for &i in free {
         let mut hit: BTreeSet<usize> = BTreeSet::new();
         for r in &lines[i].runs {
-            let dec = decimal_sep_x(&r.text, r.x, r.w);
+            let dec = decimal_sep_x(r);
             if let Some(c) = column_of_run(&global_columns, r.x, r.x + r.w, dec, col_gap) {
                 hit.insert(c);
             }
@@ -2187,7 +2437,7 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
 
     let mut out: Vec<PlannedTable> = Vec::new();
     for region in &regions {
-        if let Some(t) = build_borderless_region(lines, region, h_med, col_gap) {
+        if let Some(t) = build_borderless_region(lines, region, h_med, col_gap, fills) {
             out.push(t);
         }
     }
@@ -2196,12 +2446,15 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
 
 /// Build one borderless table from a vertical region of candidate rows, using
 /// **region-local**, alignment-aware columns. Re-validates the ≥ 2 rows / ≥ 2
-/// columns gate so a region that no longer looks tabular on its own is dropped.
+/// columns gate so a region that no longer looks tabular on its own is dropped,
+/// and vetoes a region that reads as side-by-side **prose columns** (fix V3b-1).
+/// `fills` are candidate cell backgrounds (fix V3b-6).
 fn build_borderless_region(
     lines: &[ReconLine],
     region: &[usize],
     h_med: f64,
     col_gap: f64,
+    fills: &[Shade],
 ) -> Option<PlannedTable> {
     if region.len() < 2 {
         return None;
@@ -2211,7 +2464,7 @@ fn build_borderless_region(
     let mut edges: Vec<(f64, f64, Option<f64>)> = Vec::new();
     for &i in region {
         for r in &lines[i].runs {
-            edges.push((r.x, r.x + r.w, decimal_sep_x(&r.text, r.x, r.w)));
+            edges.push((r.x, r.x + r.w, decimal_sep_x(r)));
         }
     }
     let columns = detect_columns(&edges, col_gap);
@@ -2226,7 +2479,7 @@ fn build_borderless_region(
     for &i in region {
         let mut hit: BTreeSet<usize> = BTreeSet::new();
         for r in &lines[i].runs {
-            let dec = decimal_sep_x(&r.text, r.x, r.w);
+            let dec = decimal_sep_x(r);
             if let Some(c) = column_of_run(&columns, r.x, r.x + r.w, dec, col_gap) {
                 hit.insert(c);
             }
@@ -2238,18 +2491,44 @@ fn build_borderless_region(
     if row_lines.len() < 2 {
         return None;
     }
+    // Fix V3b-1: two side-by-side columns of running text whose baselines happen
+    // to align look exactly like a 2-column borderless grid to the gates above —
+    // and materialising them INTERLEAVES the reading order (row 1 = line 1 of
+    // both columns, …). When every "column" is a stack of full text lines, this
+    // is page layout, not a table.
+    if region_is_prose_columns(lines, &row_lines, &columns, col_gap, h_med) {
+        return None;
+    }
 
-    // Column edges midway between adjacent columns' centres (extend out at the
-    // ends). Using the centre-of-mass — not the alignment anchor — keeps the
-    // boundary between a left- and a right-aligned column on the visual gap
-    // between them, so every run's *centre* still lands in the right cell.
+    // Column edges midway between adjacent columns' centres. Using the
+    // centre-of-mass — not the alignment anchor — keeps the boundary between a
+    // left- and a right-aligned column on the visual gap between them, so every
+    // run's *centre* still lands in the right cell.
+    //
+    // Fix V3b-7: the OUTER edges hug the region's real content — the min left /
+    // max right edge of the accepted rows' runs, plus a symmetric half-gap
+    // margin — instead of the flat `centre ± k × col_gap` bounds. The old
+    // `+ 4 × col_gap` right edge inflated the last column's width (and DOCX's
+    // column widths with it); the old centre-based left edge could even sit
+    // *right of* a left-aligned first column's runs (a wide cell pulls the
+    // centre-of-mass right), silently dropping their text from the grid. Every
+    // run's centre lies within its own box, so content-true outer edges keep
+    // every run on the grid.
     let centers: Vec<f64> = columns.iter().map(|c| c.center).collect();
+    let content_lo = row_lines
+        .iter()
+        .flat_map(|&i| lines[i].runs.iter().map(|r| r.x))
+        .fold(f64::INFINITY, f64::min);
+    let content_hi = row_lines
+        .iter()
+        .flat_map(|&i| lines[i].runs.iter().map(super::ReconRun::right))
+        .fold(f64::NEG_INFINITY, f64::max);
     let mut cols: Vec<f64> = Vec::with_capacity(centers.len() + 1);
-    cols.push(centers[0] - col_gap / 2.0);
+    cols.push(content_lo.min(centers[0]) - col_gap / 2.0);
     for w in centers.windows(2) {
         cols.push((w[0] + w[1]) / 2.0);
     }
-    cols.push(*centers.last().unwrap() + col_gap * 4.0);
+    cols.push(content_hi.max(*centers.last().unwrap()) + col_gap / 2.0);
     let col_align: Vec<Align> = columns.iter().map(|c| c.align).collect();
 
     // Row edges from the tabular rows' centres (descending Y).
@@ -2269,12 +2548,32 @@ fn build_borderless_region(
     // interior rule (as ruled tables do). Instead, infer spans directly from text
     // geometry: a run whose box covers several column/row bands is a merged cell.
     let spans = borderless_spans(lines, &row_lines, &cols, &rows);
+
+    // Fix V3b-6: background fills sitting (mostly) inside the grid extent are
+    // this table's cell shadings — zebra stripes, a tinted header — and their
+    // paths are consumed so the page does not also emit them as shapes. The
+    // ≥-half-area containment keeps a page-band decoration that merely brushes
+    // the table with the page.
+    let (gx_lo, gx_hi) = (cols[0], *cols.last()?);
+    let (gy_top, gy_bot) = (rows[0], *rows.last()?);
+    let shadings: Vec<Shade> = fills
+        .iter()
+        .copied()
+        .filter(|s| {
+            let ix = (s.x1.min(gx_hi) - s.x0.max(gx_lo)).max(0.0);
+            let iy = (s.y1.min(gy_top) - s.y0.max(gy_bot)).max(0.0);
+            let area = ((s.x1 - s.x0) * (s.y1 - s.y0)).max(f64::EPSILON);
+            ix * iy >= area * 0.5
+        })
+        .collect();
+    let used_paths: BTreeSet<usize> = shadings.iter().map(|s| s.path).collect();
+
     Some(PlannedTable {
         cols,
         rows,
         ruled: false,
         covered_lines: covered,
-        used_paths: BTreeSet::new(),
+        used_paths,
         start_line,
         // Borderless tables have no rules, so the rule-based merge inference cannot
         // run — leave the segs empty and rely on `spans` (geometry-derived) above.
@@ -2284,8 +2583,111 @@ fn build_borderless_region(
         rotation: Rotation::D0,
         spans,
         own_lines: Vec::new(),
-        // Borderless planning has no painted-path access, so no captured shadings.
-        shadings: Vec::new(),
+        shadings,
+    })
+}
+
+// ── prose-column veto (fix V3b-1) ────────────────────────────────────────────
+
+/// A candidate region must hold at least this many rows before the prose veto
+/// can fire — short regions (a 3-row list, a header + two data rows) are the
+/// bread-and-butter of real borderless tables and are never vetoed.
+const PROSE_MIN_ROWS: usize = 8;
+
+/// Fraction of a column's runs that must look like full text lines for the
+/// column to read as prose.
+const PROSE_FULL_LINE_SHARE: f64 = 0.6;
+
+/// A prose line carries at least this many words. Table cells are short — a
+/// label, an amount, a date; even long description cells rarely sustain this
+/// across most rows *and* the near-measure width test below.
+const PROSE_MIN_WORDS: usize = 4;
+
+/// A prose line is *wide* in absolute terms: at least this many line heights.
+const PROSE_WIDE_MULT: f64 = 8.0;
+
+/// A prose line fills its column: at least this fraction of the column's
+/// widest run (justified/near-justified text is width-uniform; cell contents
+/// scatter).
+const PROSE_WIDTH_NEAR_MAX: f64 = 0.75;
+
+/// Row-pitch regularity gate: the share of consecutive row gaps that must sit
+/// within [`PROSE_PITCH_TOL`] of the median gap. Running text is set on a
+/// uniform leading grid.
+const PROSE_PITCH_SHARE: f64 = 0.8;
+const PROSE_PITCH_TOL: f64 = 0.45;
+
+/// Whether a candidate borderless region actually reads as side-by-side
+/// **prose columns** (an academic/newsletter two-up whose column baselines
+/// happen to align) rather than a table. Tabulating such a region interleaves
+/// the columns' lines row by row and destroys the reading order (fix V3b-1).
+///
+/// Prose columns and data tables separate on three joint signals — **all**
+/// must hold to veto, so a real table is never rejected:
+/// 1. **many rows** ([`PROSE_MIN_ROWS`]) on a **regular vertical pitch** (the
+///    leading grid of running text);
+/// 2. **every** detected column is a stack of **full text lines**: a majority
+///    of its runs are multi-word, wide in absolute terms *and* near the
+///    column's own measure. A genuine table always keeps at least one column
+///    of short cells (amounts, dates, quantities), which fails this and saves
+///    the table.
+fn region_is_prose_columns(
+    lines: &[ReconLine],
+    row_lines: &[usize],
+    columns: &[Column],
+    col_gap: f64,
+    h_med: f64,
+) -> bool {
+    if row_lines.len() < PROSE_MIN_ROWS || columns.is_empty() {
+        return false;
+    }
+
+    // Regular vertical pitch (rows arrive sorted top→bottom).
+    let centers: Vec<f64> = row_lines.iter().map(|&i| lines[i].center_y()).collect();
+    let gaps: Vec<f64> = centers.windows(2).map(|w| (w[0] - w[1]).abs()).collect();
+    if gaps.is_empty() {
+        return false;
+    }
+    let mut sorted_gaps = gaps.clone();
+    let g_med = median(&mut sorted_gaps, h_med).max(1.0);
+    let regular = gaps
+        .iter()
+        .filter(|&&g| (g - g_med).abs() <= g_med * PROSE_PITCH_TOL)
+        .count();
+    if (regular as f64) < gaps.len() as f64 * PROSE_PITCH_SHARE {
+        return false;
+    }
+
+    // Per-column full-line share: every column must read as prose.
+    let wide_floor = h_med * PROSE_WIDE_MULT;
+    let mut per_col: Vec<Vec<f64>> = vec![Vec::new(); columns.len()]; // run widths
+    let mut per_col_full: Vec<usize> = vec![0; columns.len()];
+    for &i in row_lines {
+        for r in &lines[i].runs {
+            if r.text.trim().is_empty() {
+                continue;
+            }
+            let dec = decimal_sep_x(r);
+            let Some(c) = column_of_run(columns, r.x, r.x + r.w, dec, col_gap) else {
+                continue;
+            };
+            per_col[c].push(r.w);
+            if r.text.split_whitespace().count() >= PROSE_MIN_WORDS && r.w >= wide_floor {
+                per_col_full[c] += 1;
+            }
+        }
+    }
+    per_col.iter().zip(&per_col_full).all(|(widths, &full)| {
+        if widths.is_empty() {
+            return false; // a column that won no runs is no evidence of prose.
+        }
+        let max_w = widths.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+        let near_max = widths
+            .iter()
+            .filter(|&&w| w >= max_w * PROSE_WIDTH_NEAR_MAX)
+            .count();
+        let share = widths.len() as f64 * PROSE_FULL_LINE_SHARE;
+        (full as f64) >= share && (near_max as f64) >= share
     })
 }
 
@@ -2808,12 +3210,23 @@ mod tests {
         t.rows
     }
 
+    /// Flatten a paragraph's runs into one string — a [`Inline::LineBreak`]
+    /// (the per-line separator cell paragraphs now carry) reads as a space.
+    fn para_text(p: &Paragraph) -> String {
+        let mut s = String::new();
+        for i in &p.runs {
+            match i {
+                crate::model::Inline::Run(r) => s.push_str(&r.text),
+                crate::model::Inline::LineBreak => s.push(' '),
+                _ => {}
+            }
+        }
+        s
+    }
+
     fn cell_text(c: &Cell) -> String {
         match &c.blocks[0].kind {
-            BlockKind::Paragraph(p) => match p.runs.first() {
-                Some(crate::model::Inline::Run(r)) => r.text.clone(),
-                _ => String::new(),
-            },
+            BlockKind::Paragraph(p) => para_text(p),
             _ => String::new(),
         }
     }
@@ -2821,10 +3234,7 @@ mod tests {
     /// The text of the `n`th paragraph block of a cell (for multi-paragraph cells).
     fn cell_para_text(c: &Cell, n: usize) -> String {
         match c.blocks.get(n).map(|b| &b.kind) {
-            Some(BlockKind::Paragraph(p)) => match p.runs.first() {
-                Some(crate::model::Inline::Run(r)) => r.text.clone(),
-                _ => String::new(),
-            },
+            Some(BlockKind::Paragraph(p)) => para_text(p),
             _ => String::new(),
         }
     }
@@ -2899,8 +3309,10 @@ mod tests {
     #[test]
     fn wrapped_cell_lines_stay_one_paragraph() {
         // Two lines at an ordinary wrap leading (14 pt step, no blank line) inside
-        // one cell join into a SINGLE paragraph, text joined by a space — identical
-        // to the legacy flattening for a wrapped cell.
+        // one cell join into a SINGLE paragraph. Since fix a4 the lines are no
+        // longer flattened into one space-joined run: each line is its own run,
+        // separated by `Inline::LineBreak`, so consumers can tell them apart
+        // (the flattened text is unchanged).
         let runs = vec![
             run("alpha", 60.0, 140.0, 80.0),
             run("beta", 60.0, 126.0, 80.0),
@@ -2927,6 +3339,66 @@ mod tests {
         let cell = &t.rows[0].cells[0];
         assert_eq!(cell.blocks.len(), 1, "wrapped lines stay one paragraph");
         assert_eq!(cell_text(cell), "alpha beta");
+        // Line structure (fix a4): Run("alpha"), LineBreak, Run("beta").
+        let BlockKind::Paragraph(p) = &cell.blocks[0].kind else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(p.runs.len(), 3, "run, br, run");
+        assert!(
+            matches!(&p.runs[0], crate::model::Inline::Run(r) if r.text == "alpha"),
+            "first line is its own run"
+        );
+        assert!(
+            matches!(p.runs[1], crate::model::Inline::LineBreak),
+            "a LineBreak separates the cell's lines"
+        );
+        assert!(
+            matches!(&p.runs[2], crate::model::Inline::Run(r) if r.text == "beta"),
+            "second line is its own run"
+        );
+    }
+
+    #[test]
+    fn cell_line_runs_keep_their_own_source_indices() {
+        // Fix a4 companion: with one run per cell line, each line's run carries
+        // ITS OWN source ordinals (the seam the editor's `replaceText` rides),
+        // and their concatenation in reading order equals the legacy joined
+        // list — nothing is lost or reordered by the per-line split.
+        let mut a = run("alpha", 60.0, 140.0, 80.0);
+        a.source_index = Some(4);
+        let mut b = run("beta", 60.0, 126.0, 80.0);
+        b.source_index = Some(9);
+        let lines = group_into_lines(&[a, b]);
+        let mut paths = vec![
+            hrule(160.0, 50.0, 350.0),
+            hrule(110.0, 50.0, 350.0),
+            vrule(50.0, 110.0, 160.0),
+            vrule(350.0, 110.0, 160.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("table at line 0");
+        let mut ids = IdGen::default();
+        let BlockKind::Table(t) = build_table(&tbl, &lines, &mut ids, Rect::new)
+            .expect("table block")
+            .kind
+        else {
+            panic!("expected table");
+        };
+        let BlockKind::Paragraph(p) = &t.rows[0].cells[0].blocks[0].kind else {
+            panic!("expected paragraph");
+        };
+        let per_run: Vec<Vec<usize>> = p
+            .runs
+            .iter()
+            .filter_map(|i| match i {
+                crate::model::Inline::Run(r) => Some(r.source_index.clone().unwrap_or_default()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(per_run, vec![vec![4], vec![9]], "one line = one run = its own ordinals");
     }
 
     #[test]
@@ -3010,13 +3482,60 @@ mod tests {
         // 0.75 of the box; weighting per-glyph advances (the wide digits, the narrow
         // comma) shifts it right, to ≈ 0.773. Proof the per-glyph model (gap #75 #3)
         // is in effect rather than a uniform division.
-        let x = decimal_sep_x("1234,5", 0.0, 1000.0).expect("comma is a decimal sep");
+        let x = decimal_sep_x_at("1234,5", 0.0, 1000.0, false).expect("comma is a decimal sep");
         assert!(
             x > 760.0 && x < 785.0,
             "advance-weighted sep ≈ 773, got {x}"
         );
         // A wide glyph advances more than a narrow separator.
         assert!(char_advance('5') > char_advance(','));
+    }
+
+    #[test]
+    fn decimal_sep_x_uses_uniform_advances_for_monospaced_runs() {
+        // Fix V3b-8: the tabular-proportional table (digits wide, comma half a
+        // digit) is wrong for a monospaced face, where every glyph advances the
+        // same. A Courier run must place "1234,5"'s comma at the uniform 0.75 of
+        // the box — not at the proportional 0.773 — and the model must be chosen
+        // from the run's own font.
+        let x = decimal_sep_x_at("1234,5", 0.0, 1000.0, true).expect("comma is a decimal sep");
+        assert!(
+            (x - 750.0).abs() < 1.0,
+            "uniform-advance sep = 750 (0.75 of the box), got {x}"
+        );
+
+        // Family-name signal: a (subset-prefixed) Courier run selects the
+        // monospace model even without a trustworthy measured width.
+        let courier = ReconRun {
+            style: TextStyle {
+                family: "ABCDEF+CourierNew".to_string(),
+                ..TextStyle::default()
+            },
+            ..run("1234,5", 0.0, 700.0, 1000.0)
+        };
+        assert!(run_uses_mono_advances(&courier), "Courier family ⇒ mono");
+        let xc = decimal_sep_x(&courier).expect("decimal sep on the Courier run");
+        assert!((xc - 750.0).abs() < 1.0, "Courier sep at 0.75, got {xc}");
+
+        // Width signal: an unnamed face whose measured width matches the
+        // monospace prediction (0.6 em × 6 glyphs × 10 pt = 36) and not the
+        // proportional one (30.58) is read as monospaced.
+        let mono_w = run("1234,5", 0.0, 700.0, 36.0);
+        assert!(
+            run_uses_mono_advances(&mono_w),
+            "a mono-consistent measured width selects the mono model"
+        );
+
+        // A Helvetica-consistent width keeps the proportional model, and a
+        // synthetic width matching neither prediction defaults to proportional
+        // (the test-fixture case: w=1000 at size 10 is inconsistent with both).
+        let prop_w = run("1234,5", 0.0, 700.0, 30.6);
+        assert!(!run_uses_mono_advances(&prop_w), "prop width stays prop");
+        let synthetic = run("1234,5", 0.0, 700.0, 1000.0);
+        assert!(
+            !run_uses_mono_advances(&synthetic),
+            "a width matching neither model defaults to proportional"
+        );
     }
 
     #[test]
@@ -3604,30 +4123,30 @@ mod tests {
         // The estimate places the separator proportionally inside the run box. For
         // a box [400, 480] (w=80), the `,` of "12,00" (offset 2 of 5) lands near the
         // middle; an integer or a trailing-dot string has no decimal separator.
-        let x = decimal_sep_x("12,00", 400.0, 80.0).expect("comma is a decimal sep");
+        let x = decimal_sep_x_at("12,00", 400.0, 80.0, false).expect("comma is a decimal sep");
         assert!((x - 440.0).abs() < 1.0, "sep ≈ 440 (mid box), got {x}");
         // "1.234,00": the LAST separator (the comma) is the decimal point, not the
         // thousands dot.
-        let x2 = decimal_sep_x("1.234,00", 400.0, 80.0).expect("last sep is the comma");
+        let x2 = decimal_sep_x_at("1.234,00", 400.0, 80.0, false).expect("last sep is the comma");
         assert!(
             x2 > 440.0,
             "decimal sep is the comma (right of centre), got {x2}"
         );
         // Non-decimal text returns None.
         assert!(
-            decimal_sep_x("Total", 0.0, 50.0).is_none(),
+            decimal_sep_x_at("Total", 0.0, 50.0, false).is_none(),
             "word: no separator"
         );
         assert!(
-            decimal_sep_x("42", 0.0, 20.0).is_none(),
+            decimal_sep_x_at("42", 0.0, 20.0, false).is_none(),
             "integer: no separator"
         );
         assert!(
-            decimal_sep_x("End of sentence.", 0.0, 90.0).is_none(),
+            decimal_sep_x_at("End of sentence.", 0.0, 90.0, false).is_none(),
             "trailing dot is not a decimal separator"
         );
         assert!(
-            decimal_sep_x("1.234.567", 0.0, 60.0).is_none(),
+            decimal_sep_x_at("1.234.567", 0.0, 60.0, false).is_none(),
             "grouped integer (no fractional part) is not a decimal value"
         );
     }
@@ -3891,6 +4410,236 @@ mod tests {
         assert!(
             borderless_table(&lines).is_none(),
             "no table is built from prose with stray decimals"
+        );
+    }
+
+    // ── fix V3b-1: side-by-side prose columns are not a table ────────────────
+
+    #[test]
+    fn two_prose_columns_with_aligned_baselines_are_not_a_table() {
+        // An academic two-up whose column baselines share the leading grid: every
+        // visual line is one ReconLine with a left-column run AND a right-column
+        // run, separated by a real (> gutter floor) column gap. The old planner
+        // promoted this to a 2-column borderless table, INTERLEAVING the reading
+        // order (row 1 = line 1 of both columns, row 2 = line 2 of both …). Every
+        // "column" is a stack of full multi-word lines on a regular pitch — page
+        // layout, not a table.
+        let mut runs: Vec<ReconRun> = Vec::new();
+        for i in 0..10 {
+            let y = 700.0 - f64::from(i) * 14.0;
+            // Last line of each column is a short paragraph ender (realism: the
+            // veto tolerates a minority of short lines).
+            let (lw, rw) = if i == 9 { (120.0, 110.0) } else { (200.0, 200.0) };
+            runs.push(ReconRun {
+                h: 12.0,
+                size: 12.0,
+                ..run("Lorem ipsum dolor sit amet consectetur", 72.0, y, lw)
+            });
+            runs.push(ReconRun {
+                h: 12.0,
+                size: 12.0,
+                ..run("adipiscing elit sed do eiusmod tempor", 310.0, y, rw)
+            });
+        }
+        let lines = group_into_lines(&runs);
+        assert_eq!(lines.len(), 10, "aligned baselines: one line per row");
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
+        assert!(
+            (0..lines.len()).all(|i| plan.take_if_starts_at(i).is_none()),
+            "two prose columns must not become an interleaved borderless table"
+        );
+        assert!(borderless_table(&lines).is_none());
+    }
+
+    #[test]
+    fn many_long_label_rows_with_short_amounts_stay_a_table() {
+        // The prose veto must NOT fire on a real table just because it is long
+        // and its label column is wordy: the amount column's short cells fail the
+        // full-line test, and one non-prose column saves the table.
+        let mut runs: Vec<ReconRun> = Vec::new();
+        for i in 0..9 {
+            let y = 700.0 - f64::from(i) * 14.0;
+            runs.push(ReconRun {
+                h: 12.0,
+                size: 12.0,
+                ..run("Prestation de conseil en organisation", 72.0, y, 190.0)
+            });
+            runs.push(ReconRun {
+                h: 12.0,
+                size: 12.0,
+                ..run("1.234,00", 460.0, y, 45.0)
+            });
+        }
+        let lines = group_into_lines(&runs);
+        let table = borderless_table(&lines).expect("a long two-column table stays a table");
+        assert_eq!(table.rows.len(), 9, "all nine rows kept");
+        for row in &table.rows {
+            assert_eq!(row.cells.len(), 2, "label + amount");
+        }
+    }
+
+    // ── fix V3b-5: booktabs tables (horizontal rules only) ───────────────────
+
+    #[test]
+    fn booktabs_hrules_only_table_is_detected() {
+        // A scientific booktabs table: three full-width horizontal rules (top,
+        // midrule under the header, bottom) and NO vertical rules. The old
+        // planner required ≥ 2 verticals and returned nothing. The rules frame
+        // the text; columns come from the runs' x-clusters.
+        let mut paths = vec![
+            hrule(210.0, 70.0, 470.0),
+            hrule(188.0, 70.0, 470.0),
+            hrule(100.0, 70.0, 470.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let mut runs = vec![
+            run("Method", 80.0, 195.0, 60.0),
+            run("Accuracy", 250.0, 195.0, 70.0),
+            run("Time", 400.0, 195.0, 40.0),
+        ];
+        for (i, y) in [170.0, 150.0, 130.0, 110.0].into_iter().enumerate() {
+            runs.push(run(["Baseline", "Ours", "Ablated", "Prior"][i], 80.0, y, 60.0));
+            runs.push(run("0,84", 250.0, y, 32.0));
+            runs.push(run("12s", 400.0, y, 26.0));
+        }
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan
+            .take_if_starts_at(0)
+            .expect("a booktabs table is planned from horizontal rules alone");
+        let mut ids = IdGen::default();
+        let BlockKind::Table(t) = build_table(&tbl, &lines, &mut ids, Rect::new)
+            .expect("table block")
+            .kind
+        else {
+            panic!("expected table");
+        };
+        assert_eq!(t.rows.len(), 5, "header + four data rows");
+        for row in &t.rows {
+            assert_eq!(row.cells.len(), 3, "three x-cluster columns");
+        }
+        assert_eq!(cell_text(&t.rows[0].cells[0]), "Method");
+        assert_eq!(cell_text(&t.rows[1].cells[0]), "Baseline");
+        assert_eq!(cell_text(&t.rows[1].cells[1]), "0,84");
+        // The frame rules are consumed (not re-emitted as stray shapes) …
+        assert!(
+            plan.uses_path(0) && plan.uses_path(1) && plan.uses_path(2),
+            "the booktabs rules are claimed by the table"
+        );
+        // … and the booktabs look carries no full grid border.
+        assert_eq!(t.border.width, 0.0, "no fabricated full-grid border");
+    }
+
+    #[test]
+    fn scattered_field_underlines_do_not_make_a_booktabs_table() {
+        // Anti-form guard: underline-style fields ("Nom: ____") are horizontal
+        // rules too, but they neither share an X extent (each fits its own box)
+        // nor span the text around them — no booktabs frame, no table.
+        let mut paths = vec![
+            hrule(690.0, 120.0, 220.0), // field 1 underline
+            hrule(670.0, 130.0, 260.0), // field 2 underline (different span)
+            hrule(650.0, 120.0, 220.0), // matches field 1's span…
+            hrule(630.0, 120.0, 220.0), // …and field 3's — a same-span pair,
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        // …but the label+field text lines are far wider than the rules, so the
+        // rule-spans-the-text gate rejects the group.
+        let runs = vec![
+            run("Nom :", 45.0, 695.0, 40.0),
+            run("Prenom :", 45.0, 675.0, 60.0),
+            run("Adresse :", 45.0, 655.0, 65.0),
+            run("Ville :", 45.0, 635.0, 45.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        assert!(
+            (0..lines.len()).all(|i| plan.take_if_starts_at(i).is_none()),
+            "scattered field underlines must not fabricate a booktabs table"
+        );
+    }
+
+    // ── fix V3b-6: borderless tables carry their background shadings ─────────
+
+    #[test]
+    fn borderless_table_with_shaded_header_carries_shading() {
+        // A borderless table whose header row is backed by a filled rectangle:
+        // the fill must become the header cells' shading (and flag the row as a
+        // header), and the fill path must be consumed by the table instead of
+        // being re-emitted as a page shape. Before fix V3b-6 the borderless
+        // planner had no access to fills at all.
+        let tint = [0.9, 0.9, 0.5];
+        let mut fill = fill_rect(60.0, 695.0, 340.0, 17.0, tint);
+        fill.index = 7;
+        let paths = vec![fill];
+        let runs = vec![
+            run("Name", 72.0, 700.0, 50.0),
+            run("Role", 300.0, 700.0, 50.0),
+            run("Alice", 72.0, 684.0, 50.0),
+            run("Engineer", 300.0, 684.0, 70.0),
+            run("Bob", 72.0, 668.0, 50.0),
+            run("Designer", 300.0, 668.0, 70.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("borderless table");
+        assert!(
+            plan.uses_path(7),
+            "the header fill is consumed by the table"
+        );
+        let mut ids = IdGen::default();
+        let BlockKind::Table(t) = build_table(&tbl, &lines, &mut ids, Rect::new)
+            .expect("table block")
+            .kind
+        else {
+            panic!("expected table");
+        };
+        assert!(t.rows[0].is_header, "shaded leading row reads as a header");
+        for cell in &t.rows[0].cells {
+            assert_eq!(cell.shading, Some(tint), "header cell carries the tint");
+        }
+        for cell in &t.rows[1].cells {
+            assert_eq!(cell.shading, None, "body cells carry no shading");
+        }
+    }
+
+    // ── fix V3b-7: the last column's edge hugs the content ───────────────────
+
+    #[test]
+    fn borderless_outer_edges_hug_the_content() {
+        // Right edge: the old `last centre + 4 × col_gap` pushed the grid ~80 pt
+        // past the rightmost amount; the edge must now sit half a column gap
+        // after the real content. (col_gap here = max(2 × 10, 16) = 20.)
+        let runs = vec![
+            run("Libelle", 72.0, 700.0, 40.0),
+            run("Montant", 490.0, 700.0, 50.0), // right = 540
+            run("Consulting", 72.0, 684.0, 80.0),
+            run("1.234,00", 480.0, 684.0, 60.0), // right = 540
+            run("Travel", 72.0, 668.0, 40.0),
+            run("99,50", 505.0, 668.0, 35.0), // right = 540
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("borderless table");
+        let mut ids = IdGen::default();
+        let block = build_table(&tbl, &lines, &mut ids, Rect::new).expect("table block");
+        let frame = block.frame.expect("table frame");
+        let right = frame.x + frame.w;
+        assert!(
+            right <= 540.0 + 20.0 + 1e-6,
+            "right edge ≤ content + half-gap margin (≤ 560), got {right}"
+        );
+        assert!(right >= 540.0, "the content itself stays covered, got {right}");
+        // Left edge: content-true too (min run x − half gap), so a left-aligned
+        // first column whose centre-of-mass sits right of its runs cannot lose
+        // them off-grid.
+        assert!(
+            frame.x <= 72.0 && frame.x >= 72.0 - 20.0 - 1e-6,
+            "left edge within half a gap of the content, got {}",
+            frame.x
         );
     }
 

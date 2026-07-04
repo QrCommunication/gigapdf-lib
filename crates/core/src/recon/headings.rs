@@ -49,6 +49,12 @@ const BOLD_SUBHEAD_RATIO: f64 = 0.98;
 /// than this open a new, deeper level. `0.06` ⇒ within 6 %.
 const CLUSTER_TOLERANCE: f64 = 0.06;
 
+/// How much larger than the next tier a **one-shot** top size must be before
+/// the document-wide leveling reads it as a cover *title* that skews the scale
+/// (and stops it consuming the `H1` rank). Well beyond [`CLUSTER_TOLERANCE`],
+/// so two adjacent real tiers never trip it.
+const TITLE_DEMOTION_RATIO: f64 = 1.25;
+
 /// The maximum heading level the model expresses (HTML `h1..h6`).
 const MAX_LEVEL: u8 = 6;
 
@@ -71,6 +77,11 @@ pub struct HeadingLevels {
     /// is heading level `i + 1` (saturated at [`MAX_LEVEL`]). Empty when the
     /// page has no heading candidates.
     clusters: Vec<f64>,
+    /// How many candidate sizes each cluster absorbed, parallel to `clusters`.
+    /// Per-page leveling ignores it; the **document-wide** pass ([`relevel`])
+    /// reads it to spot a one-shot cover title that would otherwise skew the
+    /// whole scale (see [`Self::one_shot_cover_title`]).
+    counts: Vec<usize>,
 }
 
 impl HeadingLevels {
@@ -103,16 +114,24 @@ impl HeadingLevels {
         sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
 
         let mut clusters: Vec<f64> = Vec::new();
+        let mut counts: Vec<usize> = Vec::new();
         for size in sorted {
             match clusters.last() {
                 // Within tolerance of the current (larger) cluster representative
                 // → same level. The representative stays the larger size.
-                Some(&rep) if rep > 0.0 && size >= rep * (1.0 - CLUSTER_TOLERANCE) => {}
+                Some(&rep) if rep > 0.0 && size >= rep * (1.0 - CLUSTER_TOLERANCE) => {
+                    if let Some(n) = counts.last_mut() {
+                        *n += 1;
+                    }
+                }
                 // A clear drop (or the first size) → a new, deeper level.
-                _ => clusters.push(size),
+                _ => {
+                    clusters.push(size);
+                    counts.push(1);
+                }
             }
         }
-        Self { clusters }
+        Self { clusters, counts }
     }
 
     /// The heading level for a promoted line of representative font `size`.
@@ -121,12 +140,20 @@ impl HeadingLevels {
     /// *deepest present* level rather than always collapsing to `H6`. With no
     /// clusters recorded (degenerate), falls back to `1`.
     pub fn level_for(&self, size: f64) -> u8 {
-        if self.clusters.is_empty() {
-            return 1;
+        match self.nearest_cluster(size) {
+            Some(idx) => clamp_level(idx + 1),
+            None => 1,
         }
-        // Pick the cluster whose representative is closest to `size`; ties favour
-        // the larger (lower-numbered) level. Clusters are descending, so the
-        // first minimal-distance index is the largest such size.
+    }
+
+    /// The index of the cluster whose representative is closest to `size`;
+    /// ties favour the larger (lower-numbered) level. Clusters are descending,
+    /// so the first minimal-distance index is the largest such size. `None`
+    /// when no clusters were recorded (degenerate).
+    fn nearest_cluster(&self, size: f64) -> Option<usize> {
+        if self.clusters.is_empty() {
+            return None;
+        }
         let mut best_idx = 0usize;
         let mut best_dist = f64::INFINITY;
         for (idx, &rep) in self.clusters.iter().enumerate() {
@@ -136,7 +163,40 @@ impl HeadingLevels {
                 best_idx = idx;
             }
         }
-        clamp_level(best_idx + 1)
+        Some(best_idx)
+    }
+
+    /// Whether the **document-wide** hierarchy shows the cover-title pathology:
+    /// the top cluster holds exactly ONE heading in the whole document (a
+    /// one-shot cover/title page), it dwarfs the next tier (≥
+    /// [`TITLE_DEMOTION_RATIO`]×), and at least two tiers exist below it with a
+    /// *recurrent* first one — the document's real `H1`s. Ranking the one-shot
+    /// as `H1` would push every real heading a level down (`H1` → `H2`…); the
+    /// document-wide leveling (see [`relevel`]) instead treats it as a *title*
+    /// and hands `H1` to the largest recurrent tier. All four conditions are
+    /// required — an ordinary document whose single main title tops one tier of
+    /// subheads keeps the historic `title = H1, subhead = H2` reading.
+    fn one_shot_cover_title(&self) -> bool {
+        self.clusters.len() >= 3
+            && self.counts.first().copied().unwrap_or(0) == 1
+            && self.counts.get(1).copied().unwrap_or(0) >= 2
+            && self.clusters[0] >= self.clusters[1] * TITLE_DEMOTION_RATIO
+    }
+
+    /// [`level_for`](Self::level_for) with the document-wide renormalization:
+    /// under the [`one_shot_cover_title`](Self::one_shot_cover_title) pathology
+    /// the lone giant does not consume a rank — the largest *recurrent* tier is
+    /// `H1` (the giant itself reports `1` too, the closest the six-level model
+    /// has to a "Title"). Everywhere else this is exactly `level_for`.
+    fn document_level_for(&self, size: f64) -> u8 {
+        let Some(idx) = self.nearest_cluster(size) else {
+            return 1;
+        };
+        if self.one_shot_cover_title() {
+            clamp_level(idx.max(1))
+        } else {
+            clamp_level(idx + 1)
+        }
     }
 }
 
@@ -211,10 +271,100 @@ pub fn heading_size(heading: &Heading) -> f64 {
 /// Pairs with [`heading_size`] to make heading levels consistent across pages
 /// without re-running promotion: the per-page [`promote`] gate already chose
 /// *which* blocks are headings; this only harmonizes their *levels*. With an
-/// empty `levels` (no headings collected) [`HeadingLevels::level_for`] yields
-/// `1`, so a lone heading still gets a valid level.
+/// empty `levels` (no headings collected) the lookup yields `1`, so a lone
+/// heading still gets a valid level. When the collected set shows a one-shot
+/// cover title dwarfing a recurrent hierarchy, the giant is read as a *title*
+/// instead of consuming `H1` — the largest recurrent tier keeps the top rank
+/// (see [`HeadingLevels::one_shot_cover_title`]); per-page leveling is
+/// untouched.
 pub fn relevel(heading: &mut Heading, levels: &HeadingLevels) {
-    heading.level = levels.level_for(heading_size(heading));
+    heading.level = levels.document_level_for(heading_size(heading));
+}
+
+/// The least distinct pages a same-text/same-position heading must appear on
+/// before it is read as repeated page chrome rather than a real heading.
+const REPEATED_HEADING_MIN_PAGES: usize = 3;
+
+/// Position quantum (points) for the repeated-heading key — a running header
+/// re-draws at the same coordinates give or take sub-point jitter.
+const REPEATED_HEADING_QUANTUM: f64 = 4.0;
+
+/// Demote **running-header artifacts** promoted as headings: a heading whose
+/// exact text sits at the same position on [`REPEATED_HEADING_MIN_PAGES`]+
+/// distinct pages is repeated page chrome (a large-font running header the
+/// header/footer stripper missed), not document structure — kept as a heading
+/// it would pollute the outline with one `H1` per page. Each such block is
+/// demoted back to the plain [`Paragraph`](crate::model::BlockKind::Paragraph)
+/// it wraps; nothing else changes (frame, runs and style carry over).
+///
+/// Page-number-bearing headers differ in text page-to-page and are (correctly)
+/// left alone — this pass only ever removes *identical* repeats, so a genuine
+/// heading can never match: a document does not repeat the same section title
+/// at the same coordinates on three pages.
+///
+/// Self-contained and document-wide by design: the caller hands the same
+/// `sections` slice `reconstruct_model`'s releveling pass walks. (Wiring into
+/// that pass lives with the `document.rs` owner; until then the behaviour is
+/// exercised directly.)
+pub fn demote_repeated_headings(sections: &mut [crate::model::Section]) {
+    use std::collections::{BTreeSet, HashMap};
+
+    // First pass: how many distinct pages each (text, position) heading key
+    // appears on, page ordinals counted across all sections.
+    let mut seen: HashMap<(String, i64, i64), BTreeSet<usize>> = HashMap::new();
+    let mut page_no = 0usize;
+    for section in sections.iter() {
+        for page in &section.pages {
+            for block in &page.blocks {
+                if let (BlockKind::Heading(h), Some(frame)) = (&block.kind, block.frame) {
+                    if let Some(key) = repeated_heading_key(h, &frame) {
+                        seen.entry(key).or_default().insert(page_no);
+                    }
+                }
+            }
+            page_no += 1;
+        }
+    }
+    seen.retain(|_, pages| pages.len() >= REPEATED_HEADING_MIN_PAGES);
+    if seen.is_empty() {
+        return;
+    }
+
+    // Second pass: demote every occurrence of a repeated key.
+    for section in sections.iter_mut() {
+        for page in &mut section.pages {
+            for block in &mut page.blocks {
+                let demoted = match (&block.kind, block.frame) {
+                    (BlockKind::Heading(h), Some(frame)) => repeated_heading_key(h, &frame)
+                        .filter(|key| seen.contains_key(key))
+                        .map(|_| h.para.clone()),
+                    _ => None,
+                };
+                if let Some(para) = demoted {
+                    block.kind = BlockKind::Paragraph(para);
+                }
+            }
+        }
+    }
+}
+
+/// The repeat-detection key of a heading: its flattened text (trimmed,
+/// case-folded) plus its quantized frame position. `None` for an empty title —
+/// nothing to match on.
+fn repeated_heading_key(
+    heading: &Heading,
+    frame: &crate::model::Rect,
+) -> Option<(String, i64, i64)> {
+    let text = super::heading_title(heading).trim().to_lowercase();
+    if text.is_empty() {
+        return None;
+    }
+    let q = REPEATED_HEADING_QUANTUM;
+    Some((
+        text,
+        (frame.x / q).round() as i64,
+        (frame.y / q).round() as i64,
+    ))
 }
 
 /// Number of visual lines in a paragraph = 1 + the count of explicit line breaks.
@@ -581,5 +731,145 @@ mod tests {
         for size in [24.0, 18.0, 14.0] {
             assert_eq!(page.level_for(size), doc.level_for(size));
         }
+    }
+
+    // ── V3c fix 6b: a one-shot cover title must not skew the whole scale ─────
+
+    /// Relevel a heading of `size` against the document-wide `doc` map.
+    fn releveled(size: f64, doc: &HeadingLevels) -> u8 {
+        let mut h = heading_block("h", size);
+        relevel(&mut h, doc);
+        h.level
+    }
+
+    #[test]
+    fn one_shot_cover_title_hands_h1_to_the_recurrent_tier() {
+        // A single 36pt cover title over three 24pt chapter heads and two 18pt
+        // section heads. Rank-as-collected would make the chapters H2 and the
+        // sections H3; the document-wide leveling reads the lone giant as a
+        // *title* (reported H1 — the closest the model has) and renormalizes:
+        // the recurrent 24pt tier IS the document's H1.
+        let doc = levels(&[36.0, 24.0, 24.0, 24.0, 18.0, 18.0]);
+        assert_eq!(releveled(24.0, &doc), 1, "recurrent chapters are H1");
+        assert_eq!(releveled(18.0, &doc), 2, "sections follow at H2");
+        assert_eq!(releveled(36.0, &doc), 1, "the cover title reports H1");
+        // Per-page leveling (promotion) is untouched by the renormalization.
+        assert_eq!(doc.level_for(36.0), 1);
+        assert_eq!(doc.level_for(24.0), 2);
+        assert_eq!(doc.level_for(18.0), 3);
+    }
+
+    #[test]
+    fn ordinary_hierarchies_never_renormalize() {
+        // A normal document: one main title over one tier of recurrent
+        // subheads — the historic reading (title H1, subheads H2) holds.
+        let two_tiers = levels(&[24.0, 14.0, 14.0]);
+        assert_eq!(releveled(24.0, &two_tiers), 1);
+        assert_eq!(releveled(14.0, &two_tiers), 2);
+        // Three tiers, every size a one-shot (nothing recurrent below the
+        // top): collected ranks stand — 1/2/3.
+        let all_lone = levels(&[36.0, 24.0, 18.0]);
+        assert_eq!(releveled(36.0, &all_lone), 1);
+        assert_eq!(releveled(24.0, &all_lone), 2);
+        assert_eq!(releveled(18.0, &all_lone), 3);
+        // The top size barely exceeds the next tier (< 1.25×): not a scale-
+        // skewing giant, ranks stand.
+        let mild = levels(&[26.0, 24.0, 24.0, 18.0, 18.0]);
+        assert_eq!(releveled(24.0, &mild), 2);
+        assert_eq!(releveled(26.0, &mild), 1);
+        // A recurrent TOP tier is a real H1 tier, never a title.
+        let recurrent_top = levels(&[36.0, 36.0, 24.0, 24.0, 18.0]);
+        assert_eq!(releveled(36.0, &recurrent_top), 1);
+        assert_eq!(releveled(24.0, &recurrent_top), 2);
+    }
+
+    // ── V3c fix 6a: repeated running-header headings are demoted ─────────────
+
+    use crate::model::{Page, Rect, Section};
+
+    /// A heading block with a frame, as the reconstruction produces.
+    fn framed_heading(text: &str, size: f64, frame: Rect) -> Block {
+        let mut block = para_block(text, size, false, 0);
+        let BlockKind::Paragraph(para) = block.kind else {
+            unreachable!()
+        };
+        block.kind = BlockKind::Heading(Heading { level: 1, para });
+        block.frame = Some(frame);
+        block
+    }
+
+    fn section_of_pages(pages: Vec<Vec<Block>>) -> Section {
+        Section {
+            geometry: crate::model::geom::PageGeometry::default(),
+            header: None,
+            footer: None,
+            pages: pages
+                .into_iter()
+                .map(|blocks| Page {
+                    blocks,
+                    absolute: false,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn heading_count(sections: &[Section]) -> usize {
+        sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .filter(|b| matches!(b.kind, BlockKind::Heading(_)))
+            .count()
+    }
+
+    #[test]
+    fn a_running_header_on_three_pages_is_demoted_to_paragraphs() {
+        // The same large-font "ACME CORP" at the same spot on every page — page
+        // chrome that survived the header stripper — plus one genuine title.
+        let chrome = || framed_heading("ACME CORP", 16.0, Rect::new(72.0, 30.0, 200.0, 18.0));
+        let mut sections = vec![section_of_pages(vec![
+            vec![
+                chrome(),
+                framed_heading("Introduction", 24.0, Rect::new(72.0, 120.0, 300.0, 26.0)),
+            ],
+            vec![chrome()],
+            vec![chrome()],
+        ])];
+        demote_repeated_headings(&mut sections);
+        assert_eq!(
+            heading_count(&sections),
+            1,
+            "only the genuine title stays a heading"
+        );
+        // The demoted chrome keeps its content as a plain paragraph.
+        assert!(matches!(
+            &sections[0].pages[1].blocks[0].kind,
+            BlockKind::Paragraph(p)
+                if matches!(p.runs.first(), Some(crate::model::Inline::Run(r)) if r.text == "ACME CORP")
+        ));
+    }
+
+    #[test]
+    fn a_twice_repeated_heading_is_not_chrome() {
+        // Two occurrences (a title repeated on a part opener) stay headings —
+        // the demotion needs three distinct pages.
+        let repeat = || framed_heading("Part One", 20.0, Rect::new(72.0, 100.0, 250.0, 22.0));
+        let mut sections = vec![section_of_pages(vec![vec![repeat()], vec![repeat()]])];
+        demote_repeated_headings(&mut sections);
+        assert_eq!(heading_count(&sections), 2, "two repeats keep their rank");
+    }
+
+    #[test]
+    fn same_text_at_different_positions_is_not_chrome() {
+        // "Summary" as a genuine section head at different heights on three
+        // pages: same text, different position → not a running header.
+        let mut sections = vec![section_of_pages(vec![
+            vec![framed_heading("Summary", 18.0, Rect::new(72.0, 120.0, 200.0, 20.0))],
+            vec![framed_heading("Summary", 18.0, Rect::new(72.0, 400.0, 200.0, 20.0))],
+            vec![framed_heading("Summary", 18.0, Rect::new(72.0, 650.0, 200.0, 20.0))],
+        ])];
+        demote_repeated_headings(&mut sections);
+        assert_eq!(heading_count(&sections), 3, "moving headings are structure");
     }
 }

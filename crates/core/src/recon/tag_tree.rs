@@ -13,12 +13,17 @@
 //! `Tj`/`TJ` text, keyed by `(page, mcid)`; a range whose `BDC` property dict
 //! carries `/ActualText` (§14.9.4) uses that text verbatim instead of the
 //! decoded glyphs, and an image XObject `Do`'d inside the range is recorded so a
-//! `/Figure` leaf can recover its raster. A structure element's `/K` MCID
-//! references then pull that text/image. When the document has **no** struct
-//! tree — or the tree yields no bound content — this returns `None` and the
-//! caller falls back to the heuristic pipeline.
+//! `/Figure` leaf can recover its raster. The scan **recurses into form
+//! XObjects** (`Do` of a `/Subtype /Form`) exactly like the heuristic element
+//! walker, so marked content living inside a reusable template form (the common
+//! CERFA shape) is bound too. Each show is also recorded with its top-level op
+//! position so the leaf's **real char style** (family/size/colour, from the same
+//! element extraction the heuristic path uses) reaches the model instead of a
+//! flat 12 pt default. When the document has **no** struct tree — or the tree
+//! yields no bound content — this returns `None` and the caller falls back to
+//! the heuristic pipeline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{char_style, IdGen};
 use crate::content::{parse_content, FontDecoders};
@@ -211,6 +216,55 @@ type MarkedText = BTreeMap<(usize, i64), String>;
 /// raster (the image bytes are decoded lazily, on demand, at Figure time).
 type MarkedImages = BTreeMap<(usize, i64), Vec<u8>>;
 
+/// Per-`(page index, MCID)` every text show bound to the range, as
+/// `(top-level op position, decoded text)`. A show inside a form XObject
+/// records the page-level position of the `Do` that invoked the form — exactly
+/// where [`Document::page_elements_deep`](crate::Document::page_elements_deep)
+/// collapses the nested elements' `op_start`/`op_end` — so both the top-level
+/// and the nested case resolve to the run's extracted element (and thus its
+/// real font/size/colour). Recorded even for `/ActualText`-frozen ranges: the
+/// override replaces the *text*, not the glyphs' style.
+type MarkedShows = BTreeMap<(usize, i64), Vec<(usize, String)>>;
+
+/// Everything one marked-content scan of a page accumulates, keyed by
+/// `(page index, MCID)` so multi-page maps merge naturally.
+#[derive(Default)]
+struct MarkedContent {
+    text: MarkedText,
+    images: MarkedImages,
+    shows: MarkedShows,
+}
+
+/// The dominant recovered char style of the runs bound to one MCID: the
+/// resolved [`TextStyle`] (family/generic/bold/italic/colour), the effective
+/// point size, and the total shown-text length backing the election (`weight`,
+/// used again when a structure element spans several MCIDs).
+struct MarkedStyle {
+    style: TextStyle,
+    size: f64,
+    weight: usize,
+}
+
+/// Per-`(page index, MCID)` elected [`MarkedStyle`].
+type MarkedStyles = BTreeMap<(usize, i64), MarkedStyle>;
+
+/// The outcome of a paged `/StructTreeRoot` walk: the blocks (each with the
+/// 0-based page it belongs to, when resolvable) plus the set of pages that
+/// carry **any** marked content at all.
+#[derive(Debug)]
+pub struct PagedStructTree {
+    /// `(page hint, block)` pairs in document reading order. See
+    /// [`reconstruct_from_struct_tree_paged`] for the page-hint semantics.
+    pub blocks: Vec<(Option<usize>, Block)>,
+    /// 0-based indices of the pages with at least one marked-content binding
+    /// (`/MCID` text, style shows or a bound image) — the pages the author
+    /// actually tagged. A page **absent** from this set was never marked (a
+    /// *partially* tagged document): the author's tags say nothing about it,
+    /// so the model-reconstruction driver runs the full heuristic pipeline on
+    /// it instead of leaving the page silently empty.
+    pub marked_pages: BTreeSet<usize>,
+}
+
 /// Walk the document's `/StructTreeRoot` into model blocks. `None` when the
 /// document is not tagged, or the tree produced no text-bearing blocks (so the
 /// caller uses the heuristic reconstruction instead).
@@ -239,20 +293,43 @@ pub fn reconstruct_from_struct_tree_paged(
     doc: &crate::Document,
     ids: &mut IdGen,
 ) -> Option<Vec<(Option<usize>, Block)>> {
+    Some(reconstruct_struct_tree_pages(doc, ids)?.blocks)
+}
+
+/// Like [`reconstruct_from_struct_tree_paged`], additionally reporting **which
+/// pages carry marked content** (see [`PagedStructTree::marked_pages`]). The
+/// model-reconstruction driver uses that set to decide *per page* between the
+/// tagged blocks and the heuristic pipeline: a page the author never marked (a
+/// partially tagged document) falls back to the heuristics instead of coming
+/// out empty.
+pub fn reconstruct_struct_tree_pages(
+    doc: &crate::Document,
+    ids: &mut IdGen,
+) -> Option<PagedStructTree> {
     let root = struct_tree_root(doc)?;
-    // Collect marked-content text + image bindings for every page once.
-    let (marked, images) = collect_all_marked_content(doc);
-    if marked.is_empty() && images.is_empty() {
+    // Collect marked-content text/style/image bindings for every page once.
+    let (marked, styles) = collect_all_marked_content(doc);
+    if marked.text.is_empty() && marked.images.is_empty() {
         return None;
     }
+    // Every page with any binding at all was authored as tagged content; the
+    // rest were never marked and keep the heuristic path (per-page fallback).
+    let marked_pages: BTreeSet<usize> = marked
+        .text
+        .keys()
+        .chain(marked.images.keys())
+        .chain(marked.shows.keys())
+        .map(|(page, _)| *page)
+        .collect();
     // The author may tag with non-standard roles mapped to standard ones by the
     // tree's `/RoleMap` (ISO 32000-1 §14.7.4); resolve `/S` through it.
     let role_map = struct_role_map(doc, root);
 
     let mut walker = Walker {
         doc,
-        marked: &marked,
-        images: &images,
+        marked: &marked.text,
+        images: &marked.images,
+        styles: &styles,
         role_map: &role_map,
         ids,
     };
@@ -267,7 +344,10 @@ pub fn reconstruct_from_struct_tree_paged(
     // If nothing fruitful came out (no text- or image-bearing block), the tree
     // was unhelpful — fall back to the heuristic pipeline.
     let fruitful = paged.iter().any(|(_, b)| block_is_fruitful(b));
-    fruitful.then_some(paged)
+    fruitful.then_some(PagedStructTree {
+        blocks: paged,
+        marked_pages,
+    })
 }
 
 /// The `/StructTreeRoot` dictionary, if the catalog references one.
@@ -316,6 +396,10 @@ struct Walker<'a> {
     /// `(page, MCID) → image XObject name` bound to each marked-content range,
     /// used to recover a `/Figure` leaf's raster.
     images: &'a MarkedImages,
+    /// `(page, MCID) → dominant recovered char style` of the underlying runs,
+    /// so tagged paragraphs/headings/cells carry the real font/size/colour
+    /// instead of a flat 12 pt default.
+    styles: &'a MarkedStyles,
     /// `/RoleMap` (`custom → standard` tag-name pairs); empty when none.
     role_map: &'a [(Vec<u8>, Vec<u8>)],
     ids: &'a mut IdGen,
@@ -355,14 +439,16 @@ impl Walker<'_> {
                 let text = self.collect_text(dict, page);
                 if !text.is_empty() {
                     let frame = self.element_bbox(dict);
-                    out.push((page, self.heading_block(level, &text, frame)));
+                    let para = self.styled_paragraph(dict, page, &text);
+                    out.push((page, self.heading_block(level, para, frame)));
                 }
             }
             Some(StructRole::Paragraph) => {
                 let text = self.collect_text(dict, page);
                 if !text.is_empty() {
                     let frame = self.element_bbox(dict);
-                    out.push((page, self.paragraph_block(&text, frame)));
+                    let para = self.styled_paragraph(dict, page, &text);
+                    out.push((page, self.paragraph_block(para, frame)));
                 }
             }
             Some(StructRole::List) => {
@@ -554,6 +640,7 @@ impl Walker<'_> {
                 kind: BlockKind::Image(ImageRef {
                     resource,
                     alt: alt.map(str::to_string),
+                    ..Default::default()
                 }),
             });
         }
@@ -565,23 +652,49 @@ impl Walker<'_> {
         layout_bbox(elem, &|o| self.doc.resolve(o))
     }
 
-    fn paragraph_block(&mut self, text: &str, frame: Option<Rect>) -> Block {
+    /// The dominant recovered style among the runs bound to `elem`'s MCIDs —
+    /// the [`MarkedStyle`] with the largest shown-text weight. `None` when no
+    /// bound run resolved to a style (`/ActualText`-only content whose glyphs
+    /// never matched an element, image-only figures, …).
+    fn element_style(&self, elem: &Dictionary, page: Option<usize>) -> Option<&MarkedStyle> {
+        let mut mcids = Vec::new();
+        self.gather_mcids(elem, page, &mut mcids);
+        mcids
+            .iter()
+            .filter_map(|key| self.styles.get(key))
+            .max_by_key(|ms| ms.weight)
+    }
+
+    /// Build the leaf paragraph for a structure element's collected `text`,
+    /// carrying the element's **real** recovered char style (font family,
+    /// bold/italic, point size, colour — the same source the heuristic path
+    /// styles its runs from). Falls back to the plain 12 pt default only when
+    /// no underlying run resolved to a style, so a tagged H1 drawn red at
+    /// 18 pt reaches the model as exactly that instead of flat body text.
+    fn styled_paragraph(&self, elem: &Dictionary, page: Option<usize>, text: &str) -> Paragraph {
+        match self.element_style(elem, page) {
+            Some(ms) => paragraph_with_style(text, &ms.style, ms.size),
+            None => text_paragraph(text),
+        }
+    }
+
+    fn paragraph_block(&mut self, para: Paragraph, frame: Option<Rect>) -> Block {
         Block {
             id: self.ids.mint(),
             frame,
             rotation: Rotation::D0,
-            kind: BlockKind::Paragraph(text_paragraph(text)),
+            kind: BlockKind::Paragraph(para),
         }
     }
 
-    fn heading_block(&mut self, level: u8, text: &str, frame: Option<Rect>) -> Block {
+    fn heading_block(&mut self, level: u8, para: Paragraph, frame: Option<Rect>) -> Block {
         Block {
             id: self.ids.mint(),
             frame,
             rotation: Rotation::D0,
             kind: BlockKind::Heading(Heading {
                 level: level.clamp(1, 6),
-                para: text_paragraph(text),
+                para,
             }),
         }
     }
@@ -599,12 +712,13 @@ impl Walker<'_> {
                 if text.is_empty() {
                     continue;
                 }
+                let para = self.styled_paragraph(d, page, &text);
                 items.push(ListItem {
                     blocks: vec![Block {
                         id: self.ids.mint(),
                         frame: None,
                         rotation: Rotation::D0,
-                        kind: BlockKind::Paragraph(text_paragraph(&text)),
+                        kind: BlockKind::Paragraph(para),
                     }],
                     level: 0,
                 });
@@ -718,17 +832,17 @@ impl Walker<'_> {
             // tables come out as ragged 0-width grids.
             let (col_span, row_span) = cell_spans(td_dict, &|o| self.doc.resolve(o));
             let cell_frame = self.element_bbox(td_dict);
+            let para = self.styled_paragraph(td_dict, page, &text);
             cells.push(Cell {
                 blocks: vec![Block {
                     id: self.ids.mint(),
                     frame: cell_frame,
                     rotation: Rotation::D0,
-                    kind: BlockKind::Paragraph(text_paragraph(&text)),
+                    kind: BlockKind::Paragraph(para),
                 }],
                 col_span,
                 row_span,
-                shading: None,
-                vertical_align: None,
+                ..Default::default()
             });
         }
         if cells.is_empty() {
@@ -759,14 +873,15 @@ impl ResolveName for crate::Document {
     }
 }
 
-/// Build a single-run paragraph from plain text (default char style).
-fn text_paragraph(text: &str) -> Paragraph {
+/// Build a single-run paragraph from plain text, at the given recovered char
+/// style and point size.
+fn paragraph_with_style(text: &str, style: &TextStyle, size: f64) -> Paragraph {
     let runs = if text.trim().is_empty() {
         Vec::new()
     } else {
         vec![Inline::Run(InlineRun {
             text: text.trim().to_string(),
-            style: char_style(&TextStyle::default(), 12.0),
+            style: char_style(style, size),
             source_index: None,
         })]
     };
@@ -775,6 +890,12 @@ fn text_paragraph(text: &str) -> Paragraph {
         style_ref: None,
         runs,
     }
+}
+
+/// Build a single-run paragraph from plain text (default char style, 12 pt) —
+/// the fallback when no underlying run's style could be recovered.
+fn text_paragraph(text: &str) -> Paragraph {
+    paragraph_with_style(text, &TextStyle::default(), 12.0)
 }
 
 /// Whether a block (recursively) carries any text — used to decide if the
@@ -808,51 +929,101 @@ fn paragraph_has_text(p: &Paragraph) -> bool {
 
 // ── marked-content text collection ──────────────────────────────────────────
 
-/// Collect `(page_index, MCID) → text` for every page by scanning each page's
-/// content stream for `BDC … EMC` ranges that carry an `/MCID`.
-fn collect_all_marked_content(doc: &crate::Document) -> (MarkedText, MarkedImages) {
-    let mut text = MarkedText::new();
-    let mut images = MarkedImages::new();
+/// Collect the marked-content bindings (`(page_index, MCID)` → text / image /
+/// style shows) for every page by scanning each page's content stream — and the
+/// form XObjects it draws — for `BDC … EMC` ranges that carry an `/MCID`. The
+/// per-MCID dominant char styles are elected from the same element extraction
+/// the heuristic path styles its runs from (see [`elect_marked_styles`]).
+fn collect_all_marked_content(doc: &crate::Document) -> (MarkedContent, MarkedStyles) {
+    let mut out = MarkedContent::default();
     for page_no in 1..=doc.page_count() as u32 {
         let Ok(content) = doc.page_content(page_no) else {
             continue;
         };
         let decoders = doc.page_font_decoders(page_no);
-        collect_page_marked_content(
-            (page_no - 1) as usize,
-            &content,
-            &decoders,
-            &mut text,
-            &mut images,
-        );
+        let forms = doc.page_form_xobjects(page_no);
+        collect_page_marked_content((page_no - 1) as usize, &content, &decoders, &forms, &mut out);
     }
-    (text, images)
+    let styles = elect_marked_styles(doc, &out.shows);
+    (out, styles)
+}
+
+/// Ephemeral state threaded through one page's marked-content scan. Shared
+/// across form-XObject recursion so a `BDC` opened around a `Do` still owns the
+/// form's shows, and an MCID frozen by `/ActualText` stays frozen inside.
+#[derive(Default)]
+struct MarkedScanState {
+    /// The `BDC`/`BMC` … `EMC` nesting; `Some(mcid)` for ranges carrying one.
+    mc_stack: Vec<Option<i64>>,
+    /// MCIDs whose text was fixed by `/ActualText`; their glyph shows are
+    /// skipped for **text** (but still recorded as style shows — the override
+    /// replaces the range's text, not its glyphs' style).
+    frozen: BTreeSet<i64>,
 }
 
 /// Scan one page's content stream, accumulating per active `/MCID`: the shown
-/// text, and the resource name of any image XObject drawn (`Do`) inside the
-/// range. The `BDC`/`BMC` … `EMC` nesting is tracked on a stack; `Tj`/`TJ`/`'`/`"`
-/// text and `Do` images are bound to the innermost MCID range in effect (the
-/// standard "current marked-content sequence"). `Tf` selects the active font
-/// decoder. A range whose `BDC` property dict carries `/ActualText` (ISO 32000-1
-/// §14.9.4) takes that text **verbatim** and its glyph shows are suppressed.
+/// text, the resource name of any image XObject drawn (`Do`) inside the range,
+/// and each show's top-level op position (for style election). The
+/// `BDC`/`BMC` … `EMC` nesting is tracked on a stack; `Tj`/`TJ`/`'`/`"` text and
+/// `Do` images are bound to the innermost MCID range in effect (the standard
+/// "current marked-content sequence"). `Tf` selects the active font decoder. A
+/// range whose `BDC` property dict carries `/ActualText` (ISO 32000-1 §14.9.4)
+/// takes that text **verbatim** and its glyph shows are suppressed. A `Do` of a
+/// **form XObject** recurses into the form's own stream (see
+/// [`scan_marked_stream`]), so marked content inside a reusable template form
+/// is bound too.
 fn collect_page_marked_content(
     page: usize,
     content: &[u8],
     decoders: &FontDecoders,
-    text_out: &mut MarkedText,
-    image_out: &mut MarkedImages,
+    forms: &BTreeMap<Vec<u8>, crate::content::FormXObject>,
+    out: &mut MarkedContent,
+) {
+    let mut state = MarkedScanState::default();
+    let mut visited: BTreeSet<(u32, u16)> = BTreeSet::new();
+    scan_marked_stream(
+        page,
+        content,
+        decoders,
+        forms,
+        None,
+        0,
+        &mut visited,
+        &mut state,
+        out,
+    );
+}
+
+/// Recursive worker for [`collect_page_marked_content`]: one content stream —
+/// the page's, or a form XObject's when `depth > 0`.
+///
+/// `nested_at` is `None` for the top-level stream (each show records its own op
+/// position) and `Some(do_pos)` inside a form: every nested show records the
+/// page-level position of the **`Do` that invoked the outermost form** —
+/// exactly where the deep element extraction collapses nested elements'
+/// `op_start`/`op_end` — so style election resolves nested shows too. `visited`
+/// holds the form object-ids on the current recursion path (the runtime cycle
+/// guard) and `depth` caps pathological nesting, both mirroring the element
+/// walker.
+#[allow(clippy::too_many_arguments)]
+fn scan_marked_stream(
+    page: usize,
+    content: &[u8],
+    decoders: &FontDecoders,
+    forms: &BTreeMap<Vec<u8>, crate::content::FormXObject>,
+    nested_at: Option<usize>,
+    depth: usize,
+    visited: &mut BTreeSet<(u32, u16)>,
+    state: &mut MarkedScanState,
+    out: &mut MarkedContent,
 ) {
     let Ok(ops) = parse_content(content) else {
         return;
     };
-    let mut mc_stack: Vec<Option<i64>> = Vec::new();
-    // MCIDs whose text was fixed by `/ActualText`; their glyph shows are skipped.
-    let mut frozen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     let mut font: Option<&TextDecoder> = None;
     let default = TextDecoder::winansi();
 
-    for op in &ops {
+    for (op_pos, op) in ops.iter().enumerate() {
         match op.operator.as_slice() {
             b"BDC" => {
                 let mcid = mcid_of(op);
@@ -860,15 +1031,15 @@ fn collect_page_marked_content(
                 // decoded glyphs of the whole sequence.
                 if let Some(mcid) = mcid {
                     if let Some(actual) = actual_text_of(op) {
-                        text_out.insert((page, mcid), actual);
-                        frozen.insert(mcid);
+                        out.text.insert((page, mcid), actual);
+                        state.frozen.insert(mcid);
                     }
                 }
-                mc_stack.push(mcid);
+                state.mc_stack.push(mcid);
             }
-            b"BMC" => mc_stack.push(None),
+            b"BMC" => state.mc_stack.push(None),
             b"EMC" => {
-                mc_stack.pop();
+                state.mc_stack.pop();
             }
             b"Tf" => {
                 font = op
@@ -878,34 +1049,150 @@ fn collect_page_marked_content(
                     .and_then(|name| decoders.get(name));
             }
             b"Tj" | b"TJ" | b"'" | b"\"" => {
-                let Some(mcid) = mc_stack.iter().rev().find_map(|m| *m) else {
+                let Some(mcid) = state.mc_stack.iter().rev().find_map(|m| *m) else {
                     continue;
                 };
-                if frozen.contains(&mcid) {
-                    continue; // text fixed by /ActualText — ignore the glyphs
-                }
                 let decoder = font.unwrap_or(&default);
                 let text = decode_show(&op.operands, decoder);
                 if text.is_empty() {
                     continue;
                 }
-                text_out.entry((page, mcid)).or_default().push_str(&text);
+                // Style shows record every glyph run — even one frozen by
+                // `/ActualText` (the override replaces the text, not the style).
+                out.shows
+                    .entry((page, mcid))
+                    .or_default()
+                    .push((nested_at.unwrap_or(op_pos), text.clone()));
+                if state.frozen.contains(&mcid) {
+                    continue; // text fixed by /ActualText — ignore the glyphs
+                }
+                out.text.entry((page, mcid)).or_default().push_str(&text);
             }
             b"Do" => {
-                let Some(mcid) = mc_stack.iter().rev().find_map(|m| *m) else {
+                let Some(Object::Name(name)) = op.operands.first() else {
                     continue;
                 };
-                if let Some(Object::Name(name)) = op.operands.first() {
-                    // Keep the first image bound to this range (a `/Figure` draws
-                    // one raster); later `Do`s in the same range don't overwrite.
-                    image_out
-                        .entry((page, mcid))
-                        .or_insert_with(|| name.clone());
+                // A form XObject: recurse — marked content living inside a
+                // reusable template form (the common tagged-CERFA shape) binds
+                // to this page exactly like top-level marked content. The
+                // `mc_stack` travels in (a `BDC` wrapping the `Do` owns the
+                // form's shows) and the form decodes with its OWN fonts.
+                if let Some(form) = forms.get(name.as_slice()) {
+                    if depth >= crate::content::MAX_FORM_DEPTH {
+                        continue;
+                    }
+                    if form.ref_id.is_some_and(|id| visited.contains(&id)) {
+                        continue; // cycle: this form is already on the path
+                    }
+                    let pushed = form.ref_id.map(|id| visited.insert(id)).unwrap_or(false);
+                    scan_marked_stream(
+                        page,
+                        &form.content,
+                        &form.fns,
+                        forms,
+                        Some(nested_at.unwrap_or(op_pos)),
+                        depth + 1,
+                        visited,
+                        state,
+                        out,
+                    );
+                    if pushed {
+                        if let Some(id) = form.ref_id {
+                            visited.remove(&id);
+                        }
+                    }
+                    continue;
                 }
+                // An image XObject: bind its name to the innermost MCID so a
+                // `/Figure` recovers its raster. Top level only — a nested name
+                // is scoped to the form's own resources, so the page-level
+                // lookup at Figure time could miss it or hit a different image
+                // under the same name.
+                if depth > 0 {
+                    continue;
+                }
+                let Some(mcid) = state.mc_stack.iter().rev().find_map(|m| *m) else {
+                    continue;
+                };
+                // Keep the first image bound to this range (a `/Figure` draws
+                // one raster); later `Do`s in the same range don't overwrite.
+                out.images
+                    .entry((page, mcid))
+                    .or_insert_with(|| name.clone());
             }
             _ => {}
         }
     }
+}
+
+/// Resolve, for every `(page, MCID)` with recorded shows, the **dominant** char
+/// style of its underlying runs.
+///
+/// Each show's recorded op position is matched against the page's extracted
+/// elements — [`page_elements_deep`](crate::Document::page_elements_deep), the
+/// exact source the heuristic path styles its runs from — and the element
+/// backing the largest total shown-text length wins. A top-level show matches
+/// its own element (text elements span exactly their show op); a nested show
+/// matches the elements collapsed onto its invoking `Do`, disambiguated by the
+/// decoded text (all of one form's elements share that op position).
+fn elect_marked_styles(doc: &crate::Document, shows: &MarkedShows) -> MarkedStyles {
+    use crate::content::{ContentElement, ElementKind};
+
+    let mut out = MarkedStyles::new();
+    let pages: BTreeSet<usize> = shows.keys().map(|(page, _)| *page).collect();
+    for page in pages {
+        let page_no = (page + 1) as u32;
+        let Ok(elements) = doc.page_elements_deep(page_no) else {
+            continue;
+        };
+        let font_styles = doc.page_base_fonts(page_no);
+        // op position → the text elements anchored there (one for a top-level
+        // show; all of a form's nested elements for a `Do`).
+        let mut by_op: BTreeMap<usize, Vec<&ContentElement>> = BTreeMap::new();
+        for e in elements.iter().filter(|e| e.kind == ElementKind::Text) {
+            by_op.entry(e.op_start).or_default().push(e);
+        }
+        for ((_, mcid), ops) in shows.range((page, i64::MIN)..=(page, i64::MAX)) {
+            // Accumulate shown-text weight per matched element (keyed by the
+            // element's unique deep index), then elect the heaviest.
+            let mut weight: BTreeMap<usize, usize> = BTreeMap::new();
+            let mut matched: BTreeMap<usize, &ContentElement> = BTreeMap::new();
+            for (op_pos, text) in ops {
+                let Some(candidates) = by_op.get(op_pos) else {
+                    continue;
+                };
+                let chosen = candidates
+                    .iter()
+                    .find(|e| e.label.trim() == text.trim())
+                    .or_else(|| candidates.first());
+                if let Some(e) = chosen {
+                    *weight.entry(e.index).or_default() += text.chars().count().max(1);
+                    matched.insert(e.index, e);
+                }
+            }
+            let Some((&index, &w)) = weight.iter().max_by_key(|(_, w)| **w) else {
+                continue;
+            };
+            let e = matched[&index];
+            let style = super::element_text_style(e, &font_styles);
+            // Effective point size, mirroring `runs_from_elements`: the
+            // extracted size, else the box height, else the 12 pt default.
+            let size = e
+                .font_size
+                .or(e.bounds.map(|b| b.height))
+                .unwrap_or(12.0)
+                .max(1.0);
+            out.insert(
+                (page, *mcid),
+                MarkedStyle {
+                    style,
+                    size,
+                    weight: w,
+                },
+            );
+        }
+    }
+    out
 }
 
 /// The `/MCID` integer of a `BDC` operation (`/Tag <<… /MCID n …>> BDC` or
@@ -993,13 +1280,18 @@ mod tests {
         assert_eq!(structure_role(b"Bogus"), None);
     }
 
+    /// Scan a page's marked content with no form XObjects in scope — the
+    /// common shape of the flat-content tests.
+    fn scan_flat(page: usize, content: &[u8], decoders: &FontDecoders) -> MarkedContent {
+        let mut out = MarkedContent::default();
+        collect_page_marked_content(page, content, decoders, &BTreeMap::new(), &mut out);
+        out
+    }
+
     /// Scan a page's marked content for text only (discarding image bindings),
     /// the common shape the text tests assert against.
     fn marked_text(page: usize, content: &[u8], decoders: &FontDecoders) -> MarkedText {
-        let mut text = MarkedText::new();
-        let mut images = MarkedImages::new();
-        collect_page_marked_content(page, content, decoders, &mut text, &mut images);
-        text
+        scan_flat(page, content, decoders).text
     }
 
     #[test]
@@ -1051,25 +1343,16 @@ mod tests {
     fn image_do_binds_to_enclosing_mcid() {
         // `/Figure <</MCID 0>> BDC /Im0 Do EMC` records the image XObject name.
         let content = b"/Figure <</MCID 0>> BDC /Im0 Do EMC";
-        let mut text = MarkedText::new();
-        let mut images = MarkedImages::new();
-        collect_page_marked_content(0, content, &FontDecoders::new(), &mut text, &mut images);
+        let out = scan_flat(0, content, &FontDecoders::new());
         assert_eq!(
-            images.get(&(0, 0)).map(Vec::as_slice),
+            out.images.get(&(0, 0)).map(Vec::as_slice),
             Some(b"Im0".as_slice())
         );
         // First `Do` wins: a second image in the same range doesn't overwrite.
         let content2 = b"/Figure <</MCID 0>> BDC /Im0 Do /Im1 Do EMC";
-        let mut images2 = MarkedImages::new();
-        collect_page_marked_content(
-            0,
-            content2,
-            &FontDecoders::new(),
-            &mut MarkedText::new(),
-            &mut images2,
-        );
+        let out2 = scan_flat(0, content2, &FontDecoders::new());
         assert_eq!(
-            images2.get(&(0, 0)).map(Vec::as_slice),
+            out2.images.get(&(0, 0)).map(Vec::as_slice),
             Some(b"Im0".as_slice())
         );
     }
@@ -1077,15 +1360,104 @@ mod tests {
     #[test]
     fn image_do_outside_any_mcid_is_ignored() {
         let content = b"/Im0 Do";
-        let mut images = MarkedImages::new();
-        collect_page_marked_content(
-            0,
-            content,
-            &FontDecoders::new(),
-            &mut MarkedText::new(),
-            &mut images,
+        let out = scan_flat(0, content, &FontDecoders::new());
+        assert!(out.images.is_empty());
+    }
+
+    // ── form-XObject recursion (partially tagged templates / CERFA shape) ────
+
+    /// A [`FormXObject`](crate::content::FormXObject) with the given stream and
+    /// no fonts of its own, keyed under `name`.
+    fn form_map(
+        name: &[u8],
+        stream: &[u8],
+        ref_id: Option<(u32, u16)>,
+    ) -> BTreeMap<Vec<u8>, crate::content::FormXObject> {
+        let mut forms = BTreeMap::new();
+        forms.insert(
+            name.to_vec(),
+            crate::content::FormXObject {
+                content: stream.to_vec(),
+                fns: FontDecoders::new(),
+                styles: crate::content::FontStyles::new(),
+                matrix: crate::content::PageMatrix::IDENTITY,
+                ref_id,
+            },
         );
-        assert!(images.is_empty());
+        forms
+    }
+
+    #[test]
+    fn mcid_inside_a_form_xobject_is_bound() {
+        // The page only draws the form; the MCID range lives INSIDE the form's
+        // own stream (the tagged-CERFA shape: the reusable template carries the
+        // marked content). The scan must recurse and bind it to the page.
+        let page_content = b"q /Fm0 Do Q";
+        let form_stream = b"/P <</MCID 3>> BDC BT (inside form) Tj ET EMC";
+        let forms = form_map(b"Fm0", form_stream, Some((77, 0)));
+        let mut out = MarkedContent::default();
+        collect_page_marked_content(0, page_content, &FontDecoders::new(), &forms, &mut out);
+        assert_eq!(
+            out.text.get(&(0, 3)).map(String::as_str),
+            Some("inside form"),
+            "marked content inside the form binds to the page"
+        );
+        // The style show records the page-level `Do` position (op 1 of
+        // `q /Fm0 Do Q`) — where the deep element walk collapses nested runs.
+        let shows = out.shows.get(&(0, 3)).expect("style show recorded");
+        assert_eq!(shows.len(), 1);
+        assert_eq!(shows[0].0, 1, "nested show anchored on the invoking Do");
+        assert_eq!(shows[0].1, "inside form");
+    }
+
+    #[test]
+    fn bdc_wrapping_the_do_owns_the_forms_text() {
+        // `/P <</MCID 0>> BDC /Fm0 Do EMC`: the marked range is OUTSIDE, the
+        // glyphs INSIDE the form. The `mc_stack` travels into the recursion so
+        // the form's shows bind to MCID 0.
+        let page_content = b"/P <</MCID 0>> BDC /Fm0 Do EMC";
+        let form_stream = b"BT (wrapped) Tj ET";
+        let forms = form_map(b"Fm0", form_stream, Some((78, 0)));
+        let mut out = MarkedContent::default();
+        collect_page_marked_content(0, page_content, &FontDecoders::new(), &forms, &mut out);
+        assert_eq!(
+            out.text.get(&(0, 0)).map(String::as_str),
+            Some("wrapped"),
+            "a BDC wrapping the Do owns the form's text"
+        );
+    }
+
+    #[test]
+    fn self_referencing_form_terminates() {
+        // The form invokes ITSELF: the per-path visited set must expand it at
+        // most once (no infinite recursion), still binding its text once.
+        let page_content = b"/Fm0 Do";
+        let form_stream = b"/P <</MCID 1>> BDC BT (once) Tj ET EMC /Fm0 Do";
+        let forms = form_map(b"Fm0", form_stream, Some((79, 0)));
+        let mut out = MarkedContent::default();
+        collect_page_marked_content(0, page_content, &FontDecoders::new(), &forms, &mut out);
+        assert_eq!(
+            out.text.get(&(0, 1)).map(String::as_str),
+            Some("once"),
+            "cycle guard stops the recursion after one expansion"
+        );
+    }
+
+    #[test]
+    fn nested_image_do_is_not_bound() {
+        // An image `Do` inside a form is name-scoped to the form's resources —
+        // binding it would make the page-level Figure lookup hit the wrong
+        // (or a missing) image. Only the top-level binding survives.
+        let page_content = b"/Figure <</MCID 0>> BDC /Fm0 Do EMC";
+        let form_stream = b"/Im9 Do";
+        let forms = form_map(b"Fm0", form_stream, Some((80, 0)));
+        let mut out = MarkedContent::default();
+        collect_page_marked_content(0, page_content, &FontDecoders::new(), &forms, &mut out);
+        assert!(
+            out.images.is_empty(),
+            "form-scoped image names are not bound: {:?}",
+            out.images
+        );
     }
 
     #[test]

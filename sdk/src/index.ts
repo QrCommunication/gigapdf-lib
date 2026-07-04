@@ -419,7 +419,24 @@ export class GigaPdfEngine {
   txtToPdf(text: string): Uint8Array {
     return this._withStr(text, (p, l) => this._buffer((o) => this.ex.gp_txt_to_pdf(p, l, o)));
   }
-  htmlToPdf(html: string): Uint8Array {
+  /**
+   * HTML → PDF. With no `options` this is the fixed US-Letter portrait / 0.5in
+   * path (byte-for-byte unchanged). Pass `options` — a named/explicit page size,
+   * `landscape`, per-side `margin`, or a running `header`/`footer` — to configure
+   * the page; that route delegates to {@link GigaPdfEngine.htmlRenderWith}, the
+   * canonical rich path (use it directly for embedded fonts, host-fetched images,
+   * or `{{page}}`/`{{pages}}` tokens). External `<img>`/font URLs are omitted here
+   * (no host fetch); supply them through `htmlRenderWith`.
+   *
+   * ```ts
+   * const a4 = giga.htmlToPdf(html);                               // 612×792
+   * const land = giga.htmlToPdf(html, { pageSize: "A4", landscape: true });
+   * ```
+   */
+  htmlToPdf(html: string, options?: HtmlToPdfOptions): Uint8Array {
+    if (options && Object.keys(options).length > 0) {
+      return this.htmlRenderWith(html, [], options);
+    }
     return this._withStr(html, (p, l) => this._buffer((o) => this.ex.gp_html_to_pdf(p, l, o)));
   }
   rtfToPdf(rtf: string): Uint8Array {
@@ -768,6 +785,10 @@ export class GigaPdfEngine {
       if (!sz) throw new Error(`gigapdf: unknown page size "${options.pageSize}"`);
       pw = sz.w;
       ph = sz.h;
+    }
+    // `landscape` orients the resolved size wide (swaps to width ≥ height).
+    if (options.landscape && ph > pw) {
+      [pw, ph] = [ph, pw];
     }
     const m = options.margin ?? 36;
     const mg =
@@ -1134,6 +1155,12 @@ export interface HtmlRenderOptions {
   pageWidth?: number;
   /** Explicit page height in points (default 792). Ignored if `pageSize` is set. */
   pageHeight?: number;
+  /**
+   * Orient the resolved page in landscape (width ≥ height): swaps the width and
+   * height of the portrait size resolved from `pageSize` / `pageWidth` /
+   * `pageHeight`. No effect on an already-landscape size.
+   */
+  landscape?: boolean;
   /** Uniform margin (points) or per-side margins. Default 36pt (0.5in). */
   margin?: number | HtmlMargins;
   /** Running header HTML painted in the top margin (`{{page}}` / `{{pages}}` tokens). */
@@ -1154,6 +1181,17 @@ export interface HtmlRenderOptions {
    */
   resources?: HtmlResource[];
 }
+
+/**
+ * Page-setup options for {@link GigaPdfEngine.htmlToPdf} — the page-shaping
+ * subset of {@link HtmlRenderOptions} (size, `landscape`, margins, running
+ * header/footer). For embedded fonts, host-fetched images, or page-number
+ * tokens, call {@link GigaPdfEngine.htmlRenderWith} directly.
+ */
+export type HtmlToPdfOptions = Pick<
+  HtmlRenderOptions,
+  "pageSize" | "pageWidth" | "pageHeight" | "landscape" | "margin" | "header" | "footer"
+>;
 
 export interface FontInfo {
   family: string;
@@ -1319,6 +1357,24 @@ export interface GigaCharStyle {
   /** RGB `0..=1`, or `null` for default black. */
   color: [number, number, number] | null;
   valign: 'baseline' | 'super' | 'sub';
+  /**
+   * All-capitals display transform (`w:caps`, PPTX `cap="all"`). The run text
+   * keeps its original casing — render with `text-transform:uppercase`.
+   * Additive (omitted when off); present since 0.117.0.
+   */
+  caps?: boolean;
+  /** Small-capitals variant (`w:smallCaps`, PPTX `cap="small"`) — render with
+   * `font-variant:small-caps`. Additive (omitted when off). */
+  small_caps?: boolean;
+  /** Double strike-through (`w:dstrike`); `strike` stays set alongside as the
+   * single-line fallback. Additive (omitted when off). */
+  dstrike?: boolean;
+  /** Baseline shift in points (positive raises; `w:position` ÷ 2). Additive. */
+  baseline_shift_pt?: number;
+  /** Horizontal character scaling in percent (`w:w`; 100 = normal). Additive. */
+  char_scale_pct?: number;
+  /** Kerning threshold in points (`w:kern` ÷ 2). Additive. */
+  kern_min_pt?: number;
 }
 
 /** An axis-aligned placement box, lower-left `(x,y)` + size, in PDF points. */
@@ -1329,22 +1385,35 @@ export interface GigaRect {
   h: number;
 }
 
-/** A hyperlink destination (tagged; mirror of `model::LinkTarget`). */
+/**
+ * A hyperlink destination (tagged; mirror of `model::LinkTarget`).
+ *
+ * Beyond the external `url` and the resolved zero-based `page` jump:
+ * `anchor` is a **named in-document anchor** (a DOCX bookmark that did not —
+ * or could not yet — resolve to a page), and `other` a raw action summary a
+ * PDF link carried that has no URL/page equivalent (`"GoToR:report.pdf"`,
+ * `"Named:NextPage"`, `"Launch:app.exe"`). Both present since 0.117.0.
+ */
 export type GigaLinkTarget =
   | { t: 'url'; v: string }
-  | { t: 'page'; v: number };
+  | { t: 'page'; v: number }
+  | { t: 'anchor'; v: string }
+  | { t: 'other'; v: string };
 
 /**
  * An inline (within-paragraph) node, tagged by `t` (mirror of `model::Inline`).
  * `run` carries the styled text + its `source_index` back to the editable
  * content-stream operator; `br` is a hard line break; `image` an inline image;
- * `link` wraps children with a destination.
+ * `link` wraps children with a destination; `footnoteRef` anchors a
+ * foot-/endnote whose body lives in `GigaDocument.footnotes` (the superscript
+ * call marker is the note's 1-based position there — present since 0.117.0).
  */
 export type GigaInline =
   | { t: 'run'; v: GigaInlineRun }
   | { t: 'br' }
   | { t: 'image'; v: GigaImageRef }
-  | { t: 'link'; href: GigaLinkTarget; children: GigaInline[] };
+  | { t: 'link'; href: GigaLinkTarget; children: GigaInline[] }
+  | { t: 'footnoteRef'; id: string };
 
 /** A styled span of text (mirror of `model::InlineRun`). */
 export interface GigaInlineRun {
@@ -1374,6 +1443,64 @@ export interface GigaParagraphStyle {
     | { t: 'normal' }
     | { t: 'multiple'; v: number }
     | { t: 'points'; v: number };
+  /**
+   * Base writing direction. Omitted = unspecified (reads as `ltr`). Set from
+   * DOCX `w:bidi` / PPTX `a:pPr@rtl` / ODF `writing-mode:rl-tb` / RTF
+   * `\rtlpar`, and by reconstruction's Unicode strong-script heuristic
+   * (>60 % Hebrew/Arabic strong letters). Present since 0.117.0.
+   */
+  direction?: 'ltr' | 'rtl';
+  /**
+   * Wrap-vs-deliberate classification of the paragraph's line breaks
+   * (reconstruction only): entry `k` is `true` when the break between line
+   * `k` and `k + 1` is **soft** (a word-wrap consequence an exporter may
+   * re-flow across) and `false` for a deliberate short line (verse, address).
+   * Omitted/empty = not analysed. The `{t:'br'}` inlines themselves are
+   * unchanged. Present since 0.117.0.
+   */
+  soft_breaks?: boolean[];
+  /**
+   * Force a page break before this paragraph (DOCX `w:pageBreakBefore`, ODF
+   * `fo:break-before="page"`) — the authored intent, kept alongside the
+   * structural page split so exporters re-emit the property. Additive
+   * (omitted when off).
+   */
+  page_break_before?: boolean;
+}
+
+/**
+ * One side of a paragraph or table-cell border: width in points, a line-style
+ * keyword (`solid`/`dashed`/`dotted`/`double`), and an RGB colour (mirror of
+ * `model::ParaBorder`).
+ */
+export interface GigaParaBorder {
+  width_pt: number;
+  style: string;
+  color: [number, number, number];
+}
+
+/**
+ * A linear gradient fill (mirror of `model::Gradient`): ordered colour stops
+ * (position `0..=1`, RGB, opacity) plus the axis angle in degrees clockwise
+ * from +X (`0` = left→right, `90` = top→bottom — the DrawingML convention).
+ * Carried alongside the flat RGB fill, which stays the first stop's colour.
+ */
+export interface GigaGradient {
+  stops: { pos: number; color: [number, number, number]; alpha: number }[];
+  angle_deg: number;
+}
+
+/**
+ * An outer drop shadow (mirror of `model::Shadow`): offset in points
+ * (+X right, +Y down — the CSS `box-shadow` convention), Gaussian blur
+ * radius, RGB colour and opacity.
+ */
+export interface GigaShadow {
+  dx_pt: number;
+  dy_pt: number;
+  blur_pt: number;
+  color: [number, number, number];
+  alpha: number;
 }
 
 /** A paragraph: its own style, an optional named-style ref, and its inline runs. */
@@ -1405,11 +1532,38 @@ export interface GigaListItem {
   level: number;
 }
 
+/**
+ * One depth's marker style in a multi-level list (mirror of
+ * `model::ListLevelStyle`): the marker (its tag is the number format —
+ * `bullet` ⇒ an unordered depth), the ordinal suffix (omitted ⇒ `"."`), and
+ * the depth's first ordinal (omitted ⇒ 1). Present since 0.117.0.
+ */
+export interface GigaListLevelStyle {
+  marker: GigaListMarker;
+  /** Ordinal suffix for an ordered depth (e.g. `")"`); omitted ⇒ `"."`. */
+  suffix?: string;
+  /** First ordinal of the depth; omitted ⇒ 1. */
+  start?: number;
+}
+
 /** An ordered or unordered list (mirror of `model::List`). */
 export interface GigaList {
   ordered: boolean;
   marker: GigaListMarker;
   items: GigaListItem[];
+  /** Start number for ordered lists; omitted ⇒ 1. */
+  start?: number;
+  /** Ordinal suffix (`"."`/`")"`); omitted ⇒ the conventional `"."`. */
+  marker_suffix?: string;
+  /**
+   * Per-depth marker table indexed by `GigaListItem.level` (entry 0 = the
+   * outermost depth), from DOCX `numbering.xml` multi-level definitions.
+   * Omitted/empty ⇒ the table-wide `marker`/`marker_suffix` apply to every
+   * depth. Present since 0.117.0.
+   */
+  levels?: GigaListLevelStyle[];
+  /** Ordinal prefix — the `"("` of a `"(a)"` marker. Omitted ⇒ none. */
+  marker_prefix?: string;
 }
 
 /** A table cell: block content, span, and optional RGB shading (`model::Cell`). */
@@ -1419,6 +1573,18 @@ export interface GigaTableCell {
   row_span: number;
   /** RGB `0..=1` background, or `null` for no shading. */
   shading: [number, number, number] | null;
+  /**
+   * Per-cell borders `[top, right, bottom, left]` (same shape as the
+   * paragraph borders). Omitted = no per-cell regime: the table-wide
+   * `GigaTable.border` applies. When present, a `null` side draws nothing
+   * (an explicit "no line here"). Present since 0.117.0.
+   */
+  borders?: [
+    GigaParaBorder | null,
+    GigaParaBorder | null,
+    GigaParaBorder | null,
+    GigaParaBorder | null,
+  ];
 }
 
 /** A table row: its cells and an optional fixed height in points (`model::Row`). */
@@ -1454,6 +1620,18 @@ export interface GigaImageRef {
    */
   resource: string | number;
   alt: string | null;
+  /**
+   * Authored display size `[width, height]` in points (DOCX inline
+   * `wp:extent`) — a flow image re-exports at its real size instead of a
+   * default extent. Omitted when the source carried none. Present since 0.117.0.
+   */
+  size_pt?: [number, number];
+  /**
+   * Source-rectangle crop `[left, top, right, bottom]` inset fractions
+   * (`0..=1` each; DrawingML `a:srcRect`). Omitted = uncropped. Present
+   * since 0.117.0.
+   */
+  crop?: [number, number, number, number];
 }
 
 /** A single vector path segment (tagged; mirror of `content::vector::PathSeg`). */
@@ -1472,6 +1650,13 @@ export interface GigaShape {
   stroke: [number, number, number] | null;
   stroke_width: number;
   dash: number[];
+  /**
+   * Full gradient fill (PPTX/ODP `gradFill`). Primes over the flat `fill`,
+   * which keeps the first stop's colour as the fallback. Present since 0.117.0.
+   */
+  fill_gradient?: GigaGradient;
+  /** Outer drop shadow (`a:outerShdw`). Present since 0.117.0. */
+  shadow?: GigaShadow;
 }
 
 /** A free-floating text box holding a list of blocks (mirror of `model::TextBox`). */
@@ -1486,6 +1671,17 @@ export interface GigaSheetCell {
   /** RGB `0..=1` cell fill, or `null` for none. */
   fill: [number, number, number] | null;
   style: GigaCharStyle;
+  /**
+   * Text rotation in signed degrees CCW (`+45` slants up, `-45` down; XLSX
+   * `alignment@textRotation`). Omitted = horizontal. Present since 0.117.0.
+   */
+  rotation_deg?: number;
+  /**
+   * Diagonal border line(s): which diagonal(s) draw (`up` = bottom-left →
+   * top-right, `down` = top-left → bottom-right) and the line width/colour.
+   * Present since 0.117.0.
+   */
+  diagonal?: { up: boolean; down: boolean; border: GigaBorderStyle };
 }
 
 /** One spreadsheet row (mirror of `model::SheetRow`). */
@@ -1507,6 +1703,12 @@ export interface GigaSheet {
   rows: GigaSheetRow[];
   merges: GigaMergeRange[];
   col_widths: number[];
+  /**
+   * Frozen panes `[rows, cols]`: leading rows/columns pinned while the rest
+   * scrolls (XLSX `<pane state="frozen">`). Omitted = no freeze. Present
+   * since 0.117.0.
+   */
+  freeze?: [number, number];
 }
 
 /** A block of spreadsheet content: one or more sheets (mirror of `model::SheetBlock`). */
@@ -1532,6 +1734,17 @@ export interface GigaPageGeometry {
   width: number;
   height: number;
   margins: { top: number; right: number; bottom: number; left: number };
+  /** Text columns on the page (1 = single-column body text). */
+  column_count?: number;
+  /** Gutter between text columns in points (DOCX `w:cols@w:space`). Omitted =
+   * the suite default. Present since 0.117.0. */
+  column_gap_pt?: number;
+  /** Individual column widths in points (a `w:equalWidth="0"` layout).
+   * Omitted = equal-width columns. Present since 0.117.0. */
+  column_widths_pt?: number[];
+  /** Vertical separator rule between columns (`w:cols@w:sep`). Present since
+   * 0.117.0. */
+  column_separator?: boolean;
 }
 
 /** A single slide (mirror of `model::Slide`). */
@@ -1540,6 +1753,13 @@ export interface GigaSlide {
   shapes: GigaBlock[];
   placeholders: GigaPlaceholder[];
   notes: GigaBlock[] | null;
+  /** Full-slide background fill (RGB `0..=1`), or `null`/omitted = white. */
+  background?: [number, number, number] | null;
+  /**
+   * Full-slide gradient background; primes over the flat `background`
+   * (which keeps the first stop's colour). Present since 0.117.0.
+   */
+  background_gradient?: GigaGradient;
 }
 
 /** A block of presentation content: an ordered list of slides (`model::SlideBlock`). */
@@ -1594,6 +1814,19 @@ export interface GigaSection {
   geometry: GigaPageGeometry;
   header: GigaBlock[] | null;
   footer: GigaBlock[] | null;
+  /**
+   * Distinct first-page header/footer (DOCX `w:titlePg`). Omitted = the
+   * default applies everywhere; `[]` = a *blank* first-page variant (Word's
+   * "different first page" with an empty header). Present since 0.117.0.
+   */
+  header_first?: GigaBlock[];
+  footer_first?: GigaBlock[];
+  /**
+   * Distinct even-page header/footer (DOCX `w:evenAndOddHeaders`). Same
+   * omitted/`[]` semantics as the first-page variants. Present since 0.117.0.
+   */
+  header_even?: GigaBlock[];
+  footer_even?: GigaBlock[];
   pages: GigaPage[];
 }
 
@@ -1618,6 +1851,17 @@ export interface GigaOutlineNode {
  * beyond what a host typically edits (`styles`, `resources`) are carried
  * opaquely so a round-trip preserves them.
  */
+/**
+ * A foot-/endnote (mirror of `model::Footnote`): its document-unique `id`
+ * (matched by the in-flow `{ t: 'footnoteRef' }` anchors) and its body as a
+ * full block list. The display ordinal is the note's 1-based position in
+ * `GigaDocument.footnotes`. Present since 0.117.0.
+ */
+export interface GigaFootnote {
+  id: string;
+  blocks: GigaBlock[];
+}
+
 export interface GigaDocument {
   v: number;
   meta: {
@@ -1632,6 +1876,12 @@ export interface GigaDocument {
   /** Bookmark / chapter hierarchy (empty when the source has none). */
   outline: GigaOutlineNode[];
   resources: unknown;
+  /**
+   * Foot-/endnotes anchored in the body by `{ t: 'footnoteRef' }` inlines
+   * (DOCX `footnotes.xml`/`endnotes.xml`, RTF `{\footnote …}`). Omitted when
+   * the document carries none. Present since 0.117.0.
+   */
+  footnotes?: GigaFootnote[];
 }
 
 /**

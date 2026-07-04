@@ -107,25 +107,41 @@ impl MeasureBook {
     }
 
     /// The nearest *host-provided* face for a style, plus the exact weight of the
-    /// face that won, applying the CSS font-matching weight algorithm: among
-    /// same-family + same-italic faces, the closest weight per [`weight_pref`];
-    /// then same-family any italic; then any provided face. `None` when no font
-    /// was provided at all (the caller then falls back to the bundled face).
+    /// face that won: each family of the `font-family` fallback **list** is tried
+    /// in source order — the first family any provided face carries wins — and
+    /// within it the CSS font-matching weight algorithm applies (same-family +
+    /// same-italic faces by [`weight_pref`]; then same-family any italic). Only
+    /// when NO listed family is provided does the last resort (any provided
+    /// face) apply. `None` when no font was provided at all (the caller then
+    /// falls back to the bundled face).
     fn provided_match(&self, style: &Style) -> Option<(&Face, u16)> {
-        let fam = style.font_family.to_ascii_lowercase();
         let want = style.font_weight;
-        // 1. Same family + same italic: pick the best weight.
-        self.faces
+        // The fallback list; a style set before `font-family` ever cascaded
+        // has an empty list and resolves by its single `font_family`.
+        let single = [style.font_family.clone()];
+        let families: &[String] = if style.font_families.is_empty() {
+            &single
+        } else {
+            &style.font_families
+        };
+        let by_family = |fam: &str| -> Option<&ProvidedFace> {
+            let fam = fam.to_ascii_lowercase();
+            // 1. Same family + same italic: pick the best weight.
+            self.faces
+                .iter()
+                .filter(|f| f.family == fam && f.italic == style.italic)
+                .min_by_key(|f| weight_pref(f.weight, want))
+                // 2. Same family, ignore italic: still honour weight matching.
+                .or_else(|| {
+                    self.faces
+                        .iter()
+                        .filter(|f| f.family == fam)
+                        .min_by_key(|f| weight_pref(f.weight, want))
+                })
+        };
+        families
             .iter()
-            .filter(|f| f.family == fam && f.italic == style.italic)
-            .min_by_key(|f| weight_pref(f.weight, want))
-            // 2. Same family, ignore italic: still honour weight matching.
-            .or_else(|| {
-                self.faces
-                    .iter()
-                    .filter(|f| f.family == fam)
-                    .min_by_key(|f| weight_pref(f.weight, want))
-            })
+            .find_map(|fam| by_family(fam))
             // 3. Any provided face at all (last resort before the bundled font).
             .or_else(|| self.faces.first())
             .map(|f| (&f.face, f.weight))
@@ -479,7 +495,38 @@ pub fn render_with(html: &str, fonts: &[ProvidedFont], opts: &RenderOptions) -> 
     // alongside the caller's fonts, so a document-embedded face actually renders.
     let fonts = fonts_with_inline_faces(&nodes, fonts);
     let fonts = fonts.as_slice();
-    let sheet = Stylesheet::with_viewport(&collect_style_css(&nodes), Some(opts.page_w / 0.75));
+    let css = collect_style_css(&nodes);
+    // The author's `@page { size; margin }` rule supplies the page geometry
+    // when the caller honours it (browser print behaviour; the default). It is
+    // resolved BEFORE the stylesheet is built so `@media (min-width: …)`
+    // queries evaluate against the effective page width.
+    let mut eff = opts.clone();
+    if eff.honor_page_rule {
+        if let Some(rule) = super::css::collect_page_rule(&css) {
+            if let Some((w, h)) = rule.size {
+                eff.page_w = w;
+                eff.page_h = h;
+            }
+            let [t, r, b, l] = rule.margins;
+            if let Some(t) = t {
+                eff.margins.top = t;
+            }
+            if let Some(r) = r {
+                eff.margins.right = r;
+            }
+            if let Some(b) = b {
+                eff.margins.bottom = b;
+            }
+            if let Some(l) = l {
+                eff.margins.left = l;
+            }
+        }
+    }
+    let opts = &eff;
+    let sheet = Stylesheet::with_viewport(&css, Some(opts.page_w / 0.75));
+    // Materialise `::before`/`::after` generated content as synthetic children
+    // (an untouched clone when the stylesheet has no such rule).
+    let nodes = super::css::apply_pseudo_elements(&nodes, &sheet);
     let book = MeasureBook::new(fonts);
     let frame = Frame {
         page_w: opts.page_w,
@@ -621,12 +668,20 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 radius_v,
                 shadow,
             },
-            Fragment::Image { x, y, w, h, src } => Fragment::Image {
+            Fragment::Image {
+                x,
+                y,
+                w,
+                h,
+                src,
+                fit,
+            } => Fragment::Image {
                 x,
                 y: y + dy,
                 w,
                 h,
                 src,
+                fit,
             },
             Fragment::Svg { x, y, w, h, image } => Fragment::Svg {
                 x,
@@ -645,6 +700,9 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 color,
                 style,
                 opacity,
+                radius_start,
+                radius_end,
+                far,
             } => Fragment::Border {
                 x,
                 y: y + dy,
@@ -655,6 +713,9 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 color,
                 style,
                 opacity,
+                radius_start,
+                radius_end,
+                far,
             },
             Fragment::Gradient {
                 x,
@@ -1150,9 +1211,16 @@ fn paint(
                     let w = book.width(trimmed, style);
                     paint_text_decorations(doc, page, page_h, *x, *y, w, style);
                 }
-                Fragment::Image { x, y, w, h, src } => {
+                Fragment::Image {
+                    x,
+                    y,
+                    w,
+                    h,
+                    src,
+                    fit,
+                } => {
                     if let Some(data) = resolve_image(src, &opts.resources) {
-                        let _ = doc.add_image(page, &data, *x, page_h - y - h, *w, *h, 1.0);
+                        draw_image_fitted(doc, page, page_h, &data, *x, *y, *w, *h, *fit);
                     }
                 }
                 Fragment::Svg { x, y, w, h, image } => {
@@ -1169,6 +1237,9 @@ fn paint(
                     color,
                     style,
                     opacity,
+                    radius_start,
+                    radius_end,
+                    far,
                 } => {
                     paint_styled_border(
                         doc,
@@ -1183,6 +1254,8 @@ fn paint(
                         *color,
                         *style,
                         *opacity,
+                        [*radius_start, *radius_end],
+                        *far,
                     );
                 }
                 Fragment::Gradient {
@@ -2022,6 +2095,13 @@ fn text_shadow_passes(blur: f64) -> [(f64, f64, f64); 5] {
 /// - **double**: two thin lines (≈ width/3 each) at the band's two edges with a
 ///   gap between, spanning the whole side.
 ///
+/// `radius` carries the outer `border-radius` of the corners adjoining the
+/// band's start / end (`[radius_start, radius_end]`, `0` = square). The layout
+/// already shortened the band by those radii; here the pattern **continues
+/// along each corner's quarter-arc half** (45° per side, so the two adjacent
+/// sides tile the corner) as filled annular sectors — real curved dashes, no
+/// square overshoot. All-zero radii leave the output byte-identical.
+///
 /// A `Solid` side never reaches here (it stays a plain filled rect upstream).
 #[allow(clippy::too_many_arguments)]
 fn paint_styled_border(
@@ -2037,6 +2117,8 @@ fn paint_styled_border(
     color: [f64; 3],
     style: BorderStyle,
     opacity: f64,
+    radius: [f64; 2],
+    far: bool,
 ) {
     if width <= 0.0 || w <= 0.0 || h <= 0.0 {
         return;
@@ -2058,6 +2140,11 @@ fn paint_styled_border(
         }
     };
 
+    let (dash, gap) = match style {
+        BorderStyle::Dotted => (width.max(0.3), width.max(0.3)),
+        _ => (width * 3.0, width * 2.0), // Dashed (Double handled separately)
+    };
+
     match style {
         BorderStyle::Double => {
             // Two parallel lines ≈ width/3 thick at the band's far edges.
@@ -2072,10 +2159,6 @@ fn paint_styled_border(
         }
         // Dashed / dotted: march filled bars along the side's long axis.
         _ => {
-            let (dash, gap) = match style {
-                BorderStyle::Dotted => (width.max(0.3), width.max(0.3)),
-                _ => (width * 3.0, width * 2.0), // Dashed
-            };
             let period = (dash + gap).max(0.1);
             let length = if horizontal { w } else { h };
             let mut pos = 0.0;
@@ -2090,6 +2173,146 @@ fn paint_styled_border(
             }
         }
     }
+
+    // Continue the pattern along the rounded corners. Each corner arc is
+    // described by its centre, its "cardinal" angle (the point where the arc
+    // meets this band's end) and the sweep direction toward the 45° diagonal
+    // that this side owns. Angles parametrise `centre + ρ(cos θ, sin θ)` in
+    // top-down coordinates (θ = 270° is the topmost point, 90° the bottommost).
+    let corners: [(f64, f64, f64, f64, f64); 2] = match (horizontal, far) {
+        // Top side: start = top-left corner, end = top-right.
+        (true, false) => [
+            (x, y + radius[0], radius[0], 270.0, -1.0),
+            (x + w, y + radius[1], radius[1], 270.0, 1.0),
+        ],
+        // Bottom side: start = bottom-left, end = bottom-right.
+        (true, true) => [
+            (x, y + h - radius[0], radius[0], 90.0, 1.0),
+            (x + w, y + h - radius[1], radius[1], 90.0, -1.0),
+        ],
+        // Left side: start = top-left, end = bottom-left.
+        (false, false) => [
+            (x + radius[0], y, radius[0], 180.0, 1.0),
+            (x + radius[1], y + h, radius[1], 180.0, -1.0),
+        ],
+        // Right side: start = top-right, end = bottom-right.
+        (false, true) => [
+            (x + w - radius[0], y, radius[0], 360.0, -1.0),
+            (x + w - radius[1], y + h, radius[1], 0.0, 1.0),
+        ],
+    };
+    for (ccx, ccy, r, cardinal, dirn) in corners {
+        if r <= width / 2.0 + 0.01 {
+            continue; // corner tighter than the stroke: shortening is enough
+        }
+        let rm = r - width / 2.0; // centreline radius of the border strip
+        let span = rm * std::f64::consts::FRAC_PI_4; // 45° of arc, in points
+        let ri = (r - width).max(0.0); // inner edge of the strip
+        match style {
+            BorderStyle::Double => {
+                // Two thin concentric arcs over the whole owned 45°.
+                let t = (width / 3.0).max(0.3);
+                let a0 = cardinal.to_radians();
+                let a1 = (cardinal + dirn * 45.0).to_radians();
+                paint_annular_sector(
+                    doc,
+                    page,
+                    page_h,
+                    ccx,
+                    ccy,
+                    r,
+                    r - t,
+                    a0,
+                    a1,
+                    color,
+                    opacity,
+                );
+                paint_annular_sector(
+                    doc,
+                    page,
+                    page_h,
+                    ccx,
+                    ccy,
+                    (ri + t).min(r),
+                    ri,
+                    a0,
+                    a1,
+                    color,
+                    opacity,
+                );
+            }
+            _ => {
+                // March the dash pattern along the centreline arc, starting at
+                // the band's end so the rhythm flows out of the straight run.
+                let period = (dash + gap).max(0.1);
+                let mut pos = 0.0;
+                while pos < span - 0.01 {
+                    let seg = dash.min(span - pos);
+                    let a0 = (cardinal + dirn * (pos / rm).to_degrees()).to_radians();
+                    let a1 = (cardinal + dirn * ((pos + seg) / rm).to_degrees()).to_radians();
+                    paint_annular_sector(
+                        doc, page, page_h, ccx, ccy, r, ri, a0, a1, color, opacity,
+                    );
+                    pos += period;
+                }
+            }
+        }
+    }
+}
+
+/// Fill the annular sector between radii `ri..ro` around centre `(cx, cy)` and
+/// angles `a0..a1` (radians, top-down parametrisation `centre + ρ(cos, sin)`),
+/// as an SVG path — `add_path` expands the arcs to real Bézier curves. Used for
+/// the dash/dot/double segments that ride a rounded border corner.
+#[allow(clippy::too_many_arguments)]
+fn paint_annular_sector(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    cx: f64,
+    cy: f64,
+    ro: f64,
+    ri: f64,
+    a0: f64,
+    a1: f64,
+    color: [f64; 3],
+    opacity: f64,
+) {
+    if ro <= 0.0 || (a1 - a0).abs() < 1e-6 {
+        return;
+    }
+    // Normalise so the outer arc runs with increasing θ (sweep 1 = clockwise on
+    // screen in top-down coordinates), the inner arc back with sweep 0.
+    let (lo, hi) = if a0 <= a1 { (a0, a1) } else { (a1, a0) };
+    let pt = |rho: f64, a: f64| (cx + rho * a.cos(), cy + rho * a.sin());
+    let (ox0, oy0) = pt(ro, lo);
+    let (ox1, oy1) = pt(ro, hi);
+    let mut d = format!(
+        "M {} {} A {} {} 0 0 1 {} {} ",
+        num(ox0),
+        num(oy0),
+        num(ro),
+        num(ro),
+        num(ox1),
+        num(oy1)
+    );
+    if ri > 0.01 {
+        let (ix1, iy1) = pt(ri, hi);
+        let (ix0, iy0) = pt(ri, lo);
+        d.push_str(&format!(
+            "L {} {} A {} {} 0 0 0 {} {} ",
+            num(ix1),
+            num(iy1),
+            num(ri),
+            num(ri),
+            num(ix0),
+            num(iy0)
+        ));
+    } else {
+        d.push_str(&format!("L {} {} ", num(cx), num(cy)));
+    }
+    d.push('Z');
+    let _ = doc.add_path(page, &d, 0.0, page_h, None, Some(color), 0.0, opacity);
 }
 
 /// Paint any CSS gradient background filling the box `(x, y, w, h)` (top-down),
@@ -2192,7 +2415,9 @@ fn radial_gradient_svg_image(
         .map(|(st, off)| GradStop {
             offset: off,
             rgb: st.color,
-            alpha,
+            // The box opacity rides on every stop; a `transparent` /
+            // `rgba()` stop folds its own alpha in on top.
+            alpha: alpha * st.alpha,
         })
         .collect();
 
@@ -2269,6 +2494,9 @@ fn conic_gradient_svg_image(
         let t1 = (i + 1) as f64 * step;
         let tmid = (t0 + t1) * 0.5;
         let rgb = sample_ramp(&grad.stops, &offsets, tmid);
+        // Per-stop alpha (`transparent` / `rgba()` stops) sampled like the
+        // colour and folded into the sector's flat fill opacity.
+        let a = sample_ramp_alpha(&grad.stops, &offsets, tmid);
         // CSS conic: `0` points up and sweeps clockwise. Convert the turn fraction
         // to an SVG-(Y-down) angle measured from the +Y-up "north", clockwise.
         let a0 = conic_angle(grad.from_deg, t0);
@@ -2288,7 +2516,7 @@ fn conic_gradient_svg_image(
             fill: Some(Fill::Solid(rgb)),
             stroke: None,
             stroke_w: 0.0,
-            fill_opacity: alpha,
+            fill_opacity: alpha * a,
             stroke_opacity: 1.0,
         });
     }
@@ -2338,6 +2566,31 @@ fn sample_ramp(stops: &[super::css::GradientStop], offsets: &[f64], t: f64) -> [
         }
     }
     stops[last].color
+}
+
+/// [`sample_ramp`]'s alpha twin: interpolate the stops' opacity at `t`
+/// (clamped to the end stops outside the range). `1.0` everywhere for a ramp
+/// of plain colours, so the fully-opaque path is unchanged.
+fn sample_ramp_alpha(stops: &[super::css::GradientStop], offsets: &[f64], t: f64) -> f64 {
+    if stops.is_empty() {
+        return 1.0;
+    }
+    if t <= offsets[0] {
+        return stops[0].alpha;
+    }
+    let last = stops.len() - 1;
+    if t >= offsets[last] {
+        return stops[last].alpha;
+    }
+    for i in 0..last {
+        let (a, b) = (offsets[i], offsets[i + 1]);
+        if t >= a && t <= b {
+            let span = (b - a).max(1e-9);
+            let f = ((t - a) / span).clamp(0.0, 1.0);
+            return stops[i].alpha + (stops[i + 1].alpha - stops[i].alpha) * f;
+        }
+    }
+    stops[last].alpha
 }
 
 /// Paint a CSS `linear-gradient` filling the box `(x, y, w, h)` (top-down) as a
@@ -2416,7 +2669,9 @@ fn gradient_svg_image(
         .map(|(st, off)| GradStop {
             offset: off,
             rgb: st.color,
-            alpha,
+            // The box opacity rides on every stop; a `transparent` /
+            // `rgba()` stop folds its own alpha in on top.
+            alpha: alpha * st.alpha,
         })
         .collect();
 
@@ -2492,6 +2747,73 @@ fn resolve_stop_offsets(stops: &[super::css::GradientStop]) -> Vec<f64> {
         }
     }
     out
+}
+
+/// Draw image `data` into the top-down box `(x, y, w, h)` honouring
+/// `object-fit`. `Fill` (the default) stretches to the box exactly as before —
+/// byte-identical single `add_image` call. The other modes need the intrinsic
+/// pixel size (probed from the decoded header): `contain` letterboxes the
+/// largest fitting rect, `cover` scales the smallest covering rect and clips
+/// it to the box, `none` places the intrinsic size centred (clipped), and
+/// `scale-down` is the smaller of `none`/`contain`. An unprobeable image (or a
+/// degenerate box) falls back to the plain stretched draw.
+#[allow(clippy::too_many_arguments)]
+fn draw_image_fitted(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    data: &[u8],
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    fit: super::css::ObjectFit,
+) {
+    use super::css::ObjectFit;
+    let plain = |doc: &mut Document| {
+        let _ = doc.add_image(page, data, x, page_h - y - h, w, h, 1.0);
+    };
+    if fit == ObjectFit::Fill || w <= 0.0 || h <= 0.0 {
+        plain(doc);
+        return;
+    }
+    let Some(prep) = crate::content::image::prepare_image(data) else {
+        plain(doc);
+        return;
+    };
+    let (iw, ih) = (prep.width as f64, prep.height as f64);
+    if iw <= 0.0 || ih <= 0.0 {
+        plain(doc);
+        return;
+    }
+    // The drawn rect (dw × dh), centred in the box per the CSS default
+    // `object-position: 50% 50%`.
+    let scale_contain = (w / iw).min(h / ih);
+    let (dw, dh) = match fit {
+        ObjectFit::Contain => (iw * scale_contain, ih * scale_contain),
+        ObjectFit::Cover => {
+            let s = (w / iw).max(h / ih);
+            (iw * s, ih * s)
+        }
+        ObjectFit::None => (iw, ih),
+        ObjectFit::ScaleDown => {
+            let s = scale_contain.min(1.0);
+            (iw * s, ih * s)
+        }
+        ObjectFit::Fill => (w, h), // handled above; kept for exhaustiveness
+    };
+    let dx = x + (w - dw) / 2.0;
+    let dy = y + (h - dh) / 2.0;
+    // `cover`/`none` may spill outside the box — clip to it (PDF bottom-up).
+    let needs_clip = dw > w + 0.01 || dh > h + 0.01;
+    if needs_clip && doc.push_clip_rect(page, x, page_h - y - h, w, h).is_err() {
+        plain(doc);
+        return;
+    }
+    let _ = doc.add_image(page, data, dx, page_h - dy - dh, dw, dh, 1.0);
+    if needs_clip {
+        let _ = doc.restore_graphics(page);
+    }
 }
 
 /// Resolve an `<img>` source to image bytes: a `data:` URI is decoded inline; any
@@ -3204,6 +3526,42 @@ mod tests {
     }
 
     #[test]
+    fn dashed_border_with_radius_curves_around_the_corners() {
+        // With `border-radius`, the dashed bands stop where the arcs begin and
+        // the pattern continues ALONG the corner curves: the content stream
+        // must carry real Bézier `c` operators (the annular dash sectors),
+        // which a square dashed border never emits.
+        let content_of = |html: &str| {
+            let pdf = render(html, &[], 300.0, 200.0, 10.0);
+            assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+            let doc = Document::open(&pdf).expect("re-open");
+            String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string()
+        };
+        let rounded = content_of(
+            r#"<div style="border:2pt dashed #000000;border-radius:10pt;width:100pt;height:60pt"></div>"#,
+        );
+        let square =
+            content_of(r#"<div style="border:2pt dashed #000000;width:100pt;height:60pt"></div>"#);
+        let curves = |s: &str| s.matches(" c\n").count();
+        assert_eq!(
+            curves(&square),
+            0,
+            "square dashed border stays pure rectangles"
+        );
+        assert!(
+            curves(&rounded) >= 8,
+            "rounded dashed border emits curved dash sectors ({} curve ops)",
+            curves(&rounded)
+        );
+        // And the straight runs are shorter: fewer `re` bars than the square
+        // border (the corner zones are no longer covered by straight dashes).
+        assert!(
+            rounded.matches(" re").count() < square.matches(" re").count(),
+            "straight dash bars stop at the corner radius"
+        );
+    }
+
+    #[test]
     fn linear_gradient_background_emits_axial_shading() {
         // A `linear-gradient` background paints a real PDF axial shading
         // (`/ShadingType 2`), referenced from the page via a `/Pattern` fill.
@@ -3236,10 +3594,12 @@ mod tests {
             GradientStop {
                 color: [1.0, 0.0, 0.0],
                 pos: None,
+                alpha: 1.0,
             },
             GradientStop {
                 color: [0.0, 0.0, 1.0],
                 pos: None,
+                alpha: 1.0,
             },
         ];
         // `90deg` ≡ "to right": gradient line runs left→right across the box,
@@ -3311,14 +3671,17 @@ mod tests {
                 GradientStop {
                     color: [1.0, 0.0, 0.0],
                     pos: Some(0.0),
+                    alpha: 1.0,
                 },
                 GradientStop {
                     color: [0.0, 1.0, 0.0],
                     pos: None,
+                    alpha: 1.0,
                 },
                 GradientStop {
                     color: [0.0, 0.0, 1.0],
                     pos: Some(1.0),
+                    alpha: 1.0,
                 },
             ],
         };
@@ -3952,5 +4315,160 @@ mod tests {
         assert_eq!(combined.len(), 2, "inline + caller face");
         assert_eq!(combined[0].family, "inline", "inline @font-face first");
         assert_eq!(combined[1].family, "Host", "caller font follows");
+    }
+
+    // ── `@page` geometry ────────────────────────────────────────────────────
+
+    #[test]
+    fn at_page_rule_overrides_size_and_margins_by_default() {
+        use super::super::page::RenderOptions;
+        let html = "<style>@page { size: 400pt 500pt; margin: 50pt; }</style><p>x</p>";
+        let opts = RenderOptions::new(612.0, 792.0);
+        let pdf = render_with(html, &[], &opts);
+        let doc = Document::open(&pdf).expect("reopen");
+        let media = doc.page_boxes(1).expect("boxes").media;
+        assert!(
+            (media[2] - 400.0).abs() < 0.01 && (media[3] - 500.0).abs() < 0.01,
+            "@page size wins over the caller geometry: {media:?}"
+        );
+        // Opting out keeps the caller's paper.
+        let mut fixed = RenderOptions::new(612.0, 792.0);
+        fixed.honor_page_rule = false;
+        let pdf2 = render_with(html, &[], &fixed);
+        let media2 = Document::open(&pdf2).unwrap().page_boxes(1).unwrap().media;
+        assert!(
+            (media2[2] - 612.0).abs() < 0.01 && (media2[3] - 792.0).abs() < 0.01,
+            "honor_page_rule = false imposes the caller size: {media2:?}"
+        );
+        // A document WITHOUT @page is untouched either way.
+        let pdf3 = render_with("<p>x</p>", &[], &opts);
+        let media3 = Document::open(&pdf3).unwrap().page_boxes(1).unwrap().media;
+        assert!((media3[2] - 612.0).abs() < 0.01 && (media3[3] - 792.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn at_page_named_size_landscape_renders() {
+        use super::super::page::RenderOptions;
+        let html = "<style>@page { size: A4 landscape; }</style><p>x</p>";
+        let pdf = render_with(html, &[], &RenderOptions::new(612.0, 792.0));
+        let media = Document::open(&pdf).unwrap().page_boxes(1).unwrap().media;
+        assert!(
+            media[2] > media[3],
+            "landscape page is wider than tall: {media:?}"
+        );
+        assert!((media[2] - 841.89).abs() < 0.1, "A4 long edge: {media:?}");
+    }
+
+    // ── `object-fit` ────────────────────────────────────────────────────────
+
+    /// Render one `<img src="t.png" width=40 height=40 style="object-fit:X">`
+    /// whose pixels are a host-provided 4×2 PNG, and return the placed image
+    /// rect `(w, h)` read back from the produced PDF.
+    fn fitted_image_size(fit: &str) -> (f64, f64) {
+        use super::super::page::RenderOptions;
+        // A 4×2 white PNG (wide 2:1 ratio, distinct from the square box).
+        let png = crate::raster::png::encode_png(4, 2, &[0xFF; 4 * 2 * 4]);
+        let mut opts = RenderOptions::new(300.0, 300.0);
+        opts.resources.insert("t.png".to_string(), png);
+        let html =
+            format!("<img src=\"t.png\" width=\"40\" height=\"40\" style=\"object-fit:{fit}\">");
+        let pdf = render_with(&html, &[], &opts);
+        let doc = Document::open(&pdf).expect("reopen");
+        let imgs = doc.page_image_elements(1);
+        assert_eq!(imgs.len(), 1, "one placed image for {fit}");
+        (imgs[0].width, imgs[0].height)
+    }
+
+    #[test]
+    fn object_fit_modes_map_the_intrinsic_ratio_into_the_box() {
+        // fill (default): stretched to the 40×40 box, exactly as before.
+        let (w, h) = fitted_image_size("fill");
+        assert!(
+            (w - 40.0).abs() < 0.5 && (h - 40.0).abs() < 0.5,
+            "fill {w}x{h}"
+        );
+        // contain: the largest 2:1 rect inside 40×40 → 40×20 (letterboxed).
+        let (w, h) = fitted_image_size("contain");
+        assert!(
+            (w - 40.0).abs() < 0.5 && (h - 20.0).abs() < 0.5,
+            "contain {w}x{h}"
+        );
+        // cover: the smallest 2:1 rect covering 40×40 → 80×40 (clipped).
+        let (w, h) = fitted_image_size("cover");
+        assert!(
+            (w - 80.0).abs() < 0.5 && (h - 40.0).abs() < 0.5,
+            "cover {w}x{h}"
+        );
+        // none: the intrinsic 4×2 pixels, centred.
+        let (w, h) = fitted_image_size("none");
+        assert!((w - 4.0).abs() < 0.5 && (h - 2.0).abs() < 0.5, "none {w}x{h}");
+        // scale-down: min(none, contain) → the intrinsic 4×2 here.
+        let (w, h) = fitted_image_size("scale-down");
+        assert!(
+            (w - 4.0).abs() < 0.5 && (h - 2.0).abs() < 0.5,
+            "scale-down {w}x{h}"
+        );
+    }
+
+    // ── generated content & gradients through the full pipeline ────────────
+
+    #[test]
+    fn before_content_reaches_the_rendered_pdf() {
+        let html = "<style>p { counter-increment: x; } \
+                    p::before { content: \"NO \" counter(x) \" — \"; }</style><p>body</p>";
+        let pdf = render(html, &[], 612.0, 792.0, 36.0);
+        let text = Document::open(&pdf).expect("reopen").to_text();
+        assert!(
+            text.contains("NO 1") && text.contains("body"),
+            "generated content is painted: {text:?}"
+        );
+    }
+
+    #[test]
+    fn transparent_gradient_stop_renders_a_valid_pdf() {
+        let html = r#"<div style="width:100pt;height:50pt;
+            background:linear-gradient(to right, red, transparent)">x</div>"#;
+        let pdf = render(html, &[], 612.0, 792.0, 36.0);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        assert!(pdf.len() > 400, "gradient painted ({} bytes)", pdf.len());
+    }
+
+    // ── `font-family` fallback-list resolution ─────────────────────────────
+
+    #[test]
+    fn font_family_list_resolves_the_first_provided_family() {
+        // Two provided faces; the style lists an unknown family FIRST, then
+        // "listed". The resolver must pick "listed" (weight 700 identifies
+        // it), not fall through to the any-face last resort ("other", 300).
+        let fonts = [
+            ProvidedFont {
+                family: "other".into(),
+                weight: 300,
+                italic: false,
+                ttf: bundled::FALLBACK_TTF.to_vec(),
+            },
+            ProvidedFont {
+                family: "listed".into(),
+                weight: 700,
+                italic: false,
+                ttf: bundled::FALLBACK_TTF.to_vec(),
+            },
+        ];
+        let book = MeasureBook::new(&fonts);
+        let style = Style {
+            font_family: "MissingFont".into(),
+            font_families: vec!["MissingFont".into(), "listed".into()],
+            ..Style::default()
+        };
+        let (_, weight) = book.provided_match(&style).expect("a face resolves");
+        assert_eq!(weight, 700, "the listed fallback family wins");
+        // A single unknown family still falls back to the first provided face.
+        let lone = Style {
+            font_family: "MissingFont".into(),
+            font_families: vec!["MissingFont".into()],
+            ..Style::default()
+        };
+        let (_, w2) = book.provided_match(&lone).expect("last resort");
+        assert_eq!(w2, 300, "any-face last resort unchanged");
     }
 }

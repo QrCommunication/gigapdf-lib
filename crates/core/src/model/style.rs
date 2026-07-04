@@ -19,6 +19,21 @@ pub enum Align {
     Justify,
 }
 
+/// Base writing direction of a paragraph. Carried as `Option<Direction>` on
+/// [`ParagraphStyle`]: `None` means "unspecified" and reads as the conventional
+/// left-to-right flow, so documents that never set it serialize exactly as
+/// before. Maps DOCX `w:pPr/w:bidi`, PPTX `a:pPr@rtl="1"`, ODF
+/// `style:paragraph-properties@style:writing-mode="rl-tb"`, RTF `\rtlpar`, and
+/// the reconstruction's Unicode strong-script heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    /// Left-to-right (the implicit default).
+    #[default]
+    Ltr,
+    /// Right-to-left (Hebrew, Arabic, …).
+    Rtl,
+}
+
 /// Run vertical alignment relative to the baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VAlign {
@@ -86,6 +101,30 @@ pub struct CharStyle {
     /// Hidden text (`w:vanish` in DOCX, `display:none` in HTML). Hidden runs
     /// survive in the model but exporters may omit them or mark them hidden.
     pub hidden: bool,
+    /// All-capitals display transform (`w:caps` in DOCX, `a:rPr@cap="all"` in
+    /// PPTX, `fo:text-transform:uppercase` in ODF). The run's `text` keeps its
+    /// original casing — renderers/exporters apply the transform at display
+    /// time (CSS `text-transform:uppercase`).
+    pub caps: bool,
+    /// Small-capitals display variant (`w:smallCaps` in DOCX, `a:rPr@cap="small"`
+    /// in PPTX, `fo:font-variant:small-caps` in ODF). Like [`caps`](Self::caps),
+    /// a display-time transform (CSS `font-variant:small-caps`).
+    pub small_caps: bool,
+    /// **Double** strike-through (`w:dstrike` in DOCX), distinct from the single
+    /// [`strike`](Self::strike). Importers set `strike` alongside it so a
+    /// consumer unaware of the flag still draws one line through the run.
+    pub dstrike: bool,
+    /// Baseline shift in points — positive raises, negative lowers (`w:position`
+    /// in DOCX, half-points ÷ 2). Finer-grained than the categorical
+    /// [`vertical_align`](Self::vertical_align). `None` = no shift.
+    pub baseline_shift_pt: Option<f64>,
+    /// Horizontal character scaling in percent (`w:w` in DOCX; `100` = normal,
+    /// `200` = double-width). `None` = normal (100 %).
+    pub char_scale_pct: Option<f64>,
+    /// Kerning threshold in points (`w:kern` in DOCX, half-points ÷ 2): pair
+    /// kerning applies to glyphs at or above this size. `None` = kerning off /
+    /// unspecified.
+    pub kern_min_pt: Option<f64>,
 }
 
 impl CharStyle {
@@ -104,7 +143,13 @@ impl CharStyle {
             && self.strike == other.strike
             && self.color == other.color
             && self.background == other.background
-            && self.vertical_align == other.vertical_align;
+            && self.vertical_align == other.vertical_align
+            && self.caps == other.caps
+            && self.small_caps == other.small_caps
+            && self.dstrike == other.dstrike
+            && self.baseline_shift_pt == other.baseline_shift_pt
+            && self.char_scale_pct == other.char_scale_pct
+            && self.kern_min_pt == other.kern_min_pt;
         if !same_text_style {
             return false;
         }
@@ -172,6 +217,26 @@ pub struct ParagraphStyle {
     /// Tab stops (sorted by position). Empty = default tab stops (typically
     /// every 36pt / 0.5″).
     pub tab_stops: Vec<TabStop>,
+    /// Base writing direction. `None` = unspecified (reads as left-to-right),
+    /// so the field is additive: documents that never set it serialize exactly
+    /// as before. See [`Direction`].
+    pub direction: Option<Direction>,
+    /// Classification of the paragraph's line breaks (reconstruction only):
+    /// entry `k` says whether the break between line `k` and line `k + 1` is
+    /// **soft** (`true` — a word-wrap consequence, an exporter may re-flow
+    /// across it) or **hard** (`false` — deliberate: a verse, an address line).
+    /// Always `para.runs`' `LineBreak` count entries when populated; empty =
+    /// not analysed (imports, single-line paragraphs). The emitted
+    /// [`Inline::LineBreak`](crate::model::Inline::LineBreak)s themselves are
+    /// unchanged — this is a parallel, additive signal.
+    pub soft_breaks: Vec<bool>,
+    /// Force a page break **before** this paragraph (DOCX `w:pageBreakBefore`,
+    /// ODF `fo:break-before="page"`). Distinct from the model's page split
+    /// (importers that split pages already honour the break structurally) —
+    /// this keeps the *authored intent* so a DOCX/ODT round-trip re-emits the
+    /// property instead of a frozen layout. `false` = default. Additive:
+    /// never serialized when unset.
+    pub page_break_before: bool,
 }
 
 /// A named style (paragraph + character defaults), optionally derived from

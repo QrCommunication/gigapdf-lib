@@ -65,6 +65,47 @@ const SPAN_MIN_WIDTH_FRAC: f64 = 0.45;
 /// line genuinely straddling the corridor.
 const SPAN_MARGIN: f64 = 4.0;
 
+/// Absolute floor of the **weak** gutter tier (fix V3b-2): real academic gutters
+/// run 12–18 pt (IEEE ≈ 12, ACM ≈ 24) and the strong floor (`max(2×h_med, 18)`)
+/// misses the narrow end. A corridor at least this wide is accepted as a gutter
+/// **only** with corroborating vertical consistency (see
+/// [`narrow_gutter_consistent`]) — width alone is not enough down here.
+const WEAK_GUTTER_MIN: f64 = 10.0;
+
+/// A weak (narrow) gutter needs at least this many lines on **each** side —
+/// a couple of stray short lines must never certify a 10 pt corridor.
+const WEAK_GUTTER_SIDE_LINES: usize = 3;
+
+/// A weak gutter's two sides must overlap vertically by at least this fraction
+/// of the smaller side's Y span: the corridor has to stay empty along a high
+/// share of the region's height, not merely between two passing fragments.
+const WEAK_GUTTER_OVERLAP_FRAC: f64 = 0.7;
+
+/// Each side of a weak gutter must run down at least this many line heights —
+/// a real column is a stack of lines, not a two-line sliver.
+const WEAK_GUTTER_SIDE_SPAN_MULT: f64 = 3.0;
+
+/// **Every** accepted gutter (fix V3b-4 — reorder only after confirmation) must
+/// have its two sides *coexist vertically*: their Y spans overlap by at least
+/// this fraction of the smaller span (padded by one line height for slack). Two
+/// stacked clusters that merely share an empty vertical corridor — a top-right
+/// address block above bottom-left prose, a rejected table's halves — are not
+/// side-by-side columns, and reordering them column-major would read the lower
+/// cluster before the higher one.
+const COEXIST_OVERLAP_FRAC: f64 = 0.5;
+
+/// Fix V3b-3 (region-scoped stats): a body line at least this fraction of the
+/// content measure is *measure-scale* (an intro/abstract paragraph line, a wide
+/// caption) and breaks the page into vertical zones; the lines between such
+/// breaks are *column-scale* and get their own scoped gutter projection. Sits
+/// between a two-up column width (≈ 0.47 × measure) and header-paragraph lines
+/// (≥ 0.65), below the `FULL_WIDTH_FRAC` cut that already excluded ≥ 0.80.
+const ZONE_WIDE_FRAC: f64 = 0.6;
+
+/// Minimum lines for a column-scale zone to earn its own scoped projection —
+/// fewer can't evidence a gutter any better than the global pass did.
+const MIN_ZONE_LINES: usize = 4;
+
 /// Produce the reading order of `lines` as a list of indices into `lines`.
 /// Single column ⇒ identity-ish (top→bottom). Multiple columns ⇒ region by
 /// region (split at full-width lines), each region's bands left→right, each
@@ -270,20 +311,88 @@ pub fn column_layout(lines: &[ReconLine]) -> ColumnLayout {
 /// `content_lo`/`content_hi` bound the page measure so the outer bands reach the
 /// page edges even when the body stops short.
 ///
+/// Two passes (fix V3b-3): the projection first runs over the whole body (the
+/// prior behaviour — a page that already splits is byte-identical). When that
+/// finds no gutter, the width statistics were possibly poisoned page-wide: a
+/// full-width intro/abstract paragraph above (or a footer below) a two-column
+/// body inflates the median line width, so the spanner filter never fires and
+/// the wide prose lines keep the corridor covered. The body is then cut into
+/// **width-homogeneous vertical zones** (measure-scale lines are the zone
+/// breaks) and each column-scale zone gets its own scoped projection — so a
+/// full-width header, a two-column middle and a full-width footer coexist, the
+/// wide lines becoming region separators around the split zone.
+///
 /// Returns the column **edges** (ascending): `[lo, b1, b2, …, hi]` with
 /// `edges.len() - 1` columns. A single column yields `[lo, hi]`.
 fn column_bands(body: &[&ReconLine], content_lo: f64, content_hi: f64) -> Vec<f64> {
+    let global = band_split(body, content_lo, content_hi);
+    if global.len() > 2 {
+        return global;
+    }
+    for zone in column_scale_zones(body, content_lo, content_hi) {
+        let scoped = band_split(&zone, content_lo, content_hi);
+        if scoped.len() > 2 {
+            return scoped;
+        }
+    }
+    global
+}
+
+/// Cut `body` into maximal top→bottom runs of **column-scale** lines (width
+/// below [`ZONE_WIDE_FRAC`] of the content measure); every measure-scale line is
+/// a zone break. Only zones with at least [`MIN_ZONE_LINES`] lines are returned —
+/// smaller ones cannot evidence a gutter any better than the global pass.
+fn column_scale_zones<'a>(
+    body: &[&'a ReconLine],
+    content_lo: f64,
+    content_hi: f64,
+) -> Vec<Vec<&'a ReconLine>> {
+    let content_w = (content_hi - content_lo).max(1.0);
+    let mut sorted: Vec<&ReconLine> = body.to_vec();
+    sorted.sort_by(|a, b| {
+        b.top()
+            .partial_cmp(&a.top())
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    let mut zones: Vec<Vec<&ReconLine>> = Vec::new();
+    let mut cur: Vec<&ReconLine> = Vec::new();
+    for line in sorted {
+        if line.w >= content_w * ZONE_WIDE_FRAC {
+            if !cur.is_empty() {
+                zones.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(line);
+        }
+    }
+    if !cur.is_empty() {
+        zones.push(cur);
+    }
+    zones.retain(|z| z.len() >= MIN_ZONE_LINES);
+    zones
+}
+
+/// One gutter projection over `body` (the whole page or a single vertical zone —
+/// the width/height statistics are computed from exactly the lines given, which
+/// is what makes the zone retry of [`column_bands`] meaningful).
+fn band_split(body: &[&ReconLine], content_lo: f64, content_hi: f64) -> Vec<f64> {
     // Need at least a few body lines to trust a gutter; below that, one column.
     if body.len() < 2 {
         return vec![content_lo, content_hi];
     }
 
-    // Calibrate the minimum gutter width to the typography: a gutter must be
-    // clearly wider than a normal space — a few times the median line height,
-    // floored so tiny pages don't over-split.
+    // Calibrate the minimum gutter width to the typography (fix V3b-2, two
+    // tiers): a **strong** gutter is clearly wider than a normal space — a few
+    // times the median line height, floored so tiny pages don't over-split —
+    // and is accepted on width (plus side coexistence) alone. A **weak** gutter
+    // (down to one line height / [`WEAK_GUTTER_MIN`]) catches the narrow real
+    // gutters of dense academic layouts, but only with corroborating vertical
+    // consistency: several lines each side, both sides running down the region
+    // and overlapping — see [`narrow_gutter_consistent`].
     let mut heights: Vec<f64> = body.iter().map(|l| l.h.max(1.0)).collect();
     let h_med = super::median(&mut heights, 10.0);
-    let min_gutter = (h_med * 2.0).max(18.0);
+    let strong_gutter = (h_med * 2.0).max(18.0);
+    let weak_gutter = h_med.max(WEAK_GUTTER_MIN);
 
     // Robustness to gutter-spanning lines: a body line far wider than the typical
     // column line (and a real share of the measure) is a probable spanner — a
@@ -327,9 +436,12 @@ fn column_bands(body: &[&ReconLine], content_lo: f64, content_hi: f64) -> Vec<f6
 
     // Walk the segments, accumulating coverage, and grow a maximal empty run
     // (coverage 0) until ink resumes. An empty run strictly *interior* to the ink
-    // span (content on both sides) and at least `min_gutter` wide is a gutter; its
-    // midpoint is the column boundary. The leading/trailing empty runs (page
-    // margins) are not interior, so they never become gutters.
+    // span (content on both sides) is a gutter when it is either **strong**
+    // (wide) or **weak** (narrow but vertically consistent) — and, either way,
+    // only when the content on its two sides *coexists vertically* (fix V3b-4:
+    // a column-major reorder is confirmed, never speculative). Its midpoint is
+    // the column boundary. The leading/trailing empty runs (page margins) are
+    // not interior, so they never become gutters.
     let mut boundaries: Vec<f64> = Vec::new();
     let mut coverage: i32 = 0;
     let mut gutter_start: Option<f64> = None;
@@ -344,9 +456,13 @@ fn column_bands(body: &[&ReconLine], content_lo: f64, content_hi: f64) -> Vec<f6
             }
         } else if let Some(start) = gutter_start.take() {
             // Ink resumed: close the run at this segment's start. Interior by
-            // construction (ink follows), so test only its width.
-            if seg_lo - start >= min_gutter {
-                boundaries.push((start + seg_lo) / 2.0);
+            // construction (ink follows), so test its width and its sides.
+            let width = seg_lo - start;
+            let mid = (start + seg_lo) / 2.0;
+            let wide_enough = width >= strong_gutter
+                || (width >= weak_gutter && narrow_gutter_consistent(&proj_lines, mid, h_med));
+            if wide_enough && sides_coexist(&proj_lines, mid, h_med) {
+                boundaries.push(mid);
             }
         }
         // A run still open at the final event runs into the trailing margin (no
@@ -399,6 +515,72 @@ fn column_bands(body: &[&ReconLine], content_lo: f64, content_hi: f64) -> Vec<f6
     }
 
     edges
+}
+
+/// The Y centres of the projection lines on each side of a candidate boundary.
+/// The corridor is empty by construction, so every line falls wholly on one side;
+/// classifying by centre-X is exact.
+fn side_y_centers(proj: &[&ReconLine], boundary: f64) -> (Vec<f64>, Vec<f64>) {
+    let mut left: Vec<f64> = Vec::new();
+    let mut right: Vec<f64> = Vec::new();
+    for line in proj {
+        if line.center_x() < boundary {
+            left.push(line.center_y());
+        } else {
+            right.push(line.center_y());
+        }
+    }
+    (left, right)
+}
+
+/// Min/max of a set of Y centres, or `None` when empty.
+fn y_span(ys: &[f64]) -> Option<(f64, f64)> {
+    let lo = ys.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+}
+
+/// Whether the content on the two sides of a candidate gutter **coexists
+/// vertically** (fix V3b-4): their Y spans overlap by at least
+/// [`COEXIST_OVERLAP_FRAC`] of the smaller span, with one line height (`tol`)
+/// of slack. Two stacked clusters separated only by an accidental empty
+/// corridor fail here, so their lines keep the geometric top→bottom order
+/// instead of being re-sorted column-major (the lower cluster would be read
+/// before the higher one). A side reduced to a point span (a single line)
+/// passes trivially — the populated / single-gutter gates downstream already
+/// judge that case.
+fn sides_coexist(proj: &[&ReconLine], boundary: f64, tol: f64) -> bool {
+    let (left, right) = side_y_centers(proj, boundary);
+    let (Some((l_lo, l_hi)), Some((r_lo, r_hi))) = (y_span(&left), y_span(&right)) else {
+        return false;
+    };
+    let overlap = l_hi.min(r_hi) - l_lo.max(r_lo) + 2.0 * tol;
+    let min_span = (l_hi - l_lo).min(r_hi - r_lo);
+    overlap >= min_span * COEXIST_OVERLAP_FRAC
+}
+
+/// Whether a **narrow** (weak-tier) gutter candidate is corroborated by vertical
+/// consistency (fix V3b-2): at least [`WEAK_GUTTER_SIDE_LINES`] lines on each
+/// side, each side running down at least [`WEAK_GUTTER_SIDE_SPAN_MULT`] line
+/// heights, and the two sides overlapping by [`WEAK_GUTTER_OVERLAP_FRAC`] of the
+/// smaller span — i.e. the corridor stays empty along a high fraction of the
+/// region's height. A 10–17 pt corridor that merely slips between a few short
+/// lines never qualifies.
+fn narrow_gutter_consistent(proj: &[&ReconLine], boundary: f64, h_med: f64) -> bool {
+    let (left, right) = side_y_centers(proj, boundary);
+    if left.len() < WEAK_GUTTER_SIDE_LINES || right.len() < WEAK_GUTTER_SIDE_LINES {
+        return false;
+    }
+    let (Some((l_lo, l_hi)), Some((r_lo, r_hi))) = (y_span(&left), y_span(&right)) else {
+        return false;
+    };
+    let (l_span, r_span) = (l_hi - l_lo, r_hi - r_lo);
+    let min_side = h_med * WEAK_GUTTER_SIDE_SPAN_MULT;
+    if l_span < min_side || r_span < min_side {
+        return false;
+    }
+    let overlap = l_hi.min(r_hi) - l_lo.max(r_lo);
+    overlap >= l_span.min(r_span) * WEAK_GUTTER_OVERLAP_FRAC
 }
 
 /// The robust single-gutter two-column fallback (see [`column_bands`]). `edges`
@@ -942,6 +1124,151 @@ mod tests {
         );
         // No frames at all → single column.
         assert_eq!(column_count_from_frames(&[], 595.0, 842.0), 1);
+    }
+
+    #[test]
+    fn narrow_academic_gutter_splits_with_vertical_consistency() {
+        // Fix V3b-2: a dense academic two-up with a **14 pt** gutter (IEEE-style;
+        // the old floor `max(2×h_med, 18) = 24` missed anything under 18 pt). The
+        // weak tier accepts it because the corridor is vertically consistent:
+        // five ordinary lines per side, both sides running down the region and
+        // overlapping. Baselines staggered past the line-band tolerance so each
+        // column keeps its own lines.
+        let runs = vec![
+            run_w("L1", 72.0, 700.0, 170.0),
+            run_w("R1", 256.0, 691.0, 170.0),
+            run_w("L2", 72.0, 682.0, 170.0),
+            run_w("R2", 256.0, 673.0, 170.0),
+            run_w("L3", 72.0, 664.0, 170.0),
+            run_w("R3", 256.0, 655.0, 170.0),
+            run_w("L4", 72.0, 646.0, 170.0),
+            run_w("R4", 256.0, 637.0, 170.0),
+            run_w("L5", 72.0, 628.0, 170.0),
+            run_w("R5", 256.0, 619.0, 170.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let layout = column_layout(&lines);
+        assert!(
+            layout.is_multi_column(),
+            "a 14 pt gutter with consistent sides is a real academic gutter"
+        );
+        let order = reading_order(&lines);
+        let ordered: Vec<String> = order.iter().map(|&i| lines[i].text()).collect();
+        assert_eq!(
+            ordered,
+            vec!["L1", "L2", "L3", "L4", "L5", "R1", "R2", "R3", "R4", "R5"],
+        );
+    }
+
+    #[test]
+    fn narrow_corridor_between_stacked_fragments_stays_single_column() {
+        // Fix V3b-2 (counter-case): the same 14 pt corridor, but the two sides do
+        // NOT coexist vertically — the left fragment sits high on the page, the
+        // right one far below. Without vertical consistency the weak tier must
+        // not fire, so the page stays a single top→bottom column.
+        let runs = vec![
+            run_w("top a", 72.0, 700.0, 170.0),
+            run_w("top b", 72.0, 682.0, 170.0),
+            run_w("top c", 72.0, 664.0, 170.0),
+            run_w("bot a", 256.0, 500.0, 170.0),
+            run_w("bot b", 256.0, 482.0, 170.0),
+            run_w("bot c", 256.0, 464.0, 170.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let layout = column_layout(&lines);
+        assert!(
+            !layout.is_multi_column(),
+            "a narrow corridor between stacked fragments is not a gutter"
+        );
+        assert_eq!(reading_order(&lines), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn full_width_intro_paragraph_above_two_columns_still_splits() {
+        // Fix V3b-3: a page opening with a full-measure intro paragraph (six
+        // lines at 277 pt of a 396 pt measure — under the 0.80 full-width cut, so
+        // they stay in the body and inflate the page-wide width median) above a
+        // genuine two-column body. The page-wide projection fails (the intro
+        // lines cover the corridor and the poisoned spanner floor never sets
+        // them aside); the zone-scoped retry must recover the split, read the
+        // intro first (top→bottom), then the left column, then the right.
+        let mut runs = vec![
+            run_w("intro one", 72.0, 800.0, 277.0),
+            run_w("intro two", 72.0, 786.0, 277.0),
+            run_w("intro three", 72.0, 772.0, 277.0),
+            run_w("intro four", 72.0, 758.0, 277.0),
+            run_w("intro five", 72.0, 744.0, 277.0),
+            run_w("intro six", 72.0, 730.0, 277.0),
+        ];
+        runs.extend(vec![
+            run_w("left one", 72.0, 700.0, 168.0),
+            run_w("right one", 300.0, 691.0, 168.0),
+            run_w("left two", 72.0, 682.0, 168.0),
+            run_w("right two", 300.0, 673.0, 168.0),
+            run_w("left three", 72.0, 664.0, 168.0),
+            run_w("right three", 300.0, 655.0, 168.0),
+            run_w("left four", 72.0, 646.0, 168.0),
+            run_w("right four", 300.0, 637.0, 168.0),
+        ]);
+        let lines = group_into_lines(&runs);
+        let layout = column_layout(&lines);
+        assert!(
+            layout.is_multi_column(),
+            "the two-column zone must split despite the full-width intro above it"
+        );
+        let order = reading_order(&lines);
+        let ordered: Vec<String> = order.iter().map(|&i| lines[i].text()).collect();
+        assert_eq!(
+            ordered,
+            vec![
+                "intro one",
+                "intro two",
+                "intro three",
+                "intro four",
+                "intro five",
+                "intro six",
+                "left one",
+                "left two",
+                "left three",
+                "left four",
+                "right one",
+                "right two",
+                "right three",
+                "right four",
+            ],
+        );
+    }
+
+    #[test]
+    fn stacked_offset_clusters_keep_geometric_order() {
+        // Fix V3b-4 (reorder only after confirmation): a top-right cluster above
+        // a bottom-left cluster, with a wide empty corridor between their X
+        // spans. The old width-only gate split this into two "columns" and read
+        // the *left* (lower!) cluster before the right (higher) one — exactly the
+        // destroyed reading order a rejected table/form region suffers. The
+        // sides do not coexist vertically, so no split: geometric top→bottom
+        // order is preserved.
+        let runs = vec![
+            run_w("high a", 400.0, 700.0, 100.0),
+            run_w("high b", 400.0, 680.0, 100.0),
+            run_w("high c", 400.0, 660.0, 100.0),
+            run_w("low a", 72.0, 300.0, 100.0),
+            run_w("low b", 72.0, 280.0, 100.0),
+            run_w("low c", 72.0, 260.0, 100.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let layout = column_layout(&lines);
+        assert!(
+            !layout.is_multi_column(),
+            "stacked clusters must not be read as side-by-side columns"
+        );
+        let order = reading_order(&lines);
+        let ordered: Vec<String> = order.iter().map(|&i| lines[i].text()).collect();
+        assert_eq!(
+            ordered,
+            vec!["high a", "high b", "high c", "low a", "low b", "low c"],
+            "the higher cluster is read first (geometric order preserved)"
+        );
     }
 
     #[test]

@@ -786,6 +786,8 @@ fn inlines_to_text(runs: &[crate::model::Inline]) -> String {
             Inline::Link { children, .. } => s.push_str(&inlines_to_text(children)),
             // A comment anchor contributes no body text to the flattened output.
             Inline::CommentRef { .. } => {}
+            // A footnote anchor likewise: its body lives in `Document::footnotes`.
+            Inline::FootnoteRef { .. } => {}
         }
     }
     s
@@ -4614,7 +4616,7 @@ impl Document {
     /// and a visited-`ObjectId` set breaks self/mutual cycles. The returned map
     /// backs the `resolve_form` closure passed to
     /// [`content::extract_text_runs_resolved`] / [`content::extract_elements_resolved`].
-    fn page_form_xobjects(&self, page_no: u32) -> BTreeMap<Vec<u8>, content::FormXObject> {
+    pub(crate) fn page_form_xobjects(&self, page_no: u32) -> BTreeMap<Vec<u8>, content::FormXObject> {
         let mut forms = BTreeMap::new();
         let Ok(page) = self.page_dict(page_no) else {
             return forms;
@@ -4960,7 +4962,7 @@ impl Document {
     /// font's `/FontDescriptor` so bold/italic survive when the name omits the
     /// style tokens (subset-prefixed / renamed fonts). Used by the Office
     /// exporters to carry real fonts, not just sizes.
-    fn page_base_fonts(&self, page_no: u32) -> BTreeMap<String, crate::convert::TextStyle> {
+    pub(crate) fn page_base_fonts(&self, page_no: u32) -> BTreeMap<String, crate::convert::TextStyle> {
         let mut out = BTreeMap::new();
         let Ok(page) = self.page_dict(page_no) else {
             return out;
@@ -8953,23 +8955,28 @@ impl Document {
         // its blocks are split back onto pages by the page each block was bound to
         // (its `/Pg`, resolved to a 0-based page index by the paged walker). Blocks
         // whose page is unknown (`None` — grouping elements often omit `/Pg`) land
-        // on the first page. A tagged document is reconstructed *only* from the tag
-        // tree: every page draws from this distribution (an empty list for a page
-        // the structure never references), so the heuristic path never double-emits
-        // the same prose. The heuristic per-page path is used only when the
-        // document carries no usable tag tree (`tag_pages` is `None`).
-        let mut tag_pages: Option<std::collections::BTreeMap<usize, Vec<crate::model::Block>>> =
-            recon::tag_tree::reconstruct_from_struct_tree_paged(self, &mut ids).map(|paged| {
+        // on the first page. A **marked** page draws only from this distribution
+        // (an empty list when the structure references none of its content), so
+        // the heuristic path never double-emits the same prose. But the tagging
+        // decision is **per page**: a page carrying no marked content at all (a
+        // *partially* tagged document — some pages with MCIDs, others plain) was
+        // never described by the author's tags, so that page runs the full
+        // heuristic pipeline instead of coming out silently empty. The heuristic
+        // path also runs for every page when the document carries no usable tag
+        // tree (`tagged` is `None`).
+        let mut tagged = recon::tag_tree::reconstruct_struct_tree_pages(self, &mut ids).map(
+            |paged| {
                 let mut by_page: std::collections::BTreeMap<usize, Vec<crate::model::Block>> =
                     std::collections::BTreeMap::new();
-                for (page, block) in paged {
+                for (page, block) in paged.blocks {
                     // Unknown page (`None`) → page index 0 (the first page), the
                     // same conservative placement the flat path used.
                     by_page.entry(page.unwrap_or(0)).or_default().push(block);
                 }
-                by_page
-            });
-        let is_tagged = tag_pages.is_some();
+                (by_page, paged.marked_pages)
+            },
+        );
+        let is_tagged = tagged.is_some();
 
         let page_count = self.page_count() as u32;
         let mut sections: Vec<Section> = Vec::new();
@@ -8991,16 +8998,27 @@ impl Document {
             let rotate = page.get(b"Rotate").and_then(Object::as_i64).unwrap_or(0);
             let rotation = (((rotate % 360) + 360) % 360) as i32;
 
-            // The tagged blocks bound to this page (0-based index). For a tagged
-            // document every page is driven from the tag tree — a page the
-            // structure never references yields `Some(vec![])` so the heuristic
-            // path is skipped there too. An untagged document passes `None` so the
-            // heuristic pipeline reconstructs the page.
-            let page_tags = tag_pages.as_mut().map(|by_page| {
-                by_page
-                    .remove(&((page_no - 1) as usize))
-                    .unwrap_or_default()
+            // The tagged blocks bound to this page (0-based index). A **marked**
+            // page is driven from the tag tree — one whose content the structure
+            // never references yields `Some(vec![])` so the heuristic path is
+            // skipped there (no double emission). A page with **no marked content
+            // at all** (partially tagged document) yields `None`: the author's
+            // tags say nothing about it, so the heuristic pipeline reconstructs
+            // it — previously such pages were silently empty. An untagged
+            // document passes `None` for every page.
+            let page_tags = tagged.as_mut().and_then(|(by_page, marked_pages)| {
+                let idx = (page_no - 1) as usize;
+                let blocks = by_page.remove(&idx).unwrap_or_default();
+                if blocks.is_empty() && !marked_pages.contains(&idx) {
+                    None
+                } else {
+                    Some(blocks)
+                }
             });
+            // Whether THIS page came from the tag tree — drives the frame
+            // projector below (tagged and heuristic blocks use different
+            // coordinate conventions).
+            let page_is_tagged = page_tags.is_some();
             // Single source of truth for per-page block assembly (shared with
             // [`page_blocks`](Self::page_blocks)): extract runs/paths/images and
             // run the reconstruction pipeline, recording image blobs into the
@@ -9028,9 +9046,12 @@ impl Document {
             //   reuses the same cardinal projection. (#5)
             //
             // `rotation == 0` never reaches here, so a `/Rotate 0` document — tagged
-            // or not — keeps its frames byte-identical.
+            // or not — keeps its frames byte-identical. The projector follows the
+            // path THIS page was reconstructed by (per-page fallback: a heuristic
+            // page inside a partially tagged document carries heuristic top-down
+            // frames, not `/Layout /BBox` user-space ones).
             if rotation != 0 {
-                if is_tagged {
+                if page_is_tagged {
                     Self::rotate_tagged_blocks_for_display(&mut blocks, rotation, page_w, page_h);
                 } else {
                     Self::rotate_blocks_for_display(&mut blocks, rotation, page_w, page_h);
@@ -9067,6 +9088,7 @@ impl Document {
                 height: disp_h,
                 margins,
                 column_count,
+                ..PageGeometry::default()
             };
             let page_model = Page {
                 blocks,
@@ -9079,9 +9101,8 @@ impl Document {
                 }
                 _ => sections.push(Section {
                     geometry,
-                    header: None,
-                    footer: None,
                     pages: vec![page_model],
+                    ..Default::default()
                 }),
             }
         }
@@ -9386,6 +9407,11 @@ impl Document {
     fn relevel_headings_document_wide(sections: &mut [crate::model::Section]) {
         use crate::model::BlockKind;
 
+        // 0. Demote running-header artifacts first (the same heading text at
+        // the same position on 3+ pages is page chrome, not structure), so the
+        // repeats neither pollute the outline nor feed the size clustering.
+        crate::recon::headings::demote_repeated_headings(sections);
+
         // 1. Collect every top-level heading's representative size across the doc.
         let sizes: Vec<f64> = sections
             .iter()
@@ -9551,6 +9577,10 @@ impl Document {
         // runs' bottom-left coordinate space, so no flip is needed for matching.
         // `link::LinkTarget::Page` is 1-based; the model's `Page` is a 0-based
         // index (matching `OutlineNode::page`), so convert with a saturating −1.
+        // A link that resolves to neither a URI nor a page (a `GoToR` remote
+        // jump, a `Named` navigation, a `Launch`) surfaces as a typed
+        // `LinkTarget::Other` carrying its action summary instead of being
+        // dropped; only an action-less unresolvable link is still skipped.
         let links: Vec<recon::ParaLink> = self
             .page_links(page_no)
             .unwrap_or_default()
@@ -9561,7 +9591,9 @@ impl Document {
                     crate::link::LinkTarget::Page(p) => {
                         crate::model::LinkTarget::Page(p.saturating_sub(1) as usize)
                     }
-                    crate::link::LinkTarget::Unknown => return None,
+                    crate::link::LinkTarget::Unknown => crate::model::LinkTarget::Other(
+                        self.link_action_summary(page_no, link.index)?,
+                    ),
                 };
                 Some(recon::ParaLink {
                     target,
@@ -11048,18 +11080,29 @@ impl Document {
     /// code blocks verbatim. Top-level blocks are blank-line separated; reading
     /// order is the model's own.
     ///
-    /// For a **pure-PDF** document with no structure tree, the original PDF-layer
-    /// behaviour is kept: one text run per line, pages separated by a form feed
-    /// (`\x0C`). Both paths are font-aware (zero tofu).
+    /// For a **pure-PDF** document with no structure tree, the runs are grouped
+    /// into reading-order **baseline lines** (top→bottom, left→right) with
+    /// gap-aware inter-word spaces — the same line machinery the heuristic
+    /// reconstruction uses (`recon::lines`) — one line per output line, pages
+    /// separated by a form feed (`\x0C`). A word-positioned PDF (each word its
+    /// own `Td`/`TJ` placement, the shape this engine's own Office→PDF output
+    /// takes) therefore reads `"Titre principal H1"`, not one fused or
+    /// one-word-per-line jumble. Both paths are font-aware (zero tofu).
     pub fn to_text(&self) -> String {
         if self.has_semantic_structure() {
             return text_from_model(&self.reconstruct_model());
         }
         let mut out = String::new();
         for page in 1..=self.page_count() as u32 {
-            if let Ok(runs) = self.page_text_runs(page) {
-                for run in runs {
-                    out.push_str(&run.text);
+            // Same run source as the heuristic reconstruction: the deep element
+            // walk (form-XObject text included), styled per scope.
+            let elements = self.page_elements_deep(page).unwrap_or_default();
+            let font_styles = self.page_base_fonts(page);
+            let runs = crate::recon::runs_from_elements(&elements, &font_styles);
+            for line in crate::recon::lines::group_into_lines(&runs) {
+                let text = line.text();
+                if !text.is_empty() {
+                    out.push_str(&text);
                     out.push('\n');
                 }
             }
@@ -19276,6 +19319,57 @@ impl Document {
             Some(page) => LinkTarget::Page(page),
             None => LinkTarget::Unknown,
         }
+    }
+
+    /// A textual summary of a link annotation's **non-URI/non-GoTo action**,
+    /// for the reconstruction's typed [`crate::model::LinkTarget::Other`]:
+    /// `"GoToR:report.pdf"` (remote go-to), `"Launch:app.exe"`,
+    /// `"Named:NextPage"`, or the bare action kind (`"JavaScript"`, …) when it
+    /// has no natural operand. `annot_index` is the 0-based `/Annots` position
+    /// [`Link::index`](crate::link::Link::index) reports. Returns `None` when
+    /// the annotation has no action dictionary (a plain `/Dest` that failed to
+    /// resolve) or its kind is one of the already-handled resolvable families
+    /// (`URI`/`GoTo`) — those keep the historical drop.
+    fn link_action_summary(&self, page_no: u32, annot_index: usize) -> Option<String> {
+        let page = self.page_dict(page_no).ok()?;
+        let annots = self.resolve(page.get(b"Annots")?).as_array()?;
+        let dict = self.resolve(annots.get(annot_index)?).as_dict()?;
+        let action = self.resolve(dict.get(b"A")?).as_dict()?;
+        let kind = action.get(b"S").and_then(Object::as_name)?;
+        // URI/GoTo are the resolvable families `link_target` already mapped —
+        // reaching here means they were degenerate; keep dropping those.
+        if matches!(kind, b"URI" | b"GoTo") {
+            return None;
+        }
+        let kind_text = String::from_utf8_lossy(kind).into_owned();
+        // The natural operand per kind: a file spec (`/F`, a string or a
+        // filespec dictionary whose `/UF`/`/F` carries the path) for the
+        // remote/launch families, the destination name for `/Named`.
+        let operand = match kind {
+            b"GoToR" | b"Launch" => action
+                .get(b"F")
+                .map(|o| self.resolve(o))
+                .and_then(|o| match o {
+                    Object::String(bytes, _) => Some(crate::font::decode_pdf_text(bytes)),
+                    Object::Dictionary(fs) => fs
+                        .get(b"UF")
+                        .or_else(|| fs.get(b"F"))
+                        .map(|f| self.resolve(f))
+                        .and_then(Object::as_string)
+                        .map(crate::font::decode_pdf_text),
+                    _ => None,
+                }),
+            b"Named" => action
+                .get(b"N")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_name)
+                .map(|n| String::from_utf8_lossy(n).into_owned()),
+            _ => None,
+        };
+        Some(match operand.filter(|o| !o.trim().is_empty()) {
+            Some(op) => format!("{kind_text}:{op}"),
+            None => kind_text,
+        })
     }
 
     /// Append a ready-made annotation dictionary to a page's `/Annots`.
@@ -32200,7 +32294,7 @@ mod tests {
         let rot_frame = heading_frame(&rotated_model);
 
         // 1. The displayed page swaps width/height (612×792 → 792×612).
-        let geo = rotated_model.sections[0].geometry;
+        let geo = rotated_model.sections[0].geometry.clone();
         assert!(
             (geo.width - 792.0).abs() < 0.5 && (geo.height - 612.0).abs() < 0.5,
             "rotated model page is landscape 792×612, got {}×{}",
@@ -32208,7 +32302,7 @@ mod tests {
             geo.height
         );
         // The upright page keeps its portrait geometry (sanity baseline).
-        let up_geo = upright_model.sections[0].geometry;
+        let up_geo = upright_model.sections[0].geometry.clone();
         assert!((up_geo.width - 612.0).abs() < 0.5 && (up_geo.height - 792.0).abs() < 0.5);
 
         // 2. The rotated heading frame is exactly the upright frame projected into
@@ -32356,6 +32450,338 @@ mod tests {
         );
     }
 
+    /// All prose text (paragraphs + headings, incl. list/table leaves) of one
+    /// reconstructed model page, space-joined — the assertion surface of the
+    /// per-page tagged/heuristic fallback tests.
+    fn model_page_prose(page: &crate::model::Page) -> String {
+        use crate::model::{BlockKind, Inline};
+        fn para_text(p: &crate::model::Paragraph, out: &mut Vec<String>) {
+            for r in &p.runs {
+                if let Inline::Run(run) = r {
+                    out.push(run.text.clone());
+                }
+            }
+        }
+        fn walk(blocks: &[crate::model::Block], out: &mut Vec<String>) {
+            for b in blocks {
+                match &b.kind {
+                    BlockKind::Paragraph(p) => para_text(p, out),
+                    BlockKind::Heading(h) => para_text(&h.para, out),
+                    BlockKind::List(l) => {
+                        for item in &l.items {
+                            walk(&item.blocks, out);
+                        }
+                    }
+                    BlockKind::Table(t) => {
+                        for row in &t.rows {
+                            for cell in &row.cells {
+                                walk(&cell.blocks, out);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&page.blocks, &mut out);
+        out.join(" ")
+    }
+
+    /// R2a — per-page tagged/heuristic fallback: a **partially** tagged PDF
+    /// (page 1 marked with MCIDs and described by the struct tree, page 2 plain
+    /// content with no marked content at all) must reconstruct BOTH pages. The
+    /// document-wide gate used to hand every page to the tag tree, so page 2 —
+    /// never referenced by the structure — came out silently empty.
+    #[test]
+    fn reconstruct_model_partially_tagged_page_falls_back_to_heuristics() {
+        let c1 = "BT /F1 12 Tf 72 700 Td /P <</MCID 0>> BDC (Tagged page one.) Tj EMC ET";
+        // Page 2: real content, ZERO marked content (the author never tagged it).
+        let c2 = "BT /F1 12 Tf 72 700 Td (Untagged page two.) Tj ET";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R 9 0 R] /Count 2 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                9,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 19 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{c1}\nendstream", c1.len()),
+            ),
+            (
+                19,
+                format!("<< /Length {} >> stream\n{c2}\nendstream", c2.len()),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (
+                11,
+                "<< /Type /StructElem /S /Document /K [12 0 R] >>".into(),
+            ),
+            (12, "<< /S /P /Pg 8 0 R /K 0 >>".into()),
+        ]);
+        let doc = Document::open(&pdf).expect("valid partially tagged PDF");
+        assert!(doc.has_semantic_structure(), "fixture must be tagged");
+
+        let model = doc.reconstruct_model();
+        let pages: Vec<&crate::model::Page> =
+            model.sections.iter().flat_map(|s| s.pages.iter()).collect();
+        assert_eq!(pages.len(), 2, "two model pages");
+
+        let p1 = model_page_prose(pages[0]);
+        let p2 = model_page_prose(pages[1]);
+        assert!(
+            p1.contains("Tagged page one"),
+            "the marked page keeps its tagged block, got {p1:?}"
+        );
+        assert!(
+            p2.contains("Untagged page two"),
+            "the never-marked page is reconstructed heuristically instead of \
+             coming out empty, got {p2:?}"
+        );
+        assert!(
+            !p1.contains("Untagged page two"),
+            "the heuristic content stays on its own page, got {p1:?}"
+        );
+    }
+
+    /// R2b — the tagged path carries the runs' **real** style: a red 18 pt
+    /// tagged `/H1` must reach the model as a level-1 heading whose run says
+    /// size ≈ 18 pt and colour red — not the flat 12 pt black default the
+    /// tag-tree leaves used to emit.
+    #[test]
+    fn reconstruct_model_tagged_heading_keeps_real_style() {
+        use crate::model::{BlockKind, Inline};
+
+        let c1 = "BT /F1 18 Tf 1 0 0 rg 72 700 Td /H1 <</MCID 0>> BDC (Big Red Title) Tj EMC ET";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{c1}\nendstream", c1.len()),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (
+                11,
+                "<< /Type /StructElem /S /Document /K [12 0 R] >>".into(),
+            ),
+            (12, "<< /S /H1 /Pg 8 0 R /K 0 >>".into()),
+        ]);
+        let doc = Document::open(&pdf).expect("valid tagged PDF");
+        assert!(doc.has_semantic_structure(), "fixture must be tagged");
+
+        let model = doc.reconstruct_model();
+        let heading = model
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                BlockKind::Heading(h) => Some(h),
+                _ => None,
+            })
+            .expect("the tagged H1 survives as a Heading block");
+        assert_eq!(heading.level, 1, "structural role kept");
+        let run = heading
+            .para
+            .runs
+            .iter()
+            .find_map(|r| match r {
+                Inline::Run(run) => Some(run),
+                _ => None,
+            })
+            .expect("heading carries its text run");
+        assert_eq!(run.text, "Big Red Title");
+        assert!(
+            (run.style.size_pt - 18.0).abs() < 1.0,
+            "run size ≈ 18 pt (the Tf size), got {}",
+            run.style.size_pt
+        );
+        assert_eq!(
+            run.style.color,
+            Some([1.0, 0.0, 0.0]),
+            "run colour = the red fill in effect at the show"
+        );
+        assert!(
+            run.style.family.contains("Helvetica"),
+            "run family resolved from /BaseFont, got {:?}",
+            run.style.family
+        );
+    }
+
+    /// R2c — marked content living **inside a form XObject** (the tagged-CERFA
+    /// shape: the page only `Do`'s a reusable template that carries the
+    /// `BDC /MCID` ranges itself) must reach the tagged model. The scan used to
+    /// stop at the top-level stream, so such documents reconstructed empty.
+    #[test]
+    fn reconstruct_model_binds_marked_content_inside_form_xobject() {
+        let page_content = "q /Fm0 Do Q";
+        let form_stream = "BT /F1 12 Tf 72 700 Td /P <</MCID 0>> BDC (Form template text.) Tj EMC ET";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 20 0 R >> >> \
+                 /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!(
+                    "<< /Length {} >> stream\n{page_content}\nendstream",
+                    page_content.len()
+                ),
+            ),
+            (
+                20,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 400 800] \
+                     /Resources << /Font << /F1 6 0 R >> >> /Length {} >> \
+                     stream\n{form_stream}\nendstream",
+                    form_stream.len()
+                ),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (
+                11,
+                "<< /Type /StructElem /S /Document /K [12 0 R] >>".into(),
+            ),
+            (12, "<< /S /P /Pg 8 0 R /K 0 >>".into()),
+        ]);
+        let doc = Document::open(&pdf).expect("valid tagged PDF with form");
+        assert!(
+            doc.has_semantic_structure(),
+            "the form-hosted MCID makes the tree fruitful"
+        );
+
+        let model = doc.reconstruct_model();
+        let prose: String = model
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .map(model_page_prose)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            prose.contains("Form template text"),
+            "marked content inside the form XObject reaches the model: {prose:?}"
+        );
+
+        // The nested run's style is elected too (the show recorded the `Do`
+        // position, where the deep extraction collapses the form's elements).
+        let run = model
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                crate::model::BlockKind::Paragraph(p) => {
+                    p.runs.iter().find_map(|r| match r {
+                        crate::model::Inline::Run(run)
+                            if run.text.contains("Form template") =>
+                        {
+                            Some(run)
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("the form paragraph run");
+        assert!(
+            (run.style.size_pt - 12.0).abs() < 1.0,
+            "nested run size elected from the form's own Tf, got {}",
+            run.style.size_pt
+        );
+        assert!(
+            run.style.family.contains("Helvetica"),
+            "nested run family resolved via the form's fonts, got {:?}",
+            run.style.family
+        );
+    }
+
+    /// R1b — `to_text` on an **untagged** PDF groups the runs into baseline
+    /// lines and synthesizes the inter-word spaces (a word-positioned PDF used
+    /// to come out one run per line: `"Titre\nprincipal\n…"`).
+    #[test]
+    fn to_text_word_positioned_pdf_reads_as_spaced_lines() {
+        // Two baseline rows, each drawn word by word (own Td per word) — the
+        // exact shape this engine's own Office→PDF output takes.
+        let c1 = "BT /F1 12 Tf 72 700 Td (Titre) Tj ET \
+                  BT /F1 12 Tf 110 700 Td (principal) Tj ET \
+                  BT /F1 12 Tf 72 680 Td (Deuxieme) Tj ET \
+                  BT /F1 12 Tf 132 680 Td (ligne) Tj ET";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{c1}\nendstream", c1.len()),
+            ),
+        ]);
+        let doc = Document::open(&pdf).expect("valid PDF");
+        assert!(!doc.has_semantic_structure(), "untagged → PDF-layer path");
+
+        let text = doc.to_text();
+        let lines: Vec<&str> = text
+            .split(['\n', '\u{000C}'])
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["Titre principal", "Deuxieme ligne"],
+            "baseline rows become lines, word gaps become spaces: {text:?}"
+        );
+    }
+
     /// A one-page tagged PDF: a single `/P` element carrying a `/Layout /BBox`
     /// `[72 700 300 750]` on a 400×800 page, with the page's `/Rotate` set to
     /// `rotate`. Used by the tagged-rotation #5 tests.
@@ -32435,7 +32861,7 @@ mod tests {
         let model = doc.reconstruct_model();
 
         // The displayed page swaps to landscape (400×800 → 800×400).
-        let geo = model.sections[0].geometry;
+        let geo = model.sections[0].geometry.clone();
         assert!(
             (geo.width - 800.0).abs() < 0.5 && (geo.height - 400.0).abs() < 0.5,
             "rotated tagged page is 800×400, got {}×{}",
@@ -32484,7 +32910,7 @@ mod tests {
 
         let model = doc.reconstruct_model();
         // No swap: the displayed page equals the MediaBox.
-        let geo = model.sections[0].geometry;
+        let geo = model.sections[0].geometry.clone();
         assert!(
             (geo.width - 400.0).abs() < 0.5 && (geo.height - 800.0).abs() < 0.5,
             "unrotated tagged page keeps 400×800, got {}×{}",
@@ -32573,7 +32999,7 @@ mod tests {
 
         let model = doc.reconstruct_model();
         // Geometry is the raw MediaBox (612×792, no swap).
-        let geo = model.sections[0].geometry;
+        let geo = model.sections[0].geometry.clone();
         assert!(
             (geo.width - 612.0).abs() < 0.5 && (geo.height - 792.0).abs() < 0.5,
             "upright page keeps MediaBox dimensions 612×792"
@@ -38695,6 +39121,7 @@ mod tests {
                     blocks,
                     absolute: false,
                 }],
+                ..Default::default()
             }],
             ..crate::model::Document::default()
         }
@@ -38912,6 +39339,7 @@ mod tests {
                     absolute: false,
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -38951,6 +39379,43 @@ mod tests {
         );
         assert_eq!(p2_head, 2, "the 14pt heading is H2 (below the 24pt title)");
         assert!(title < p2_head, "the title outranks the 14pt heading");
+    }
+
+    #[test]
+    fn relevel_headings_document_wide_demotes_repeated_running_headers() {
+        // M1 fix 6 wiring: `demote_repeated_headings` now runs INSIDE the
+        // document-wide releveling pass. The same heading text at the same
+        // framed position on 3+ pages is page chrome → demoted to a plain
+        // paragraph by the wired pass; the genuine one-off title stays a
+        // heading (and, with the repeats gone, is releveled alone).
+        use crate::model::{BlockKind, Rect};
+        let chrome = || {
+            let mut b = heading_block_sized("ACME CONFIDENTIAL", 14.0, 1);
+            b.frame = Some(Rect::new(72.0, 20.0, 200.0, 16.0));
+            b
+        };
+        let mut sections = vec![section_with_pages(vec![
+            vec![chrome(), heading_block_sized("Real Title", 24.0, 1)],
+            vec![chrome(), para_block("Body on page 2.")],
+            vec![chrome(), para_block("Body on page 3.")],
+        ])];
+
+        Document::relevel_headings_document_wide(&mut sections);
+
+        let kinds: Vec<bool> = sections[0]
+            .pages
+            .iter()
+            .map(|p| matches!(p.blocks[0].kind, BlockKind::Heading(_)))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![false, false, false],
+            "the repeated running header is demoted on every page"
+        );
+        assert!(
+            matches!(sections[0].pages[0].blocks[1].kind, BlockKind::Heading(_)),
+            "the genuine title stays a heading"
+        );
     }
 
     #[test]

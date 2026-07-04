@@ -37,11 +37,13 @@ pub mod style;
 
 pub use edit::{apply_ops, parse_ops, BlockAddr, ModelOp, StylePatch};
 pub use geom::{Margins, PageGeometry, Rect, Rotation};
-pub use sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow};
+pub use sheet::{
+    CellValue, DiagonalBorder, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow,
+};
 pub use slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
 pub use style::{
-    Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParaBorder, ParagraphStyle, StyleId,
-    StyleTable, TabAlign, TabStop, VAlign,
+    Align, CellVAlign, CharStyle, Direction, LineHeight, NamedStyle, ParaBorder, ParagraphStyle,
+    StyleId, StyleTable, TabAlign, TabStop, VAlign,
 };
 
 use crate::content::vector::PathSeg;
@@ -59,6 +61,24 @@ pub struct Document {
     /// body by a matching [`Inline::CommentRef`] (by [`Comment::id`]); HTML
     /// renders them as an endnote-style list. Empty ⇒ none.
     pub comments: Vec<Comment>,
+    /// Foot-/endnotes imported from the source document (DOCX
+    /// `word/footnotes.xml`/`word/endnotes.xml`, RTF `{\footnote …}`). Each is
+    /// anchored in the body by a matching [`Inline::FootnoteRef`] (by
+    /// [`Footnote::id`]); renderers synthesize the superscript call marker and
+    /// a notes section at the bottom. Empty ⇒ none (additive — documents
+    /// without notes serialize exactly as before).
+    pub footnotes: Vec<Footnote>,
+}
+
+/// A foot-/endnote: its document-unique `id` (matched by an
+/// [`Inline::FootnoteRef`] anchor in the body) and its body as a full block
+/// list (paragraphs, lists, …), mirroring the [`Comment`] pattern but keeping
+/// the note's structure instead of flattened text. The display ordinal is the
+/// note's 1-based position in [`Document::footnotes`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Footnote {
+    pub id: String,
+    pub blocks: Vec<Block>,
 }
 
 /// A review comment / annotation: its document-unique `id` (matched by an
@@ -114,11 +134,28 @@ pub struct DocMeta {
 
 /// A document section: one page geometry, optional running header/footer
 /// (themselves block lists), and the section's pages.
+///
+/// Beyond the default running [`header`](Self::header)/[`footer`](Self::footer),
+/// a section may carry **first-page** and **even-page** variants (DOCX
+/// `w:titlePg` + `w:headerReference w:type="first"`, `w:evenAndOddHeaders` +
+/// `w:type="even"`; ODT `style:header-first` / left-page master styles).
+/// `None` ⇒ the variant is not distinct (the default applies everywhere);
+/// `Some(vec![])` ⇒ the variant exists but is **blank** (Word's "different
+/// first page" with an empty first-page header). All four are additive: never
+/// serialized when `None`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Section {
     pub geometry: PageGeometry,
     pub header: Option<Vec<Block>>,
     pub footer: Option<Vec<Block>>,
+    /// Distinct first-page header (`w:titlePg`).
+    pub header_first: Option<Vec<Block>>,
+    /// Distinct first-page footer (`w:titlePg`).
+    pub footer_first: Option<Vec<Block>>,
+    /// Distinct even-page header (`w:evenAndOddHeaders`).
+    pub header_even: Option<Vec<Block>>,
+    /// Distinct even-page footer (`w:evenAndOddHeaders`).
+    pub footer_even: Option<Vec<Block>>,
     pub pages: Vec<Page>,
 }
 
@@ -219,6 +256,14 @@ pub enum Inline {
     CommentRef {
         id: String,
     },
+    /// An anchor marking where a foot-/endnote (matched by `id` against
+    /// [`Document::footnotes`]) is referenced in the run flow. Carries no text
+    /// of its own: renderers synthesize the superscript call marker (the note's
+    /// 1-based ordinal) and the note body renders in a notes section, mirroring
+    /// [`CommentRef`](Self::CommentRef).
+    FootnoteRef {
+        id: String,
+    },
 }
 
 /// A styled span of text. `source_index` optionally records the originating
@@ -262,6 +307,48 @@ pub struct List {
     /// behaviour, so the JSON stays retro-compatible: the field is only
     /// serialized when set). Ignored for unordered lists.
     pub marker_suffix: Option<char>,
+    /// Per-depth marker styles, indexed by [`ListItem::level`] (entry 0 = the
+    /// outermost depth). Empty ⇒ unresolved: the table-wide
+    /// [`marker`](Self::marker)/[`marker_suffix`](Self::marker_suffix) apply to
+    /// every depth (the pre-existing behaviour, so the field is additive).
+    /// Populated by the DOCX importer from `numbering.xml`'s multi-level
+    /// definitions so a nested list keeps `1. / a) / i.` per depth.
+    pub levels: Vec<ListLevelStyle>,
+    /// Ordinal **prefix** for ordered markers — the opening punctuation of a
+    /// `"(a)"` / `"(1)"` template (DOCX `w:lvlText` `"(%1)"`, ODF
+    /// `style:num-prefix`, reconstruction's paren-both shape). `None` ⇒ no
+    /// prefix (the field is only serialized when set).
+    pub marker_prefix: Option<String>,
+}
+
+/// One depth's marker style in a multi-level [`List`]: the marker (its variant
+/// is the number format; [`ListMarker::Bullet`] ⇒ an unordered depth), the
+/// ordinal suffix (`None` ⇒ the conventional `'.'`), and the depth's first
+/// ordinal (`w:start`, 1 by default).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ListLevelStyle {
+    pub marker: ListMarker,
+    /// Ordinal suffix for an ordered depth; `None` ⇒ `'.'`.
+    pub suffix: Option<char>,
+    /// First ordinal of the depth (1 by default). Meaningless for bullets.
+    pub start: u32,
+}
+
+impl Default for ListLevelStyle {
+    fn default() -> Self {
+        Self {
+            marker: ListMarker::default(),
+            suffix: None,
+            start: 1,
+        }
+    }
+}
+
+impl ListLevelStyle {
+    /// Whether this depth numbers its items (any non-bullet marker).
+    pub fn is_ordered(&self) -> bool {
+        !matches!(self.marker, ListMarker::Bullet(_))
+    }
 }
 
 impl List {
@@ -332,6 +419,23 @@ pub struct Cell {
     /// DOCX `w:tcPr/w:vAlign`, ODF `style:table-cell-properties@style:vertical-align`,
     /// and the PPTX/ODP slide-table cell anchor.
     pub vertical_align: Option<CellVAlign>,
+    /// Per-cell borders `[top, right, bottom, left]`, mirroring
+    /// [`ParagraphStyle::borders`] (same [`ParaBorder`] leaf: width in points,
+    /// line style keyword, RGB colour). All-`None` (the default) ⇒ no per-cell
+    /// regime: the table-wide [`Table::border`] applies as before. When **any**
+    /// side is set, this cell declares its own border regime: a `Some` side
+    /// draws that border, a `None` side draws **nothing** (an explicit "no line
+    /// here", not a fall-through to the table default). Round-trips DOCX
+    /// `w:tcPr/w:tcBorders`, PPTX `a:tcPr/a:lnT`/`lnR`/`lnB`/`lnL`, and ODF
+    /// per-cell `fo:border-*`. Additive: never serialized when all-`None`.
+    pub borders: [Option<ParaBorder>; 4],
+}
+
+impl Cell {
+    /// Whether this cell declares its own border regime (any side set).
+    pub fn has_borders(&self) -> bool {
+        self.borders.iter().any(Option::is_some)
+    }
 }
 
 impl Default for Cell {
@@ -342,6 +446,7 @@ impl Default for Cell {
             row_span: 1,
             shading: None,
             vertical_align: None,
+            borders: [None, None, None, None],
         }
     }
 }
@@ -352,6 +457,53 @@ impl Default for Cell {
 pub struct ImageRef {
     pub resource: u64,
     pub alt: Option<String>,
+    /// The image's authored display size `(width, height)` in points — DOCX
+    /// inline `wp:extent@cx/@cy` (EMU÷12700), ODF `svg:width`/`svg:height`.
+    /// `None` ⇒ no authored size survived (exporters fall back to a default
+    /// extent; a framed block image uses its [`Block::frame`] instead).
+    /// Additive: never serialized when unset.
+    pub size_pt: Option<(f64, f64)>,
+    /// Source-rectangle crop `[left, top, right, bottom]` as inset fractions of
+    /// the full bitmap, each `0.0..=1.0` (DrawingML `a:srcRect@l/t/r/b`,
+    /// thousandths-of-a-percent ÷ 100000). `[0.1, 0.0, 0.2, 0.0]` cuts 10 % off
+    /// the left and 20 % off the right. `None` = uncropped. Additive.
+    pub crop: Option<[f64; 4]>,
+}
+
+/// One colour stop of a [`Gradient`]: its position along the gradient axis
+/// (`0.0..=1.0`), RGB colour (`0.0..=1.0` components), and opacity `alpha`
+/// (`1.0` = opaque). Maps DrawingML `a:gs@pos` (thousandths-of-a-percent) with
+/// `a:srgbClr` + `a:alpha`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub pos: f64,
+    pub color: [f64; 3],
+    pub alpha: f64,
+}
+
+/// A linear gradient fill: ordered colour stops plus the gradient axis angle in
+/// **degrees clockwise from the positive X axis** (DrawingML `a:lin@ang`,
+/// 60000ths of a degree — `0` = left→right, `90` = top→bottom). Carried
+/// *alongside* the flat RGB fill (which stays the first stop's colour) so
+/// consumers unaware of gradients keep rendering the previous solid
+/// approximation.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Gradient {
+    pub stops: Vec<GradientStop>,
+    pub angle_deg: f64,
+}
+
+/// An outer drop shadow (DrawingML `a:effectLst/a:outerShdw`): offset
+/// `dx_pt`/`dy_pt` (points, +X right / +Y **down**, matching the CSS
+/// `box-shadow` convention), Gaussian `blur_pt` radius, RGB colour, and
+/// opacity `alpha` (`1.0` = opaque).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Shadow {
+    pub dx_pt: f64,
+    pub dy_pt: f64,
+    pub blur_pt: f64,
+    pub color: [f64; 3],
+    pub alpha: f64,
 }
 
 /// A vector shape: a path (reusing [`PathSeg`]) with fill/stroke styling. Stroke
@@ -365,6 +517,13 @@ pub struct Shape {
     pub stroke: Option<[f64; 3]>,
     pub stroke_width: f64,
     pub dash: Vec<f64>,
+    /// Gradient fill (PPTX/ODP `a:gradFill`). When set it **primes over**
+    /// [`fill`](Self::fill), which keeps the first stop's colour as the flat
+    /// fallback for gradient-unaware consumers. Additive: never serialized
+    /// when unset.
+    pub fill_gradient: Option<Gradient>,
+    /// Outer drop shadow (`a:effectLst/a:outerShdw`). Additive.
+    pub shadow: Option<Shadow>,
 }
 
 /// A free-floating text box. Holds a list of blocks (paragraphs, lists, nested
@@ -422,6 +581,14 @@ pub enum LinkTarget {
     Url(String),
     /// An internal jump to a zero-based page index.
     Page(usize),
+    /// A named in-document anchor (a DOCX bookmark / HTML fragment name) that
+    /// did not — or could not yet — resolve to a page. Keeps the anchor name
+    /// **typed** instead of a `"#name"` URL placeholder.
+    Anchor(String),
+    /// A link action with no URL/page/anchor equivalent, kept as a raw textual
+    /// summary instead of being dropped — e.g. a PDF `GoToR:report.pdf`
+    /// (remote go-to), `Named:NextPage`, or `Launch:app.exe`.
+    Other(String),
 }
 
 impl Default for LinkTarget {

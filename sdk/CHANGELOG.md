@@ -6,6 +6,37 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.117.0] - 2026-07-04
+
+Exhaustive two-way fidelity release (see the root
+[`CHANGELOG.md`](../CHANGELOG.md) for the full engine-level detail).
+
+### Added
+- `htmlToPdf(html, options?)` — optional page size, margins, header/footer and
+  `landscape`; `htmlRenderWith` documented as the canonical configurable path.
+- New model types surfaced on `pageBlocks` / structured output:
+  `direction` (RTL), `footnotes` + `FootnoteRef`, per-level list styles
+  (`levels`) and `marker_prefix`, per-cell table borders (`GigaParaBorder`),
+  image `size_pt` + `crop`, sheet `freeze`, cell `rotation_deg` + `diagonal`,
+  gradient fills (`GigaGradient`) + `shadow` (`GigaShadow`), first-page /
+  even-odd section headers, multi-column geometry, extended character styles
+  (caps, small-caps, double-strike, baseline shift, char scale, kerning),
+  `LinkTarget::Anchor` / `Other`, paragraph `soft_breaks`, `indent_left_pt` /
+  `space_before_pt`, `page_break_before`.
+- Office→PDF can emit a tagged `/StructTreeRoot` (opt-in; default off while the
+  tag-tree list-marker fidelity is finalized).
+
+### Fixed
+- `modelToPdf` now draws images and renders full Unicode (routed through the
+  rich model→HTML→PDF renderer instead of the WinAnsi std-14 path).
+- Chart data labels (`c:dLbls`) parsed and rendered as extractable text.
+- The JSON reader accepts exact u64 image-resource ids (pre-0.116 dumps).
+
+### Changed
+- `GigaImageRef.resource` stays `string | number`; `PageBlockGroup` and the
+  paragraph-style shape carry the new optional fields above (all additive —
+  existing consumers are unaffected).
+
 ## [0.116.0] - 2026-07-03
 
 ### Fixed — images survived NO JSON-bridged export (html, rtf, epub, md)

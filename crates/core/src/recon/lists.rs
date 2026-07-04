@@ -41,6 +41,10 @@ pub enum Segment<'a> {
 enum Marker {
     Bullet(char),
     Decimal,
+    /// Compound decimal numbering (`1.1`, `2.3.1.`) — sequenced by its **last**
+    /// component. Its own scheme: a `1.1` run must not merge with a plain `1.`
+    /// run at the same level.
+    DecimalCompound,
     LowerAlpha,
     UpperAlpha,
     LowerRoman,
@@ -51,7 +55,9 @@ impl Marker {
     fn to_list_marker(&self) -> ListMarker {
         match self {
             Marker::Bullet(c) => ListMarker::Bullet(*c),
-            Marker::Decimal => ListMarker::Decimal,
+            // The model has no compound-numbering marker; `Decimal` plus the
+            // recovered `start` (the last component) is the closest reading.
+            Marker::Decimal | Marker::DecimalCompound => ListMarker::Decimal,
             Marker::LowerAlpha => ListMarker::LowerAlpha,
             Marker::UpperAlpha => ListMarker::UpperAlpha,
             Marker::LowerRoman => ListMarker::LowerRoman,
@@ -72,16 +78,20 @@ impl Marker {
             Marker::UpperAlpha => 3,
             Marker::LowerRoman => 4,
             Marker::UpperRoman => 5,
+            Marker::DecimalCompound => 6,
         }
     }
 }
 
-/// An ordered marker's numbering delimiter — `.` or `)`. `1.` and `1)` are
-/// different list FORMATS and must not merge into one run; bullets carry `None`.
+/// An ordered marker's numbering delimiter — `.`, `)`, or parentheses on both
+/// sides (`(a)`). `1.`, `1)` and `(1)` are different list FORMATS and must not
+/// merge into one run; bullets carry `None`, and so does a compound number with
+/// no trailing dot (`1.1 Text`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delim {
     Dot,
     Paren,
+    ParenBoth,
 }
 
 /// The full classification of a line's leading marker: its scheme, its
@@ -168,6 +178,23 @@ fn marker_token_len_chars(trimmed: &str) -> usize {
     }
 }
 
+/// The ordered-list context a later, shorter run may **continue**: the format
+/// (scheme key + delimiter) and last base-level ordinal of the most recent
+/// accepted ordered list, decayed by the interleaved prose. A note of one or
+/// two lines between items keeps the context alive; a longer interruption
+/// clears it — a distant stray number must not ride an old list's numbering.
+#[derive(Debug, Clone)]
+struct ResumeCtx {
+    style_key: u8,
+    delim: Option<Delim>,
+    last_ordinal: u32,
+    prose_lines: usize,
+}
+
+/// The most prose lines a list may be interrupted by and still resume its
+/// numbering (the "note between two items" shape).
+const RESUME_MAX_PROSE_LINES: usize = 2;
+
 /// Split a reading-order group into list / prose segments.
 ///
 /// A list run starts at a marker line and absorbs every following marker line.
@@ -181,7 +208,11 @@ fn marker_token_len_chars(trimmed: &str) -> usize {
 /// the markers to form a coherent **ordinal sequence** (consecutive/monotonic in
 /// one format, plausible first ordinal) — so numeric sentences, citations and
 /// stray section numbers (`12. Smith et al.`) fall back to prose instead of
-/// becoming phantom lists.
+/// becoming phantom lists. A short run (even a single item) that **continues
+/// the numbering** of the list interrupted just above (same format, next
+/// ordinal, ≤ [`RESUME_MAX_PROSE_LINES`] of interleaved prose) stays a list —
+/// the interleaved note remains a paragraph and the resumed [`List`] carries
+/// the correct `start`, so `1. 2. — note — 3. 4.` no longer flattens its tail.
 pub fn split_lists<'a>(lines: &[&'a ReconLine]) -> Vec<Segment<'a>> {
     let mut segments: Vec<Segment> = Vec::new();
     let mut run: Vec<&ReconLine> = Vec::new();
@@ -190,6 +221,8 @@ pub fn split_lists<'a>(lines: &[&'a ReconLine]) -> Vec<Segment<'a>> {
     // a tolerance derived from that line's height — the continuation threshold.
     let mut item_text_x = f64::INFINITY;
     let mut item_tol = 0.0_f64;
+    // The resumable ordered-list context (see [`ResumeCtx`]).
+    let mut resume: Option<ResumeCtx> = None;
 
     for &line in lines {
         let is_item = detect_marker(&line.text()).is_some();
@@ -205,7 +238,7 @@ pub fn split_lists<'a>(lines: &[&'a ReconLine]) -> Vec<Segment<'a>> {
         if is_item {
             // A marker line continues a list run, or starts one out of prose.
             if !run_is_list {
-                push_run(&mut segments, std::mem::take(&mut run), run_is_list);
+                push_run(&mut segments, std::mem::take(&mut run), run_is_list, &mut resume);
                 run_is_list = true;
             }
             run.push(line);
@@ -219,35 +252,94 @@ pub fn split_lists<'a>(lines: &[&'a ReconLine]) -> Vec<Segment<'a>> {
         } else {
             // Plain prose: break the run (whatever it was) and start anew.
             if run_is_list {
-                push_run(&mut segments, std::mem::take(&mut run), run_is_list);
+                push_run(&mut segments, std::mem::take(&mut run), run_is_list, &mut resume);
                 run_is_list = false;
             }
             run.push(line);
         }
     }
     if !run.is_empty() {
-        push_run(&mut segments, run, run_is_list);
+        push_run(&mut segments, run, run_is_list, &mut resume);
     }
     segments
 }
 
-/// Emit a finished run as one or more segments. Prose passes straight through; a
-/// candidate list run is validated/sub-split by [`classify_list_run`] (which may
-/// yield a mix of [`Segment::List`] and [`Segment::Prose`] when only part of the
-/// run is a genuine ordinal sequence).
-fn push_run<'a>(segments: &mut Vec<Segment<'a>>, lines: Vec<&'a ReconLine>, is_list: bool) {
+/// Emit a finished run as one or more segments. Prose passes straight through
+/// (decaying the resumable-list context by its line count); a candidate list
+/// run is validated/sub-split by [`classify_list_run`] (which may yield a mix
+/// of [`Segment::List`] and [`Segment::Prose`] when only part of the run is a
+/// genuine ordinal sequence), then `resume` is re-armed from the last accepted
+/// ordered list so a following short run can continue its numbering.
+fn push_run<'a>(
+    segments: &mut Vec<Segment<'a>>,
+    lines: Vec<&'a ReconLine>,
+    is_list: bool,
+    resume: &mut Option<ResumeCtx>,
+) {
     if !is_list {
         if !lines.is_empty() {
+            if let Some(ctx) = resume.as_mut() {
+                ctx.prose_lines += lines.len();
+                if ctx.prose_lines > RESUME_MAX_PROSE_LINES {
+                    *resume = None;
+                }
+            }
             coalesce_prose(segments, lines);
         }
         return;
     }
-    for seg in classify_list_run(lines) {
+    for seg in classify_list_run(lines, resume.as_ref()) {
         match seg {
-            Segment::Prose(p) => coalesce_prose(segments, p),
-            list => segments.push(list),
+            Segment::Prose(p) => {
+                // Rejected marker lines are prose too — they decay the context
+                // exactly like any other interruption.
+                if let Some(ctx) = resume.as_mut() {
+                    ctx.prose_lines += p.len();
+                    if ctx.prose_lines > RESUME_MAX_PROSE_LINES {
+                        *resume = None;
+                    }
+                }
+                coalesce_prose(segments, p);
+            }
+            Segment::List(l) => {
+                // Re-arm (or clear, for bullets) the resumable context from
+                // the accepted list.
+                *resume = resume_ctx_of(&l);
+                segments.push(Segment::List(l));
+            }
         }
     }
+}
+
+/// The [`ResumeCtx`] a just-accepted list leaves behind: its base format and
+/// the last base-level ordinal. `None` for bullet lists (nothing to resume —
+/// and an interleaved bullet list breaks an ordered list's continuity anyway).
+fn resume_ctx_of(lines: &[&ReconLine]) -> Option<ResumeCtx> {
+    let levels = run_levels(lines);
+    let markers: Vec<(MarkerInfo, u8)> = lines
+        .iter()
+        .filter_map(|l| {
+            let info = classify_marker(&l.text())?;
+            let level = levels.get(&line_key(l)).copied()?;
+            Some((info, level))
+        })
+        .collect();
+    let (first, _) = markers.first()?;
+    if !first.marker.ordered() {
+        return None;
+    }
+    let base_level = markers.iter().map(|(_, lvl)| *lvl).min()?;
+    let last_ordinal = markers
+        .iter()
+        .rev()
+        .filter(|(_, lvl)| *lvl == base_level)
+        .find_map(|(info, _)| info.ordinal)?;
+    Some(ResumeCtx {
+        style_key: first.marker.style_key(),
+        delim: first.delim,
+        last_ordinal,
+        prose_lines: 0,
+    })
 }
 
 /// Append prose lines, merging into the preceding [`Segment::Prose`] if one is
@@ -275,7 +367,10 @@ fn coalesce_prose<'a>(segments: &mut Vec<Segment<'a>>, mut lines: Vec<&'a ReconL
 /// sub-list). Each sub-run is then accepted as a [`Segment::List`] only if its
 /// base-level markers pass [`is_ordinal_sequence`]; otherwise it degrades to
 /// [`Segment::Prose`].
-fn classify_list_run<'a>(lines: Vec<&'a ReconLine>) -> Vec<Segment<'a>> {
+fn classify_list_run<'a>(
+    lines: Vec<&'a ReconLine>,
+    resume: Option<&ResumeCtx>,
+) -> Vec<Segment<'a>> {
     // Bucket marker start-Xs into nesting levels using each line's own height as
     // the tolerance (mirrors `build_list`'s `body`-tolerance bucketing — which is
     // unavailable here, `split_lists` taking no body size).
@@ -285,6 +380,9 @@ fn classify_list_run<'a>(lines: Vec<&'a ReconLine>) -> Vec<Segment<'a>> {
     let mut sub: Vec<&ReconLine> = Vec::new();
     // The base (shallowest) marker info + level of the sub-run being built.
     let mut base: Option<(MarkerInfo, u8)> = None;
+    // Only the run's FIRST sub-run is adjacent to the interrupted list — later
+    // sub-runs (after a format break) cannot resume its numbering.
+    let mut first_sub = true;
 
     for &line in &lines {
         let info = classify_marker(&line.text());
@@ -296,7 +394,12 @@ fn classify_list_run<'a>(lines: Vec<&'a ReconLine>) -> Vec<Segment<'a>> {
                         if level <= *base_level && !info.same_format(base_info) =>
                     {
                         // Format change at/above the base level → break the run.
-                        out.push(classify_sub_run(std::mem::take(&mut sub), &levels));
+                        out.extend(classify_sub_run(
+                            std::mem::take(&mut sub),
+                            &levels,
+                            first_sub.then_some(resume).flatten(),
+                        ));
+                        first_sub = false;
                         base = Some((info.clone(), level));
                     }
                     Some((_, base_level)) if level < *base_level => {
@@ -314,19 +417,33 @@ fn classify_list_run<'a>(lines: Vec<&'a ReconLine>) -> Vec<Segment<'a>> {
         }
     }
     if !sub.is_empty() {
-        out.push(classify_sub_run(sub, &levels));
+        out.extend(classify_sub_run(
+            sub,
+            &levels,
+            first_sub.then_some(resume).flatten(),
+        ));
     }
     out
 }
 
 /// Decide whether one format-coherent sub-run is a genuine list ([`Segment::List`])
-/// or a phantom ([`Segment::Prose`]). Bullets are always lists (no ordinal
-/// requirement, keeping the existing `detect_marker` guards); an ordered sub-run
-/// must pass [`is_ordinal_sequence`] over its **base-level** markers.
+/// or a phantom. Bullets are always lists (no ordinal requirement, keeping the
+/// existing `detect_marker` guards); an ordered sub-run must pass
+/// [`is_ordinal_sequence`] over its **base-level** markers. `resume` (when the
+/// sub-run directly follows an interrupted list of the SAME format) lets a
+/// short tail continue that list's numbering.
+///
+/// On rejection the sub-run does **not** flatten wholesale: the base-level
+/// lines (a numbered section title, a citation) degrade to prose, but any
+/// *deeper* marker lines dragged in as would-be nesting are re-classified on
+/// their own — a genuine bullet list sitting under a rejected `11.3. Titre`
+/// line must survive as a list, exactly as it did when the section number was
+/// not read as a marker at all.
 fn classify_sub_run<'a>(
     lines: Vec<&'a ReconLine>,
     levels: &std::collections::HashMap<u64, u8>,
-) -> Segment<'a> {
+    resume: Option<&ResumeCtx>,
+) -> Vec<Segment<'a>> {
     let markers: Vec<(MarkerInfo, u8)> = lines
         .iter()
         .filter_map(|l| {
@@ -336,14 +453,14 @@ fn classify_sub_run<'a>(
         })
         .collect();
     let Some((first, _)) = markers.first().cloned() else {
-        return Segment::Prose(lines);
+        return vec![Segment::Prose(lines)];
     };
     // The list's own level is the shallowest marker present; deeper markers are
     // nested sub-list items (validated through their own base ordinal run).
     let base_level = markers.iter().map(|(_, lvl)| *lvl).min().unwrap_or(0);
     // Bullets: a coherent list with no ordinal demand (one bullet is still a list).
     if !first.marker.ordered() {
-        return Segment::List(lines);
+        return vec![Segment::List(lines)];
     }
     // Ordered: validate the ordinal run formed by the base-level markers only
     // (deeper markers belong to nested sub-lists, validated by their own base).
@@ -353,11 +470,49 @@ fn classify_sub_run<'a>(
         .filter_map(|(info, _)| info.ordinal)
         .collect();
     let total_markers = markers.len();
-    if is_ordinal_sequence(&base_ords, total_markers) {
-        Segment::List(lines)
-    } else {
-        Segment::Prose(lines)
+    // The numbering may only resume across a format-faithful boundary.
+    let continues_from = resume
+        .filter(|r| r.style_key == first.marker.style_key() && r.delim == first.delim)
+        .map(|r| r.last_ordinal);
+    if is_ordinal_sequence(&base_ords, total_markers, continues_from) {
+        return vec![Segment::List(lines)];
     }
+
+    // Rejected. Peel the base-level lines off as prose and re-classify each
+    // contiguous deeper span on its own (its shallowest level becomes its own
+    // base there — a nested bullet run turns back into the list it is). A
+    // markerless line follows the marker line above it, whichever side that
+    // was on. Recursion is bounded: every recursive call has a strictly
+    // deeper base level.
+    let mut out: Vec<Segment> = Vec::new();
+    let mut chunk: Vec<&ReconLine> = Vec::new();
+    let mut chunk_deep = false;
+    let flush = |chunk: &mut Vec<&'a ReconLine>, deep: bool, out: &mut Vec<Segment<'a>>| {
+        if chunk.is_empty() {
+            return;
+        }
+        if deep {
+            out.extend(classify_sub_run(std::mem::take(chunk), levels, None));
+        } else {
+            out.push(Segment::Prose(std::mem::take(chunk)));
+        }
+    };
+    for &line in &lines {
+        let deep = match classify_marker(&line.text())
+            .and_then(|_| levels.get(&line_key(line)).copied())
+        {
+            Some(lvl) => lvl > base_level,
+            // Continuation lines stay with the item above them.
+            None => chunk_deep,
+        };
+        if !chunk.is_empty() && deep != chunk_deep {
+            flush(&mut chunk, chunk_deep, &mut out);
+        }
+        chunk.push(line);
+        chunk_deep = deep;
+    }
+    flush(&mut chunk, chunk_deep, &mut out);
+    out
 }
 
 /// Whether `ords` (the base-level ordinals of an ordered sub-run, in reading
@@ -369,27 +524,36 @@ fn classify_sub_run<'a>(
 ///   arbitrary jumps.
 /// * **Plausible first ordinal** — starts at `1` (`1`/`a`/`i`/`A`/`I`), *or*
 ///   starts mid-stream only with corroboration: ≥ 3 items all stepping by exactly
-///   `1` (a list continued from an earlier column/page). This is what rejects a
-///   lone `12. Smith et al.` or a stray `7.` line.
+///   `1` (a list continued from an earlier column/page), *or* — the resumption
+///   case — `continues_from` says a same-format list just above ended at `N`
+///   and this run picks up within the gap tolerance of it. This is what rejects
+///   a lone `12. Smith et al.` or a stray `7.` line while a genuine `3. 4.` (or
+///   even a lone `3.`) after an interleaved note stays the list it visibly is.
 ///
-/// A **lone** ordered marker (`total_markers == 1`) is never a list — a single
-/// `1.` paragraph is prose. (Unordered single bullets are handled before here.)
-fn is_ordinal_sequence(ords: &[u32], total_markers: usize) -> bool {
+/// A **lone** ordered marker is never a list on its own — a single `1.`
+/// paragraph is prose — *except* as a numbered resumption (`continues_from`).
+/// (Unordered single bullets are handled before here.)
+fn is_ordinal_sequence(ords: &[u32], total_markers: usize, continues_from: Option<u32>) -> bool {
     /// Largest accepted gap between consecutive ordinals (absorbs one missed item).
     const GAP_TOL: u32 = 2;
-    // A lone ordered marker, or markers we couldn't value, is not a list.
-    if total_markers <= 1 || ords.len() < 2 {
-        return false;
-    }
-    // Strictly increasing with bounded positive gaps.
+    // Strictly increasing with bounded positive gaps (trivially true when < 2).
     let monotonic = ords
         .windows(2)
         .all(|w| w[1] > w[0] && w[1] - w[0] <= GAP_TOL);
     if !monotonic {
         return false;
     }
-    // Plausible start: at 1, or a corroborated mid-list continuation.
-    if ords[0] == 1 {
+    // A same-format list just above ended at N and this run picks up right
+    // after it (within the same gap tolerance).
+    let resumed = continues_from
+        .zip(ords.first())
+        .is_some_and(|(last, &first)| first > last && first - last <= GAP_TOL);
+    // A lone ordered marker (or markers we couldn't value): only a resumption.
+    if total_markers <= 1 || ords.len() < 2 {
+        return resumed && ords.len() == 1;
+    }
+    // Plausible start: at 1, a resumption, or a corroborated mid-list run.
+    if ords[0] == 1 || resumed {
         return true;
     }
     ords.len() >= 3 && ords.windows(2).all(|w| w[1] - w[0] == 1)
@@ -474,6 +638,7 @@ pub fn build_list(
         .position(|l| detect_marker(&l.text()).is_some())?;
     let first_marker = detect_marker(&items[first_idx].text())?;
     let first_info = classify_marker(&items[first_idx].text());
+    let first_delim = first_info.as_ref().and_then(|i| i.delim);
     let mut list = List {
         ordered: first_marker.ordered(),
         marker: first_marker.to_list_marker(),
@@ -483,10 +648,14 @@ pub fn build_list(
             .and_then(|i| i.ordinal)
             .filter(|_| first_marker.ordered())
             .unwrap_or(1),
-        marker_suffix: match first_info.as_ref().and_then(|i| i.delim) {
-            Some(Delim::Paren) => Some(')'),
+        marker_suffix: match first_delim {
+            Some(Delim::Paren) | Some(Delim::ParenBoth) => Some(')'),
             _ => None,
         },
+        // `(a)` keeps its opening paren too, now that the model carries a
+        // marker *prefix* (additive; a plain `a)` / `a.` list leaves it unset).
+        marker_prefix: matches!(first_delim, Some(Delim::ParenBoth)).then(|| "(".to_string()),
+        ..List::default()
     };
 
     // Bucket each marker line's start-X into a nesting level (0 = shallowest).
@@ -714,11 +883,34 @@ fn detect_marker(text: &str) -> Option<Marker> {
     // Ordinals: a token ending in '.' or ')' that is a number / single letter /
     // roman numeral.
     let token: String = t.chars().take_while(|c| !c.is_whitespace()).collect();
+    // Parenthesized on both sides: `(a)` / `(1)` / `(iv)` — the same label
+    // schemes, wrapped. (Sequencing guards downstream keep body-text asides
+    // like `(see)` out: the label itself must classify.)
+    if let Some(inner) = token
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return ordinal_label_marker(inner);
+    }
+    // Compound decimal numbering: `1.1` / `1.1.2` / `2.3.1.` — two to four
+    // short numeric components (each ≤ 3 digits), an optional trailing dot.
+    // A body-text number (`3.14159`) fails the component-length guard, and a
+    // lone survivor (`3.14 est …`) is rejected later by the ordinal-sequence
+    // validation (a marker needs aligned company to become a list).
+    if is_compound_decimal(&token) {
+        return Some(Marker::DecimalCompound);
+    }
     let (label, term) = match token.chars().last() {
         Some('.') | Some(')') => (&token[..token.len() - 1], token.chars().last().unwrap()),
         _ => return None,
     };
     let _ = term;
+    ordinal_label_marker(label)
+}
+
+/// Classify a bare ordinal label (no delimiter): decimal digits, a single
+/// ASCII letter, or a roman numeral. `None` for anything else.
+fn ordinal_label_marker(label: &str) -> Option<Marker> {
     if label.is_empty() {
         return None;
     }
@@ -741,6 +933,19 @@ fn detect_marker(text: &str) -> Option<Marker> {
         return Some(Marker::UpperRoman);
     }
     None
+}
+
+/// Whether `token` is a compound decimal marker (`1.1`, `1.1.2`, `2.3.1.`):
+/// 2–4 dot-separated components, each 1–3 digits, optionally dot-terminated.
+/// The short-component guard keeps real numbers (`3.14159`) and versions with
+/// long builds out; sequencing (`is_ordinal_sequence`) does the rest.
+fn is_compound_decimal(token: &str) -> bool {
+    let label = token.strip_suffix('.').unwrap_or(token);
+    let components: Vec<&str> = label.split('.').collect();
+    (2..=4).contains(&components.len())
+        && components
+            .iter()
+            .all(|c| (1..=3).contains(&c.len()) && c.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 /// Whether `label` is a roman numeral in the given case (≥ 2 chars, to avoid
@@ -767,6 +972,30 @@ fn classify_marker(text: &str) -> Option<MarkerInfo> {
     }
     let t = text.trim_start();
     let token: String = t.chars().take_while(|c| !c.is_whitespace()).collect();
+    // `(a)` / `(1)`: the label sits between the parentheses.
+    if let Some(inner) = token
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let ordinal = marker_ordinal(&marker, inner);
+        return Some(MarkerInfo {
+            marker,
+            delim: Some(Delim::ParenBoth),
+            ordinal,
+        });
+    }
+    // `1.1` / `1.1.2.`: the trailing dot (when present) is the delimiter; the
+    // ordinal is the LAST component (so `1.1.1 → 1.1.2 → 1.1.3` sequences).
+    if matches!(marker, Marker::DecimalCompound) {
+        let delim = token.ends_with('.').then_some(Delim::Dot);
+        let label = token.strip_suffix('.').unwrap_or(&token);
+        let ordinal = marker_ordinal(&marker, label);
+        return Some(MarkerInfo {
+            marker,
+            delim,
+            ordinal,
+        });
+    }
     let delim = match token.chars().last() {
         Some('.') => Delim::Dot,
         Some(')') => Delim::Paren,
@@ -788,6 +1017,8 @@ fn classify_marker(text: &str) -> Option<MarkerInfo> {
 fn marker_ordinal(marker: &Marker, label: &str) -> Option<u32> {
     match marker {
         Marker::Decimal => label.parse::<u32>().ok(),
+        // `1.1.2` sequences on its last component (`… → 2`).
+        Marker::DecimalCompound => label.rsplit('.').next()?.parse::<u32>().ok(),
         Marker::LowerAlpha | Marker::UpperAlpha => {
             let c = label.chars().next()?.to_ascii_lowercase();
             if c.is_ascii_lowercase() {
@@ -1330,6 +1561,243 @@ mod tests {
             1,
             "ii iii iv is an ordered roman list"
         );
+    }
+
+    // ── V3c fix 5a: compound (`1.1.2`) and both-paren (`(a)`) markers ─────────
+
+    #[test]
+    fn compound_decimal_sequence_is_an_ordered_list() {
+        assert_eq!(
+            detect_marker("1.1.2 item text"),
+            Some(Marker::DecimalCompound)
+        );
+        assert_eq!(detect_marker("2.3.1. dotted too"), Some(Marker::DecimalCompound));
+        let runs = vec![
+            run("1.1.1 premier point", 72.0, 700.0),
+            run("1.1.2 deuxième point", 72.0, 686.0),
+            run("1.1.3 troisième point", 72.0, 672.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(list_segments(&segs), 1, "1.1.1/1.1.2/1.1.3 is one list");
+
+        let mut ids = IdGen::default();
+        let block = build_list(&refs, 12.0, &mut ids, Rect::new).unwrap();
+        let BlockKind::List(list) = block.kind else {
+            panic!("expected list");
+        };
+        assert!(list.ordered);
+        assert_eq!(list.marker, ListMarker::Decimal, "compound lowers to Decimal");
+        assert_eq!(list.start, 1, "sequenced on the LAST component");
+        assert_eq!(list.items.len(), 3);
+        assert_eq!(item_text(&list.items[0]), "premier point", "marker stripped");
+    }
+
+    #[test]
+    fn body_text_numbers_are_not_compound_markers() {
+        // A real number fails the short-component guard outright…
+        assert_eq!(detect_marker("3.14159 est une approximation"), None);
+        // …and a plausible-looking pair (`3.14` / `3.15`) fails the sequence
+        // plausibility (starts mid-stream, only two items, no resumption).
+        let runs = vec![
+            run("3.14 la constante bien connue", 72.0, 700.0),
+            run("3.15 une autre décimale ici", 72.0, 686.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(list_segments(&segs), 0, "decimal prose is never a list");
+        // A lone numbered section title stays prose too.
+        let runs = vec![run("2.1 Méthodologie retenue", 72.0, 700.0)];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        assert_eq!(list_segments(&split_lists(&refs)), 0);
+    }
+
+    #[test]
+    fn a_numbered_section_title_does_not_swallow_its_bullet_list() {
+        // The Contrat regression: `11.3. Modalités …` (a lone compound marker
+        // = a section TITLE, not a list) followed by an indented bullet item
+        // and its wrapped continuation. The rejected ordered sub-run must peel
+        // the title off as prose and keep the nested bullet a LIST — before
+        // compound detection existed, that is exactly what happened.
+        let runs = vec![
+            run("11.3. Modalités de la cession", 72.0, 700.0),
+            run("• La cession prend effet à la livraison", 108.0, 686.0),
+            run("suspensive du paiement intégral", 120.0, 672.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(list_segments(&segs), 1, "the bullet survives as a list");
+        let Some(Segment::List(list_lines)) = segs
+            .iter()
+            .find(|s| matches!(s, Segment::List(_)))
+        else {
+            panic!("expected a list segment");
+        };
+        assert_eq!(list_lines.len(), 2, "bullet + its continuation");
+        // The section title stays prose.
+        assert!(segs.iter().any(|s| matches!(s, Segment::Prose(p)
+            if p.iter().any(|l| l.text().contains("Modalités")))));
+        // And the built list strips the bullet glyph as usual.
+        let mut ids = IdGen::default();
+        let block = build_list(list_lines, 12.0, &mut ids, Rect::new).unwrap();
+        let BlockKind::List(list) = block.kind else {
+            panic!("expected list");
+        };
+        assert!(!list.ordered);
+        assert!(
+            !item_text(&list.items[0]).contains('•'),
+            "no bullet glyph leaks into the item text"
+        );
+    }
+
+    #[test]
+    fn parenthesized_alpha_sequence_is_an_ordered_list() {
+        assert_eq!(detect_marker("(a) premier"), Some(Marker::LowerAlpha));
+        assert_eq!(detect_marker("(1) premier"), Some(Marker::Decimal));
+        let runs = vec![
+            run("(a) apples here", 72.0, 700.0),
+            run("(b) bananas too", 72.0, 686.0),
+            run("(c) cherries end", 72.0, 672.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(list_segments(&segs), 1, "(a)(b)(c) is one list");
+
+        let mut ids = IdGen::default();
+        let block = build_list(&refs, 12.0, &mut ids, Rect::new).unwrap();
+        let BlockKind::List(list) = block.kind else {
+            panic!("expected list");
+        };
+        assert!(list.ordered);
+        assert_eq!(list.marker, ListMarker::LowerAlpha);
+        assert_eq!(list.marker_suffix, Some(')'));
+        assert_eq!(item_text(&list.items[0]), "apples here", "(a) stripped");
+    }
+
+    #[test]
+    fn paren_both_and_paren_only_are_distinct_formats() {
+        // `(a)` and `b)` must not fuse into one run — different delimiters.
+        let runs = vec![run("(a) first", 72.0, 700.0), run("b) second", 72.0, 686.0)];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        for seg in &segs {
+            if let Segment::List(lines) = seg {
+                assert!(lines.len() < 2, "`(a)` and `b)` must not share one list");
+            }
+        }
+        assert_eq!(list_segments(&segs), 0);
+    }
+
+    // ── V3c fix 5b/5c: numbered resumption across an interleaved note ────────
+
+    #[test]
+    fn a_short_list_tail_resuming_the_numbering_stays_a_list() {
+        // `1. 2. — note — 3. 4.`: the tail used to flatten to prose (2 items,
+        // starts at 3, no corroboration). As a numbered continuation of the
+        // list interrupted just above it stays a list, and `build_list` gives
+        // it the correct `start` — the note remains a paragraph in between.
+        let runs = vec![
+            run("1. premier point", 72.0, 700.0),
+            run("2. deuxième point", 72.0, 686.0),
+            run("Une note intercalée ici", 72.0, 672.0),
+            run("3. troisième point", 72.0, 658.0),
+            run("4. quatrième point", 72.0, 644.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(segs.len(), 3, "list / note / list");
+        assert!(matches!(segs[0], Segment::List(_)));
+        assert!(matches!(segs[1], Segment::Prose(_)));
+        let Segment::List(tail) = &segs[2] else {
+            panic!("the resuming tail stays a list");
+        };
+        assert_eq!(tail.len(), 2);
+
+        let mut ids = IdGen::default();
+        let block = build_list(tail, 12.0, &mut ids, Rect::new).unwrap();
+        let BlockKind::List(list) = block.kind else {
+            panic!("expected list");
+        };
+        assert_eq!(list.start, 3, "the resumed list starts at its real number");
+        assert_eq!(list.items.len(), 2);
+    }
+
+    #[test]
+    fn even_a_single_resuming_item_stays_a_list() {
+        let runs = vec![
+            run("1. premier point", 72.0, 700.0),
+            run("2. deuxième point", 72.0, 686.0),
+            run("Une note intercalée ici", 72.0, 672.0),
+            run("3. dernier point", 72.0, 658.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(segs.len(), 3, "list / note / one-item list");
+        let Segment::List(tail) = &segs[2] else {
+            panic!("a lone `3.` right after `1. 2.` resumes the list");
+        };
+        assert_eq!(tail.len(), 1);
+    }
+
+    #[test]
+    fn a_non_continuing_number_after_a_list_is_still_prose() {
+        // `12.` does not continue `1. 2.` — the citation guard survives.
+        let runs = vec![
+            run("1. premier point", 72.0, 700.0),
+            run("2. deuxième point", 72.0, 686.0),
+            run("Une note intercalée ici", 72.0, 672.0),
+            run("12. Smith et al. étudient", 72.0, 658.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(list_segments(&segs), 1, "only the opening 1. 2. is a list");
+    }
+
+    #[test]
+    fn a_long_interruption_clears_the_resumption() {
+        // Three prose lines between `2.` and `3.` — too far to resume: the
+        // conservative historic reading (tail = prose) is kept.
+        let runs = vec![
+            run("1. premier point", 72.0, 700.0),
+            run("2. deuxième point", 72.0, 686.0),
+            run("Un paragraphe entier vient ici", 72.0, 672.0),
+            run("et il continue sur une deuxième", 72.0, 658.0),
+            run("et même une troisième ligne", 72.0, 644.0),
+            run("3. un nombre isolé après", 72.0, 630.0),
+            run("4. et son suivant direct", 72.0, 616.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(
+            list_segments(&segs),
+            1,
+            "a distant 3. 4. does not ride the old numbering"
+        );
+    }
+
+    #[test]
+    fn a_different_format_never_resumes() {
+        // `a) …` after `1. 2.` shares nothing: format-faithful resumption only.
+        let runs = vec![
+            run("1. premier point", 72.0, 700.0),
+            run("2. deuxième point", 72.0, 686.0),
+            run("Une note intercalée ici", 72.0, 672.0),
+            run("c) une lettre isolée", 72.0, 658.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(list_segments(&segs), 1, "the alpha stray stays prose");
     }
 
     /// A continuation line attached to a *nested* sub-item keeps that item's

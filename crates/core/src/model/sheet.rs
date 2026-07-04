@@ -22,6 +22,11 @@ pub struct Sheet {
     pub merges: Vec<MergeRange>,
     /// Per-column widths in points; shorter than the widest row ⇒ defaults.
     pub col_widths: Vec<f64>,
+    /// Frozen panes as `(rows, cols)`: the number of leading rows and columns
+    /// pinned while the rest of the sheet scrolls (XLSX `<pane ySplit xSplit
+    /// state="frozen">`). `(1, 0)` freezes the header row. `None` ⇒ no freeze.
+    /// Additive: never serialized when unset.
+    pub freeze: Option<(u32, u32)>,
 }
 
 /// One row of cells, with an optional fixed height (points).
@@ -59,6 +64,24 @@ pub struct SheetCell {
     /// Cell hyperlink target (an external URL, or an in-workbook `#Sheet!A1`
     /// location). `None` ⇒ no link.
     pub hyperlink: Option<String>,
+    /// Text rotation in **signed degrees counter-clockwise** (`+45` slants
+    /// up-right, `-45` down-right), from XLSX `alignment@textRotation` (whose
+    /// `0..=90` maps to `+0..=+90` and `91..=180` to `-1..=-90`; the vertical
+    /// marker `255` is not modelled). `None` ⇒ horizontal. Additive.
+    pub rotation_deg: Option<i32>,
+    /// Diagonal border line(s) across the cell (XLSX `border/diagonal` with
+    /// `@diagonalUp`/`@diagonalDown`). `None` ⇒ none. Additive.
+    pub diagonal: Option<DiagonalBorder>,
+}
+
+/// A diagonal cell border: which diagonal(s) are drawn and the line to draw
+/// them with. `up` runs bottom-left → top-right (XLSX `@diagonalUp`), `down`
+/// top-left → bottom-right (`@diagonalDown`); both may be set (an X).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DiagonalBorder {
+    pub up: bool,
+    pub down: bool,
+    pub border: BorderStyle,
 }
 
 /// A cell's typed value.

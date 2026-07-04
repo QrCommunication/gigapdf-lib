@@ -123,6 +123,14 @@ pub struct RenderOptions {
     /// here, so external images render with browser fidelity while staying
     /// zero-dependency. `data:` URIs are decoded inline and need no entry.
     pub resources: BTreeMap<String, Vec<u8>>,
+    /// Honour the document's `@page { size: …; margin: … }` rule: when the
+    /// author declares one, its size / margins override `page_w`/`page_h`/
+    /// `margins` (browser print behaviour — the author's `@page` is the
+    /// strongest signal of intended geometry). The constructors default it to
+    /// `true`, so `@page` acts as the geometry default; a caller that must
+    /// impose its own paper regardless sets it to `false`. Documents without
+    /// `@page` are unaffected either way.
+    pub honor_page_rule: bool,
 }
 
 impl RenderOptions {
@@ -139,6 +147,7 @@ impl RenderOptions {
             footer_offset: 18.0,
             start_page_number: 1,
             resources: BTreeMap::new(),
+            honor_page_rule: true,
         }
     }
 

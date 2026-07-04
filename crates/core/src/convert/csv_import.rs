@@ -63,8 +63,7 @@ pub fn csv_to_model(bytes: &[u8]) -> Option<Document> {
             sheets: vec![Sheet {
                 name: String::new(),
                 rows,
-                merges: Vec::new(),
-                col_widths: Vec::new(),
+                ..Default::default()
             }],
         }),
         ..Block::default()
@@ -73,12 +72,11 @@ pub fn csv_to_model(bytes: &[u8]) -> Option<Document> {
     Some(Document {
         sections: vec![Section {
             geometry: crate::model::PageGeometry::default(),
-            header: None,
-            footer: None,
             pages: vec![Page {
                 blocks: vec![block],
                 absolute: false,
             }],
+            ..Default::default()
         }],
         ..Document::default()
     })
@@ -275,7 +273,11 @@ fn make_cell(text: &str, header: bool) -> SheetCell {
 /// [`CellValue::Text`]. In particular [`looks_like_number`] rejects leading-zero
 /// runs (`01234` ZIP), over-long digit strings, and `+`-prefixed / separator-laden
 /// tokens (`+1-555-0100` phone), matching spreadsheet-import convention.
-fn infer_cell(text: &str) -> (CellValue, Option<String>) {
+///
+/// Shared with the Table→Sheet export bridge (`export_model::typed_sheet_value`),
+/// which layers locale-aware forms (`1 234,50`, `15,50 %`) on top of this strict
+/// core.
+pub(crate) fn infer_cell(text: &str) -> (CellValue, Option<String>) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return (CellValue::Empty, None);
@@ -320,7 +322,7 @@ fn parse_bool(s: &str) -> Option<bool> {
 ///   exponent (`1e5`, `-3.14E-2`) are allowed — no thousands separators, spaces,
 ///   or other punctuation (so `+1-555-0100` and `1,234` never parse here; the
 ///   XLSX/ODS path likewise types only bare `f64`-parseable tokens).
-fn parse_number(s: &str) -> Option<f64> {
+pub(crate) fn parse_number(s: &str) -> Option<f64> {
     let bytes = s.as_bytes();
     let mut i = 0;
     if matches!(bytes.first(), Some(b'+' | b'-')) {

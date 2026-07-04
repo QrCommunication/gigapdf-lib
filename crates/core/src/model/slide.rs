@@ -29,6 +29,11 @@ pub struct Slide {
     /// a solid (or first-stop gradient) page fill — PPTX `p:bg`/`p:bgPr`/`p:bgRef`
     /// or ODP `draw:page` (page or master) fill. `None` leaves the slide white.
     pub background: Option<[f64; 3]>,
+    /// Full-slide gradient background (PPTX `p:bgPr/a:gradFill`, ODP gradient
+    /// page fill). When set it primes over the flat [`background`](Self::background)
+    /// (which keeps the first stop's colour so gradient-unaware consumers keep
+    /// their previous solid approximation). Additive: never serialized when unset.
+    pub background_gradient: Option<crate::model::Gradient>,
 }
 
 /// A layout placeholder: a [`Block`] tagged with its semantic [`PlaceholderRole`].

@@ -2409,6 +2409,7 @@ mod tests {
                 .collect(),
             merges: Vec::new(),
             col_widths: vec![50.0; cols],
+            ..Default::default()
         }
     }
 

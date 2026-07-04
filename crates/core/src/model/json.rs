@@ -37,13 +37,14 @@ use crate::model::geom::{Margins, PageGeometry, Rect, Rotation};
 use crate::model::sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow};
 use crate::model::slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
 use crate::model::style::{
-    Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParaBorder, ParagraphStyle, StyleId,
-    StyleTable, TabStop, VAlign,
+    Align, CellVAlign, CharStyle, Direction, LineHeight, NamedStyle, ParaBorder, ParagraphStyle,
+    StyleId, StyleTable, TabStop, VAlign,
 };
 use crate::model::{
     Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, Comment, DocMeta,
-    Document, Heading, ImageRef, ImageResource, Inline, InlineRun, LinkTarget, List, ListItem,
-    ListMarker, OutlineNode, Page, Paragraph, ResourceTable, Row, Section, Shape, Table, TextBox,
+    Document, Footnote, Heading, ImageRef, ImageResource, Inline, InlineRun, LinkTarget, List,
+    ListItem, ListLevelStyle, ListMarker, OutlineNode, Page, Paragraph, ResourceTable, Row,
+    Section, Shape, Table, TextBox,
 };
 
 /// Current envelope version. Bump on any incompatible layout change.
@@ -256,6 +257,25 @@ impl Writer {
             self.comment(c);
         }
         self.arr_close();
+        // Additive: only emitted when the document carries notes, so a document
+        // without any serializes exactly as before (retro-compatible).
+        if !d.footnotes.is_empty() {
+            self.key("footnotes");
+            self.arr_open();
+            for f in &d.footnotes {
+                self.elem();
+                self.footnote(f);
+            }
+            self.arr_close();
+        }
+        self.obj_close();
+    }
+
+    fn footnote(&mut self, f: &Footnote) {
+        self.obj_open();
+        self.k_str("id", &f.id);
+        self.key("blocks");
+        self.block_array(&f.blocks);
         self.obj_close();
     }
 
@@ -352,6 +372,29 @@ impl Writer {
             self.key("tab_stops");
             self.tab_stops(&p.tab_stops);
         }
+        // Additive fields: only emitted when set, so documents without them
+        // serialize exactly as before (retro-compatible).
+        if let Some(d) = p.direction {
+            self.k_str(
+                "direction",
+                match d {
+                    Direction::Ltr => "ltr",
+                    Direction::Rtl => "rtl",
+                },
+            );
+        }
+        if !p.soft_breaks.is_empty() {
+            self.key("soft_breaks");
+            self.arr_open();
+            for &b in &p.soft_breaks {
+                self.elem();
+                self.bool_val(b);
+            }
+            self.arr_close();
+        }
+        if p.page_break_before {
+            self.k_bool("page_break_before", true);
+        }
         self.obj_close();
     }
 
@@ -434,6 +477,25 @@ impl Writer {
         if c.hidden {
             self.k_bool("hidden", true);
         }
+        // Additive fields: only emitted when set (retro-compatible).
+        if c.caps {
+            self.k_bool("caps", true);
+        }
+        if c.small_caps {
+            self.k_bool("small_caps", true);
+        }
+        if c.dstrike {
+            self.k_bool("dstrike", true);
+        }
+        if let Some(v) = c.baseline_shift_pt {
+            self.k_f64("baseline_shift_pt", v);
+        }
+        if let Some(v) = c.char_scale_pct {
+            self.k_f64("char_scale_pct", v);
+        }
+        if let Some(v) = c.kern_min_pt {
+            self.k_f64("kern_min_pt", v);
+        }
         self.obj_close();
     }
 
@@ -447,6 +509,27 @@ impl Writer {
         self.opt_blocks(&s.header);
         self.key("footer");
         self.opt_blocks(&s.footer);
+        // First-/even-page header/footer variants: additive, only emitted when
+        // the section declares them (a `None` variant writes nothing so older
+        // documents serialize exactly as before). `Some(vec![])` — a *blank*
+        // variant (Word's "different first page" with an empty header) — still
+        // emits its empty array, which is the whole point of the distinction.
+        if let Some(v) = &s.header_first {
+            self.key("header_first");
+            self.block_array(v);
+        }
+        if let Some(v) = &s.footer_first {
+            self.key("footer_first");
+            self.block_array(v);
+        }
+        if let Some(v) = &s.header_even {
+            self.key("header_even");
+            self.block_array(v);
+        }
+        if let Some(v) = &s.footer_even {
+            self.key("footer_even");
+            self.block_array(v);
+        }
         self.key("pages");
         self.arr_open();
         for p in &s.pages {
@@ -480,6 +563,17 @@ impl Writer {
         self.key("margins");
         self.margins(&g.margins);
         self.k_f64("column_count", g.column_count as f64);
+        // Additive column-layout details: only emitted when set.
+        if let Some(gap) = g.column_gap_pt {
+            self.k_f64("column_gap_pt", gap);
+        }
+        if let Some(widths) = &g.column_widths_pt {
+            self.key("column_widths_pt");
+            self.f64_array(widths);
+        }
+        if g.column_separator {
+            self.k_bool("column_separator", true);
+        }
         self.obj_close();
     }
 
@@ -676,6 +770,10 @@ impl Writer {
                 self.k_str("t", "commentRef");
                 self.k_str("id", id);
             }
+            Inline::FootnoteRef { id } => {
+                self.k_str("t", "footnoteRef");
+                self.k_str("id", id);
+            }
         }
         self.obj_close();
     }
@@ -717,6 +815,14 @@ impl Writer {
                 self.k_str("t", "page");
                 self.k_usize("v", *p);
             }
+            LinkTarget::Anchor(a) => {
+                self.k_str("t", "anchor");
+                self.k_str("v", a);
+            }
+            LinkTarget::Other(o) => {
+                self.k_str("t", "other");
+                self.k_str("v", o);
+            }
         }
         self.obj_close();
     }
@@ -741,6 +847,34 @@ impl Writer {
         if let Some(suffix) = l.marker_suffix {
             let mut tmp = [0u8; 4];
             self.k_str("marker_suffix", suffix.encode_utf8(&mut tmp));
+        }
+        // Additive: the per-depth marker table (empty ⇒ omitted) and the
+        // ordinal prefix (the "(" of "(a)"), each only when set.
+        if !l.levels.is_empty() {
+            self.key("levels");
+            self.arr_open();
+            for lvl in &l.levels {
+                self.elem();
+                self.list_level_style(lvl);
+            }
+            self.arr_close();
+        }
+        if let Some(prefix) = &l.marker_prefix {
+            self.k_str("marker_prefix", prefix);
+        }
+        self.obj_close();
+    }
+
+    fn list_level_style(&mut self, l: &ListLevelStyle) {
+        self.obj_open();
+        self.key("marker");
+        self.list_marker(l.marker);
+        if let Some(suffix) = l.suffix {
+            let mut tmp = [0u8; 4];
+            self.k_str("suffix", suffix.encode_utf8(&mut tmp));
+        }
+        if l.start != 1 {
+            self.k_f64("start", l.start as f64);
         }
         self.obj_close();
     }
@@ -826,6 +960,12 @@ impl Writer {
             Some(v) => self.str_val(cell_valign_tag(v)),
             None => self.null(),
         }
+        // Per-cell borders (same `[top, right, bottom, left]` shape as the
+        // paragraph borders). Additive: only emitted when a side is set.
+        if c.has_borders() {
+            self.key("borders");
+            self.para_borders(&c.borders);
+        }
         self.obj_close();
     }
 
@@ -852,6 +992,20 @@ impl Writer {
             Some(a) => self.str_val(a),
             None => self.null(),
         }
+        // Authored display size + source-rect crop: additive, emitted when set.
+        if let Some((w, h)) = i.size_pt {
+            self.key("size_pt");
+            self.arr_open();
+            self.elem();
+            self.f64(w);
+            self.elem();
+            self.f64(h);
+            self.arr_close();
+        }
+        if let Some(crop) = &i.crop {
+            self.key("crop");
+            self.f64_array(crop);
+        }
         self.obj_close();
     }
 
@@ -869,6 +1023,46 @@ impl Writer {
         self.k_f64("stroke_width", s.stroke_width);
         self.key("dash");
         self.f64_array(&s.dash);
+        // Gradient fill + drop shadow: additive, emitted when set.
+        if let Some(g) = &s.fill_gradient {
+            self.key("fill_gradient");
+            self.gradient(g);
+        }
+        if let Some(sh) = &s.shadow {
+            self.key("shadow");
+            self.shadow(sh);
+        }
+        self.obj_close();
+    }
+
+    /// `{stops: [{pos, color, alpha}…], angle_deg}` — see [`crate::model::Gradient`].
+    fn gradient(&mut self, g: &crate::model::Gradient) {
+        self.obj_open();
+        self.key("stops");
+        self.arr_open();
+        for stop in &g.stops {
+            self.elem();
+            self.obj_open();
+            self.k_f64("pos", stop.pos);
+            self.key("color");
+            self.rgb(&stop.color);
+            self.k_f64("alpha", stop.alpha);
+            self.obj_close();
+        }
+        self.arr_close();
+        self.k_f64("angle_deg", g.angle_deg);
+        self.obj_close();
+    }
+
+    /// `{dx_pt, dy_pt, blur_pt, color, alpha}` — see [`crate::model::Shadow`].
+    fn shadow(&mut self, s: &crate::model::Shadow) {
+        self.obj_open();
+        self.k_f64("dx_pt", s.dx_pt);
+        self.k_f64("dy_pt", s.dy_pt);
+        self.k_f64("blur_pt", s.blur_pt);
+        self.key("color");
+        self.rgb(&s.color);
+        self.k_f64("alpha", s.alpha);
         self.obj_close();
     }
 
@@ -939,6 +1133,16 @@ impl Writer {
         self.arr_close();
         self.key("col_widths");
         self.f64_array(&s.col_widths);
+        // Frozen panes `(rows, cols)`: additive, emitted when set.
+        if let Some((rows, cols)) = s.freeze {
+            self.key("freeze");
+            self.arr_open();
+            self.elem();
+            self.u64(rows as u64);
+            self.elem();
+            self.u64(cols as u64);
+            self.arr_close();
+        }
         self.obj_close();
     }
 
@@ -996,6 +1200,20 @@ impl Writer {
         match &c.hyperlink {
             Some(h) => self.str_val(h),
             None => self.null(),
+        }
+        // Text rotation + diagonal border: additive, emitted when set.
+        if let Some(deg) = c.rotation_deg {
+            self.key("rotation_deg");
+            self.out.push_str(&deg.to_string());
+        }
+        if let Some(d) = &c.diagonal {
+            self.key("diagonal");
+            self.obj_open();
+            self.k_bool("up", d.up);
+            self.k_bool("down", d.down);
+            self.key("border");
+            self.border(&d.border);
+            self.obj_close();
         }
         self.obj_close();
     }
@@ -1059,6 +1277,11 @@ impl Writer {
         self.key("notes");
         self.opt_blocks(&s.notes);
         self.k_opt_rgb("background", &s.background);
+        // Gradient page fill: additive, emitted when set.
+        if let Some(g) = &s.background_gradient {
+            self.key("background_gradient");
+            self.gradient(g);
+        }
         self.obj_close();
     }
 
@@ -1296,13 +1519,50 @@ impl<'a> Reader<'a> {
 
     /// A `u64` written either as a JSON string (`"123"`, exact — the canonical
     /// form for 64-bit content hashes, which overflow the f64-safe integer
-    /// range) or as a legacy bare number (parsed via the f64 scanner, lossy
-    /// past 2^53).
+    /// range) or as a legacy bare number. A bare **plain integer** (digits
+    /// only — the shape every pre-0.116 writer produced for `resource`) is
+    /// parsed **exactly from its raw lexeme**, so hashes past 2^53 survive
+    /// instead of being rounded through the f64 scanner and orphaned from
+    /// their `resources.images` key. Only a fractional/exponent form (never
+    /// written for these ids) still takes the lossy f64 route.
     fn u64_or_string(&mut self) -> Option<u64> {
         if self.peek()? == b'"' {
-            self.string()?.parse().ok()
-        } else {
-            self.u64()
+            return self.string()?.parse().ok();
+        }
+        if let Some(n) = self.u64_exact() {
+            return Some(n);
+        }
+        self.u64()
+    }
+
+    /// Scan a bare non-negative **plain integer** (no sign, no fraction, no
+    /// exponent) and parse its raw digit lexeme as an exact `u64`. Leaves the
+    /// cursor untouched and returns `None` when the next token is anything
+    /// else (a string, `-`, `1.5`, `1e9`, out-of-range digits…), so callers
+    /// can fall back to the general scanners.
+    fn u64_exact(&mut self) -> Option<u64> {
+        self.ws();
+        let start = self.i;
+        while matches!(self.b.get(self.i), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        // No digits, or the number continues as a fraction/exponent ⇒ not a
+        // plain integer: rewind for the caller's fallback path.
+        if self.i == start
+            || matches!(
+                self.b.get(self.i),
+                Some(b'.') | Some(b'e') | Some(b'E')
+            )
+        {
+            self.i = start;
+            return None;
+        }
+        match std::str::from_utf8(&self.b[start..self.i]).ok()?.parse() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                self.i = start;
+                None
+            }
         }
     }
 
@@ -1473,6 +1733,8 @@ impl<'a> Reader<'a> {
                 // Optional (added after v1 shipped without comments): a document
                 // serialized before this field simply omits it ⇒ empty.
                 "comments" => d.comments = r.array(Reader::comment)?,
+                // Optional (additive, like `comments`): absent ⇒ no notes.
+                "footnotes" => d.footnotes = r.array(Reader::footnote)?,
                 _ => return None,
             }
             Some(())
@@ -1557,6 +1819,15 @@ impl<'a> Reader<'a> {
                 "keep_with_next" => p.keep_with_next = r.bool()?,
                 "keep_together" => p.keep_together = r.bool()?,
                 "tab_stops" => p.tab_stops = r.tab_stops()?,
+                "direction" => {
+                    p.direction = Some(match r.string()?.as_str() {
+                        "ltr" => Direction::Ltr,
+                        "rtl" => Direction::Rtl,
+                        _ => return None,
+                    });
+                }
+                "soft_breaks" => p.soft_breaks = r.array(Reader::bool)?,
+                "page_break_before" => p.page_break_before = r.bool()?,
                 _ => return None,
             }
             Some(())
@@ -1662,6 +1933,12 @@ impl<'a> Reader<'a> {
                 "valign" => c.vertical_align = parse_valign(&r.string()?)?,
                 "letter_spacing_pt" => c.letter_spacing_pt = r.number()?,
                 "hidden" => c.hidden = r.bool()?,
+                "caps" => c.caps = r.bool()?,
+                "small_caps" => c.small_caps = r.bool()?,
+                "dstrike" => c.dstrike = r.bool()?,
+                "baseline_shift_pt" => c.baseline_shift_pt = Some(r.number()?),
+                "char_scale_pct" => c.char_scale_pct = Some(r.number()?),
+                "kern_min_pt" => c.kern_min_pt = Some(r.number()?),
                 _ => return None,
             }
             Some(())
@@ -1676,6 +1953,10 @@ impl<'a> Reader<'a> {
                 "geometry" => s.geometry = r.geometry()?,
                 "header" => s.header = r.opt_blocks()?,
                 "footer" => s.footer = r.opt_blocks()?,
+                "header_first" => s.header_first = Some(r.array(Reader::block)?),
+                "footer_first" => s.footer_first = Some(r.array(Reader::block)?),
+                "header_even" => s.header_even = Some(r.array(Reader::block)?),
+                "footer_even" => s.footer_even = Some(r.array(Reader::block)?),
                 "pages" => s.pages = r.array(Reader::page)?,
                 _ => return None,
             }
@@ -1701,6 +1982,9 @@ impl<'a> Reader<'a> {
                 "height" => g.height = r.number()?,
                 "margins" => g.margins = r.margins()?,
                 "column_count" => g.column_count = r.number().unwrap_or(1.0).clamp(1.0, 8.0) as u8,
+                "column_gap_pt" => g.column_gap_pt = Some(r.number()?),
+                "column_widths_pt" => g.column_widths_pt = Some(r.array(Reader::number)?),
+                "column_separator" => g.column_separator = r.bool()?,
                 _ => return None,
             }
             Some(())
@@ -1926,6 +2210,7 @@ impl<'a> Reader<'a> {
                 children: children?,
             }),
             "commentRef" => Some(Inline::CommentRef { id: comment_id? }),
+            "footnoteRef" => Some(Inline::FootnoteRef { id: comment_id? }),
             _ => None,
         }
     }
@@ -1943,6 +2228,19 @@ impl<'a> Reader<'a> {
             Some(())
         })?;
         Some(c)
+    }
+
+    fn footnote(&mut self) -> Option<Footnote> {
+        let mut f = Footnote::default();
+        self.object(|r, k| {
+            match k {
+                "id" => f.id = r.string()?,
+                "blocks" => f.blocks = r.array(Reader::block)?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(f)
     }
 
     fn inline_run(&mut self) -> Option<InlineRun> {
@@ -1986,7 +2284,7 @@ impl<'a> Reader<'a> {
             match k {
                 "t" => tag = Some(r.string()?),
                 "v" => match tag.as_deref()? {
-                    "url" => sval = Some(r.string()?),
+                    "url" | "anchor" | "other" => sval = Some(r.string()?),
                     "page" => pval = Some(r.usize()?),
                     _ => return None,
                 },
@@ -1997,6 +2295,8 @@ impl<'a> Reader<'a> {
         match tag.as_deref()? {
             "url" => Some(LinkTarget::Url(sval?)),
             "page" => Some(LinkTarget::Page(pval?)),
+            "anchor" => Some(LinkTarget::Anchor(sval?)),
+            "other" => Some(LinkTarget::Other(sval?)),
             _ => None,
         }
     }
@@ -2010,6 +2310,22 @@ impl<'a> Reader<'a> {
                 "items" => l.items = r.array(Reader::list_item)?,
                 "start" => l.start = r.number()? as u32,
                 "marker_suffix" => l.marker_suffix = r.string()?.chars().next(),
+                "levels" => l.levels = r.array(Reader::list_level_style)?,
+                "marker_prefix" => l.marker_prefix = Some(r.string()?),
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(l)
+    }
+
+    fn list_level_style(&mut self) -> Option<ListLevelStyle> {
+        let mut l = ListLevelStyle::default();
+        self.object(|r, k| {
+            match k {
+                "marker" => l.marker = r.list_marker()?,
+                "suffix" => l.suffix = r.string()?.chars().next(),
+                "start" => l.start = r.number()? as u32,
                 _ => return None,
             }
             Some(())
@@ -2109,6 +2425,7 @@ impl<'a> Reader<'a> {
                         None => None,
                     };
                 }
+                "borders" => c.borders = r.para_borders()?,
                 _ => return None,
             }
             Some(())
@@ -2150,6 +2467,20 @@ impl<'a> Reader<'a> {
                 // to strings.
                 "resource" => i.resource = r.u64_or_string()?,
                 "alt" => i.alt = r.opt_string()?,
+                "size_pt" => {
+                    let v = r.array(Reader::number)?;
+                    if v.len() != 2 {
+                        return None;
+                    }
+                    i.size_pt = Some((v[0], v[1]));
+                }
+                "crop" => {
+                    let v = r.array(Reader::number)?;
+                    if v.len() != 4 {
+                        return None;
+                    }
+                    i.crop = Some([v[0], v[1], v[2], v[3]]);
+                }
                 _ => return None,
             }
             Some(())
@@ -2166,11 +2497,65 @@ impl<'a> Reader<'a> {
                 "stroke" => s.stroke = r.opt_rgb()?,
                 "stroke_width" => s.stroke_width = r.number()?,
                 "dash" => s.dash = r.array(Reader::number)?,
+                "fill_gradient" => s.fill_gradient = Some(r.gradient()?),
+                "shadow" => s.shadow = Some(r.shadow()?),
                 _ => return None,
             }
             Some(())
         })?;
         Some(s)
+    }
+
+    /// Inverse of [`Writer::gradient`].
+    fn gradient(&mut self) -> Option<crate::model::Gradient> {
+        let mut g = crate::model::Gradient::default();
+        self.object(|r, k| {
+            match k {
+                "stops" => g.stops = r.array(Reader::gradient_stop)?,
+                "angle_deg" => g.angle_deg = r.number()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(g)
+    }
+
+    fn gradient_stop(&mut self) -> Option<crate::model::GradientStop> {
+        let (mut pos, mut color, mut alpha) = (0.0, [0.0; 3], 1.0);
+        self.object(|r, k| {
+            match k {
+                "pos" => pos = r.number()?,
+                "color" => color = r.rgb()?,
+                "alpha" => alpha = r.number()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(crate::model::GradientStop { pos, color, alpha })
+    }
+
+    /// Inverse of [`Writer::shadow`].
+    fn shadow(&mut self) -> Option<crate::model::Shadow> {
+        let (mut dx_pt, mut dy_pt, mut blur_pt) = (0.0, 0.0, 0.0);
+        let (mut color, mut alpha) = ([0.0; 3], 1.0);
+        self.object(|r, k| {
+            match k {
+                "dx_pt" => dx_pt = r.number()?,
+                "dy_pt" => dy_pt = r.number()?,
+                "blur_pt" => blur_pt = r.number()?,
+                "color" => color = r.rgb()?,
+                "alpha" => alpha = r.number()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(crate::model::Shadow {
+            dx_pt,
+            dy_pt,
+            blur_pt,
+            color,
+            alpha,
+        })
     }
 
     fn path_seg(&mut self) -> Option<PathSeg> {
@@ -2231,6 +2616,13 @@ impl<'a> Reader<'a> {
                 "rows" => s.rows = r.array(Reader::sheet_row)?,
                 "merges" => s.merges = r.array(Reader::merge_range)?,
                 "col_widths" => s.col_widths = r.array(Reader::number)?,
+                "freeze" => {
+                    let v = r.array(Reader::u64)?;
+                    if v.len() != 2 || v.iter().any(|n| *n > u32::MAX as u64) {
+                        return None;
+                    }
+                    s.freeze = Some((v[0] as u32, v[1] as u32));
+                }
                 _ => return None,
             }
             Some(())
@@ -2282,11 +2674,34 @@ impl<'a> Reader<'a> {
                 }
                 "wrap" => c.wrap = r.bool()?,
                 "hyperlink" => c.hyperlink = r.opt_string()?,
+                "rotation_deg" => {
+                    let n = r.number()?;
+                    if n.fract() != 0.0 || !(-180.0..=180.0).contains(&n) {
+                        return None;
+                    }
+                    c.rotation_deg = Some(n as i32);
+                }
+                "diagonal" => c.diagonal = Some(r.diagonal_border()?),
                 _ => return None,
             }
             Some(())
         })?;
         Some(c)
+    }
+
+    /// Inverse of the writer's `diagonal` member: `{up, down, border}`.
+    fn diagonal_border(&mut self) -> Option<crate::model::DiagonalBorder> {
+        let mut d = crate::model::DiagonalBorder::default();
+        self.object(|r, k| {
+            match k {
+                "up" => d.up = r.bool()?,
+                "down" => d.down = r.bool()?,
+                "border" => d.border = r.border()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(d)
     }
 
     fn cell_value(&mut self) -> Option<CellValue> {
@@ -2352,6 +2767,7 @@ impl<'a> Reader<'a> {
                 "placeholders" => s.placeholders = r.array(Reader::placeholder)?,
                 "notes" => s.notes = r.opt_blocks()?,
                 "background" => s.background = r.opt_rgb()?,
+                "background_gradient" => s.background_gradient = Some(r.gradient()?),
                 _ => return None,
             }
             Some(())
@@ -2582,6 +2998,14 @@ mod tests {
                 color: blue,
                 background: Some([1.0, 1.0, 0.0]),
                 vertical_align: VAlign::Super,
+                // The additive display-transform / metrics fields must survive
+                // the round trip too.
+                caps: true,
+                small_caps: true,
+                dstrike: true,
+                baseline_shift_pt: Some(3.5),
+                char_scale_pct: Some(150.0),
+                kern_min_pt: Some(8.0),
 
                 ..Default::default()
             },
@@ -2608,6 +3032,9 @@ mod tests {
                 indent_right_pt: 0.0,
                 first_line_pt: -9.0,
                 line_height: LineHeight::Multiple(1.5),
+                // Additive: base direction + line-break softness flags.
+                direction: Some(Direction::Rtl),
+                soft_breaks: vec![true, false],
                 ..Default::default()
             },
             style_ref: Some(StyleId("Body".to_string())),
@@ -2615,9 +3042,31 @@ mod tests {
                 run_a,
                 run_b,
                 link,
+                // The typed link targets and the footnote anchor must survive
+                // the round trip.
+                Inline::Link {
+                    href: LinkTarget::Anchor("section-2".to_string()),
+                    children: vec![Inline::Run(InlineRun {
+                        text: "see §2".to_string(),
+                        style: CharStyle::default(),
+                        source_index: None,
+                    })],
+                },
+                Inline::Link {
+                    href: LinkTarget::Other("GoToR:annexe.pdf".to_string()),
+                    children: vec![Inline::Run(InlineRun {
+                        text: "annexe".to_string(),
+                        style: CharStyle::default(),
+                        source_index: None,
+                    })],
+                },
+                Inline::FootnoteRef {
+                    id: "fn1".to_string(),
+                },
                 Inline::Image(ImageRef {
                     resource: 7,
                     alt: Some("logo".to_string()),
+                    ..Default::default()
                 }),
             ],
         };
@@ -2663,6 +3112,7 @@ mod tests {
                 row_span: 1,
                 shading: shade,
                 vertical_align: va,
+                ..Default::default()
             };
         let table = Table {
             rows: vec![
@@ -2706,6 +3156,21 @@ mod tests {
                     level: 1,
                 },
             ],
+            // Per-depth marker table + ordinal prefix (the "(" of "(a)") must
+            // survive the round trip.
+            levels: vec![
+                ListLevelStyle {
+                    marker: ListMarker::Decimal,
+                    suffix: None,
+                    start: 3,
+                },
+                ListLevelStyle {
+                    marker: ListMarker::LowerAlpha,
+                    suffix: Some(')'),
+                    start: 1,
+                },
+            ],
+            marker_prefix: Some("(".to_string()),
 
             ..Default::default()
         };
@@ -2721,6 +3186,7 @@ mod tests {
             stroke: None,
             stroke_width: 1.5,
             dash: vec![3.0, 2.0],
+            ..Default::default()
         };
 
         let sheet = SheetBlock {
@@ -2746,6 +3212,7 @@ mod tests {
                                 vertical_align: Some(CellVAlign::Middle),
                                 wrap: true,
                                 hyperlink: Some("https://example.com/".to_string()),
+                                ..Default::default()
                             },
                             SheetCell {
                                 value: CellValue::Number(1234.56),
@@ -2786,6 +3253,7 @@ mod tests {
                     c1: 1,
                 }],
                 col_widths: vec![64.0, 64.0],
+                ..Default::default()
             }],
         };
 
@@ -2844,6 +3312,7 @@ mod tests {
                     kind: BlockKind::Paragraph(Paragraph::default()),
                 }]),
                 background: Some([0.125, 0.219, 0.392]),
+                ..Default::default()
             }],
         };
 
@@ -2898,6 +3367,7 @@ mod tests {
                     kind: BlockKind::Image(ImageRef {
                         resource: 7,
                         alt: None,
+                        ..Default::default()
                     }),
                 },
                 Block {
@@ -3044,6 +3514,7 @@ mod tests {
                 }]),
                 footer: None,
                 pages: vec![page],
+                ..Default::default()
             }],
             outline: vec![OutlineNode {
                 title: "Chapter 1".to_string(),
@@ -3069,6 +3540,24 @@ mod tests {
                 author: "Reviewer".to_string(),
                 date: "2026-06-24T10:00:00Z".to_string(),
                 text: "Round-trip me — café 🎯".to_string(),
+            }],
+            // A typed footnote matching the body's `Inline::FootnoteRef` anchor;
+            // its body is a full block list (not flattened text).
+            footnotes: vec![Footnote {
+                id: "fn1".to_string(),
+                blocks: vec![Block {
+                    id: BlockId(950),
+                    frame: None,
+                    rotation: Rotation::D0,
+                    kind: BlockKind::Paragraph(Paragraph {
+                        runs: vec![Inline::Run(InlineRun {
+                            text: "The note body — café".to_string(),
+                            style: CharStyle::default(),
+                            source_index: None,
+                        })],
+                        ..Default::default()
+                    }),
+                }],
             }],
         }
     }
@@ -3114,6 +3603,7 @@ mod tests {
                         kind: BlockKind::Image(ImageRef {
                             resource: HASH,
                             alt: None,
+                            ..Default::default()
                         }),
                         ..Block::default()
                     }],
@@ -3226,6 +3716,222 @@ mod tests {
     }
 
     #[test]
+    fn legacy_bare_number_u64_parses_exactly_past_2_pow_53() {
+        // A pre-0.116 dump wrote `resource` as a bare JSON number. Ids past
+        // 2^53 must parse EXACTLY from the raw digit lexeme, not through the
+        // f64 scanner (which rounds them and orphans the resource reference).
+        let big: u64 = 0xDEAD_BEEF_CAFE_F00D; // 16045690985374125069 > 2^53
+        assert_ne!(big as f64 as u64, big, "test id must not be f64-exact");
+        let json = sample_doc()
+            .to_json()
+            .replace("\"resource\":\"7\"", &format!("\"resource\":{big}"));
+        let doc = Document::from_json(&json).expect("bare huge id must parse");
+        let mut found = false;
+        for section in &doc.sections {
+            for page in &section.pages {
+                for block in &page.blocks {
+                    if let BlockKind::Image(img) = &block.kind {
+                        assert_eq!(img.resource, big, "raw lexeme must survive");
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "sample_doc carries a top-level image block");
+        // Fraction / exponent forms still take the checked f64 route.
+        let frac = sample_doc()
+            .to_json()
+            .replace("\"resource\":\"7\"", "\"resource\":7.0");
+        assert!(Document::from_json(&frac).is_some(), "7.0 stays accepted");
+    }
+
+    #[test]
+    fn m2_additive_fields_round_trip() {
+        use crate::model::{DiagonalBorder, Gradient, GradientStop, Shadow};
+        let mut doc = Document::default();
+        // Section with first/even header-footer variants (one blank — the
+        // `Some(vec![])` distinction must survive) + full column layout.
+        doc.sections.push(Section {
+            geometry: PageGeometry {
+                column_count: 3,
+                column_gap_pt: Some(18.5),
+                column_widths_pt: Some(vec![144.0, 200.0, 100.5]),
+                column_separator: true,
+                ..Default::default()
+            },
+            header: Some(vec![]),
+            header_first: Some(vec![Block::default()]),
+            footer_first: Some(vec![]),
+            header_even: Some(vec![Block::default()]),
+            footer_even: None,
+            pages: vec![Page {
+                blocks: vec![
+                    // Paragraph with page_break_before.
+                    Block {
+                        kind: BlockKind::Paragraph(Paragraph {
+                            style: ParagraphStyle {
+                                page_break_before: true,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                        ..Block::default()
+                    },
+                    // Table cell with per-cell borders (top + left only).
+                    Block {
+                        kind: BlockKind::Table(Table {
+                            rows: vec![Row {
+                                cells: vec![Cell {
+                                    borders: [
+                                        Some(ParaBorder {
+                                            width_pt: 1.5,
+                                            style: "dashed".to_string(),
+                                            color: [1.0, 0.0, 0.0],
+                                        }),
+                                        None,
+                                        None,
+                                        Some(ParaBorder {
+                                            width_pt: 0.75,
+                                            style: "solid".to_string(),
+                                            color: [0.0, 0.0, 1.0],
+                                        }),
+                                    ],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Block::default()
+                    },
+                    // Image with authored size + crop.
+                    Block {
+                        kind: BlockKind::Image(ImageRef {
+                            resource: 7,
+                            size_pt: Some((123.5, 67.25)),
+                            crop: Some([0.1, 0.0, 0.25, 0.05]),
+                            ..Default::default()
+                        }),
+                        ..Block::default()
+                    },
+                    // Shape with gradient fill + shadow.
+                    Block {
+                        kind: BlockKind::Shape(Shape {
+                            fill: Some([0.2, 0.4, 0.6]),
+                            fill_gradient: Some(Gradient {
+                                stops: vec![
+                                    GradientStop {
+                                        pos: 0.0,
+                                        color: [0.2, 0.4, 0.6],
+                                        alpha: 1.0,
+                                    },
+                                    GradientStop {
+                                        pos: 1.0,
+                                        color: [1.0, 1.0, 1.0],
+                                        alpha: 0.5,
+                                    },
+                                ],
+                                angle_deg: 90.0,
+                            }),
+                            shadow: Some(Shadow {
+                                dx_pt: 2.0,
+                                dy_pt: 3.0,
+                                blur_pt: 4.5,
+                                color: [0.0, 0.0, 0.0],
+                                alpha: 0.4,
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Block::default()
+                    },
+                    // Sheet with freeze + rotated cell + diagonal border.
+                    Block {
+                        kind: BlockKind::Sheet(SheetBlock {
+                            sheets: vec![Sheet {
+                                name: "S".to_string(),
+                                freeze: Some((2, 1)),
+                                rows: vec![SheetRow {
+                                    cells: vec![SheetCell {
+                                        rotation_deg: Some(-45),
+                                        diagonal: Some(DiagonalBorder {
+                                            up: true,
+                                            down: true,
+                                            border: BorderStyle {
+                                                width: 1.0,
+                                                color: [0.5, 0.0, 0.0],
+                                            },
+                                        }),
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                        }),
+                        ..Block::default()
+                    },
+                    // Slide with a gradient background.
+                    Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![Slide {
+                                background: Some([0.9, 0.9, 0.9]),
+                                background_gradient: Some(Gradient {
+                                    stops: vec![GradientStop {
+                                        pos: 0.5,
+                                        color: [0.9, 0.9, 0.9],
+                                        alpha: 1.0,
+                                    }],
+                                    angle_deg: 45.0,
+                                }),
+                                ..Default::default()
+                            }],
+                        }),
+                        ..Block::default()
+                    },
+                ],
+                absolute: false,
+            }],
+            ..Default::default()
+        });
+        doc.resources.images.insert(
+            7,
+            ImageResource {
+                bytes: vec![1, 2, 3],
+                format: "png".to_string(),
+            },
+        );
+
+        let json = doc.to_json();
+        let back = Document::from_json(&json).expect("round trip");
+        assert_eq!(doc, back, "all M2 additive fields survive the round trip");
+
+        // Unset fields stay OFF the wire (retro-compat with older readers).
+        let plain = Document::default().to_json();
+        for key in [
+            "header_first",
+            "footer_even",
+            "column_gap_pt",
+            "column_widths_pt",
+            "column_separator",
+            "page_break_before",
+            "\"borders\":[", // cell borders (para borders always emit inside styles)
+            "size_pt",
+            "crop",
+            "fill_gradient",
+            "\"shadow\"",
+            "freeze",
+            "rotation_deg",
+            "diagonal",
+            "background_gradient",
+        ] {
+            assert!(
+                !plain.contains(key),
+                "unset additive field `{key}` must not serialize"
+            );
+        }
+    }
+
+    #[test]
     fn f64_precision_preserved() {
         // Odd, full-precision floats must survive exactly (shortest round-trip).
         let mut doc = Document::default();
@@ -3245,10 +3951,11 @@ mod tests {
             header: None,
             footer: None,
             pages: vec![],
+            ..Default::default()
         });
         let back = Document::from_json(&doc.to_json()).unwrap();
         assert_eq!(doc, back);
-        let g = back.sections[0].geometry;
+        let g = back.sections[0].geometry.clone();
         assert_eq!(g.height, 0.1 + 0.2);
         assert_eq!(g.margins.top, -12.345_678_9);
         assert_eq!(g.margins.right, 1e-9);

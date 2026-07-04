@@ -296,7 +296,45 @@ fn collect_inline_images(runs: &[Inline], out: &mut Vec<u64>) {
 /// stay under this; a numbered running *title* like `Chapter 1 Title` (≈12
 /// letters) does not — so its number is **kept**, and a sequence of numbered
 /// chapter headings does not collapse to one false-positive signature.
+///
+/// Letters belonging to the localized page-numbering vocabulary
+/// ([`PAGE_NUMBER_WORDS`]) do **not** count against this budget: `Page 3 sur 12`
+/// (7 letters) and `Seite 3 von 12` (8 letters) are page numbers in French /
+/// German and must fold like the bare English `Page 3`.
 const PAGE_NUMBER_MAX_LETTERS: usize = 6;
+
+/// The localized page-numbering vocabulary: leader words (`Page`, `Seite`,
+/// `Página`, …) and the *x of y* connectors (`sur`, `of`, `von`, `di`, …) that
+/// page-number furniture is built from. Words on this list are excluded from
+/// the [`PAGE_NUMBER_MAX_LETTERS`] letter budget, so a localized `Page 3 sur
+/// 12` footer still counts as number-dominated and folds to one signature per
+/// section. A real body sentence is unaffected: its *other* words blow the
+/// budget regardless of any connector it contains.
+/// Leaders first ("page" in the major Latin-script locales), then the
+/// connectors (the "of"/"sur"/"von" of "Page 3 of 12").
+const PAGE_NUMBER_WORDS: &[&str] = &[
+    "page", "pages", "seite", "sida", "pagina", "página", "pag", "pág", "pagine", "blz", "folio",
+    "p", "pg", "sur", "of", "de", "di", "von", "van", "av", "da",
+];
+
+/// Whether `word` (a maximal alphabetic run) belongs to the localized
+/// page-numbering vocabulary. Case-insensitive (Unicode lowercase, so `Página`
+/// matches `página`).
+fn is_page_number_word(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    PAGE_NUMBER_WORDS.contains(&lower.as_str())
+}
+
+/// The number of alphabetic characters in `raw` that count against the
+/// page-number letter budget: every letter *outside* the localized
+/// page-numbering vocabulary. `Page 3 sur 12` counts 0; `Le contrat porte sur 3
+/// points` counts the letters of `Le contrat porte points` (well over budget).
+fn countable_letters(raw: &str) -> usize {
+    raw.split(|c: char| !c.is_alphabetic())
+        .filter(|w| !w.is_empty() && !is_page_number_word(w))
+        .map(|w| w.chars().count())
+        .sum()
+}
 
 /// The longest digit run that may be folded as a page number (gap #75, sub-item
 /// 12). Page numbers are short; a longer run is a year-range, an account/ISBN, a
@@ -307,14 +345,16 @@ const PAGE_NUMBER_MAX_DIGITS: usize = 4;
 
 /// Collapse `raw` to a signature that clusters the *same* furniture across pages:
 /// ASCII-lowercased with whitespace collapsed to single spaces, and — *only when
-/// the block is dominated by the number* (≤ [`PAGE_NUMBER_MAX_LETTERS`] letters,
-/// the page-number case) — every **short** digit run (≤ [`PAGE_NUMBER_MAX_DIGITS`])
-/// folded to `#`. A running title that merely repeats verbatim already matches
-/// without folding; the letter guard keeps it from swallowing distinct numbered
-/// headings, and the digit-length guard keeps a long number (year-range, id) from
-/// folding into a page-number-shaped signature.
+/// the block is dominated by the number* (≤ [`PAGE_NUMBER_MAX_LETTERS`] letters
+/// **outside** the localized page-numbering vocabulary, the page-number case) —
+/// every **short** digit run (≤ [`PAGE_NUMBER_MAX_DIGITS`]) folded to `#`. So
+/// `Page 3 sur 12` / `Page 3 of 12` / `Seite 3 von 12` / `3 / 12` all fold and
+/// cluster across pages. A running title that merely repeats verbatim already
+/// matches without folding; the letter guard keeps it from swallowing distinct
+/// numbered headings, and the digit-length guard keeps a long number
+/// (year-range, id) from folding into a page-number-shaped signature.
 fn normalize_text(raw: &str) -> String {
-    let fold_digits = raw.chars().filter(|c| c.is_alphabetic()).count() <= PAGE_NUMBER_MAX_LETTERS;
+    let fold_digits = countable_letters(raw) <= PAGE_NUMBER_MAX_LETTERS;
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::with_capacity(raw.len());
     let mut last_was_space = true; // trims leading whitespace
@@ -411,6 +451,8 @@ fn append_runs(runs: &[Inline], out: &mut String) {
             Inline::Link { children, .. } => append_runs(children, out),
             Inline::Image(_) => {}
             Inline::CommentRef { .. } => {}
+            // A note anchor has no text of its own (body in `Document::footnotes`).
+            Inline::FootnoteRef { .. } => {}
         }
     }
 }
@@ -502,6 +544,7 @@ mod tests {
             header: None,
             footer: None,
             pages,
+            ..Default::default()
         };
 
         strip_running_furniture(std::slice::from_mut(&mut section));
@@ -570,6 +613,7 @@ mod tests {
             header: None,
             footer: None,
             pages,
+            ..Default::default()
         };
 
         strip_running_furniture(std::slice::from_mut(&mut section));
@@ -602,6 +646,7 @@ mod tests {
                 blocks: section_blocks.clone(),
                 absolute: false,
             }],
+            ..Default::default()
         };
 
         strip_running_furniture(std::slice::from_mut(&mut section));
@@ -651,6 +696,7 @@ mod tests {
             header: None,
             footer: None,
             pages,
+            ..Default::default()
         };
 
         strip_running_furniture(std::slice::from_mut(&mut section));
@@ -671,6 +717,102 @@ mod tests {
         assert_eq!(normalize_text("  3 "), "#");
         // Distinct prose does NOT collapse.
         assert_ne!(normalize_text("Chapter 1 Title"), normalize_text("Summary"));
+    }
+
+    /// Localized "page x of y" footers fold to one signature per language, so a
+    /// French `Page 3 sur 12` (7 letters — over the raw budget) is still
+    /// recognised as a page number and clusters across pages.
+    #[test]
+    fn localized_page_x_of_y_folds_to_one_signature() {
+        // French — the connector "sur" pushed the letter count past the old
+        // budget, so the number never folded and every page had a distinct
+        // signature (the page number leaked into the body on EVERY French doc).
+        assert_eq!(normalize_text("Page 3 sur 12"), "page # sur #");
+        assert_eq!(
+            normalize_text("Page 3 sur 12"),
+            normalize_text("Page 11 sur 12")
+        );
+        // English with the "of" connector.
+        assert_eq!(
+            normalize_text("Page 3 of 12"),
+            normalize_text("Page 7 of 12")
+        );
+        // German.
+        assert_eq!(
+            normalize_text("Seite 3 von 12"),
+            normalize_text("Seite 9 von 12")
+        );
+        // Bare "x / y" (no words at all).
+        assert_eq!(normalize_text("3 / 12"), "# / #");
+        assert_eq!(normalize_text("3 / 12"), normalize_text("7 / 12"));
+    }
+
+    /// A real body sentence containing a number (even one using a connector
+    /// word like "sur") keeps its digits: its other words blow the letter
+    /// budget, so two variants do NOT collapse to one furniture signature.
+    #[test]
+    fn body_sentence_with_number_keeps_its_digits() {
+        let a = normalize_text("Le contrat porte sur 3 points importants");
+        let b = normalize_text("Le contrat porte sur 4 points importants");
+        assert_ne!(a, b, "distinct body sentences keep distinct signatures");
+        assert!(a.contains('3'), "digits kept verbatim in prose: {a:?}");
+        // Same for English prose with "of".
+        let c = normalize_text("A review of 3 recent studies");
+        assert!(c.contains('3'), "digits kept verbatim in prose: {c:?}");
+    }
+
+    /// End-to-end: a French document with a `Page N sur 12` footer on every
+    /// page has the footer lifted (once) and stripped from every body.
+    #[test]
+    fn strips_french_page_n_sur_total_footer() {
+        let mut pages = Vec::new();
+        for n in 1..=4u64 {
+            pages.push(Page {
+                blocks: vec![
+                    para_block(
+                        n * 10,
+                        &format!("Paragraphe unique de la page {n}."),
+                        60.0,
+                        400.0,
+                        470.0,
+                        14.0,
+                    ),
+                    para_block(
+                        n * 10 + 1,
+                        &format!("Page {n} sur 12"),
+                        250.0,
+                        815.0,
+                        95.0,
+                        12.0,
+                    ),
+                ],
+                absolute: false,
+            });
+        }
+        let mut section = Section {
+            geometry: geom(),
+            header: None,
+            footer: None,
+            pages,
+            ..Default::default()
+        };
+
+        strip_running_furniture(std::slice::from_mut(&mut section));
+
+        let footer = section.footer.expect("French page-number footer detected");
+        assert_eq!(footer.len(), 1);
+        assert!(
+            block_text(&footer[0]).starts_with("Page ") && block_text(&footer[0]).contains("sur"),
+            "footer is the localized page number, got {:?}",
+            block_text(&footer[0])
+        );
+        for (i, page) in section.pages.iter().enumerate() {
+            assert_eq!(page.blocks.len(), 1, "page {i} keeps only its body block");
+            assert!(
+                !block_text(&page.blocks[0]).contains("sur 12"),
+                "page {i} footer stripped from the body"
+            );
+        }
     }
 
     #[test]
@@ -700,6 +842,7 @@ mod tests {
             kind: BlockKind::Image(crate::model::ImageRef {
                 resource: 0xABCD,
                 alt: None,
+                ..Default::default()
             }),
         };
         let mut pages = Vec::new();
@@ -724,6 +867,7 @@ mod tests {
             header: None,
             footer: None,
             pages,
+            ..Default::default()
         };
         strip_running_furniture(std::slice::from_mut(&mut section));
 

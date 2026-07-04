@@ -156,6 +156,13 @@ pub fn txt_to_pdf(text: &str) -> Vec<u8> {
 /// (headings, bold/italic, colour, tables, lists, `data:` images) — US-Letter
 /// portrait with 0.5in margins. External `<img src>`/web-font URLs are omitted
 /// here (no host fetch on this entry point); use the host-fetch path for those.
+///
+/// This is the fixed-page-setup convenience. For a configurable page size
+/// (named, explicit, or landscape), per-side margins, a running header/footer,
+/// or host-supplied fonts/images, render through [`crate::html::render_with`]
+/// with a [`RenderOptions`](crate::html::RenderOptions) — the canonical rich
+/// path, exposed on the SDK as `htmlRenderWith` (and, for the common cases, via
+/// the optional `options` on `htmlToPdf`).
 pub fn html_to_pdf(html: &str) -> Vec<u8> {
     crate::html::render(html, &[], 612.0, 792.0, 36.0)
 }
@@ -334,11 +341,22 @@ use crate::model::{
 ///   [`List::marker`] and each item's nesting [`ListItem::level`].
 /// * **Images** ([`BlockKind::Image`]) interned in [`Document::resources`] emit a
 ///   `{\pict …}` group — `\pngblip` for PNG, `\jpegblip` for JPEG, with
-///   `\picwgoal`/`\pichgoal` from the pixel size and a hex payload. GIF / WebP /
-///   AVIF are transcoded to PNG first, then emitted as `\pngblip`.
+///   `\picwgoal`/`\pichgoal` from the block's placement frame when set (else
+///   the pixel size) and a hex payload. GIF / WebP / AVIF are transcoded to
+///   PNG first, then emitted as `\pngblip`.
 /// * **Hyperlinks** ([`Inline::Link`]) emit
-///   `{\field{\*\fldinst HYPERLINK "url"}{\fldrslt <styled children>}}`, the form
-///   the RTF importer ([`super::rtf::rtf_to_model`]) reads back.
+///   `{\field{\*\fldinst HYPERLINK "url"}{\fldrslt <styled children>}}` for an
+///   external URL / page jump, or `HYPERLINK \l "name"` (the local-jump
+///   switch) for a named in-document anchor — the form the RTF importer
+///   ([`super::rtf::rtf_to_model`]) reads back (anchors round-trip as a plain
+///   `HYPERLINK` target, a known importer limitation).
+/// * **Footnotes** ([`Inline::FootnoteRef`]) resolved against
+///   [`Document::footnotes`] emit the standard auto-numbered
+///   `{\super\chftn}{\footnote …}` construct; a dangling reference (no
+///   matching id) emits nothing.
+/// * **Paragraph direction** (`ParagraphStyle::direction`) emits `\rtlpar` for
+///   [`Direction::Rtl`](crate::model::Direction::Rtl); unset/`Ltr` paragraphs
+///   emit nothing (byte-identical to before this field existed).
 pub fn rtf_from_model(doc: &Document) -> Vec<u8> {
     // Collect the distinct run colours into the RTF colour table; runs reference
     // a colour by 1-based index (`\cfN`).
@@ -376,6 +394,7 @@ pub fn rtf_from_model(doc: &Document) -> Vec<u8> {
         &colors,
         &fonts,
         &doc.resources,
+        &doc.footnotes,
         &mut first,
         &mut s,
     );
@@ -579,11 +598,12 @@ fn rtf_blocks_from_model(
     colors: &[[u8; 3]],
     fonts: &[(String, Generic)],
     res: &ResourceTable,
+    footnotes: &[crate::model::Footnote],
     first: &mut bool,
     out: &mut String,
 ) {
     for b in blocks {
-        rtf_block_from_model(b, colors, fonts, res, first, out);
+        rtf_block_from_model(b, colors, fonts, res, footnotes, first, out);
     }
 }
 
@@ -592,15 +612,24 @@ fn rtf_block_from_model(
     colors: &[[u8; 3]],
     fonts: &[(String, Generic)],
     res: &ResourceTable,
+    footnotes: &[crate::model::Footnote],
     first: &mut bool,
     out: &mut String,
 ) {
     match &block.kind {
-        BlockKind::Paragraph(p) => rtf_para_from_model(p, colors, fonts, res, false, first, out),
-        BlockKind::Heading(h) => rtf_heading_from_model(h, colors, fonts, first, out),
-        BlockKind::List(list) => rtf_list_from_model(list, colors, fonts, res, first, out),
-        BlockKind::Table(table) => rtf_table_from_model(table, colors, fonts, res, first, out),
-        BlockKind::TextBox(tb) => rtf_blocks_from_model(&tb.blocks, colors, fonts, res, first, out),
+        BlockKind::Paragraph(p) => {
+            rtf_para_from_model(p, colors, fonts, res, footnotes, false, first, out)
+        }
+        BlockKind::Heading(h) => rtf_heading_from_model(h, colors, fonts, footnotes, first, out),
+        BlockKind::List(list) => {
+            rtf_list_from_model(list, colors, fonts, res, footnotes, first, out)
+        }
+        BlockKind::Table(table) => {
+            rtf_table_from_model(table, colors, fonts, res, footnotes, first, out)
+        }
+        BlockKind::TextBox(tb) => {
+            rtf_blocks_from_model(&tb.blocks, colors, fonts, res, footnotes, first, out)
+        }
         BlockKind::Sheet(sb) => {
             for sheet in &sb.sheets {
                 for row in &sheet.rows {
@@ -624,7 +653,7 @@ fn rtf_block_from_model(
         BlockKind::Slide(sb) => {
             for slide in &sb.slides {
                 for ph in &slide.placeholders {
-                    rtf_block_from_model(&ph.block, colors, fonts, res, first, out);
+                    rtf_block_from_model(&ph.block, colors, fonts, res, footnotes, first, out);
                 }
             }
         }
@@ -639,7 +668,15 @@ fn rtf_block_from_model(
             rtf_par_sep(first, out);
             out.push_str("{\\li360 ");
             let mut inner_first = true;
-            rtf_blocks_from_model(&bq.blocks, colors, fonts, res, &mut inner_first, out);
+            rtf_blocks_from_model(
+                &bq.blocks,
+                colors,
+                fonts,
+                res,
+                footnotes,
+                &mut inner_first,
+                out,
+            );
             out.push('}');
         }
         BlockKind::HorizontalRule => {
@@ -647,9 +684,10 @@ fn rtf_block_from_model(
             rtf_par_sep(first, out);
             out.push_str("{\\pard\\brdrb\\brdrs\\brdrw10\\par}");
         }
-        // A block-level image emits a `\pict` group (PNG/JPEG only); a Shape's
+        // A block-level image emits a `\pict` group (PNG/JPEG only); its
+        // placement frame, when set, drives the display goals. A Shape's
         // vector geometry has no portable RTF mapping and is dropped.
-        BlockKind::Image(img) => rtf_image_from_model(img, res, first, out),
+        BlockKind::Image(img) => rtf_image_from_model(img, block.frame.as_ref(), res, first, out),
         BlockKind::Shape(_) => {}
     }
 }
@@ -667,16 +705,29 @@ fn rtf_plain_line(text: &str, first: &mut bool, out: &mut String) {
     rtf_escape(text, out);
 }
 
+// `colors`/`fonts`/`res`/`footnotes` are the same read-only, document-wide
+// tables every sibling `rtf_*_from_model` function threads through (all at or
+// under the 7-argument default); `force_bold` (heading/table-cell callers)
+// is what tips this one specific function to 8. Bundling the four tables into
+// a context struct would ripple through every call site in this file for a
+// purely stylistic gain, so the threshold is waived here instead.
+#[allow(clippy::too_many_arguments)]
 fn rtf_para_from_model(
     para: &Paragraph,
     colors: &[[u8; 3]],
     fonts: &[(String, Generic)],
     res: &ResourceTable,
+    footnotes: &[crate::model::Footnote],
     force_bold: bool,
     first: &mut bool,
     out: &mut String,
 ) {
     rtf_par_sep(first, out);
+    // `\rtlpar` — right-to-left paragraph flow. `Ltr`/unset emits nothing, so
+    // paragraphs that never set a direction serialize exactly as before.
+    if para.style.direction == Some(crate::model::Direction::Rtl) {
+        out.push_str("\\rtlpar ");
+    }
     // Paragraph alignment control word.
     match para.style.align {
         crate::model::Align::Left => {}
@@ -685,7 +736,7 @@ fn rtf_para_from_model(
         crate::model::Align::Justify => out.push_str("\\qj "),
     }
     for r in &para.runs {
-        rtf_inline_from_model(r, colors, fonts, res, force_bold, out);
+        rtf_inline_from_model(r, colors, fonts, res, footnotes, force_bold, out);
     }
 }
 
@@ -694,6 +745,7 @@ fn rtf_inline_from_model(
     colors: &[[u8; 3]],
     fonts: &[(String, Generic)],
     res: &ResourceTable,
+    footnotes: &[crate::model::Footnote],
     force_bold: bool,
     out: &mut String,
 ) {
@@ -708,32 +760,164 @@ fn rtf_inline_from_model(
             out.push('}');
         }
         Inline::LineBreak => out.push_str("\\line "),
-        // An inline image emits its own `\pict` group inline (PNG/JPEG only).
+        // An inline image emits its own `\pict` group inline (PNG/JPEG only);
+        // inline placement has no frame, so its pixel size drives the goals.
         Inline::Image(img) => {
             let mut sink = true; // a `\pict` carries no paragraph separator
-            rtf_image_from_model(img, res, &mut sink, out);
+            rtf_image_from_model(img, None, res, &mut sink, out);
         }
         // A hyperlink lowers to an RTF field whose `\fldinst` carries the
-        // `HYPERLINK "url"` target and whose `\fldrslt` holds the styled visible
-        // children — mirroring the form the RTF importer reads back.
+        // `HYPERLINK "url"` target (`\l "name"` for a named in-document anchor)
+        // and whose `\fldrslt` holds the styled visible children — mirroring
+        // the form the RTF importer reads back.
         Inline::Link { href, children } => {
-            let url = match href {
-                LinkTarget::Url(u) => u.clone(),
+            let (switch, target) = match href {
+                LinkTarget::Url(u) => ("", u.clone()),
                 // No portable RTF for an internal page jump → emit a fragment
                 // anchor so the link is at least preserved as a field target.
-                LinkTarget::Page(p) => format!("#page{}", p + 1),
+                LinkTarget::Page(p) => ("", format!("#page{}", p + 1)),
+                // `\l` is RTF's local-jump field switch — the canonical way to
+                // target a named in-document anchor/bookmark. The importer's
+                // `HYPERLINK` miner does not currently special-case it, so
+                // this round-trips as `LinkTarget::Url(name)` rather than
+                // `LinkTarget::Anchor(name)` — an importer limitation, not
+                // something export can paper over.
+                LinkTarget::Anchor(a) => ("\\l ", a.clone()),
+                // A raw action summary has no RTF equivalent (empty target).
+                LinkTarget::Other(_) => ("", String::new()),
             };
-            out.push_str("{\\field{\\*\\fldinst HYPERLINK \"");
-            rtf_escape(&url, out);
+            out.push_str("{\\field{\\*\\fldinst HYPERLINK ");
+            out.push_str(switch);
+            out.push('"');
+            rtf_escape(&target, out);
             out.push_str("\"}{\\fldrslt ");
             for c in children {
-                rtf_inline_from_model(c, colors, fonts, res, force_bold, out);
+                rtf_inline_from_model(c, colors, fonts, res, footnotes, force_bold, out);
             }
             out.push_str("}}");
         }
         // A comment anchor carries no body and has no plain-RTF representation;
         // it emits nothing (comments degrade gracefully on RTF export).
         Inline::CommentRef { .. } => {}
+        // A footnote reference resolved against `Document::footnotes` emits
+        // the standard auto-numbered `{\super\chftn}{\footnote …}` construct;
+        // a dangling id (no matching note) emits nothing, as before.
+        Inline::FootnoteRef { id } => {
+            if let Some(note) = footnotes.iter().find(|f| &f.id == id) {
+                rtf_footnote_from_model(note, colors, fonts, res, footnotes, out);
+            }
+        }
+    }
+}
+
+/// Emit `{\footnote …}` for a resolved [`Footnote`](crate::model::Footnote): a
+/// superscript `\chftn` marker (for readers that render the destination
+/// inline) followed by the standard auto-numbered footnote destination the
+/// RTF importer ([`super::rtf::rtf_to_model`]) recovers back into
+/// `Document::footnotes` plus a matching `Inline::FootnoteRef` — RTF
+/// footnotes are always auto-numbered by position, so the reimported id is
+/// the note's sequential position, not necessarily [`Footnote::id`] verbatim.
+///
+/// The body reuses the run/paragraph emission helpers (so styled text
+/// round-trips) for `Paragraph`/`Heading` blocks; any other block kind (list,
+/// table, image, …) flattens to its plain unstyled text — footnote bodies are
+/// simple notes, not full documents.
+fn rtf_footnote_from_model(
+    note: &crate::model::Footnote,
+    colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
+    res: &ResourceTable,
+    footnotes: &[crate::model::Footnote],
+    out: &mut String,
+) {
+    out.push_str("{\\super\\chftn}{\\footnote\\pard\\plain {\\super\\chftn} ");
+    let mut first_para = true;
+    for b in &note.blocks {
+        match &b.kind {
+            BlockKind::Paragraph(p) => {
+                if first_para {
+                    first_para = false;
+                } else {
+                    out.push_str("\\par ");
+                }
+                for r in &p.runs {
+                    rtf_inline_from_model(r, colors, fonts, res, footnotes, false, out);
+                }
+            }
+            BlockKind::Heading(h) => {
+                if first_para {
+                    first_para = false;
+                } else {
+                    out.push_str("\\par ");
+                }
+                for r in &h.para.runs {
+                    rtf_inline_from_model(r, colors, fonts, res, footnotes, true, out);
+                }
+            }
+            other => {
+                let mut text = String::new();
+                footnote_plain_text_block(other, &mut text);
+                if !text.is_empty() {
+                    if first_para {
+                        first_para = false;
+                    } else {
+                        out.push_str("\\par ");
+                    }
+                    rtf_escape(&text, out);
+                }
+            }
+        }
+    }
+    out.push('}');
+}
+
+/// Plain-text fallback for a footnote-body block that is not a
+/// `Paragraph`/`Heading` (list/table/text-box/blockquote containers recurse
+/// into their own paragraphs; images/shapes/rules/sheets/slides/code
+/// contribute nothing), used only by [`rtf_footnote_from_model`].
+fn footnote_plain_text_block(kind: &BlockKind, out: &mut String) {
+    match kind {
+        BlockKind::Paragraph(p) => footnote_plain_text_inlines(&p.runs, out),
+        BlockKind::Heading(h) => footnote_plain_text_inlines(&h.para.runs, out),
+        BlockKind::List(list) => {
+            for item in &list.items {
+                for b in &item.blocks {
+                    footnote_plain_text_block(&b.kind, out);
+                }
+            }
+        }
+        BlockKind::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for b in &cell.blocks {
+                        footnote_plain_text_block(&b.kind, out);
+                    }
+                }
+            }
+        }
+        BlockKind::TextBox(tb) => {
+            for b in &tb.blocks {
+                footnote_plain_text_block(&b.kind, out);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            for b in &bq.blocks {
+                footnote_plain_text_block(&b.kind, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Plain-text concatenation of a run list — no character styling — for
+/// [`footnote_plain_text_block`].
+fn footnote_plain_text_inlines(runs: &[Inline], out: &mut String) {
+    for r in runs {
+        match r {
+            Inline::Run(run) => out.push_str(&run.text),
+            Inline::Link { children, .. } => footnote_plain_text_inlines(children, out),
+            _ => {}
+        }
     }
 }
 
@@ -792,6 +976,7 @@ fn rtf_heading_from_model(
     h: &Heading,
     colors: &[[u8; 3]],
     fonts: &[(String, Generic)],
+    footnotes: &[crate::model::Footnote],
     first: &mut bool,
     out: &mut String,
 ) {
@@ -802,6 +987,7 @@ fn rtf_heading_from_model(
         colors,
         fonts,
         &ResourceTable::default(),
+        footnotes,
         true,
         first,
         out,
@@ -821,6 +1007,7 @@ fn rtf_list_from_model(
     colors: &[[u8; 3]],
     fonts: &[(String, Generic)],
     res: &ResourceTable,
+    footnotes: &[crate::model::Footnote],
     first: &mut bool,
     out: &mut String,
 ) {
@@ -861,13 +1048,13 @@ fn rtf_list_from_model(
                         "\\pard\\li{indent}\\fi-{RTF_LIST_INDENT} {marker}"
                     ));
                     for r in &p.runs {
-                        rtf_inline_from_model(r, colors, fonts, res, false, out);
+                        rtf_inline_from_model(r, colors, fonts, res, footnotes, false, out);
                     }
                     continue;
                 }
             }
             // Non-paragraph leading block, or trailing blocks of the item.
-            rtf_block_from_model(b, colors, fonts, res, first, out);
+            rtf_block_from_model(b, colors, fonts, res, footnotes, first, out);
         }
     }
     // Reset paragraph defaults after the list so following blocks are not
@@ -976,6 +1163,7 @@ fn rtf_table_from_model(
     colors: &[[u8; 3]],
     fonts: &[(String, Generic)],
     res: &ResourceTable,
+    footnotes: &[crate::model::Footnote],
     first: &mut bool,
     out: &mut String,
 ) {
@@ -1002,7 +1190,7 @@ fn rtf_table_from_model(
             // readable (RTF readers treat intra-cell `\par` as a line break).
             let mut cell_first = true;
             for b in &cell.blocks {
-                rtf_cell_block(b, colors, fonts, res, &mut cell_first, out);
+                rtf_cell_block(b, colors, fonts, res, footnotes, &mut cell_first, out);
             }
             out.push_str("\\cell ");
         }
@@ -1019,6 +1207,7 @@ fn rtf_cell_block(
     colors: &[[u8; 3]],
     fonts: &[(String, Generic)],
     res: &ResourceTable,
+    footnotes: &[crate::model::Footnote],
     cell_first: &mut bool,
     out: &mut String,
 ) {
@@ -1030,7 +1219,7 @@ fn rtf_cell_block(
                 out.push_str("\\par ");
             }
             for r in &p.runs {
-                rtf_inline_from_model(r, colors, fonts, res, false, out);
+                rtf_inline_from_model(r, colors, fonts, res, footnotes, false, out);
             }
         }
         BlockKind::Heading(h) => {
@@ -1040,7 +1229,7 @@ fn rtf_cell_block(
                 out.push_str("\\par ");
             }
             for r in &h.para.runs {
-                rtf_inline_from_model(r, colors, fonts, res, true, out);
+                rtf_inline_from_model(r, colors, fonts, res, footnotes, true, out);
             }
         }
         // Any other block kind (nested list/table/image…) renders via the general
@@ -1055,6 +1244,7 @@ fn rtf_cell_block(
                 colors,
                 fonts,
                 res,
+                footnotes,
                 &mut inner_first,
                 out,
             );
@@ -1099,9 +1289,16 @@ fn cell_edges(col_widths: &[f64], n: usize) -> Vec<i64> {
 /// Emit a `{\pict …}` group for an image resource. PNG and JPEG embed verbatim
 /// (`\pngblip` / `\jpegblip`); GIF / WebP / AVIF are transcoded to PNG first
 /// (via [`embeddable_image`], the same coercion the image→PDF embedder uses) and
-/// emitted as `\pngblip`. The display size comes from the pixel dimensions
-/// (96 dpi → twips). Unrecognized bytes are skipped.
-fn rtf_image_from_model(img: &ImageRef, res: &ResourceTable, first: &mut bool, out: &mut String) {
+/// emitted as `\pngblip`. The display size prefers the block's placement
+/// `frame` (points → twips) when one is set; otherwise it falls back to the
+/// intrinsic pixel dimensions (96 dpi → twips). Unrecognized bytes are skipped.
+fn rtf_image_from_model(
+    img: &ImageRef,
+    frame: Option<&crate::model::Rect>,
+    res: &ResourceTable,
+    first: &mut bool,
+    out: &mut String,
+) {
     let Some(resource) = res.images.get(&img.resource) else {
         return;
     };
@@ -1122,10 +1319,18 @@ fn rtf_image_from_model(img: &ImageRef, res: &ResourceTable, first: &mut bool, o
     };
 
     rtf_par_sep(first, out);
-    // 96 dpi: px → pt = px * 72/96 = px * 0.75; pt → twips = pt * 20. So
-    // twips = px * 15. Guard against a zero goal (some readers ignore a 0 goal).
-    let goalw = (w as i64 * 15).max(15);
-    let goalh = (h as i64 * 15).max(15);
+    // Display goals: the author-intended frame (points, ×20 → twips) wins when
+    // present and non-degenerate; else 96 dpi intrinsics: px → pt = px * 72/96
+    // = px * 0.75; pt → twips = pt * 20, so twips = px * 15. Guard against a
+    // zero goal (some readers ignore a 0 goal).
+    let (goalw, goalh) = match frame {
+        Some(r) if r.w > 0.0 && r.h > 0.0 => {
+            ((r.w * 20.0).round() as i64, (r.h * 20.0).round() as i64)
+        }
+        _ => (w as i64 * 15, h as i64 * 15),
+    };
+    let goalw = goalw.max(15);
+    let goalh = goalh.max(15);
     out.push_str(&format!(
         "{{\\pict\\{blip}\\picwgoal{goalw}\\pichgoal{goalh} "
     ));
@@ -1316,6 +1521,28 @@ mod tests {
         assert_eq!(
             unescape("a &amp; b &lt;c&gt; &#65; &#x42;"),
             "a & b <c> A B"
+        );
+    }
+
+    /// `html_to_pdf` (no options) stays US-Letter portrait, and the configurable
+    /// rich path (`html::render` with explicit dims — what the SDK's
+    /// `htmlToPdf({ pageSize, landscape })` resolves to) honours a landscape size
+    /// in the `/MediaBox`.
+    #[test]
+    fn html_to_pdf_default_letter_and_render_honours_landscape() {
+        let html = "<p>hello world</p>";
+        // Retro-compatible default: 612×792 (US Letter portrait).
+        let media = opens(&html_to_pdf(html)).page_boxes(1).unwrap().media;
+        assert_eq!(media, [0.0, 0.0, 612.0, 792.0], "default MediaBox");
+        // Landscape A4 (portrait dims swapped to width ≥ height) → wide MediaBox.
+        let (pw, ph) = crate::html::page_size("A4").expect("A4 resolves");
+        let (lw, lh) = (pw.max(ph), pw.min(ph));
+        let land = opens(&crate::html::render(html, &[], lw, lh, 36.0));
+        let m = land.page_boxes(1).unwrap().media;
+        assert!(m[2] > m[3], "landscape MediaBox is wide ({m:?})");
+        assert!(
+            (m[2] - lw).abs() < 0.01 && (m[3] - lh).abs() < 0.01,
+            "MediaBox follows the requested landscape dims ({m:?})"
         );
     }
 
@@ -1654,6 +1881,7 @@ mod tests {
                         kind: BlockKind::Image(ImageRef {
                             resource: 7,
                             alt: None,
+                            ..Default::default()
                         }),
                         ..Default::default()
                     }],
@@ -1695,6 +1923,55 @@ mod tests {
             .expect("image bytes re-interned");
         assert_eq!(res.bytes, png, "PNG bytes survive the round-trip");
         assert_eq!(res.format, "png");
+    }
+
+    #[test]
+    fn model_image_frame_drives_pict_goals() {
+        use crate::model::{ImageResource, Page, Rect, Section};
+        // Same 2×2 PNG as above, but the block carries a placement frame of
+        // 144×72 pt: the author-intended size must drive the display goals
+        // (144 pt × 20 = 2880 twips, 72 pt × 20 = 1440 twips) instead of the
+        // 2-px intrinsics (which would emit 30 twips).
+        let rgba = vec![
+            0u8, 0, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255,
+        ];
+        let png = crate::raster::encode_png(2, 2, &rgba);
+        let mut images = std::collections::BTreeMap::new();
+        images.insert(
+            7u64,
+            ImageResource {
+                bytes: png,
+                format: "png".to_string(),
+            },
+        );
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        frame: Some(Rect::new(10.0, 20.0, 144.0, 72.0)),
+                        kind: BlockKind::Image(ImageRef {
+                            resource: 7,
+                            alt: None,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            resources: ResourceTable { images },
+            ..Document::default()
+        };
+        let rtf = String::from_utf8(rtf_from_model(&doc)).unwrap();
+        assert!(
+            rtf.contains("\\picwgoal2880"),
+            "frame width (144pt → 2880 twips): {rtf}"
+        );
+        assert!(
+            rtf.contains("\\pichgoal1440"),
+            "frame height (72pt → 1440 twips): {rtf}"
+        );
     }
 
     /// A minimal but spec-valid 2×2 GIF89a (mirrors `raster::gif`'s own fixture)
@@ -1750,6 +2027,7 @@ mod tests {
                         kind: BlockKind::Image(ImageRef {
                             resource: 1,
                             alt: None,
+                            ..Default::default()
                         }),
                         ..Default::default()
                     }],
@@ -1785,6 +2063,7 @@ mod tests {
                             kind: BlockKind::Image(ImageRef {
                                 resource: 3,
                                 alt: None,
+                                ..Default::default()
                             }),
                             ..Default::default()
                         },
@@ -1994,6 +2273,181 @@ mod tests {
             LinkTarget::Url("https://example.com".to_string()),
             "link target round-trips"
         );
+    }
+
+    #[test]
+    fn model_link_anchor_emits_hyperlink_local_jump_switch() {
+        use crate::model::InlineRun;
+        // A paragraph whose run is a hyperlink to a named in-document anchor.
+        let para = Paragraph {
+            runs: vec![Inline::Link {
+                href: LinkTarget::Anchor("section1".to_string()),
+                children: vec![Inline::Run(InlineRun {
+                    text: "jump".to_string(),
+                    ..Default::default()
+                })],
+            }],
+            ..Paragraph::default()
+        };
+        let rtf =
+            String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::Paragraph(para)))).unwrap();
+
+        // `\l` is RTF's local-jump field switch — the canonical way to target a
+        // named anchor/bookmark. This is a byte-level assertion only: the
+        // importer's `HYPERLINK` miner does not currently special-case `\l`,
+        // so an anchor round-trips as a plain `LinkTarget::Url`, not
+        // `LinkTarget::Anchor` (a known importer limitation).
+        assert!(
+            rtf.contains("HYPERLINK \\l \"section1\""),
+            "anchor emits the local-jump field switch: {rtf}"
+        );
+        assert!(rtf.contains("jump"), "visible link text present: {rtf}");
+
+        // `Page`/`Other` targets are untouched by the anchor fix.
+        let page_para = Paragraph {
+            runs: vec![Inline::Link {
+                href: LinkTarget::Page(0),
+                children: vec![Inline::Run(InlineRun {
+                    text: "go".to_string(),
+                    ..Default::default()
+                })],
+            }],
+            ..Paragraph::default()
+        };
+        let page_rtf = String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::Paragraph(
+            page_para,
+        ))))
+        .unwrap();
+        assert!(
+            page_rtf.contains("HYPERLINK \"#page1\""),
+            "page jump keeps the plain HYPERLINK form (no `\\l`): {page_rtf}"
+        );
+    }
+
+    #[test]
+    fn model_footnote_ref_emits_footnote_construct_round_trip() {
+        use crate::model::{Footnote, InlineRun};
+        let para = Paragraph {
+            runs: vec![
+                Inline::Run(InlineRun {
+                    text: "Before".to_string(),
+                    ..Default::default()
+                }),
+                Inline::FootnoteRef {
+                    id: "myid".to_string(),
+                },
+                Inline::Run(InlineRun {
+                    text: " after".to_string(),
+                    ..Default::default()
+                }),
+            ],
+            ..Paragraph::default()
+        };
+        let mut doc = doc_with_block(BlockKind::Paragraph(para));
+        doc.footnotes = vec![Footnote {
+            id: "myid".to_string(),
+            blocks: vec![para_block("note body")],
+        }];
+
+        let rtf = String::from_utf8(rtf_from_model(&doc)).unwrap();
+        assert!(
+            rtf.contains("\\footnote"),
+            "footnote destination emitted: {rtf}"
+        );
+        assert!(rtf.contains("\\chftn"), "superscript marker emitted: {rtf}");
+        assert!(rtf.contains("note body"), "note body text emitted: {rtf}");
+
+        // Round-trips: the importer recovers exactly one footnote whose body
+        // contains the note text, anchored by a FootnoteRef in the host flow.
+        // RTF footnotes are always auto-numbered by position, so the
+        // reimported id need not match the original `Footnote::id` verbatim.
+        let doc2 = crate::convert::rtf::rtf_to_model(&rtf);
+        assert_eq!(doc2.footnotes.len(), 1, "one recovered footnote: {doc2:?}");
+        let body_text: String = doc2.footnotes[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(
+                    p.runs
+                        .iter()
+                        .filter_map(|i| match i {
+                            Inline::Run(r) => Some(r.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            body_text.contains("note body"),
+            "note body recovered: {body_text:?}"
+        );
+        let has_ref = doc2.sections[0].pages[0].blocks.iter().any(|b| {
+            if let BlockKind::Paragraph(p) = &b.kind {
+                p.runs
+                    .iter()
+                    .any(|i| matches!(i, Inline::FootnoteRef { .. }))
+            } else {
+                false
+            }
+        });
+        assert!(has_ref, "host paragraph still anchors a FootnoteRef");
+
+        // A dangling FootnoteRef (no matching footnote) emits nothing, same as
+        // before this case was implemented.
+        let dangling = doc_with_block(BlockKind::Paragraph(Paragraph {
+            runs: vec![Inline::FootnoteRef {
+                id: "ghost".to_string(),
+            }],
+            ..Paragraph::default()
+        }));
+        let rtf_dangling = String::from_utf8(rtf_from_model(&dangling)).unwrap();
+        assert!(
+            !rtf_dangling.contains("\\footnote"),
+            "dangling footnote ref emits nothing: {rtf_dangling}"
+        );
+    }
+
+    #[test]
+    fn model_rtl_direction_emits_rtlpar_round_trip() {
+        use crate::model::{Direction, InlineRun, ParagraphStyle};
+        let para = Paragraph {
+            runs: vec![Inline::Run(InlineRun {
+                text: "shalom".to_string(),
+                ..Default::default()
+            })],
+            style: ParagraphStyle {
+                direction: Some(Direction::Rtl),
+                ..ParagraphStyle::default()
+            },
+            ..Paragraph::default()
+        };
+        let rtf =
+            String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::Paragraph(para)))).unwrap();
+        assert!(rtf.contains("\\rtlpar"), "direction control word emitted: {rtf}");
+
+        // Round-trips: the importer reads `\rtlpar` back into the same typed
+        // direction.
+        let doc = crate::convert::rtf::rtf_to_model(&rtf);
+        let dir = doc.sections[0].pages[0].blocks.iter().find_map(|b| {
+            if let BlockKind::Paragraph(p) = &b.kind {
+                Some(p.style.direction)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            dir,
+            Some(Some(Direction::Rtl)),
+            "direction round-trips through export + reimport"
+        );
+
+        // A paragraph with no direction set (the default) emits no `\rtlpar` at
+        // all — additive-only, byte-identical to before this field existed.
+        let ltr = String::from_utf8(rtf_from_model(&doc_with_block(para_block("hello").kind)))
+            .unwrap();
+        assert!(!ltr.contains("\\rtlpar"), "no direction set emits nothing: {ltr}");
     }
 
     #[test]
