@@ -9,6 +9,16 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Model→text (`to_text` on the struct-tree/model path) now honours the authored
+  ordinal list delimiter captured on `List::marker_suffix` (DOCX `%1)`, ODF
+  `style:num-suffix`) instead of always regenerating a period, so `a)` reads back
+  as `a)` rather than `a.`. One of several fidelity gaps on the road to making
+  Office→PDF tagged by default (the others — chiefly faithful **nested**-list
+  reconstruction from the struct tree, which currently flattens sub-levels and
+  their per-level marker styles — remain; see `tech_debt.md` #23).
+
 ## [0.119.0] - 2026-07-05
 
 ### Fixed

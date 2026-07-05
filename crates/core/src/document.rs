@@ -633,7 +633,7 @@ fn push_list(list: &crate::model::List, indent: usize, out: &mut String) {
         counters.truncate(depth + 1);
         counters[depth] += 1;
         let marker = if list.ordered {
-            ordered_marker(list.marker, counters[depth])
+            ordered_marker(list.marker, counters[depth], list.marker_suffix)
         } else {
             unordered_marker(list.marker)
         };
@@ -675,7 +675,11 @@ fn unordered_marker(marker: crate::model::ListMarker) -> String {
 /// (`a`,`b`,…,`aa`,…) or lower/upper roman. Reuses the document's existing
 /// page-label formatters ([`alpha_label`], [`roman_numeral`]) so the letter/roman
 /// sequences match the rest of the engine.
-fn ordered_marker(marker: crate::model::ListMarker, n: usize) -> String {
+fn ordered_marker(
+    marker: crate::model::ListMarker,
+    n: usize,
+    suffix: Option<char>,
+) -> String {
     use crate::model::ListMarker;
     let v = n.max(1) as u32;
     let body = match marker {
@@ -688,7 +692,12 @@ fn ordered_marker(marker: crate::model::ListMarker, n: usize) -> String {
         // decimal so the item still carries a sequential label.
         ListMarker::Bullet(_) => v.to_string(),
     };
-    format!("{body}.")
+    // Honour the authored ordinal delimiter (`%1.` vs `%1)` in DOCX,
+    // `style:num-suffix` in ODF) captured on the list model; `None` keeps the
+    // conventional period so existing behaviour is unchanged. This is what lets
+    // the tagged `to_text` path read `a)` back as `a)` instead of regenerating
+    // `a.` — the last gap before Office→PDF can default to tagged (PDF-UA).
+    format!("{body}{}", suffix.unwrap_or('.'))
 }
 
 /// Render a [`crate::model::Table`] as aligned columns: each cell becomes a
@@ -39263,6 +39272,45 @@ mod tests {
         let bl: Vec<&str> = bl_text.lines().collect();
         assert_eq!(bl[0], "• Apple", "bullet marker prefix: {bl_text:?}");
         assert_eq!(bl[1], "  • Sub", "nested bullet indented one level");
+    }
+
+    #[test]
+    fn text_from_model_ordered_marker_honours_suffix() {
+        use crate::model::{Block, BlockKind, List, ListItem, ListMarker};
+        // The authored ordinal delimiter (DOCX `%1)`, ODF `style:num-suffix`) is
+        // captured on `List::marker_suffix`; the model→text path must emit it
+        // rather than regenerating the conventional period — otherwise a tagged
+        // `to_text` reads `a)` back as `a.`.
+        let paren = List {
+            ordered: true,
+            marker: ListMarker::LowerAlpha,
+            marker_suffix: Some(')'),
+            items: vec![
+                ListItem { blocks: vec![para_block("first")], level: 0 },
+                ListItem { blocks: vec![para_block("second")], level: 0 },
+            ],
+            ..Default::default()
+        };
+        let text = text_from_model(&model_with_blocks(vec![Block {
+            kind: BlockKind::List(paren),
+            ..Block::default()
+        }]));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "a) first", "honours the ')' suffix: {text:?}");
+        assert_eq!(lines[1], "b) second", "suffix + increments: {text:?}");
+
+        // A `None` suffix keeps the conventional period (unchanged behaviour).
+        let dot = List {
+            ordered: true,
+            marker: ListMarker::LowerAlpha,
+            items: vec![ListItem { blocks: vec![para_block("only")], level: 0 }],
+            ..Default::default()
+        };
+        let dot_text = text_from_model(&model_with_blocks(vec![Block {
+            kind: BlockKind::List(dot),
+            ..Block::default()
+        }]));
+        assert_eq!(dot_text.lines().next().unwrap(), "a. only", "None suffix ⇒ period");
     }
 
     #[test]
