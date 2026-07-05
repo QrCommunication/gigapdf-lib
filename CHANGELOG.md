@@ -11,29 +11,29 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [0.119.0] - 2026-07-05
 
-### Changed
-
-- **`office_to_pdf` now emits a Tagged (accessible / PDF-UA-ready) PDF by
-  default.** The `office_to_pdf` / `office_to_pdf_with_fonts` entry points (and
-  the SDK `officeToPdf` / `officeToPdfWith`) previously shipped the untagged
-  baseline; they now lay a logical `/StructTreeRoot` + marked content over the
-  render so Office→PDF output is accessible out of the box. A document with no
-  reconstructable structure, or one where tagging fails, still ships the untagged
-  baseline (never a regression). Pass `tagged: false` to `office_to_pdf_opts` for
-  the raw untagged bytes.
-
 ### Fixed
 
 - **Tagged `to_text` reading order — a heading no longer merges with the
-  paragraph that follows it.** On the struct-tree path the geometric recon
-  coalesced a heading line and the body line beneath it into one block that
-  heading promotion then stamped as a single heading, gluing the body text onto
-  the title (`"Title body…"` on one line). `split_paragraphs` now breaks on a
-  font-size **tier** crossing (heading-sized ↔ body-sized, mirroring
-  `headings::is_heading_size`), so the heading is its own block and the tagged
-  text layer reads per-line exactly like the untagged one. This closed the last
-  blocker to the tagged-by-default change above. Size signal only — a bold phrase
-  inside a body paragraph never splits it. 2882 tests, clippy clean.
+  paragraph that follows it.** On the struct-tree path (the faithful tagged
+  reconstruction) the geometric recon coalesced a heading line and the body line
+  beneath it into one block that heading promotion then stamped as a single
+  heading, gluing the body text onto the title (`"Title body…"` on one line).
+  `split_paragraphs` now breaks on a font-size **tier** crossing (heading-sized ↔
+  body-sized, mirroring `headings::is_heading_size`), so the heading is its own
+  block and a tagged Office→PDF document's `to_text` reads per-line exactly like
+  the untagged layer. Size signal only — a bold phrase inside a body paragraph
+  never splits it. This also improves the editor's `page_blocks` (a heading and
+  its following paragraph are now distinct blocks). Since the recon change is
+  shared, `page_blocks`/`reconstruct_from_struct_tree` now yield `Heading` +
+  `Paragraph` where they returned one merged `Heading`. 2882 unit + all
+  integration tests, clippy clean.
+
+  This closes the documented reading-order blocker to making Office→PDF tagged
+  (PDF-UA) by default. The default stays **untagged** for now pending one further
+  gap surfaced while attempting the flip: the tagged `to_text` regenerates
+  ordered-list markers from the semantic model (`a.`) rather than preserving the
+  rendered delimiter (`a)`), so flipping the default would change list-marker
+  extraction for raw-text-layer consumers (see the note on `office_to_pdf_opts`).
 
 ## [0.118.0] - 2026-07-05
 
