@@ -1215,6 +1215,16 @@ impl Writer {
             self.border(&d.border);
             self.obj_close();
         }
+        // Base reading direction: additive, emitted only when set (RTL cells).
+        if let Some(dir) = c.direction {
+            self.k_str(
+                "direction",
+                match dir {
+                    Direction::Ltr => "ltr",
+                    Direction::Rtl => "rtl",
+                },
+            );
+        }
         self.obj_close();
     }
 
@@ -2682,6 +2692,13 @@ impl<'a> Reader<'a> {
                     c.rotation_deg = Some(n as i32);
                 }
                 "diagonal" => c.diagonal = Some(r.diagonal_border()?),
+                "direction" => {
+                    c.direction = Some(match r.string()?.as_str() {
+                        "ltr" => Direction::Ltr,
+                        "rtl" => Direction::Rtl,
+                        _ => return None,
+                    })
+                }
                 _ => return None,
             }
             Some(())

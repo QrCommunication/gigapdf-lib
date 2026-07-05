@@ -9,6 +9,29 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.118.0] - 2026-07-05
+
+Closes the fidelity items deferred from 0.117.0 — all seven now implemented.
+
+- **Numbered lists survive the tagged path.** A `/L` structure element with
+  numbered `/Lbl` markers ("1.", "a)") reconstructs ordered instead of falling
+  back to bullets; Office→PDF emits `/ListNumbering` on the list so a
+  DOCX numbered list round-trips ordered through the tagged path. (Office→PDF
+  tagging stays opt-in: `to_text` still regresses on the struct-tree reading
+  order — a separate item.)
+- **ODS frozen panes + cell rotation** are emitted (`settings.xml` split
+  positions, `style:rotation-angle`) and re-imported.
+- **ODT first-page / even-odd headers** (`style:header-first`,
+  `style:header-left`) export and round-trip.
+- **Table cell diagonals paint in the PDF** — the cell now carries a gradient
+  fragment through the HTML engine, not just a flat background.
+- **Charts fall back to their data table** when no series can be plotted,
+  instead of dropping the chart entirely.
+- **Right-to-left spreadsheet cells** — new `SheetCell.direction`; XLSX
+  `readingOrder` and ODS `writing-mode` import and export.
+- **Slides lower to positioned HTML** — `modelToPdf` places each shape at its
+  absolute frame instead of reflowing, matching the Office→PDF slide path.
+
 ## [0.117.0] - 2026-07-04
 
 Exhaustive two-way Office/HTML/PDF fidelity release — the largest single

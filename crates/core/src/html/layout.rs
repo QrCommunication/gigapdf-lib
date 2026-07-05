@@ -2944,6 +2944,11 @@ impl Flow<'_> {
             pad_top: f64,
             background: Option<[f64; 3]>,
             background_alpha: f64,
+            /// A CSS gradient background of the cell (e.g. a spreadsheet cell's
+            /// diagonal line, emitted as a `linear-gradient`). Painted over the
+            /// flat `background` fill, under the cell content. `None` ⇒ no
+            /// gradient (the common case).
+            background_gradient: Option<CssGradient>,
             border_width: super::css::Edges,
             border_color_edges: [[f64; 3]; 4],
             border_color_alpha: f64,
@@ -3007,6 +3012,7 @@ impl Flow<'_> {
                     pad_top: p.top,
                     background: cstyle.background,
                     background_alpha: cstyle.background_alpha,
+                    background_gradient: cstyle.background_gradient.clone(),
                     border_width: bw,
                     border_color_edges: cstyle.border_color_edges,
                     border_color_alpha: cstyle.border_color_alpha,
@@ -3125,6 +3131,23 @@ impl Flow<'_> {
                         radius: [0.0; 4],
                         radius_v: [0.0; 4],
                         shadow: None,
+                    },
+                });
+            }
+            // A cell gradient background (spreadsheet diagonal, or any
+            // `linear-gradient` on the cell) paints over the flat fill, under the
+            // cell content — the same box the flat fill covers.
+            if let Some(grad) = &pl.background_gradient {
+                self.out.push(Abs {
+                    z: 0,
+                    zk: Vec::new(),
+                    frag: Fragment::Gradient {
+                        x: cell_x,
+                        y: top,
+                        w: cw,
+                        h: cell_h,
+                        gradient: grad.clone(),
+                        opacity: pl.opacity,
                     },
                 });
             }
@@ -6304,6 +6327,26 @@ mod tests {
         let bg = bg_idx.expect("a grey header-background rect");
         let tx = text_idx.expect("the header text");
         assert!(bg < tx, "header background paints before its text");
+    }
+
+    #[test]
+    fn table_cell_gradient_background_paints() {
+        // A spreadsheet cell diagonal is emitted as a `linear-gradient`
+        // background; the cell must now render it as a `Fragment::Gradient` at
+        // z=0 behind the content — the deferred item-d fix (cells used to carry
+        // only a flat fill).
+        let layout = run(
+            r#"<table><tr><td style="background-image:linear-gradient(to top right,transparent 49.3%,#ff0000 49.3%,#ff0000 50.7%,transparent 50.7%)">X</td></tr></table>"#,
+        );
+        let grad_idx = layout.pages[0]
+            .iter()
+            .position(|f| matches!(f, Fragment::Gradient { .. }));
+        let text_idx = layout.pages[0]
+            .iter()
+            .position(|f| matches!(f, Fragment::Text { text, .. } if text == "X"));
+        let g = grad_idx.expect("a cell gradient (diagonal) fragment");
+        let t = text_idx.expect("the cell text");
+        assert!(g < t, "cell gradient paints before (behind) its text");
     }
 
     #[test]

@@ -177,6 +177,42 @@ where
     })
 }
 
+/// The list scheme a set of per-item `/Lbl` votes agrees on: the plurality
+/// `(ordered, marker, prefix, suffix)` group, represented by that group's
+/// **first** member (whose `ordinal` seeds the list's start number). `None`
+/// when there are no votes. A real list is homogeneous, so the plurality is the
+/// list's scheme; the first-member representative keeps a list that starts at
+/// e.g. `3.` from being renumbered to `1.`.
+fn vote_label_scheme(votes: &[crate::recon::lists::LabelKind]) -> Option<crate::recon::lists::LabelKind> {
+    let mut best: Option<(usize, &crate::recon::lists::LabelKind)> = None;
+    for v in votes {
+        let count = votes
+            .iter()
+            .filter(|w| {
+                w.ordered == v.ordered
+                    && w.marker == v.marker
+                    && w.prefix == v.prefix
+                    && w.suffix == v.suffix
+            })
+            .count();
+        if best.is_none_or(|(bc, _)| count > bc) {
+            // The representative is the FIRST vote of the winning scheme, so its
+            // ordinal is the list's opening number.
+            let first = votes
+                .iter()
+                .find(|w| {
+                    w.ordered == v.ordered
+                        && w.marker == v.marker
+                        && w.prefix == v.prefix
+                        && w.suffix == v.suffix
+                })
+                .unwrap_or(v);
+            best = Some((count, first));
+        }
+    }
+    best.map(|(_, v)| v.clone())
+}
+
 /// The element's bounding box from its `/Layout` `/BBox` attribute
 /// (`[llx lly urx ury]` in default user space) as a [`Rect`] (lower-left +
 /// width/height). `None` when absent or malformed.
@@ -700,17 +736,40 @@ impl Walker<'_> {
     }
 
     /// Build a [`List`] from an `/L` element: each `/LI` (or its `/LBody`)
-    /// becomes a [`ListItem`].
+    /// becomes a [`ListItem`]. When the `/L` carries no `/ListNumbering`
+    /// attribute (the common Word/Acrobat shape — a real `/Lbl` per item but no
+    /// declared numbering), each item's `/Lbl` (or an inline leading marker on a
+    /// flat item) is classified so a numbered/lettered list keeps its number and
+    /// format instead of collapsing to bullets.
     fn list_block(&mut self, elem: &Dictionary, page: Option<usize>) -> Option<Block> {
         let page = self.page_of(elem).or(page);
         let mut items: Vec<ListItem> = Vec::new();
+        // One scheme vote per item, from its `/Lbl` (or a stripped inline marker).
+        let mut label_votes: Vec<crate::recon::lists::LabelKind> = Vec::new();
         for kid in kids_of(self.doc, elem) {
             let Some(d) = kid.as_dict() else { continue };
             let tag = d.get(b"S").and_then(|o| self.doc.resolve(o).as_name());
             if tag == Some(b"LI".as_slice()) {
-                let text = self.collect_text(d, page);
+                let (label, mut text) = self.list_item_parts(d, page);
+                // A structured `/Lbl` classifies directly; a flat item's marker is
+                // detected inline and stripped from the body so it is not doubled
+                // once the model re-emits the marker.
+                let vote = match label.as_deref() {
+                    Some(lbl) => crate::recon::lists::classify_label(lbl),
+                    None => {
+                        let (kind, stripped) =
+                            crate::recon::lists::classify_and_strip_inline(&text);
+                        if kind.is_some() {
+                            text = stripped;
+                        }
+                        kind
+                    }
+                };
                 if text.is_empty() {
                     continue;
+                }
+                if let Some(v) = vote {
+                    label_votes.push(v);
                 }
                 let para = self.styled_paragraph(d, page, &text);
                 items.push(ListItem {
@@ -727,10 +786,24 @@ impl Walker<'_> {
         if items.is_empty() {
             return None;
         }
-        // `/ListNumbering` (ISO 32000-1 §14.8.5.2, `/List` owner) decides ordered
-        // vs unordered and the marker glyph/format; absent ⇒ unordered default.
-        let (ordered, marker) = list_numbering(elem, &|o| self.doc.resolve(o))
-            .unwrap_or((false, ListMarker::default()));
+        // `/ListNumbering` (ISO 32000-1 §14.8.5.2, `/List` owner) is authoritative
+        // when present; otherwise the recovered `/Lbl` scheme decides ordered vs
+        // unordered and the marker glyph/format, keeping a `/Lbl`-numbered list's
+        // numbers instead of falling back to the unordered-bullet default.
+        let (ordered, marker, marker_prefix, marker_suffix, start) =
+            match list_numbering(elem, &|o| self.doc.resolve(o)) {
+                Some((o, m)) => (o, m, None, None, 1),
+                None => match vote_label_scheme(&label_votes) {
+                    Some(k) => (
+                        k.ordered,
+                        k.marker,
+                        k.prefix,
+                        k.suffix,
+                        k.ordinal.unwrap_or(1).max(1),
+                    ),
+                    None => (false, ListMarker::default(), None, None, 1),
+                },
+            };
         let frame = self.element_bbox(elem);
         Some(Block {
             id: self.ids.mint(),
@@ -740,10 +813,50 @@ impl Walker<'_> {
                 ordered,
                 marker,
                 items,
-
+                start,
+                marker_suffix,
+                marker_prefix,
                 ..Default::default()
             }),
         })
+    }
+
+    /// Split an `/LI` into its label (`/Lbl` text) and body (`/LBody` text),
+    /// returning `(label, body)`. When the `/LI` has no `/Lbl`/`/LBody` children
+    /// (a flat item whose glyphs sit directly under it), `label` is `None` and
+    /// `body` is the whole item text (the caller detects any inline marker).
+    fn list_item_parts(&self, li: &Dictionary, page: Option<usize>) -> (Option<String>, String) {
+        let page = self.page_of(li).or(page);
+        let mut label: Option<String> = None;
+        let mut body = String::new();
+        let mut structured = false;
+        for kid in kids_of(self.doc, li) {
+            let Some(d) = kid.as_dict() else { continue };
+            match d.get(b"S").and_then(|o| self.doc.resolve(o).as_name()) {
+                Some(b"Lbl") => {
+                    structured = true;
+                    let t = self.collect_text(d, page);
+                    if !t.is_empty() {
+                        label = Some(t);
+                    }
+                }
+                Some(b"LBody") => {
+                    structured = true;
+                    let t = self.collect_text(d, page);
+                    if !t.is_empty() {
+                        if !body.is_empty() {
+                            body.push(' ');
+                        }
+                        body.push_str(&t);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !structured {
+            body = self.collect_text(li, page);
+        }
+        (label, body)
     }
 
     /// Build a [`Table`] from a `/Table` element: each `/TR` is a row, each
@@ -1806,6 +1919,103 @@ mod tests {
             .expect("a list block");
         assert!(list.ordered, "/ListNumbering /Decimal ⇒ ordered list");
         assert_eq!(list.marker, ListMarker::Decimal);
+    }
+
+    /// An `/L` with **no** `/ListNumbering` whose items carry real numbered
+    /// `/Lbl`s ("1.", "2.") must reconstruct as an *ordered decimal* list — the
+    /// Word/Acrobat shape that used to collapse to bullets (deferred item a).
+    fn lbl_numbered_list_doc(lbl0: &str, lbl1: &str) -> crate::Document {
+        // Escape the PDF-string metacharacters `(`/`)` in a marker (`a)` → `a\)`).
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('(', "\\(").replace(')', "\\)");
+        let (lbl0, lbl1) = (esc(lbl0), esc(lbl1));
+        // MCID 0/2 = the two `/Lbl` markers; 1/3 = the two `/LBody` texts.
+        let c1 = format!(
+            "BT /F1 12 Tf \
+             /Lbl <</MCID 0>> BDC ({lbl0}) Tj EMC \
+             /LBody <</MCID 1>> BDC (First) Tj EMC \
+             /Lbl <</MCID 2>> BDC ({lbl1}) Tj EMC \
+             /LBody <</MCID 3>> BDC (Second) Tj EMC ET"
+        );
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{c1}\nendstream", c1.len()),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (11, "<< /S /Document /K 12 0 R >>".into()),
+            // List (12) with NO /ListNumbering → LI (13) + LI (14).
+            (12, "<< /S /L /Pg 8 0 R /K [13 0 R 14 0 R] >>".into()),
+            (13, "<< /S /LI /Pg 8 0 R /K [20 0 R 21 0 R] >>".into()),
+            (20, "<< /S /Lbl /Pg 8 0 R /K 0 >>".into()),
+            (21, "<< /S /LBody /Pg 8 0 R /K 1 >>".into()),
+            (14, "<< /S /LI /Pg 8 0 R /K [22 0 R 23 0 R] >>".into()),
+            (22, "<< /S /Lbl /Pg 8 0 R /K 2 >>".into()),
+            (23, "<< /S /LBody /Pg 8 0 R /K 3 >>".into()),
+        ]);
+        crate::Document::open(&pdf).expect("valid tagged PDF")
+    }
+
+    #[test]
+    fn tagged_lbl_numbered_list_recovers_ordered_decimal() {
+        let doc = lbl_numbered_list_doc("1.", "2.");
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_from_struct_tree(&doc, &mut ids).expect("tag tree blocks");
+        let list = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::List(l) => Some(l),
+                _ => None,
+            })
+            .expect("a list block");
+        assert!(list.ordered, "numbered /Lbl (no /ListNumbering) ⇒ ordered");
+        assert_eq!(list.marker, ListMarker::Decimal);
+        assert_eq!(list.items.len(), 2);
+        // The `/Lbl` marker text must NOT leak into the item body (the /LBody
+        // carries the content; the marker is re-emitted from the model scheme).
+        let body0 = match &list.items[0].blocks[0].kind {
+            BlockKind::Paragraph(p) => p.runs.iter().fold(String::new(), |mut s, r| {
+                if let Inline::Run(run) = r {
+                    s.push_str(&run.text);
+                }
+                s
+            }),
+            _ => String::new(),
+        };
+        assert_eq!(body0.trim(), "First", "marker stripped from body");
+    }
+
+    /// Lettered `/Lbl`s with a `)` delimiter recover a lower-alpha list whose
+    /// ordinal suffix is `)` — proving the delimiter/scheme flow through.
+    #[test]
+    fn tagged_lbl_lettered_list_recovers_lower_alpha() {
+        let doc = lbl_numbered_list_doc("a)", "b)");
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_from_struct_tree(&doc, &mut ids).expect("tag tree blocks");
+        let list = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::List(l) => Some(l),
+                _ => None,
+            })
+            .expect("a list block");
+        assert!(list.ordered, "lettered /Lbl ⇒ ordered");
+        assert_eq!(list.marker, ListMarker::LowerAlpha);
+        assert_eq!(list.marker_suffix, Some(')'));
     }
 
     #[test]

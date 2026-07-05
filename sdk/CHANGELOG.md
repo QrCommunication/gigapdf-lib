@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.118.0] - 2026-07-05
+
+Closes the seven fidelity items deferred from 0.117.0 (see the root
+[`CHANGELOG.md`](../CHANGELOG.md) for engine detail).
+
+### Added
+- `GigaSheetCell.direction` (`"ltr" | "rtl"`) — right-to-left spreadsheet
+  cells now import/export through XLSX `readingOrder` and ODS `writing-mode`.
+
+### Fixed
+- Tagged Office→PDF preserves numbered-list ordinals; ODS frozen panes + cell
+  rotation, ODT first-page/even-odd headers, table-cell diagonals in PDF,
+  chart data-table fallback, and positioned slide rendering in `modelToPdf`.
+
 ## [0.117.0] - 2026-07-04
 
 Exhaustive two-way fidelity release (see the root

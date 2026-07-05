@@ -198,12 +198,22 @@ pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<V
 /// rendering-neutral (only balanced `BDC`/`EMC` are inserted); a document with no
 /// reconstructable structure ships the untagged baseline (never a regression).
 ///
+/// **Ordered lists round-trip faithfully** (fixed 2026-07): the tagged `/L`
+/// carries its `/ListNumbering` (see [`super::tagged`]), and the tag-tree
+/// reconstruction now reads real `/Lbl` labels (and inline markers) — so a
+/// numbered/lettered list keeps its number and format instead of collapsing to
+/// bullets on the round-trip.
+///
 /// **Default is `false` (untagged).** Tagging changes what [`Document::to_text`]
 /// (and any struct-tree-aware consumer) reads — it flattens the tag tree instead
 /// of the raw text layer — so it is opt-in to keep the untagged text-layer contract
-/// the existing o2p callers rely on (e.g. numbered list markers surface from the
-/// painted layer, not the tag-tree list reconstruction). Enable it per call for the
-/// accessible / faithful-round-trip output.
+/// the existing o2p callers rely on. The remaining blocker to a tagged default is
+/// **not** lists but `to_text` reading order: on the struct-tree path a heading
+/// and the paragraph that follows it merge onto one line (the heading loses its
+/// trailing break), unlike the clean per-line raw layer. Flipping the default is
+/// therefore deferred until that reading-order gap is closed and coordinated with
+/// the raw-text-layer consumers; enable `tagged` per call for accessible /
+/// faithful-round-trip output today.
 pub fn office_to_pdf_opts(bytes: &[u8], host: &[ProvidedFont], tagged: bool) -> Option<Vec<u8>> {
     let pdf = office_render(bytes, host)?;
     Some(if tagged { tag_office_pdf(pdf) } else { pdf })
@@ -4120,6 +4130,7 @@ fn xlsx_sheet_model(
                                 wrap: cell_style.wrap,
                                 rotation_deg: cell_style.rotation_deg,
                                 diagonal: cell_style.diagonal,
+                                direction: cell_style.direction,
                                 ..Default::default()
                             },
                         );
@@ -7056,13 +7067,29 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     // (in `styles.xml`'s `office:master-styles`) into flat block lists, reusing
     // the body walker so their paragraphs/tables/styling/images keep their real
     // formatting. Any images intern into the same `resources` table as the body.
+    // The first-page (`style:header-first`) and even-page (`style:header-left`)
+    // variants lower into the model's first/even slots — the exact inverse of the
+    // exporter's master-page emission; `odf_master_header_footer_model` matches by
+    // element local-name, so `header` never captures `header-first`/`header-left`.
     let header = odf_master_header_footer_model(&styles_xml, &ctx, "header", &mut resources);
     let footer = odf_master_header_footer_model(&styles_xml, &ctx, "footer", &mut resources);
+    let header_first =
+        odf_master_header_footer_model(&styles_xml, &ctx, "header-first", &mut resources);
+    let footer_first =
+        odf_master_header_footer_model(&styles_xml, &ctx, "footer-first", &mut resources);
+    let header_even =
+        odf_master_header_footer_model(&styles_xml, &ctx, "header-left", &mut resources);
+    let footer_even =
+        odf_master_header_footer_model(&styles_xml, &ctx, "footer-left", &mut resources);
     let mut doc = flow_document(blocks, page_geometry(geom));
     doc.resources.images = resources;
     if let Some(section) = doc.sections.first_mut() {
         section.header = header;
         section.footer = footer;
+        section.header_first = header_first;
+        section.footer_first = footer_first;
+        section.header_even = header_even;
+        section.footer_even = footer_even;
     }
     // Resolve internal `text:a` `#name` anchors to their bookmark's page (ODT is a
     // single flowed page, so a matched bookmark resolves to page 0; an unmatched
@@ -7876,6 +7903,16 @@ pub fn ods_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         }
     }
 
+    // Frozen panes live in settings.xml (view state), keyed by sheet name.
+    let frozen = ods_frozen_panes(&part(zip, "settings.xml"));
+    if !frozen.is_empty() {
+        for sheet in &mut sheets {
+            if let Some(&(rows, cols)) = frozen.get(&sheet.name) {
+                sheet.freeze = Some((rows, cols));
+            }
+        }
+    }
+
     let block = Block {
         kind: BlockKind::Sheet(SheetBlock { sheets }),
         ..Block::default()
@@ -8031,6 +8068,8 @@ fn ods_row_model(
                         cell.vertical_align = p.valign;
                         cell.wrap = p.wrap;
                         cell.number_format = p.number_format.clone();
+                        cell.direction = p.direction;
+                        cell.rotation_deg = p.rotation_deg;
                     }
                     // `table:number-{columns,rows}-spanned` define a merge anchor.
                     let cspan = attr(&attrs, "number-columns-spanned")
@@ -13540,6 +13579,9 @@ struct CellFmt {
     /// The referenced `<border>`'s diagonal line(s) (`@diagonalUp`/`@diagonalDown`
     /// + the `<diagonal>` edge), for [`model::SheetCell::diagonal`].
     diagonal: Option<model::DiagonalBorder>,
+    /// `<alignment @readingOrder>` → base reading direction, for
+    /// [`model::SheetCell::direction`] (`2` ⇒ RTL, `1` ⇒ LTR).
+    direction: Option<model::Direction>,
 }
 
 impl XlsxStyles {
@@ -13772,6 +13814,7 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                             cf.valign = valign;
                             cf.wrap = wrap;
                             cf.rotation_deg = xlsx_text_rotation(&attrs);
+                            cf.direction = xlsx_reading_order(&attrs);
                         }
                     }
                     _ => {}
@@ -14116,12 +14159,8 @@ fn xlsx_text_rotation(attrs: &[(String, String)]) -> Option<i32> {
 /// `@vertical` → [`CellVAlign`](model::CellVAlign) via [`xlsx_cell_valign`]
 /// (`top`/`center`/`bottom`; unknown ⇒ `None`), and `@wrapText` → bool.
 ///
-/// `@readingOrder="2"` (right-to-left cell text) is **not lowered**: the sheet
-/// model's cell ([`model::SheetCell`]) carries a flat [`CharStyle`] + value,
-/// not styled paragraphs, so there is no [`ParagraphStyle::direction`] slot to
-/// land it on. When the cell model grows paragraph-level content, map
-/// `readingOrder=2` → [`model::Direction::Rtl`] here (same for the ODS cell
-/// styles' `style:writing-mode`).
+/// `@readingOrder` (the cell's base reading direction) is lowered separately by
+/// [`xlsx_reading_order`] onto [`model::SheetCell::direction`].
 fn xlsx_alignment_struct(
     attrs: &[(String, String)],
 ) -> (Option<MAlign>, Option<model::CellVAlign>, bool) {
@@ -14135,6 +14174,18 @@ fn xlsx_alignment_struct(
     let valign = attr(attrs, "vertical").and_then(xlsx_cell_valign);
     let wrap = matches!(attr(attrs, "wrapText"), Some("1") | Some("true"));
     (align, valign, wrap)
+}
+
+/// Parse `<alignment @readingOrder>` into the cell's base reading direction:
+/// `2` → [`model::Direction::Rtl`], `1` → [`model::Direction::Ltr`]; `0`
+/// (context-dependent, the default) and absent read as `None` so LTR cells stay
+/// additive-clean.
+fn xlsx_reading_order(attrs: &[(String, String)]) -> Option<model::Direction> {
+    match attr(attrs, "readingOrder")?.trim() {
+        "2" => Some(model::Direction::Rtl),
+        "1" => Some(model::Direction::Ltr),
+        _ => None,
+    }
 }
 
 /// Width in CSS px for an XLSX border line `style` (`thin`/`medium`/`thick`/
@@ -15318,9 +15369,17 @@ fn pptx_shape(
 /// origin. Labels become `position:absolute` `<div>`s at their frame — kept as real
 /// HTML text so they extract as **selectable PDF text** (an SVG `<text>` would be
 /// traced to glyph outlines, defeating extraction). The chart's data `Table` block
-/// is its numbers, not part of the picture, so it is not drawn (a slide shows the
-/// figure, matching PowerPoint). Every box is positioned relative to the graphic
-/// frame's absolute wrapper added by [`pptx_shape`]. Returns `""` for an empty chart.
+/// is its numbers, not part of the picture, so it is normally not drawn (a slide
+/// shows the figure, matching PowerPoint).
+///
+/// **Fallback (item e):** when the chart drew **no** vector series — an
+/// unsupported or degenerate plot type that produced no bars/wedges/lines — the
+/// data `Table` is rendered instead ([`chart_data_table_html`]) so the numbers
+/// are never lost. This only fires when there is no figure; a chart that plots
+/// keeps the PowerPoint-parity figure-only display.
+///
+/// Every box is positioned relative to the graphic frame's absolute wrapper added
+/// by [`pptx_shape`]. Returns `""` for an empty chart.
 fn chart_blocks_to_html(blocks: &[Block]) -> String {
     // Canvas extent from the blocks themselves (shapes span the whole canvas
     // frame; labels sit within it) — no chart-internal constant needed.
@@ -15333,7 +15392,16 @@ fn chart_blocks_to_html(blocks: &[Block]) -> String {
         .filter_map(|b| b.frame.map(|r| r.y + r.h))
         .fold(0.0_f64, f64::max);
     if !(canvas_w > 0.0 && canvas_h > 0.0) {
-        return String::new();
+        // No positioned figure or labels at all — the chart rendered nothing.
+        // The underlying data table (if any) is all that can survive (the item-e
+        // fallback: never lose the numbers to an unrenderable plot).
+        return blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(chart_data_table_html(t)),
+                _ => None,
+            })
+            .unwrap_or_default();
     }
 
     let mut paths = String::new();
@@ -15412,6 +15480,21 @@ fn chart_blocks_to_html(blocks: &[Block]) -> String {
         }
     }
 
+    // Fallback (item e): the chart's scaffolding/labels exist but NO vector
+    // series was drawn — an unsupported or degenerate plot. Render the underlying
+    // data table so the numbers are not lost. PowerPoint shows the figure, so
+    // this only fires when there is no figure (`paths` empty).
+    if paths.is_empty() {
+        if let Some(html) = blocks.iter().find_map(|b| match &b.kind {
+            BlockKind::Table(t) => Some(chart_data_table_html(t)),
+            _ => None,
+        }) {
+            if !html.is_empty() {
+                return html;
+            }
+        }
+    }
+
     if paths.is_empty() && labels.is_empty() {
         return String::new();
     }
@@ -15438,6 +15521,49 @@ fn chart_blocks_to_html(blocks: &[Block]) -> String {
         out.push_str("</svg></div>");
     }
     out.push_str(&labels);
+    out
+}
+
+/// The item-e fallback rendering: a chart's underlying data [`Table`](model::Table)
+/// as a positioned HTML `<table>` filling the graphic-frame wrapper, used only
+/// when no vector series was drawn (so the numbers survive an unrenderable plot).
+/// The first row is a header (`<th>`); cell text is the flattened plain text of
+/// each cell's paragraphs. `width:100%` (no fixed height) lets the table take its
+/// natural height inside the caller's absolute wrapper, which clips any overflow.
+/// Returns `""` for an empty table.
+fn chart_data_table_html(table: &model::Table) -> String {
+    if table.rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "<div style=\"position:absolute;left:0pt;top:0pt;width:100%;overflow:hidden\">\
+<table style=\"border-collapse:collapse;font-size:8pt\">",
+    );
+    for (r, row) in table.rows.iter().enumerate() {
+        out.push_str("<tr>");
+        let tag = if r == 0 { "th" } else { "td" };
+        for cell in &row.cells {
+            let mut text = String::new();
+            for b in &cell.blocks {
+                if let BlockKind::Paragraph(p) = &b.kind {
+                    let t = inlines_plain_text(&p.runs);
+                    if !t.is_empty() {
+                        if !text.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(&t);
+                    }
+                }
+            }
+            out.push_str(&format!(
+                "<{tag} style=\"border:0.5pt solid #999;padding:1pt 3pt\">"
+            ));
+            esc(&text, &mut out);
+            out.push_str(&format!("</{tag}>"));
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</table></div>");
     out
 }
 
@@ -16611,11 +16737,12 @@ fn odf_points_segments(
 /// inline images keep their real formatting (not plain text). Any images intern
 /// into the shared `resources` table.
 ///
-/// The first master page's header/footer wins ([`model::Section`] holds a single
-/// `header`/`footer` slot for the document's one section). Only the *primary*
-/// running element is taken; ODF's left/first variants (`style:header-left`,
-/// `style:header-first`, …) are distinct element names and are not collapsed in
-/// here because the model has no per-page-type slot for them.
+/// The first master page's element wins ([`model::Section`] holds one slot per
+/// variant for the document's one section). `kind` selects the element by its
+/// *local name*, so this lowers the default (`"header"`/`"footer"`) **and** the
+/// ODF first-page / even-page variants (`"header-first"`/`"header-left"`, …) —
+/// the caller passes each `kind` into its matching `Section` slot. Matching by
+/// exact local name means `"header"` never captures `header-first`/`header-left`.
 ///
 /// Returns `None` when no such element is present (or it lowers to no blocks).
 fn odf_master_header_footer_model(
@@ -16852,6 +16979,92 @@ fn odf_writing_mode(v: &str) -> Option<model::Direction> {
         "lr-tb" | "lr" => Some(model::Direction::Ltr),
         _ => None,
     }
+}
+
+/// Map an ODF `style:rotation-angle` (CCW degrees, optionally suffixed `deg`) to
+/// the model's signed degrees CCW: `0..=90` stays positive; `270..=359` wraps to
+/// negative (`315` ⇒ `-45`) — the inverse of the exporter's `360 + deg`. Values
+/// outside the modelled `[-90, 90]` band (and a plain `0`) read as `None` so
+/// unrotated cells stay additive-clean. The exact inverse of the ODS export.
+fn odf_rotation_angle(v: &str) -> Option<i32> {
+    let raw = v.trim().trim_end_matches("deg").trim();
+    let deg = raw.parse::<f64>().ok()?.round() as i32;
+    // Normalize into `(-180, 180]`, then keep only the modelled ±90 band.
+    let norm = ((deg % 360) + 360) % 360;
+    let signed = if norm <= 180 { norm } else { norm - 360 };
+    (signed != 0 && (-90..=90).contains(&signed)).then_some(signed)
+}
+
+/// Parse an ODS `settings.xml` into `sheet name → (frozen_rows, frozen_cols)`
+/// for each table whose view is frozen (`Horizontal/VerticalSplitMode == 2`).
+/// The split *positions* give the row/column counts; an axis whose mode is not
+/// `2` (or absent) contributes `0`. A table with neither axis frozen is omitted.
+/// The inverse of the exporter's `ods_settings_xml`.
+///
+/// Table entries live under `config:config-item-map-named config:name="Tables"`;
+/// a map stack disambiguates them from the outer `Views` indexed map's entries.
+fn ods_frozen_panes(settings_xml: &str) -> BTreeMap<String, (u32, u32)> {
+    let mut out = BTreeMap::new();
+    if settings_xml.is_empty() {
+        return out;
+    }
+    let mut x = Xml::new(settings_xml);
+    // Per open map: whether it is the `Tables` named map. A `config-item-map-
+    // entry` is a table entry iff the top of the stack is `true`.
+    let mut map_stack: Vec<bool> = Vec::new();
+    let mut cur_name: Option<String> = None;
+    let mut items: BTreeMap<String, i64> = BTreeMap::new();
+    let mut cur_item: Option<String> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "config-item-map-named" => {
+                    map_stack.push(attr(&attrs, "name") == Some("Tables"));
+                }
+                "config-item-map-indexed" => map_stack.push(false),
+                "config-item-map-entry" if map_stack.last() == Some(&true) => {
+                    cur_name = attr(&attrs, "name").map(str::to_string);
+                    items.clear();
+                }
+                "config-item" if cur_name.is_some() && !sc => {
+                    cur_item = attr(&attrs, "name").map(str::to_string);
+                }
+                _ => {}
+            },
+            Tok::Text(t) => {
+                if let Some(nm) = &cur_item {
+                    if let Ok(v) = t.trim().parse::<i64>() {
+                        items.insert(nm.clone(), v);
+                    }
+                }
+            }
+            Tok::Close(name) => match local(&name) {
+                "config-item" => cur_item = None,
+                "config-item-map-entry" if cur_name.is_some() => {
+                    if let Some(nm) = cur_name.take() {
+                        let axis = |mode: &str, pos: &str| -> u32 {
+                            if items.get(mode).copied() == Some(2) {
+                                items.get(pos).copied().unwrap_or(0).max(0) as u32
+                            } else {
+                                0
+                            }
+                        };
+                        let cols = axis("HorizontalSplitMode", "HorizontalSplitPosition");
+                        let rows = axis("VerticalSplitMode", "VerticalSplitPosition");
+                        if rows > 0 || cols > 0 {
+                            out.insert(nm, (rows, cols));
+                        }
+                    }
+                    items.clear();
+                }
+                "config-item-map-named" | "config-item-map-indexed" => {
+                    map_stack.pop();
+                }
+                _ => {}
+            },
+        }
+    }
+    out
 }
 
 /// Map an ODF `fo:text-align` value (`start`/`end`/`center`/`justify`, plus the
@@ -17651,6 +17864,10 @@ struct OdsCellProps {
     valign: Option<model::CellVAlign>,
     wrap: bool,
     number_format: Option<String>,
+    /// `style:writing-mode` → base reading direction (`rl-tb` ⇒ RTL).
+    direction: Option<model::Direction>,
+    /// `style:rotation-angle` → text rotation in the model's signed degrees CCW.
+    rotation_deg: Option<i32>,
 }
 
 /// Resolved ODS style tables for the typed model path: column widths, row
@@ -17753,6 +17970,18 @@ fn odf_cell_props(
                         }
                         if let Some(v) = attr(&attrs, "vertical-align").and_then(odf_cell_valign) {
                             props.valign = Some(v);
+                            *any = true;
+                        }
+                        if let Some(d) =
+                            attr(&attrs, "writing-mode").and_then(odf_writing_mode)
+                        {
+                            props.direction = Some(d);
+                            *any = true;
+                        }
+                        if let Some(deg) =
+                            attr(&attrs, "rotation-angle").and_then(odf_rotation_angle)
+                        {
+                            props.rotation_deg = Some(deg);
                             *any = true;
                         }
                     }
@@ -27537,6 +27766,83 @@ mod tests {
         );
     }
 
+    /// XLSX `alignment@readingOrder="2"` lowers to the spreadsheet cell's
+    /// [`model::Direction::Rtl`]; `1` → `Ltr`; absent → `None` (item f).
+    #[test]
+    fn xlsx_model_reads_cell_reading_order_direction() {
+        let styles = r#"<styleSheet>
+          <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+          <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+          <borders count="1"><border/></borders>
+          <cellXfs count="3">
+            <xf/>
+            <xf applyAlignment="1"><alignment readingOrder="2"/></xf>
+            <xf applyAlignment="1"><alignment readingOrder="1"/></xf>
+          </cellXfs>
+        </styleSheet>"#;
+        let sheet_xml = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" t="inlineStr" s="1"><is><t>شلום</t></is></c>
+            <c r="B1" t="inlineStr" s="2"><is><t>Left</t></is></c>
+            <c r="C1" t="inlineStr"><is><t>Def</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let sheet = xlsx_model_sheet(styles, sheet_xml, None);
+        assert_eq!(
+            sheet.rows[0].cells[0].direction,
+            Some(model::Direction::Rtl),
+            "readingOrder=2 → Rtl"
+        );
+        assert_eq!(
+            sheet.rows[0].cells[1].direction,
+            Some(model::Direction::Ltr),
+            "readingOrder=1 → Ltr"
+        );
+        assert_eq!(
+            sheet.rows[0].cells[2].direction, None,
+            "no readingOrder → None"
+        );
+    }
+
+    /// ODS `style:table-cell-properties@style:writing-mode="rl-tb"` lowers to the
+    /// spreadsheet cell's [`model::Direction::Rtl`] (item f).
+    #[test]
+    fn ods_model_reads_cell_writing_mode_direction() {
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+            xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+          <office:automatic-styles>
+            <style:style style:name="ceRtl" style:family="table-cell">
+              <style:table-cell-properties style:writing-mode="rl-tb"/>
+            </style:style>
+          </office:automatic-styles>
+          <office:body><office:spreadsheet>
+            <table:table table:name="S">
+              <table:table-row>
+                <table:table-cell table:style-name="ceRtl"><text:p>שלום</text:p></table:table-cell>
+                <table:table-cell><text:p>Def</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+          </office:spreadsheet></office:body>
+        </office:document-content>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.spreadsheet");
+        z.add_stored("content.xml", content.as_bytes());
+        let model = office_to_model(&z.finish()).expect("ods → model");
+        let sheet = match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Sheet(sb) => &sb.sheets[0],
+            other => panic!("expected a Sheet block, got {other:?}"),
+        };
+        assert_eq!(
+            sheet.rows[0].cells[0].direction,
+            Some(model::Direction::Rtl),
+            "writing-mode=rl-tb → Rtl"
+        );
+        assert_eq!(sheet.rows[0].cells[1].direction, None, "no style → None");
+    }
+
     #[test]
     fn odt_model_table_cell_vertical_align() {
         // ODT table cell `style:table-cell-properties@style:vertical-align="bottom"`
@@ -29707,6 +30013,52 @@ mod tests {
         );
     }
 
+    /// A numbered DOCX list → tagged o2p PDF → tag-tree reconstruction must keep
+    /// the list **ordered** (deferred item a). The `/L` now carries a
+    /// `/ListNumbering /Decimal` attribute, so the round-trip recovers the
+    /// number format instead of collapsing to bullets.
+    #[test]
+    fn office_to_pdf_tagged_preserves_ordered_list_numbers() {
+        let numbering = r#"<w:numbering xmlns:w="x">
+          <w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+        </w:numbering>"#;
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>First item</w:t></w:r></w:p>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Second item</w:t></w:r></w:p>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Third item</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let bytes = build_docx(
+            doc,
+            None,
+            &[("word/numbering.xml", numbering.as_bytes().to_vec())],
+        );
+        let pdf = office_to_pdf_opts(&bytes, &[], true).expect("docx converts");
+
+        // The tagged `/L` carries the ordered number format.
+        assert!(
+            String::from_utf8_lossy(&pdf).contains("/ListNumbering"),
+            "tagged ordered list carries /ListNumbering"
+        );
+
+        // The struct-tree reconstruction recovers an ORDERED decimal list.
+        let out = opens(&pdf);
+        let mut ids = crate::recon::IdGen::default();
+        let blocks = crate::recon::tag_tree::reconstruct_from_struct_tree(&out, &mut ids)
+            .expect("tagged reconstruction path is elected");
+        let list = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                crate::model::BlockKind::List(l) => Some(l),
+                _ => None,
+            })
+            .expect("a list block reconstructs");
+        assert!(list.ordered, "numbered list round-trips ordered (not bullets)");
+        assert_eq!(list.marker, crate::model::ListMarker::Decimal);
+    }
+
     #[test]
     fn office_to_pdf_defaults_to_untagged() {
         let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
@@ -29763,6 +30115,90 @@ mod tests {
     }
 
     // ─── Fix 2: PPTX charts render (bars + labels) on the o2p display path ───
+
+    /// Item e: a chart whose series drew **no** vector figure falls back to
+    /// rendering its data table (so the numbers are not lost), while a chart that
+    /// drew a series shows the figure only (PowerPoint parity).
+    #[test]
+    fn chart_without_series_falls_back_to_data_table() {
+        use model::{Cell, Inline, InlineRun, Paragraph, Rect, Row, Shape, Table};
+        let text_para = |t: &str| Paragraph {
+            runs: vec![Inline::Run(InlineRun {
+                text: t.to_string(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let cell = |t: &str| Cell {
+            blocks: vec![Block {
+                kind: BlockKind::Paragraph(text_para(t)),
+                ..Block::default()
+            }],
+            ..Default::default()
+        };
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![
+                    Row {
+                        cells: vec![cell("Q1"), cell("Q2")],
+                        ..Default::default()
+                    },
+                    Row {
+                        cells: vec![cell("10"), cell("20")],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Block::default()
+        };
+
+        // No drawn series (only a framed title label) → data table fallback.
+        let label = Block {
+            frame: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 120.0,
+                h: 16.0,
+            }),
+            kind: BlockKind::Paragraph(text_para("Sales")),
+            ..Block::default()
+        };
+        let html = chart_blocks_to_html(&[label, table.clone()]);
+        assert!(
+            html.contains("<table") && html.contains("Q1") && html.contains("10"),
+            "no-series chart renders the data table: {html}"
+        );
+        assert!(!html.contains("<svg"), "no vector figure drawn: {html}");
+
+        // A drawn series → figure only, data table not drawn (PowerPoint parity).
+        let series = Block {
+            frame: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            }),
+            kind: BlockKind::Shape(Shape {
+                segments: vec![
+                    PathSeg::Move(0.0, 0.0),
+                    PathSeg::Line(20.0, 0.0),
+                    PathSeg::Line(20.0, 40.0),
+                    PathSeg::Line(0.0, 40.0),
+                    PathSeg::Close,
+                ],
+                fill: Some([0.2, 0.4, 0.8]),
+                ..Default::default()
+            }),
+            ..Block::default()
+        };
+        let html = chart_blocks_to_html(&[series, table]);
+        assert!(html.contains("<svg"), "a drawn series shows the figure: {html}");
+        assert!(
+            !html.contains("<table"),
+            "figure-only: data table not drawn: {html}"
+        );
+    }
 
     #[test]
     fn pptx_to_pdf_renders_chart_shapes_and_labels() {

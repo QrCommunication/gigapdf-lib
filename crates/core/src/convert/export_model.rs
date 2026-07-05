@@ -2916,6 +2916,10 @@ struct XlsxAlign {
     /// exact inverse of the importer's `xlsx_text_rotation`). `None` ⇒
     /// horizontal (no attribute).
     rotation_deg: Option<i32>,
+    /// Base reading direction; emitted as `@readingOrder` (`Rtl` ⇒ `2`, `Ltr` ⇒
+    /// `1`; inverse of the importer's `xlsx_reading_order`). `None` ⇒ context
+    /// (no attribute).
+    direction: Option<crate::model::Direction>,
 }
 
 impl XlsxAlign {
@@ -2924,6 +2928,7 @@ impl XlsxAlign {
             && self.vertical.is_none()
             && !self.wrap
             && self.rotation_deg.is_none()
+            && self.direction.is_none()
     }
 }
 
@@ -3083,6 +3088,7 @@ impl XlsxStyler {
             vertical: cell.vertical_align,
             wrap: cell.wrap,
             rotation_deg: cell.rotation_deg.filter(|d| (-90..=90).contains(d) && *d != 0),
+            direction: cell.direction,
         };
         if num_fmt_id == 0
             && fill_idx == 0
@@ -3241,6 +3247,15 @@ impl XlsxStyler {
                     // importer's `xlsx_text_rotation`).
                     let v = if deg >= 0 { deg } else { 90 - deg };
                     a.push_str(&format!(" textRotation=\"{v}\""));
+                }
+                if let Some(dir) = xf.align.direction {
+                    // Base reading direction → `@readingOrder` (inverse of the
+                    // importer's `xlsx_reading_order`): RTL ⇒ 2, LTR ⇒ 1.
+                    let v = match dir {
+                        crate::model::Direction::Rtl => 2,
+                        crate::model::Direction::Ltr => 1,
+                    };
+                    a.push_str(&format!(" readingOrder=\"{v}\""));
                 }
                 a.push_str("/>");
                 (" applyAlignment=\"1\"".to_string(), a)
@@ -5223,24 +5238,42 @@ fn odt_section_styles(
 
         page_layouts.push_str(&odf_page_layout(&layout_name, geom));
 
-        // Running header/footer for this master (rendered into hf_ctx so their
-        // styles/images land in styles.xml).
-        let header_xml = section
-            .and_then(|s| s.header.as_ref())
-            .map(|h| odt_blocks(h, hf_ctx));
-        let footer_xml = section
-            .and_then(|s| s.footer.as_ref())
-            .map(|f| odt_blocks(f, hf_ctx));
-        let header = match &header_xml {
-            Some(h) => format!("<style:header>{h}</style:header>"),
-            None => String::new(),
-        };
-        let footer = match &footer_xml {
-            Some(f) => format!("<style:footer>{f}</style:footer>"),
-            None => String::new(),
-        };
+        // Running header/footer for this master, plus the first-page and even-page
+        // variants (rendered into hf_ctx so their styles/images land in
+        // styles.xml). ODF maps: default → `<style:header>`/`<style:footer>`
+        // (also the odd/right page when an even variant is present), even →
+        // `<style:header-left>`/`<style:footer-left>`, first → ODF 1.3
+        // `<style:header-first>`/`<style:footer-first>`.
+        let render = |b: Option<&Vec<Block>>, hf_ctx: &mut OdfCtx| b.map(|v| odt_blocks(v, hf_ctx));
+        let header_xml = render(section.and_then(|s| s.header.as_ref()), hf_ctx);
+        let header_even_xml = render(section.and_then(|s| s.header_even.as_ref()), hf_ctx);
+        let header_first_xml = render(section.and_then(|s| s.header_first.as_ref()), hf_ctx);
+        let footer_xml = render(section.and_then(|s| s.footer.as_ref()), hf_ctx);
+        let footer_even_xml = render(section.and_then(|s| s.footer_even.as_ref()), hf_ctx);
+        let footer_first_xml = render(section.and_then(|s| s.footer_first.as_ref()), hf_ctx);
+
+        // ODF `<style:master-page>` child order: header, header-left,
+        // header-first, then footer, footer-left, footer-first. When only a
+        // variant (even/first) is present, an empty `<style:header/>` default is
+        // emitted so the variant is honoured (ODF applies `-left`/`-first` as
+        // overrides of the default).
+        let mut hf = String::new();
+        odt_push_hf(
+            &mut hf,
+            "header",
+            &header_xml,
+            &header_even_xml,
+            &header_first_xml,
+        );
+        odt_push_hf(
+            &mut hf,
+            "footer",
+            &footer_xml,
+            &footer_even_xml,
+            &footer_first_xml,
+        );
         master_styles.push_str(&format!(
-            "<style:master-page style:name=\"{master_name}\" style:page-layout-name=\"{layout_name}\">{header}{footer}</style:master-page>"
+            "<style:master-page style:name=\"{master_name}\" style:page-layout-name=\"{layout_name}\">{hf}</style:master-page>"
         ));
 
         // A master-switch paragraph style for every master *after* the first.
@@ -5254,6 +5287,36 @@ style:master-page-name=\"{master_name}\"/>"
     }
 
     (page_layouts, master_styles)
+}
+
+/// Append one header-or-footer group to a `<style:master-page>` body: the
+/// `default` (`<style:{tag}>`, the odd/right page), the `even` variant
+/// (`<style:{tag}-left>`, ODF's even/left page), and the `first` variant (ODF
+/// 1.3 `<style:{tag}-first>`). When only a variant is present, an empty default
+/// `<style:{tag}/>` is emitted first so ODF honours the `-left`/`-first`
+/// override. Nothing is written when all three are absent (byte-identical to a
+/// header-less master).
+fn odt_push_hf(
+    out: &mut String,
+    tag: &str,
+    default: &Option<String>,
+    even: &Option<String>,
+    first: &Option<String>,
+) {
+    if default.is_none() && even.is_none() && first.is_none() {
+        return;
+    }
+    match default {
+        Some(d) => out.push_str(&format!("<style:{tag}>{d}</style:{tag}>")),
+        // A variant needs a default present for ODF to treat it as an override.
+        None => out.push_str(&format!("<style:{tag}/>")),
+    }
+    if let Some(e) = even {
+        out.push_str(&format!("<style:{tag}-left>{e}</style:{tag}-left>"));
+    }
+    if let Some(f) = first {
+        out.push_str(&format!("<style:{tag}-first>{f}</style:{tag}-first>"));
+    }
 }
 
 /// One `<style:page-layout>` (ODF page geometry + margins) for a master page.
@@ -5344,7 +5407,7 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
         .collect();
     zip.add_deflated(
         "META-INF/manifest.xml",
-        odf_manifest("text", &image_exts).as_bytes(),
+        odf_manifest("text", &image_exts, false).as_bytes(),
     );
     for (i, (bytes, ext)) in ctx.images.iter().enumerate() {
         zip.add_deflated(&format!("Pictures/img{}.{ext}", i + 1), bytes);
@@ -5394,11 +5457,72 @@ pub fn ods_from_model(doc: &Document) -> Vec<u8> {
         ods_styles_xml(&odf_default_lang_styles(&doc.meta)).as_bytes(),
     );
     zip.add_deflated("meta.xml", odf_meta_xml(&doc.meta).as_bytes());
+    // Frozen panes live in settings.xml (ODF stores split/freeze view state
+    // there, not in content). Emitted only when a sheet is frozen — otherwise
+    // the package stays byte-identical to before.
+    let settings = ods_settings_xml(&sheets);
+    if let Some(xml) = &settings {
+        zip.add_deflated("settings.xml", xml.as_bytes());
+    }
     zip.add_deflated(
         "META-INF/manifest.xml",
-        odf_manifest("spreadsheet", &[]).as_bytes(),
+        odf_manifest("spreadsheet", &[], settings.is_some()).as_bytes(),
     );
     zip.finish()
+}
+
+/// The ODF `settings.xml` restoring each sheet's frozen panes (LibreOffice reads
+/// the freeze from view settings, not from content.xml). `None` when no sheet is
+/// frozen, so a freeze-less workbook emits no settings part at all.
+///
+/// Each frozen `Sheet.freeze = (rows, cols)` becomes a
+/// `config:config-item-map-entry` (keyed by the sheet name) carrying
+/// `HorizontalSplitMode`/`VerticalSplitMode = 2` (frozen) with
+/// `HorizontalSplitPosition = cols` / `VerticalSplitPosition = rows`, plus the
+/// matching `PositionRight`/`PositionBottom` (the first scrolling cell). The
+/// importer's `ods_frozen_panes` reads it back.
+fn ods_settings_xml(sheets: &[Sheet]) -> Option<String> {
+    let frozen: Vec<&Sheet> = sheets
+        .iter()
+        .filter(|s| matches!(s.freeze, Some((r, c)) if r > 0 || c > 0))
+        .collect();
+    if frozen.is_empty() {
+        return None;
+    }
+    let mut tables = String::new();
+    for sheet in frozen {
+        let (rows, cols) = sheet.freeze.unwrap();
+        let h_mode = if cols > 0 { 2 } else { 0 };
+        let v_mode = if rows > 0 { 2 } else { 0 };
+        let mut name = String::new();
+        esc(&sheet.name, &mut name);
+        tables.push_str(&format!(
+            "<config:config-item-map-entry config:name=\"{name}\">\
+<config:config-item config:name=\"HorizontalSplitMode\" config:type=\"short\">{h_mode}</config:config-item>\
+<config:config-item config:name=\"VerticalSplitMode\" config:type=\"short\">{v_mode}</config:config-item>\
+<config:config-item config:name=\"HorizontalSplitPosition\" config:type=\"int\">{cols}</config:config-item>\
+<config:config-item config:name=\"VerticalSplitPosition\" config:type=\"int\">{rows}</config:config-item>\
+<config:config-item config:name=\"PositionRight\" config:type=\"int\">{cols}</config:config-item>\
+<config:config-item config:name=\"PositionBottom\" config:type=\"int\">{rows}</config:config-item>\
+</config:config-item-map-entry>",
+        ));
+    }
+    Some(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<office:document-settings \
+xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:config=\"urn:oasis:names:tc:opendocument:xmlns:config:1.0\" office:version=\"1.3\">\
+<office:settings>\
+<config:config-item-set config:name=\"ooo:view-settings\">\
+<config:config-item-map-indexed config:name=\"Views\">\
+<config:config-item-map-entry>\
+<config:config-item-map-named config:name=\"Tables\">{tables}</config:config-item-map-named>\
+</config:config-item-map-entry>\
+</config:config-item-map-indexed>\
+</config:config-item-set>\
+</office:settings>\
+</office:document-settings>"
+    ))
 }
 
 /// ODS `styles.xml`: an otherwise-empty `office:document-styles`, optionally
@@ -5450,7 +5574,7 @@ pub fn odp_from_model(doc: &Document) -> Vec<u8> {
     let image_exts: Vec<&str> = ctx.images.iter().map(|(_, ext)| *ext).collect();
     zip.add_deflated(
         "META-INF/manifest.xml",
-        odf_manifest("presentation", &image_exts).as_bytes(),
+        odf_manifest("presentation", &image_exts, false).as_bytes(),
     );
     for (i, (bytes, ext)) in ctx.images.iter().enumerate() {
         zip.add_deflated(&format!("Pictures/img{}.{ext}", i + 1), bytes);
@@ -6504,7 +6628,7 @@ fn odf_list_style(name: &str, list: &List) -> String {
 /// ODF `META-INF/manifest.xml`. `image_exts[i]` is the package-native extension
 /// of `Pictures/img{i+1}.<ext>`; each picture is declared with that path and the
 /// matching `image/<ext>` media-type (ISO 26300 §2.2 / OpenDocument package).
-fn odf_manifest(kind: &str, image_exts: &[&str]) -> String {
+fn odf_manifest(kind: &str, image_exts: &[&str], has_settings: bool) -> String {
     let media = match kind {
         "text" => "application/vnd.oasis.opendocument.text",
         "spreadsheet" => "application/vnd.oasis.opendocument.spreadsheet",
@@ -6519,6 +6643,11 @@ fn odf_manifest(kind: &str, image_exts: &[&str]) -> String {
 <manifest:file-entry manifest:full-path=\"styles.xml\" manifest:media-type=\"text/xml\"/>\
 <manifest:file-entry manifest:full-path=\"meta.xml\" manifest:media-type=\"text/xml\"/>"
     );
+    if has_settings {
+        s.push_str(
+            "<manifest:file-entry manifest:full-path=\"settings.xml\" manifest:media-type=\"text/xml\"/>",
+        );
+    }
     for (i, ext) in image_exts.iter().enumerate() {
         let mime = office_image_format(ext).0;
         s.push_str(&format!(
@@ -6548,6 +6677,11 @@ struct CellStyleKey {
     align: Option<Align>,
     valign: Option<CellVAlign>,
     wrap: bool,
+    /// Base reading direction → `style:writing-mode` (`rl-tb`/`lr-tb`).
+    direction: Option<crate::model::Direction>,
+    /// Text rotation in the model's signed degrees CCW → `style:rotation-angle`
+    /// (ODF's CCW degrees; a negative model angle wraps to `360 + deg`).
+    rotation_deg: Option<i32>,
 }
 
 /// Accumulates ODS automatic styles: number-format data styles (`<number:*>`),
@@ -6600,6 +6734,8 @@ impl OdsStyler {
             align: cell.align,
             valign: cell.vertical_align,
             wrap: cell.wrap,
+            direction: cell.direction,
+            rotation_deg: cell.rotation_deg.filter(|d| (-90..=90).contains(d) && *d != 0),
         };
         if key.fill.is_none()
             && key.data_style.is_none()
@@ -6608,6 +6744,8 @@ impl OdsStyler {
             && key.align.is_none()
             && key.valign.is_none()
             && !key.wrap
+            && key.direction.is_none()
+            && key.rotation_deg.is_none()
         {
             return String::new();
         }
@@ -6639,6 +6777,21 @@ impl OdsStyler {
                 " style:vertical-align=\"{}\"",
                 odf_cell_valign_attr(v)
             ));
+        }
+        // Base reading direction → `style:writing-mode` (mirrors the paragraph
+        // path; the importer's `odf_writing_mode` reads it back).
+        if let Some(dir) = key.direction {
+            let mode = match dir {
+                crate::model::Direction::Rtl => "rl-tb",
+                crate::model::Direction::Ltr => "lr-tb",
+            };
+            cell_props.push_str(&format!(" style:writing-mode=\"{mode}\""));
+        }
+        // Text rotation → `style:rotation-angle` (ODF CCW degrees; the importer's
+        // `odf_rotation_angle` maps it back to the model's signed degrees).
+        if let Some(deg) = key.rotation_deg {
+            let angle = if deg >= 0 { deg } else { 360 + deg };
+            cell_props.push_str(&format!(" style:rotation-angle=\"{angle}\""));
         }
         let cell_props_xml = if cell_props.is_empty() {
             String::new()
@@ -11198,6 +11351,61 @@ mod tests {
         assert!(
             content.contains("style:vertical-align=\"middle\""),
             "Middle → style:vertical-align=middle: {content}"
+        );
+    }
+
+    /// A one-cell sheet doc carrying a given cell `direction`, for the RTL
+    /// reading-order export tests (item f).
+    fn sheet_doc_with_direction(dir: crate::model::Direction) -> Document {
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Sheet(SheetBlock {
+                            sheets: vec![Sheet {
+                                name: "S".to_string(),
+                                rows: vec![SheetRow {
+                                    cells: vec![SheetCell {
+                                        value: CellValue::Text("שלום".to_string()),
+                                        direction: Some(dir),
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn xlsx_from_model_emits_rtl_reading_order() {
+        // `SheetCell.direction = Rtl` → `<alignment readingOrder="2">` (item f).
+        let doc = sheet_doc_with_direction(crate::model::Direction::Rtl);
+        let styles = String::from_utf8(entry(&xlsx_from_model(&doc), "xl/styles.xml").unwrap())
+            .unwrap();
+        assert!(
+            styles.contains("readingOrder=\"2\""),
+            "Rtl → readingOrder=2: {styles}"
+        );
+    }
+
+    #[test]
+    fn ods_from_model_emits_rtl_writing_mode() {
+        // `SheetCell.direction = Rtl` → `style:writing-mode="rl-tb"` (item f).
+        let doc = sheet_doc_with_direction(crate::model::Direction::Rtl);
+        let content =
+            String::from_utf8(entry(&ods_from_model(&doc), "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("style:writing-mode=\"rl-tb\""),
+            "Rtl → writing-mode=rl-tb: {content}"
         );
     }
 
@@ -17273,6 +17481,61 @@ resolved against the body's styles"
         assert!(even_text.contains("even footer"));
     }
 
+    /// ODT master pages now carry the first-page (`style:header-first`) and
+    /// even-page (`style:header-left`/`-left`) header/footer variants (item c);
+    /// the importer reads them back into the model's first/even slots. (A *blank*
+    /// variant `Some(vec![])` lowers to an empty ODF element that re-imports as
+    /// `None` — ODF cannot distinguish an empty running element from an absent
+    /// one; non-empty variants round-trip fully.)
+    #[test]
+    fn m2_odt_first_and_even_headers_round_trip() {
+        let mut doc = doc_with(para("body"));
+        {
+            let section = &mut doc.sections[0];
+            section.header = Some(vec![para("default header")]);
+            section.header_first = Some(vec![para("first header")]);
+            section.footer_even = Some(vec![para("even footer")]);
+        }
+        let bytes = odt_from_model(&doc);
+        let styles = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("<style:header-first>") && styles.contains("first header"),
+            "first-page header emitted: {styles}"
+        );
+        // The even footer has no default footer, so an empty `<style:footer/>`
+        // precedes the `<style:footer-left>` override.
+        assert!(
+            styles.contains("<style:footer-left>") && styles.contains("even footer"),
+            "even footer emitted: {styles}"
+        );
+
+        // Round-trip through the ODT importer.
+        let back =
+            crate::convert::office_import::odt_to_model(&crate::convert::zip::read_zip(&bytes));
+        let section = &back.sections[0];
+        let text = |bs: &Option<Vec<Block>>| {
+            let mut s = String::new();
+            for b in bs.as_deref().unwrap_or(&[]) {
+                if let BlockKind::Paragraph(p) = &b.kind {
+                    inlines_plain_text(&p.runs, &mut s);
+                }
+            }
+            s
+        };
+        assert!(
+            text(&section.header).contains("default header"),
+            "default header survives"
+        );
+        assert!(
+            text(&section.header_first).contains("first header"),
+            "first-page header survives"
+        );
+        assert!(
+            text(&section.footer_even).contains("even footer"),
+            "even footer survives"
+        );
+    }
+
     #[test]
     fn m2_docx_cell_borders_round_trip() {
         let table = Block {
@@ -17447,6 +17710,80 @@ activePane=\"bottomRight\" state=\"frozen\"/>"),
         assert_eq!(cell.rotation_deg, Some(-45), "rotation round-trips");
         let diag = cell.diagonal.expect("diagonal round-trips");
         assert!(diag.up && !diag.down);
+    }
+
+    /// ODS now emits frozen panes (settings.xml) and cell text rotation
+    /// (`style:rotation-angle`), and the importer reads both back (item b).
+    #[test]
+    fn ods_freeze_rotation_round_trip() {
+        let sheet = Sheet {
+            name: "S1".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("t".to_string()),
+                    rotation_deg: Some(-45),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            freeze: Some((2, 1)),
+            ..Default::default()
+        };
+        let doc = doc_with(Block {
+            kind: BlockKind::Sheet(SheetBlock {
+                sheets: vec![sheet],
+            }),
+            ..Default::default()
+        });
+        let bytes = ods_from_model(&doc);
+
+        // settings.xml carries the frozen split for the sheet.
+        let settings = String::from_utf8(entry(&bytes, "settings.xml").unwrap()).unwrap();
+        assert!(
+            settings.contains("config:name=\"S1\""),
+            "sheet freeze entry: {settings}"
+        );
+        assert!(
+            settings.contains("HorizontalSplitPosition\" config:type=\"int\">1<"),
+            "cols split = 1: {settings}"
+        );
+        assert!(
+            settings.contains("VerticalSplitPosition\" config:type=\"int\">2<"),
+            "rows split = 2: {settings}"
+        );
+        // -45° model rotation → ODF CCW 315.
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("style:rotation-angle=\"315\""),
+            "-45° → 315: {content}"
+        );
+        // The manifest registers the new settings part.
+        let manifest =
+            String::from_utf8(entry(&bytes, "META-INF/manifest.xml").unwrap()).unwrap();
+        assert!(
+            manifest.contains("full-path=\"settings.xml\""),
+            "manifest lists settings.xml: {manifest}"
+        );
+
+        // Round-trip through the ODS importer.
+        let model =
+            crate::convert::office_import::ods_to_model(&crate::convert::zip::read_zip(&bytes));
+        let sheet = model
+            .sections
+            .iter()
+            .flat_map(|s| &s.pages)
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match &b.kind {
+                BlockKind::Sheet(sb) => sb.sheets.first().cloned(),
+                _ => None,
+            })
+            .expect("sheet survives");
+        assert_eq!(sheet.freeze, Some((2, 1)), "freeze round-trips");
+        assert_eq!(
+            sheet.rows[0].cells[0].rotation_deg,
+            Some(-45),
+            "rotation round-trips"
+        );
     }
 
     #[test]

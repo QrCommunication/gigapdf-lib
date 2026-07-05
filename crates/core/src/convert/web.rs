@@ -927,9 +927,10 @@ fn html_sheet_table(sheet: &Sheet, out: &mut String) {
 /// `None` when neither diagonal is set. Aspect-approximate: exactly
 /// corner-to-corner only for a square cell.
 ///
-/// This is standards-correct CSS a browser consuming the HTML export paints; the
-/// in-engine PDF renderer does not currently paint gradient backgrounds on table
-/// cells, so the slash is deferred there — no regression, the fill still shows.
+/// This is standards-correct CSS a browser consuming the HTML export paints, and
+/// the in-engine PDF renderer now paints it too: table cells carry a
+/// `background_gradient` that lays a `Fragment::Gradient` over the flat fill,
+/// under the cell content (see `html::layout`'s table cell painting).
 fn cell_diagonal_background(diag: &crate::model::DiagonalBorder) -> Option<String> {
     if !diag.up && !diag.down {
         return None;
@@ -948,7 +949,18 @@ fn html_slides(slides: &SlideBlock, doc: &Document, out: &mut String) {
 }
 
 fn html_slide(slide: &Slide, doc: &Document, out: &mut String) {
-    out.push_str("<section>");
+    // A slide is a positioned canvas at its own point dimensions; every
+    // placeholder/shape is absolutely placed at its model `frame` (points), so a
+    // deck rendered via `modelToPdf` keeps the authored layout instead of
+    // reflowing the shapes top-to-bottom (the reverse of the o2p pptx path,
+    // which already emits positioned shapes the engine honours).
+    let sw = slide.geometry.width.max(1.0);
+    let sh = slide.geometry.height.max(1.0);
+    out.push_str(&format!(
+        "<section style=\"position:relative;overflow:hidden;width:{}pt;height:{}pt\">",
+        n(sw),
+        n(sh),
+    ));
     // Slide background fill: a full-coverage, absolutely-positioned backdrop
     // `<div>` emitted first so it paints behind the slide content. A gradient
     // background (`Slide::background_gradient`) renders as a CSS
@@ -962,18 +974,39 @@ fn html_slide(slide: &Slide, doc: &Document, out: &mut String) {
     };
     if let Some(background) = backdrop {
         out.push_str(&format!(
-            "<div style=\"position:absolute;left:0;top:0;width:{:.0}pt;height:{:.0}pt;background:{background}\"></div>",
-            slide.geometry.width,
-            slide.geometry.height,
+            "<div style=\"position:absolute;left:0;top:0;width:{}pt;height:{}pt;background:{background}\"></div>",
+            n(sw),
+            n(sh),
         ));
     }
     for ph in &slide.placeholders {
-        html_block(&ph.block, doc, out);
+        html_positioned_block(&ph.block, doc, out);
     }
-    for sh in &slide.shapes {
-        html_block(sh, doc, out);
+    for shape in &slide.shapes {
+        html_positioned_block(shape, doc, out);
     }
     out.push_str("</section>");
+}
+
+/// Emit one slide block absolutely positioned at its model [`Block::frame`]
+/// (points), so its slide position is faithful under `modelToPdf`. A frameless
+/// block (rare — a master-inherited placeholder with no explicit geometry) falls
+/// back to in-flow rendering so its content is never dropped.
+fn html_positioned_block(block: &Block, doc: &Document, out: &mut String) {
+    match block.frame {
+        Some(f) => {
+            out.push_str(&format!(
+                "<div style=\"position:absolute;left:{}pt;top:{}pt;width:{}pt;height:{}pt\">",
+                n(f.x),
+                n(f.y),
+                n(f.w),
+                n(f.h),
+            ));
+            html_block(block, doc, out);
+            out.push_str("</div>");
+        }
+        None => html_block(block, doc, out),
+    }
 }
 
 #[cfg(test)]
@@ -1944,23 +1977,102 @@ mod tests {
     #[test]
     fn slide_renders_placeholders_and_shapes() {
         use crate::model::slide::{Placeholder, PlaceholderRole};
-        use crate::model::{PageGeometry, Slide};
+        use crate::model::{PageGeometry, Rect, Slide};
+        // Each block carries a model frame, so it is absolutely positioned at
+        // that frame (item g) rather than reflowed top-to-bottom.
+        let framed = |text: &str, x: f64, y: f64| Block {
+            frame: Some(Rect::new(x, y, 200.0, 40.0)),
+            ..para(text)
+        };
         let slide = Slide {
             geometry: PageGeometry::default(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
-                block: para("Title text"),
+                block: framed("Title text", 30.0, 20.0),
             }],
-            shapes: vec![para("Shape text")],
+            shapes: vec![framed("Shape text", 50.0, 300.0)],
             notes: None,
             background: None,
             ..Default::default()
         };
         let mut out = String::new();
         html_slide(&slide, &Document::default(), &mut out);
-        assert!(out.contains("<section>"), "slide section: {out}");
-        assert!(out.contains("Title text"), "placeholder rendered: {out}");
-        assert!(out.contains("Shape text"), "shape block rendered: {out}");
+        // A positioned slide canvas, each shape absolutely placed at its frame.
+        assert!(
+            out.contains("<section style=\"position:relative"),
+            "positioned slide canvas: {out}"
+        );
+        assert!(
+            out.contains("position:absolute;left:30pt;top:20pt;width:200pt;height:40pt"),
+            "title placed at its frame: {out}"
+        );
+        assert!(
+            out.contains("position:absolute;left:50pt;top:300pt"),
+            "shape placed at its frame: {out}"
+        );
+        assert!(
+            out.contains("Title text") && out.contains("Shape text"),
+            "content rendered: {out}"
+        );
+    }
+
+    /// End-to-end (item g): a deck with two framed shapes, lowered through
+    /// `html_from_model` → `html_to_pdf`, places each shape at its **absolute**
+    /// frame — the rendered PDF's two text runs are far apart vertically (the
+    /// frame gap, ~320pt) with distinct X offsets, not the ~1-line spacing a
+    /// reflow would give.
+    #[test]
+    fn slide_deck_shapes_render_at_absolute_positions() {
+        use crate::model::{Page, PageGeometry, Rect, Section, Slide, SlideBlock};
+        let framed = |text: &str, x: f64, y: f64| Block {
+            frame: Some(Rect::new(x, y, 300.0, 40.0)),
+            ..para(text)
+        };
+        let slide = Slide {
+            geometry: PageGeometry::default(),
+            shapes: vec![
+                framed("AlphaShape", 40.0, 40.0),
+                framed("BetaShape", 120.0, 360.0),
+            ],
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let html = html_from_model(&doc);
+        let pdf = crate::convert::reverse::html_to_pdf(&html);
+        let opened = crate::Document::open(&pdf).expect("valid pdf");
+        let els = opened.page_text_elements(1);
+        let find = |needle: &str| els.iter().find(|e| e.text.contains(needle)).cloned();
+        let a = find("AlphaShape").expect("alpha shape present");
+        let b = find("BetaShape").expect("beta shape present");
+        // Absolute placement: the vertical gap tracks the frames (~320pt), far
+        // more than a reflow's ~1-line spacing.
+        assert!(
+            (a.y - b.y).abs() > 200.0,
+            "large absolute vertical gap (a.y={} b.y={})",
+            a.y,
+            b.y
+        );
+        // Distinct X offsets (frames x=40 vs x=120), not a shared flow left edge.
+        assert!(
+            (b.x - a.x) > 40.0,
+            "distinct x offsets (a.x={} b.x={})",
+            a.x,
+            b.x
+        );
     }
 
     #[test]

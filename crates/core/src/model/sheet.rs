@@ -5,7 +5,7 @@
 //! editable counterpart of the XLSX/ODS reconstruction path — typed values, not
 //! a rasterised table.
 
-use crate::model::style::{Align, CellVAlign, CharStyle};
+use crate::model::style::{Align, CellVAlign, CharStyle, Direction};
 use crate::model::BorderStyle;
 
 /// A block of spreadsheet content: one or more named sheets.
@@ -72,6 +72,13 @@ pub struct SheetCell {
     /// Diagonal border line(s) across the cell (XLSX `border/diagonal` with
     /// `@diagonalUp`/`@diagonalDown`). `None` ⇒ none. Additive.
     pub diagonal: Option<DiagonalBorder>,
+    /// Base reading direction of the cell's text, from XLSX
+    /// `alignment@readingOrder` (`2` ⇒ right-to-left, `1` ⇒ left-to-right, `0`
+    /// / absent ⇒ context-dependent) and ODS
+    /// `style:table-cell-properties@style:writing-mode` (`rl-tb` ⇒ RTL). `None`
+    /// ⇒ unspecified (reads left-to-right). Reuses the model [`Direction`] enum.
+    /// Additive: never serialized when unset.
+    pub direction: Option<Direction>,
 }
 
 /// A diagonal cell border: which diagonal(s) are drawn and the line to draw

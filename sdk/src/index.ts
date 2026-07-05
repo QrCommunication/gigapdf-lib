@@ -1682,6 +1682,12 @@ export interface GigaSheetCell {
    * Present since 0.117.0.
    */
   diagonal?: { up: boolean; down: boolean; border: GigaBorderStyle };
+  /**
+   * Base reading direction of the cell's text (XLSX `alignment@readingOrder`
+   * `2`⇒`rtl`/`1`⇒`ltr`, ODS `style:writing-mode`). Omitted = unspecified
+   * (reads left-to-right). Additive.
+   */
+  direction?: 'ltr' | 'rtl';
 }
 
 /** One spreadsheet row (mirror of `model::SheetRow`). */

@@ -101,6 +101,14 @@ struct StructNode {
     /// document-global index, else a generic placeholder so the figure stays
     /// PDF/UA-valid. `None` for non-figure nodes (they emit no `/Alt`).
     alt: Option<Vec<u8>>,
+    /// For a [`Role::L`] container: the ISO 32000-1 §14.8.5.2 `/ListNumbering`
+    /// value (`Decimal`, `LowerAlpha`, `Disc`, …) to emit under `/A <</O /List
+    /// …>>`, derived from the model list's ordered/marker. Carries the list's
+    /// number format across a gigapdf→gigapdf round-trip (the drawn marker
+    /// glyph is an artifact, so the attribute is what the reconstruction reads).
+    /// `None` for every other node, and for unordered lists whose bullet glyph
+    /// is not one of the three standard kinds.
+    list_numbering: Option<Vec<u8>>,
     /// Child structure elements (containers only).
     kids: Vec<StructNode>,
 }
@@ -114,6 +122,7 @@ impl StructNode {
             page: None,
             mcids: Vec::new(),
             alt: None,
+            list_numbering: None,
             kids: Vec::new(),
         }
     }
@@ -126,6 +135,7 @@ impl StructNode {
             page: None,
             mcids: Vec::new(),
             alt: None,
+            list_numbering: None,
             kids: Vec::new(),
         }
     }
@@ -334,6 +344,7 @@ fn node_from_block(
         }
         BlockKind::List(list) => {
             let mut l = StructNode::container(Role::L);
+            l.list_numbering = list_numbering_name(list);
             for item in &list.items {
                 let mut li = StructNode::container(Role::LI);
                 let mut body = StructNode::container(Role::LBody);
@@ -399,6 +410,38 @@ fn node_from_block(
         }
         _ => None,
     }
+}
+
+/// The ISO 32000-1 §14.8.5.2 `/ListNumbering` name for a model [`List`], so the
+/// tagged `/L` carries its number format (an ordered list's marker glyph is
+/// drawn as an artifact, so this attribute is what a reconstruction reads back).
+/// Every ordered scheme maps to its named kind; an unordered list maps only when
+/// its bullet glyph is one of the three standard kinds (else `None` — the plain
+/// bullet default reconstructs identically).
+fn list_numbering_name(list: &crate::model::List) -> Option<Vec<u8>> {
+    use crate::model::ListMarker;
+    let name: &[u8] = if list.ordered {
+        match list.marker {
+            ListMarker::Decimal => b"Decimal",
+            ListMarker::UpperRoman => b"UpperRoman",
+            ListMarker::LowerRoman => b"LowerRoman",
+            ListMarker::UpperAlpha => b"UpperAlpha",
+            ListMarker::LowerAlpha => b"LowerAlpha",
+            // A bullet glyph on an ordered list is contradictory; fall back to
+            // the most common ordered kind so the number survives the round-trip.
+            ListMarker::Bullet(_) => b"Decimal",
+        }
+    } else {
+        match list.marker {
+            ListMarker::Bullet('•') => b"Disc",
+            ListMarker::Bullet('◦') => b"Circle",
+            ListMarker::Bullet('▪') => b"Square",
+            // Any other bullet glyph has no standard `/ListNumbering` kind — omit
+            // it and let the default bullet reconstruct (identical result).
+            _ => return None,
+        }
+    };
+    Some(name.to_vec())
 }
 
 /// Encode a figure's `/Alt` string value: the author's alternate text when
@@ -648,6 +691,15 @@ fn emit_node(node: &StructNode, parent: ObjectId, objects: &mut BTreeMap<ObjectI
             b"Alt",
             Object::String(alt.clone(), crate::object::StringKind::Literal),
         );
+    }
+
+    // A `/L` carries its number format as `/A <</O /List /ListNumbering /X>>`
+    // (ISO 32000-1 §14.8.5.2) so an ordered list survives a round-trip.
+    if let Some(kind) = &node.list_numbering {
+        let mut attr = Dictionary::new();
+        attr.set(b"O", crate::annot::name(b"List"));
+        attr.set(b"ListNumbering", Object::Name(kind.clone()));
+        dict.set(b"A", Object::Dictionary(attr));
     }
 
     if node.leaf_id.is_some() {

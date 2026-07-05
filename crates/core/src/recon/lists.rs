@@ -1010,6 +1010,59 @@ fn classify_marker(text: &str) -> Option<MarkerInfo> {
     })
 }
 
+/// The list scheme a standalone label token implies — recovered from a tagged
+/// PDF's `/Lbl` text (`"1."`, `"a)"`, `"(iv)"`, `"•"`) or a flat item's inline
+/// leading marker, classified with the **same** scheme detection the heuristic
+/// path uses. Lets the tag-tree reconstruction keep a numbered/lettered list's
+/// format instead of collapsing every `/Lbl` to a bullet.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LabelKind {
+    /// Whether the label numbers its item (any non-bullet scheme).
+    pub ordered: bool,
+    /// The recovered marker (bullet glyph, or ordered number format).
+    pub marker: ListMarker,
+    /// Ordinal **prefix** for an ordered `(a)`/`(1)` template; `None` otherwise.
+    pub prefix: Option<String>,
+    /// Ordinal **suffix** for an ordered label (`'.'`/`')'`); `None` for a bullet.
+    pub suffix: Option<char>,
+    /// The label's 1-based ordinal value (`"3." → 3`, `"c)" → 3`); `None` for a
+    /// bullet or an unvalued label.
+    pub ordinal: Option<u32>,
+}
+
+/// Classify a standalone list-label token into the [`LabelKind`] it implies.
+/// Reuses [`classify_marker`] so a tagged `/Lbl` recovers the exact scheme the
+/// heuristic path would on the same leading marker. `None` when the label
+/// matches no known scheme (empty / glyphless).
+pub(crate) fn classify_label(text: &str) -> Option<LabelKind> {
+    let info = classify_marker(text)?;
+    let ordered = info.marker.ordered();
+    let (prefix, suffix) = match info.delim {
+        Some(Delim::Dot) => (None, Some('.')),
+        Some(Delim::Paren) => (None, Some(')')),
+        Some(Delim::ParenBoth) => (Some("(".to_string()), Some(')')),
+        // A bullet (or a compound number with no trailing dot) has no delimiter.
+        None => (None, None),
+    };
+    Some(LabelKind {
+        ordered,
+        marker: info.marker.to_list_marker(),
+        prefix,
+        suffix,
+        ordinal: info.ordinal,
+    })
+}
+
+/// If `text` opens with a recognizable list marker, return `(Some(kind),
+/// text_without_marker)`; otherwise `(None, text)` unchanged. For a flat tagged
+/// `/LI` whose marker glyphs sit inline (no distinct `/Lbl` element).
+pub(crate) fn classify_and_strip_inline(text: &str) -> (Option<LabelKind>, String) {
+    match classify_label(text) {
+        Some(kind) => (Some(kind), strip_marker(text)),
+        None => (None, text.to_string()),
+    }
+}
+
 /// The 1-based ordinal value of an ordered marker's `label`:
 /// decimal digits → the number; a single letter → its position in the alphabet
 /// (`a`/`A` = 1 … `z`/`Z` = 26); a roman numeral → its decoded value. `None`
