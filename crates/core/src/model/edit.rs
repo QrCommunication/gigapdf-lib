@@ -2849,6 +2849,7 @@ mod tests {
                     .map(|&level| ListItem {
                         blocks: vec![para_block(vec![run("item")])],
                         level,
+                        label: None,
                     })
                     .collect(),
 

@@ -2583,6 +2583,7 @@ fn list_item(text: &str, level: u8) -> ListItem {
             ..Block::default()
         }],
         level,
+        label: None,
     }
 }
 

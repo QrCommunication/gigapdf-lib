@@ -1614,10 +1614,12 @@ mod tests {
                 ListItem {
                     blocks: vec![block(BlockKind::Paragraph(paragraph("First")), None)],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![block(BlockKind::Paragraph(paragraph("Second")), None)],
                     level: 0,
+                    label: None,
                 },
             ],
             start: 1,
@@ -1876,10 +1878,12 @@ mod tests {
                 ListItem {
                     blocks: vec![block(BlockKind::Paragraph(paragraph("alpha")), None)],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![block(BlockKind::Paragraph(paragraph("beta")), None)],
                     level: 1, // deeper → larger indent
+                    label: None,
                 },
             ],
             start: 1,
@@ -2115,6 +2119,7 @@ mod tests {
             items: vec![ListItem {
                 blocks: vec![block(BlockKind::Paragraph(paragraph("nested")), None)],
                 level: 0,
+                label: None,
             }],
             start: 1,
         };
@@ -2131,14 +2136,17 @@ mod tests {
                         block(BlockKind::Paragraph(paragraph("continued")), None),
                     ],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![block(BlockKind::List(nested), None)],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![], // empty item
                     level: 0,
+                    label: None,
                 },
             ],
             start: 1,

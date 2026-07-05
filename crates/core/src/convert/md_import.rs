@@ -494,6 +494,7 @@ fn parse_list(lines: &[&str], defs: &Defs) -> (Block, usize) {
         items.push(ListItem {
             blocks: vec![paragraph_block(list_item_runs(content, defs))],
             level: m.level,
+            label: None,
         });
         i += 1;
     }

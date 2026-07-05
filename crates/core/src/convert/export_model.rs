@@ -10435,10 +10435,12 @@ mod tests {
                     ListItem {
                         blocks: vec![para("first")],
                         level: 0,
+                        label: None,
                     },
                     ListItem {
                         blocks: vec![para("second")],
                         level: 0,
+                        label: None,
                     },
                 ],
 
@@ -12261,10 +12263,12 @@ style:family=\"paragraph\""
                     ListItem {
                         blocks: vec![para("alpha")],
                         level: 0,
+                        label: None,
                     },
                     ListItem {
                         blocks: vec![para("beta")],
                         level: 1,
+                        label: None,
                     },
                 ],
 
@@ -12839,6 +12843,7 @@ style:family=\"paragraph\""
             items: vec![ListItem {
                 blocks: vec![para("item")],
                 level: 0,
+                label: None,
             }],
             ..Default::default()
         }
@@ -14121,6 +14126,7 @@ style:print-orientation=\"landscape\""
                 items: vec![ListItem {
                     blocks: vec![para("sub")],
                     level: 0,
+                    label: None,
                 }],
 
                 ..Default::default()
@@ -14135,10 +14141,12 @@ style:print-orientation=\"landscape\""
                     ListItem {
                         blocks: vec![para("one"), nested],
                         level: 0,
+                        label: None,
                     },
                     ListItem {
                         blocks: vec![para("two")],
                         level: 0,
+                        label: None,
                     },
                 ],
 
@@ -14934,6 +14942,7 @@ style:print-orientation=\"landscape\""
         let item = |text: &str, level: u8| ListItem {
             blocks: vec![para(text)],
             level,
+            label: None,
         };
         let list = Block {
             kind: BlockKind::List(List {
@@ -17400,10 +17409,12 @@ resolved against the body's styles"
                     ListItem {
                         blocks: vec![para("first")],
                         level: 0,
+                        label: None,
                     },
                     ListItem {
                         blocks: vec![para("second")],
                         level: 1,
+                        label: None,
                     },
                 ],
                 start: 1,

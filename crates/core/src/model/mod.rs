@@ -364,6 +364,22 @@ impl List {
 pub struct ListItem {
     pub blocks: Vec<Block>,
     pub level: u8,
+    /// The item's **literal** marker label (`•`, `◦`, `1.`, `a)`), preserved
+    /// verbatim rather than regenerated from the list-wide
+    /// [`marker`](List::marker). Additive (`None` ⇒ the marker is regenerated
+    /// semantically, the pre-existing behaviour, so the JSON stays
+    /// retro-compatible: only serialized when set).
+    ///
+    /// Two independent flows populate and consume it — they never coexist in one
+    /// model instance:
+    ///  * **write** (geometric recon → tagged PDF): [`crate::recon`]'s list
+    ///    builder captures the *painted* marker glyph run here, carrying its
+    ///    [`source_index`](InlineRun::source_index) so the tagger can bind it to
+    ///    a `/Lbl` structure element (the reconstruction reads that `/Lbl` back).
+    ///  * **read** (tagged PDF → text): the struct-tree reconstruction stores the
+    ///    `/Lbl` text here so `to_text`/exporters emit the *exact* nested marker
+    ///    (`1. / a) / ◦`) instead of a flattened list-wide scheme.
+    pub label: Option<InlineRun>,
 }
 
 /// The bullet/number style for a [`List`].

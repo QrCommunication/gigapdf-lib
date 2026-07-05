@@ -1614,6 +1614,7 @@ mod tests {
         let li = |t: &str| ListItem {
             blocks: vec![para(t)],
             level: 0,
+            label: None,
         };
         let list = List {
             marker_suffix: None,

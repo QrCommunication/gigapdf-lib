@@ -771,6 +771,18 @@ impl Walker<'_> {
                 if let Some(v) = vote {
                     label_votes.push(v);
                 }
+                // Preserve a *structured* `/Lbl` verbatim as the item's literal
+                // marker, so `to_text`/exporters emit the exact per-depth marker
+                // (`1.`/`a)`/`◦`) instead of the voted list-wide scheme. A flat
+                // item (no `/Lbl`) keeps `None` and is regenerated as before.
+                let item_label = label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| InlineRun {
+                        text: s.to_string(),
+                        ..Default::default()
+                    });
                 let para = self.styled_paragraph(d, page, &text);
                 items.push(ListItem {
                     blocks: vec![Block {
@@ -780,6 +792,7 @@ impl Walker<'_> {
                         kind: BlockKind::Paragraph(para),
                     }],
                     level: 0,
+                    label: item_label,
                 });
             }
         }

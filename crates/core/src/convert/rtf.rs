@@ -2290,6 +2290,7 @@ fn lower_blocks(
                     items.push(ListItem {
                         blocks: vec![model_block(BlockKind::Paragraph(para_to_model(p, q)))],
                         level: lvl,
+                        label: None,
                     });
                     i += 1;
                 }

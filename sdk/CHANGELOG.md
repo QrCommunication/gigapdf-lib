@@ -6,6 +6,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.120.0] - 2026-07-05
+
+### Changed
+
+- **`officeToPdf()` is now tagged (PDF/UA-shaped) by default.** Every DOCX / ODT
+  / XLSX / PPTX / … conversion ships a `/StructTreeRoot` + marked content, so the
+  output is accessible and `toText()` reads the faithful declared structure. The
+  two former blockers — tagged reading order (0.119.0) and nested-list markers
+  (this release) — are closed. Pass `{ tagged: false }` for the raw untagged
+  text-layer baseline.
+
+### Fixed
+
+- **Nested lists keep their exact per-depth marker on the tagged round-trip.** A
+  level-2 `a)` no longer reads back as `2.`, and `◦`/`▪` sub-bullets no longer
+  collapse to `•`: each item's literal marker is preserved as a `/Lbl` and emitted
+  verbatim, so `toText()` of a tagged `1. / a) / i.` (or `• / ◦ / ▪`) list matches
+  the rendered glyphs. Authored ordinal delimiters (`a)` vs `a.`) are honoured on
+  the semantic path too.
+
 ## [0.119.0] - 2026-07-05
 
 ### Fixed

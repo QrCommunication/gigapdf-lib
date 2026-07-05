@@ -258,7 +258,7 @@ fn list_item(
         }));
         blocks.insert(0, para);
     }
-    ListItem { blocks, level }
+    ListItem { blocks, level, label: None }
 }
 
 /// Build a [`Table`] from a `table`: every `tr` (anywhere under it) becomes a

@@ -46,6 +46,7 @@ enum Role {
     H(u8),
     L,
     LI,
+    Lbl,
     LBody,
     Table,
     TR,
@@ -63,6 +64,7 @@ impl Role {
             Role::H(level) => format!("H{}", level.clamp(1, 6)).into_bytes(),
             Role::L => b"L".to_vec(),
             Role::LI => b"LI".to_vec(),
+            Role::Lbl => b"Lbl".to_vec(),
             Role::LBody => b"LBody".to_vec(),
             Role::Table => b"Table".to_vec(),
             Role::TR => b"TR".to_vec(),
@@ -346,7 +348,8 @@ fn node_from_block(
             let mut l = StructNode::container(Role::L);
             l.list_numbering = list_numbering_name(list);
             for item in &list.items {
-                let mut li = StructNode::container(Role::LI);
+                // Body first, so a `/Lbl` is only minted (and its glyph bound)
+                // for an item we actually keep — never an orphan plan entry.
                 let mut body = StructNode::container(Role::LBody);
                 for b in &item.blocks {
                     if let Some(child) =
@@ -355,10 +358,20 @@ fn node_from_block(
                         body.kids.push(child);
                     }
                 }
-                if !body.kids.is_empty() {
-                    li.kids.push(body);
-                    l.kids.push(li);
+                if body.kids.is_empty() {
+                    continue;
                 }
+                let mut li = StructNode::container(Role::LI);
+                // The literal marker (`•`/`◦`/`a)`) as a `/Lbl` before the body,
+                // binding the *painted* marker glyph so the reconstruction reads
+                // the exact per-depth marker instead of a flattened scheme.
+                if let Some(label) = &item.label {
+                    if let Some(lbl) = label_node(label, leaf_seq, plan) {
+                        li.kids.push(lbl);
+                    }
+                }
+                li.kids.push(body);
+                l.kids.push(li);
             }
             (!l.kids.is_empty()).then_some(l)
         }
@@ -476,6 +489,27 @@ fn paragraph_node(
         plan.by_text_run.entry(src).or_insert((leaf_id, tag.clone()));
     }
     Some(StructNode::leaf(role, leaf_id))
+}
+
+/// Build a `/Lbl` leaf from a list item's literal marker
+/// ([`crate::model::ListItem::label`]): mint a leaf id and bind the marker
+/// glyph's [`source_index`](crate::model::InlineRun::source_index) to it so the
+/// content rewrite tags the painted marker under this `/Lbl`. `None` when the
+/// label carries no source-bound glyph (a synthesized marker with no painted
+/// counterpart — nothing to tag).
+fn label_node(
+    label: &crate::model::InlineRun,
+    leaf_seq: &mut LeafId,
+    plan: &mut PagePlan,
+) -> Option<StructNode> {
+    let sources = label.source_index.as_ref().filter(|v| !v.is_empty())?;
+    let leaf_id = *leaf_seq;
+    *leaf_seq += 1;
+    let tag = Role::Lbl.tag();
+    for &src in sources {
+        plan.by_text_run.entry(src).or_insert((leaf_id, tag.clone()));
+    }
+    Some(StructNode::leaf(Role::Lbl, leaf_id))
 }
 
 /// Collect every run's source ordinals (the page's top-level text-run index

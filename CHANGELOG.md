@@ -9,15 +9,44 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.120.0] - 2026-07-05
+
+### Changed
+
+- **Office→PDF is now tagged (PDF/UA-shaped) by default.** `office_to_pdf` /
+  `office_to_pdf_with_fonts` emit a `/StructTreeRoot` + marked content over the
+  rendered baseline, so every DOCX/ODT/XLSX/PPTX/… conversion is accessible and
+  round-trips through the faithful tagged reconstruction (declared roles) instead
+  of re-deriving structure heuristically. Both historical blockers are now closed
+  (reading order in 0.119.0; nested-list markers below). Pass `tagged: false` to
+  `office_to_pdf_opts` for the raw untagged text-layer baseline.
+
+### Added
+
+- **List items carry their literal marker end-to-end** — new additive
+  `ListItem::label` (`Option<InlineRun>`). The geometric list recon captures the
+  *painted* marker glyph (`1.`, `a)`, `◦`) with its `source_index`; the tagger
+  binds it to a `/Lbl` structure element; the tag-tree reconstruction reads that
+  `/Lbl` back verbatim, so `to_text`/exporters emit the exact per-depth marker.
+  Additive + retro-compatible: `None` ⇒ the marker is regenerated semantically
+  (the pre-existing behaviour), and the field only serializes to JSON when set.
+
 ### Fixed
 
+- **Nested tagged lists keep their per-depth marker scheme.** The struct-tree
+  reconstruction previously flattened sub-levels — a level-2 `a)` (LowerAlpha)
+  read back as a list-wide `2.` (Decimal), and level-2+ bullets `◦`/`▪` collapsed
+  to `•` — because `/ListNumbering` cannot carry an arbitrary bullet glyph and the
+  reader voted a single list-wide scheme. Preserving the literal `/Lbl` per item
+  (above) makes a tagged `1. / a) / i.` (or `• / ◦ / ▪`) list round-trip exactly,
+  so tagged `to_text` matches the rendered glyphs.
 - Model→text (`to_text` on the struct-tree/model path) now honours the authored
-  ordinal list delimiter captured on `List::marker_suffix` (DOCX `%1)`, ODF
-  `style:num-suffix`) instead of always regenerating a period, so `a)` reads back
-  as `a)` rather than `a.`. One of several fidelity gaps on the road to making
-  Office→PDF tagged by default (the others — chiefly faithful **nested**-list
-  reconstruction from the struct tree, which currently flattens sub-levels and
-  their per-level marker styles — remain; see `tech_debt.md` #23).
+  ordinal delimiter on `List::marker_suffix` (DOCX `%1)`, ODF `style:num-suffix`)
+  instead of always regenerating a period, so `a)` reads back as `a)` rather than
+  `a.` (the label-less semantic path).
+
+2900 unit + integration tests, clippy clean. Closes the last blocker in
+`tech_debt.md` #23 (Office→PDF tagged by default).
 
 ## [0.119.0] - 2026-07-05
 

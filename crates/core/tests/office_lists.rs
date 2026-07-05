@@ -205,6 +205,7 @@ fn model_lists_render_markers_to_pdf() {
     fn item(text: &str, level: u8) -> ListItem {
         ListItem {
             level,
+            label: None,
             blocks: vec![Block {
                 kind: BlockKind::Paragraph(Paragraph {
                     runs: vec![Inline::Run(InlineRun {

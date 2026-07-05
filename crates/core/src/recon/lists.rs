@@ -693,6 +693,7 @@ pub fn build_list(
                 list.items.push(ListItem {
                     blocks: vec![paragraph_block(runs, line.rotation(), ids)],
                     level: 0,
+                    label: None,
                 });
             }
             // Marker line: open a new item at its nesting level.
@@ -708,9 +709,15 @@ pub fn build_list(
                         source_index: None,
                     }));
                 }
+                // Preserve the *literal* marker (`•`/`◦`/`a)`) plus its painted
+                // glyph ordinals, so the tagger can bind it to a `/Lbl` and the
+                // reconstruction reads the exact nested marker back instead of a
+                // flattened list-wide scheme.
+                let label = item_label(line, &runs);
                 list.items.push(ListItem {
                     blocks: vec![paragraph_block(runs, line.rotation(), ids)],
                     level: *level,
+                    label,
                 });
             }
         }
@@ -1118,6 +1125,51 @@ fn roman_value(label: &str) -> Option<u32> {
 }
 
 /// Strip the leading marker token (and the whitespace after it) from a line.
+/// The item's literal marker label — the painted marker token (`•`/`◦`/`1.`/`a)`)
+/// with the source ordinals of the glyph runs it occupies — so a tagged round-trip
+/// can bind it to a `/Lbl` and reconstruct the exact (per-depth) marker instead of
+/// a flattened list-wide scheme. `None` when the line carries no detectable marker.
+fn item_label(line: &ReconLine, body: &[Inline]) -> Option<InlineRun> {
+    let full = line.text();
+    let t = full.trim_start();
+    let marker = detect_marker(t)?;
+    let len: usize = match marker {
+        Marker::Bullet(c) => c.len_utf8(),
+        _ => t
+            .chars()
+            .take_while(|c| !c.is_whitespace())
+            .map(|c| c.len_utf8())
+            .sum(),
+    };
+    // The marker's painted glyph ordinals = the line's run sources the body runs
+    // did not claim (the body took every source of the item text; the leading
+    // marker glyphs are what remain).
+    let mut body_srcs: Vec<usize> = Vec::new();
+    collect_inline_sources(body, &mut body_srcs);
+    let marker_srcs: Vec<usize> = line
+        .runs
+        .iter()
+        .filter_map(|r| r.source_index)
+        .filter(|s| !body_srcs.contains(s))
+        .collect();
+    Some(InlineRun {
+        text: t[..len].to_string(),
+        style: line.runs.first().map(run_char_style).unwrap_or_default(),
+        source_index: (!marker_srcs.is_empty()).then_some(marker_srcs),
+    })
+}
+
+/// Accumulate the source ordinals of an inline run sequence into `out`.
+fn collect_inline_sources(runs: &[Inline], out: &mut Vec<usize>) {
+    for inline in runs {
+        if let Inline::Run(r) = inline {
+            if let Some(src) = &r.source_index {
+                out.extend(src.iter().copied());
+            }
+        }
+    }
+}
+
 fn strip_marker(text: &str) -> String {
     let t = text.trim_start();
     let Some(marker) = detect_marker(t) else {

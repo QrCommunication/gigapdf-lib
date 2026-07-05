@@ -901,6 +901,12 @@ impl Writer {
         self.key("blocks");
         self.block_array(&it.blocks);
         self.k_u64("level", it.level as u64);
+        // Additive: the literal marker label, only when preserved (keeps the
+        // JSON of a regenerated-marker list byte-for-byte unchanged).
+        if let Some(label) = &it.label {
+            self.key("label");
+            self.inline_run(label);
+        }
         self.obj_close();
     }
 
@@ -2379,6 +2385,7 @@ impl<'a> Reader<'a> {
             match k {
                 "blocks" => it.blocks = r.array(Reader::block)?,
                 "level" => it.level = r.u8()?,
+                "label" => it.label = Some(r.inline_run()?),
                 _ => return None,
             }
             Some(())
@@ -3167,10 +3174,12 @@ mod tests {
                         kind: BlockKind::Paragraph(Paragraph::default()),
                     }],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![],
                     level: 1,
+                    label: None,
                 },
             ],
             // Per-depth marker table + ordinal prefix (the "(" of "(a)") must

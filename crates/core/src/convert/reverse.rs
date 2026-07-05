@@ -1763,6 +1763,7 @@ mod tests {
         let item = |text: &str, level: u8| ListItem {
             blocks: vec![para_block(text)],
             level,
+            label: None,
         };
         // 1. top-A / 2. top-B / (nested) 1. child / 3. top-C — an explicit
         // decimal marker is honoured at every depth; the nested counter restarts.
@@ -1836,10 +1837,12 @@ mod tests {
                 ListItem {
                     blocks: vec![para_block("one")],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![para_block("two")],
                     level: 0,
+                    label: None,
                 },
             ],
 

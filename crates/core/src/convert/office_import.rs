@@ -164,13 +164,15 @@ fn render_geom_with_fonts(
 /// XLSX, else the ODF `mimetype` marker → ODT/ODS/ODP, else the OLE2 magic →
 /// legacy text extraction.
 ///
-/// **Default is untagged** — the raw styled baseline. Enable `tagged` via
-/// [`office_to_pdf_opts`] for accessible / faithful-round-trip output. (The
-/// tagged `to_text` reading-order gap that used to glue a heading onto the next
-/// paragraph is now fixed — see [`office_to_pdf_opts`] — but the default stays
-/// untagged pending the remaining tagged-`to_text` list-marker gap noted there.)
+/// **Default is tagged** (2026-07): the rendered baseline plus a logical
+/// `/StructTreeRoot` + marked content, so every Office→PDF conversion is
+/// accessible (PDF/UA-shaped roles) and round-trips faithfully. The two former
+/// blockers are closed — the reading-order heading/paragraph merge (a font-size
+/// tier break) and the nested-list marker flattening (`/Lbl` literal
+/// preservation); see [`office_to_pdf_opts`]. Pass `tagged: false` there for the
+/// raw styled baseline when a caller needs the un-tagged text layer.
 pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
-    office_to_pdf_opts(bytes, &[], false)
+    office_to_pdf_opts(bytes, &[], true)
 }
 
 /// Phase 2 of the two-phase font flow for [`office_to_pdf`]: render the container
@@ -186,7 +188,7 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
 /// is identical to [`office_to_pdf`] regardless of `host`. `None` for an
 /// unrecognized archive.
 pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<Vec<u8>> {
-    office_to_pdf_opts(bytes, host, false)
+    office_to_pdf_opts(bytes, host, true)
 }
 
 /// The shared core of the [`office_to_pdf`] family, with explicit control over
@@ -204,30 +206,28 @@ pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<V
 /// rendering-neutral (only balanced `BDC`/`EMC` are inserted); a document with no
 /// reconstructable structure ships the untagged baseline (never a regression).
 ///
-/// **Ordered lists round-trip faithfully** (fixed 2026-07): the tagged `/L`
-/// carries its `/ListNumbering` (see [`super::tagged`]), and the tag-tree
-/// reconstruction now reads real `/Lbl` labels (and inline markers) — so a
-/// numbered/lettered list keeps its number and format instead of collapsing to
-/// bullets on the round-trip.
+/// **Lists round-trip faithfully — including nested markers** (2026-07): each
+/// item's *literal* painted marker (`1.`, `a)`, `◦`) is emitted as a `/Lbl`
+/// structure element bound to its glyph (see [`super::tagged`]) and read back
+/// verbatim by the tag-tree reconstruction, so a multi-level list keeps its exact
+/// per-depth scheme (`1. / a) / i.`, `• / ◦ / ▪`) instead of collapsing to a
+/// single list-wide format on the round-trip.
 ///
-/// **Default is `false` (untagged).** Tagging changes what [`Document::to_text`]
-/// (and any struct-tree-aware consumer) reads — it flattens the tag tree instead
-/// of the raw text layer — so it is opt-in to keep the untagged text-layer
-/// contract the existing o2p callers rely on.
+/// **Default is `true` (tagged)** as of 2026-07 — both historical blockers are
+/// closed:
+///  * *Reading order* — a heading and the paragraph that followed it merging onto
+///    one line on the struct-tree path — fixed by a font-size tier break in
+///    [`crate::recon::paragraphs::split_paragraphs`] (see
+///    [`crate::recon::headings::is_heading_size`]): a heading-sized line abutting
+///    a body-sized one is its own block, so a tagged heading reads on its own line
+///    exactly like the raw layer.
+///  * *List markers* — the tagged `to_text` used to REGENERATE ordered markers
+///    from the semantic model (`a.` for an authored `a)`) and flatten nested
+///    depths; the `/Lbl` literal-preservation round-trip above closes this, so the
+///    tagged text layer now matches the rendered glyphs.
 ///
-/// The historical reading-order blocker — a heading and the paragraph that
-/// followed it merging onto one line on the struct-tree path (the heading losing
-/// its trailing break) — is **fixed (2026-07)** by a font-size tier break in
-/// [`crate::recon::paragraphs::split_paragraphs`] (see
-/// [`crate::recon::headings::is_heading_size`]): a heading-sized line abutting a
-/// body-sized one is now its own block, so a tagged heading reads on its own line
-/// exactly like the raw layer. **One gap still keeps the default untagged**: the
-/// tagged `to_text` REGENERATES ordered-list markers from the semantic model
-/// (`1.`, `a.`), so a list authored with a `)` delimiter (`a)`) reads back with
-/// `.` — unlike the raw layer, which preserves the rendered glyphs. Flipping the
-/// default is deferred until that marker-delimiter round-trip is closed and
-/// coordinated with the raw-text-layer consumers; enable `tagged` per call for
-/// accessible / faithful-round-trip output today.
+/// Pass `tagged: false` for the raw styled baseline (the un-tagged text layer)
+/// when a caller specifically needs it.
 pub fn office_to_pdf_opts(bytes: &[u8], host: &[ProvidedFont], tagged: bool) -> Option<Vec<u8>> {
     let pdf = office_render(bytes, host)?;
     Some(if tagged { tag_office_pdf(pdf) } else { pdf })
@@ -2320,6 +2320,7 @@ fn docx_paragraph_model(
                         ..Block::default()
                     }],
                     level: level.min(u8::MAX as u32) as u8,
+                    label: None,
                 }],
                 start: if ordered { ordinal } else { 1 },
                 marker_suffix,
@@ -5775,6 +5776,7 @@ fn pptx_group_paras_to_blocks(paras: Vec<PptxPara>) -> Vec<Block> {
                 let item = ListItem {
                     blocks: vec![p.block],
                     level: p.level,
+                    label: None,
                 };
                 match &mut cur {
                     // Extend the open list when the ordered-ness still matches; the
@@ -7239,6 +7241,7 @@ fn odf_walk_model(
                                                 ..Block::default()
                                             }],
                                             level: level.min(u8::MAX as u32) as u8,
+                                            label: None,
                                         }],
                                         start,
                                         marker_suffix,
@@ -30120,25 +30123,25 @@ mod tests {
     }
 
     #[test]
-    fn office_to_pdf_defaults_to_untagged() {
+    fn office_to_pdf_defaults_to_tagged() {
         let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
             <w:p><w:r><w:t>Plain body</w:t></w:r></w:p>
         </w:body></w:document>"#;
         let bytes = build_docx(doc, None, &[]);
-        // The public entry point (and the tagged=false opt-out) ship the untagged
-        // baseline — no structure tree — preserving the raw text-layer contract.
+        // The public entry point ships the tagged output (a `/StructTreeRoot`) by
+        // default — accessible + faithful round-trip.
         let plain = office_to_pdf(&bytes).expect("docx converts");
         assert!(
-            !String::from_utf8_lossy(&plain).contains("StructTreeRoot"),
-            "default o2p output is untagged"
+            String::from_utf8_lossy(&plain).contains("StructTreeRoot"),
+            "default o2p output is tagged"
         );
-        assert!(!String::from_utf8_lossy(
-            &office_to_pdf_opts(&bytes, &[], false).expect("docx converts")
-        )
-        .contains("StructTreeRoot"));
-        // Opting in adds the tree.
         assert!(String::from_utf8_lossy(
             &office_to_pdf_opts(&bytes, &[], true).expect("docx converts")
+        )
+        .contains("StructTreeRoot"));
+        // Opting out (tagged=false) ships the raw untagged baseline.
+        assert!(!String::from_utf8_lossy(
+            &office_to_pdf_opts(&bytes, &[], false).expect("docx converts")
         )
         .contains("StructTreeRoot"));
     }

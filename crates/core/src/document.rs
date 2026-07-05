@@ -632,10 +632,25 @@ fn push_list(list: &crate::model::List, indent: usize, out: &mut String) {
         // Stepping back out to a shallower level restarts the deeper counters.
         counters.truncate(depth + 1);
         counters[depth] += 1;
-        let marker = if list.ordered {
-            ordered_marker(list.marker, counters[depth], list.marker_suffix)
+        // A preserved *literal* marker (a tagged `/Lbl` round-trip, or a recon
+        // that kept the painted glyph) is emitted verbatim — the exact per-depth
+        // `1.`/`a)`/`◦` — taking precedence over any semantic regeneration.
+        // Otherwise: per-depth marker style when the model resolved one (a
+        // multi-level DOCX/ODF numbering keeps `1. / a) / i.` per depth), else
+        // the list-wide marker/suffix. `levels` is indexed by absolute
+        // `item.level`; the counter still advances so label-less siblings number
+        // correctly.
+        let level_style = list.levels.get(item.level as usize);
+        let marker = if let Some(label) = &item.label {
+            label.text.clone()
+        } else if list.ordered {
+            let (m, suffix) = level_style
+                .map(|lv| (lv.marker, lv.suffix))
+                .unwrap_or((list.marker, list.marker_suffix));
+            ordered_marker(m, counters[depth], suffix)
         } else {
-            unordered_marker(list.marker)
+            let m = level_style.map(|lv| lv.marker).unwrap_or(list.marker);
+            unordered_marker(m)
         };
         let pad = "  ".repeat(indent + depth);
         // The first paragraph/heading of the item sits on the marker line; any
@@ -39220,14 +39235,17 @@ mod tests {
                 ListItem {
                     blocks: vec![para_block("First")],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![para_block("Second")],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![para_block("Nested under second")],
                     level: 1,
+                    label: None,
                 },
             ],
 
@@ -39256,10 +39274,12 @@ mod tests {
                 ListItem {
                     blocks: vec![para_block("Apple")],
                     level: 0,
+                    label: None,
                 },
                 ListItem {
                     blocks: vec![para_block("Sub")],
                     level: 1,
+                    label: None,
                 },
             ],
 
@@ -39286,8 +39306,8 @@ mod tests {
             marker: ListMarker::LowerAlpha,
             marker_suffix: Some(')'),
             items: vec![
-                ListItem { blocks: vec![para_block("first")], level: 0 },
-                ListItem { blocks: vec![para_block("second")], level: 0 },
+                ListItem { blocks: vec![para_block("first")], level: 0, label: None },
+                ListItem { blocks: vec![para_block("second")], level: 0, label: None },
             ],
             ..Default::default()
         };
@@ -39303,7 +39323,7 @@ mod tests {
         let dot = List {
             ordered: true,
             marker: ListMarker::LowerAlpha,
-            items: vec![ListItem { blocks: vec![para_block("only")], level: 0 }],
+            items: vec![ListItem { blocks: vec![para_block("only")], level: 0, label: None }],
             ..Default::default()
         };
         let dot_text = text_from_model(&model_with_blocks(vec![Block {
