@@ -181,7 +181,17 @@ pub fn split_paragraphs<'a>(
             && (is_centered(cur, body_left, block_right(lines))
                 || is_centered(prev, body_left, block_right(lines)));
 
-        if big_gap || ceiling || disjoint || indent || align_break {
+        // Font-size tier crossing: a heading-sized line abutting a body-sized one
+        // (a heading and the paragraph it introduces) is two blocks even when the
+        // gap is regular — otherwise the whole thing coalesces into one block that
+        // heading promotion then stamps as a single heading, gluing the body onto
+        // the title. Mirrors [`headings::is_heading_size`] so the boundary lands
+        // exactly where a heading is later detected. Size only — never bold — so a
+        // bold phrase inside a body paragraph cannot split it line by line.
+        let size_tier_break = crate::recon::headings::is_heading_size(line_font_size(prev), body)
+            != crate::recon::headings::is_heading_size(line_font_size(cur), body);
+
+        if big_gap || ceiling || disjoint || indent || align_break || size_tier_break {
             paras.push(vec![cur]);
         } else {
             paras.last_mut().unwrap().push(cur);

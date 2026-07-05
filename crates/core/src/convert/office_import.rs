@@ -163,8 +163,15 @@ fn render_geom_with_fonts(
 /// `word/document.xml`→DOCX, `ppt/presentation.xml`→PPTX, `xl/workbook.xml`→
 /// XLSX, else the ODF `mimetype` marker → ODT/ODS/ODP, else the OLE2 magic →
 /// legacy text extraction.
+///
+/// **Output is a Tagged (accessible / PDF-UA-ready) PDF by default** (since
+/// 2026-07, once the tagged `to_text` reading-order gap was closed — see
+/// [`office_to_pdf_opts`]). A document with no reconstructable structure, or one
+/// where tagging fails, gracefully ships the untagged baseline (never a
+/// regression). Pass `tagged: false` via [`office_to_pdf_opts`] to force the raw
+/// untagged baseline.
 pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
-    office_to_pdf_opts(bytes, &[], false)
+    office_to_pdf_opts(bytes, &[], true)
 }
 
 /// Phase 2 of the two-phase font flow for [`office_to_pdf`]: render the container
@@ -180,7 +187,7 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
 /// is identical to [`office_to_pdf`] regardless of `host`. `None` for an
 /// unrecognized archive.
 pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<Vec<u8>> {
-    office_to_pdf_opts(bytes, host, false)
+    office_to_pdf_opts(bytes, host, true)
 }
 
 /// The shared core of the [`office_to_pdf`] family, with explicit control over
@@ -204,16 +211,17 @@ pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<V
 /// numbered/lettered list keeps its number and format instead of collapsing to
 /// bullets on the round-trip.
 ///
-/// **Default is `false` (untagged).** Tagging changes what [`Document::to_text`]
-/// (and any struct-tree-aware consumer) reads — it flattens the tag tree instead
-/// of the raw text layer — so it is opt-in to keep the untagged text-layer contract
-/// the existing o2p callers rely on. The remaining blocker to a tagged default is
-/// **not** lists but `to_text` reading order: on the struct-tree path a heading
-/// and the paragraph that follows it merge onto one line (the heading loses its
-/// trailing break), unlike the clean per-line raw layer. Flipping the default is
-/// therefore deferred until that reading-order gap is closed and coordinated with
-/// the raw-text-layer consumers; enable `tagged` per call for accessible /
-/// faithful-round-trip output today.
+/// **The [`office_to_pdf`] family now defaults to `tagged: true`** (accessible /
+/// PDF-UA-ready). Tagging changes what [`Document::to_text`] (and any struct-tree
+/// -aware consumer) reads — it flattens the tag tree instead of the raw text
+/// layer. The former blocker to this default was a `to_text` reading-order gap on
+/// the struct-tree path — a heading and the paragraph that followed it merged
+/// onto one line (the heading lost its trailing break) — **fixed 2026-07** by a
+/// font-size tier break in [`crate::recon::paragraphs::split_paragraphs`] (see
+/// [`crate::recon::headings::is_heading_size`]): a heading-sized line abutting a
+/// body-sized one is now its own block, so the tagged text layer reads per-line
+/// exactly like the raw one. Pass `tagged: false` for the raw untagged baseline
+/// (the same bytes a non-tagging renderer would emit).
 pub fn office_to_pdf_opts(bytes: &[u8], host: &[ProvidedFont], tagged: bool) -> Option<Vec<u8>> {
     let pdf = office_render(bytes, host)?;
     Some(if tagged { tag_office_pdf(pdf) } else { pdf })
@@ -30013,6 +30021,52 @@ mod tests {
         );
     }
 
+    /// Reading-order regression (deferred #23, fixed 2026-07-05): on the
+    /// **tagged** struct-tree path a heading used to merge onto one line with the
+    /// paragraph that follows it — the geometric recon coalesced the larger
+    /// heading line and the body line into a single block that heading promotion
+    /// then stamped as one heading. `split_paragraphs` now breaks on a font-size
+    /// **tier** crossing (heading-sized ↔ body-sized), so the heading is its own
+    /// block and `to_text` keeps the trailing break, matching the untagged layer.
+    #[test]
+    fn tagged_heading_does_not_merge_with_following_paragraph() {
+        let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+            <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Tagged Heading</w:t></w:r></w:p>
+            <w:p><w:r><w:t>A tagged body paragraph with enough text to reconstruct.</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let tagged = office_to_pdf_opts(&bytes, &[], true).expect("docx converts");
+
+        // to_text on the tagged path keeps the heading on its own line — it must
+        // NOT be glued to the body ("Tagged Heading A tagged body…").
+        let text = opens(&tagged).to_text();
+        assert!(
+            text.contains("Tagged Heading\n"),
+            "heading keeps its trailing break on the tagged path, got: {text:?}"
+        );
+        assert!(
+            !text.contains("Tagged Heading A tagged"),
+            "heading must not merge with the following paragraph, got: {text:?}"
+        );
+
+        // The struct-tree reconstruction yields two distinct blocks (Heading then
+        // Paragraph), not one merged heading.
+        let out = opens(&tagged);
+        let mut ids = crate::recon::IdGen::default();
+        let blocks = crate::recon::tag_tree::reconstruct_from_struct_tree(&out, &mut ids)
+            .expect("tagged reconstruction path is elected");
+        let heads = blocks
+            .iter()
+            .filter(|b| matches!(b.kind, crate::model::BlockKind::Heading(_)))
+            .count();
+        let paras = blocks
+            .iter()
+            .filter(|b| matches!(b.kind, crate::model::BlockKind::Paragraph(_)))
+            .count();
+        assert_eq!(heads, 1, "exactly one heading block, got blocks: {}", blocks.len());
+        assert_eq!(paras, 1, "the body paragraph is its own block, got blocks: {}", blocks.len());
+    }
+
     /// A numbered DOCX list → tagged o2p PDF → tag-tree reconstruction must keep
     /// the list **ordered** (deferred item a). The `/L` now carries a
     /// `/ListNumbering /Decimal` attribute, so the round-trip recovers the
@@ -30060,23 +30114,24 @@ mod tests {
     }
 
     #[test]
-    fn office_to_pdf_defaults_to_untagged() {
+    fn office_to_pdf_defaults_to_tagged() {
         let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
             <w:p><w:r><w:t>Plain body</w:t></w:r></w:p>
         </w:body></w:document>"#;
         let bytes = build_docx(doc, None, &[]);
-        // The public entry point (and the tagged=false opt-out) ship the untagged
-        // baseline — no structure tree — preserving the raw text-layer contract.
-        let plain = office_to_pdf(&bytes).expect("docx converts");
+        // The public entry point now ships an accessible Tagged PDF by default
+        // (the reading-order blocker was fixed 2026-07).
+        let default = office_to_pdf(&bytes).expect("docx converts");
         assert!(
-            !String::from_utf8_lossy(&plain).contains("StructTreeRoot"),
-            "default o2p output is untagged"
+            String::from_utf8_lossy(&default).contains("StructTreeRoot"),
+            "default o2p output is now tagged (accessible)"
         );
+        // The explicit tagged=false opt-out still ships the raw untagged baseline.
         assert!(!String::from_utf8_lossy(
             &office_to_pdf_opts(&bytes, &[], false).expect("docx converts")
         )
-        .contains("StructTreeRoot"));
-        // Opting in adds the tree.
+        .contains("StructTreeRoot"), "tagged=false forces the untagged baseline");
+        // And opting in explicitly matches the default.
         assert!(String::from_utf8_lossy(
             &office_to_pdf_opts(&bytes, &[], true).expect("docx converts")
         )

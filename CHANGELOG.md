@@ -9,6 +9,32 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.119.0] - 2026-07-05
+
+### Changed
+
+- **`office_to_pdf` now emits a Tagged (accessible / PDF-UA-ready) PDF by
+  default.** The `office_to_pdf` / `office_to_pdf_with_fonts` entry points (and
+  the SDK `officeToPdf` / `officeToPdfWith`) previously shipped the untagged
+  baseline; they now lay a logical `/StructTreeRoot` + marked content over the
+  render so Office→PDF output is accessible out of the box. A document with no
+  reconstructable structure, or one where tagging fails, still ships the untagged
+  baseline (never a regression). Pass `tagged: false` to `office_to_pdf_opts` for
+  the raw untagged bytes.
+
+### Fixed
+
+- **Tagged `to_text` reading order — a heading no longer merges with the
+  paragraph that follows it.** On the struct-tree path the geometric recon
+  coalesced a heading line and the body line beneath it into one block that
+  heading promotion then stamped as a single heading, gluing the body text onto
+  the title (`"Title body…"` on one line). `split_paragraphs` now breaks on a
+  font-size **tier** crossing (heading-sized ↔ body-sized, mirroring
+  `headings::is_heading_size`), so the heading is its own block and the tagged
+  text layer reads per-line exactly like the untagged one. This closed the last
+  blocker to the tagged-by-default change above. Size signal only — a bold phrase
+  inside a body paragraph never splits it. 2882 tests, clippy clean.
+
 ## [0.118.0] - 2026-07-05
 
 Closes the fidelity items deferred from 0.117.0 — all seven now implemented.

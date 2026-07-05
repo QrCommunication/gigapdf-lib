@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.119.0] - 2026-07-05
+
+### Changed
+
+- `officeToPdf` / `officeToPdfWith` now produce a **Tagged (accessible /
+  PDF-UA-ready) PDF by default** — a logical structure tree + marked content laid
+  over the render. Documents with no reconstructable structure still ship the
+  untagged baseline.
+
+### Fixed
+
+- Tagged text extraction reading order: a heading no longer merges onto one line
+  with the paragraph that follows it (the engine now splits blocks on a
+  heading↔body font-size tier crossing), so `toText()` on a tagged Office→PDF
+  document reads per-line correctly.
+
 ## [0.118.0] - 2026-07-05
 
 Closes the seven fidelity items deferred from 0.117.0 (see the root

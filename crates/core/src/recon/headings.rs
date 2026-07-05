@@ -211,6 +211,18 @@ fn is_candidate_size(size: f64, bold: bool, body: f64) -> bool {
     big || bold_subhead
 }
 
+/// A line's font `size` is in the **heading size tier** (≥ body × [`HEADING_RATIO`]).
+///
+/// Shared with paragraph splitting ([`crate::recon::paragraphs::split_paragraphs`])
+/// so a size-tier crossing — a heading-sized line abutting a body-sized one —
+/// is a block boundary exactly where [`promote`] would later see a heading.
+/// This is the SIZE signal only, deliberately NOT the bold-subhead one: a bold
+/// *phrase* on one line of a body paragraph must not shatter that paragraph line
+/// by line, whereas a genuinely larger heading run does start a new block.
+pub(crate) fn is_heading_size(size: f64, body: f64) -> bool {
+    size >= body * HEADING_RATIO
+}
+
 /// Clamp a 1-based rank to the `1..=MAX_LEVEL` range.
 fn clamp_level(rank: usize) -> u8 {
     rank.clamp(1, MAX_LEVEL as usize) as u8
