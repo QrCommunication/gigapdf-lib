@@ -8964,32 +8964,56 @@ impl Document {
     /// and restyled, not only re-placed. Every `to_*` Office/web exporter now
     /// flows through this single reconstruction.
     ///
+    /// **Fidelity-first: always the geometric pipeline** (lines → columns →
+    /// paragraphs → headings → lists → tables), even on a tagged document. The
+    /// tag-tree blocks carry declared roles but no frames, no per-run styles,
+    /// no `source_index`, no table metrics and no vector decor — letting them
+    /// replace the geometric blocks here is what gutted every PDF→Office
+    /// export of a tagged PDF down to bare prose (2026-07-06 incident; see
+    /// `tests/tagged_export_fidelity.rs`). The `/StructTreeRoot`, when present,
+    /// keeps informing **text extraction** — [`to_text`](Self::to_text) reads
+    /// via [`reconstruct_model_opts`](Self::reconstruct_model_opts)`(true)`
+    /// for the author's reading order and literal list `/Lbl` markers.
+    ///
     /// One [`Section`](crate::model::Section) is emitted per run of consecutive
     /// pages that share a MediaBox geometry; each PDF page becomes one
-    /// [`Page`](crate::model::Page). When the catalog carries a `/StructTreeRoot`
-    /// the author's tags are trusted (see [`recon::tag_tree`](crate::recon::tag_tree));
-    /// otherwise the geometric heuristic pipeline runs (lines → columns →
-    /// paragraphs → headings → lists → tables).
+    /// [`Page`](crate::model::Page).
     pub fn reconstruct_model(&self) -> crate::model::Document {
+        self.reconstruct_model_opts(false)
+    }
+
+    /// [`reconstruct_model`](Self::reconstruct_model) with an explicit source
+    /// preference. `prefer_tags = true` trusts the catalog's `/StructTreeRoot`
+    /// (see [`recon::tag_tree`](crate::recon::tag_tree)) for every page it
+    /// marks: the author's declared reading order, roles and literal list
+    /// labels — the [`to_text`](Self::to_text) contract. `false` (the
+    /// [`reconstruct_model`](Self::reconstruct_model) default) runs the
+    /// geometric pipeline everywhere: full visual fidelity (frames, per-run
+    /// styles, images, table metrics, editable `source_index`) — the exporters'
+    /// and editor's contract. An untagged document behaves identically either
+    /// way.
+    pub(crate) fn reconstruct_model_opts(&self, prefer_tags: bool) -> crate::model::Document {
         use crate::model::{geom::PageGeometry, DocMeta, Page, Section};
         use crate::recon::{self, IdGen};
 
         let mut ids = IdGen::default();
-        // A tagged document is reconstructed once, from the `/StructTreeRoot`, then
-        // its blocks are split back onto pages by the page each block was bound to
-        // (its `/Pg`, resolved to a 0-based page index by the paged walker). Blocks
-        // whose page is unknown (`None` — grouping elements often omit `/Pg`) land
-        // on the first page. A **marked** page draws only from this distribution
-        // (an empty list when the structure references none of its content), so
-        // the heuristic path never double-emits the same prose. But the tagging
-        // decision is **per page**: a page carrying no marked content at all (a
-        // *partially* tagged document — some pages with MCIDs, others plain) was
-        // never described by the author's tags, so that page runs the full
-        // heuristic pipeline instead of coming out silently empty. The heuristic
-        // path also runs for every page when the document carries no usable tag
-        // tree (`tagged` is `None`).
-        let mut tagged = recon::tag_tree::reconstruct_struct_tree_pages(self, &mut ids).map(
-            |paged| {
+        // When the caller prefers tags, a tagged document is reconstructed once,
+        // from the `/StructTreeRoot`, then its blocks are split back onto pages
+        // by the page each block was bound to (its `/Pg`, resolved to a 0-based
+        // page index by the paged walker). Blocks whose page is unknown (`None`
+        // — grouping elements often omit `/Pg`) land on the first page. A
+        // **marked** page draws only from this distribution (an empty list when
+        // the structure references none of its content), so the heuristic path
+        // never double-emits the same prose. But the tagging decision is **per
+        // page**: a page carrying no marked content at all (a *partially* tagged
+        // document — some pages with MCIDs, others plain) was never described by
+        // the author's tags, so that page runs the full heuristic pipeline
+        // instead of coming out silently empty. The heuristic path also runs for
+        // every page when the document carries no usable tag tree (`tagged` is
+        // `None`) — and for EVERY page when `prefer_tags` is off (the
+        // fidelity-first default).
+        let mut tagged = if prefer_tags {
+            recon::tag_tree::reconstruct_struct_tree_pages(self, &mut ids).map(|paged| {
                 let mut by_page: std::collections::BTreeMap<usize, Vec<crate::model::Block>> =
                     std::collections::BTreeMap::new();
                 for (page, block) in paged.blocks {
@@ -8998,8 +9022,10 @@ impl Document {
                     by_page.entry(page.unwrap_or(0)).or_default().push(block);
                 }
                 (by_page, paged.marked_pages)
-            },
-        );
+            })
+        } else {
+            None
+        };
         let is_tagged = tagged.is_some();
 
         let page_count = self.page_count() as u32;
@@ -11114,7 +11140,11 @@ impl Document {
     /// one-word-per-line jumble. Both paths are font-aware (zero tofu).
     pub fn to_text(&self) -> String {
         if self.has_semantic_structure() {
-            return text_from_model(&self.reconstruct_model());
+            // Tag-preferring reconstruction: the author's declared reading
+            // order and literal list `/Lbl` markers drive text extraction.
+            // (The exporters go through the fidelity-first `reconstruct_model`
+            // instead — see `reconstruct_model_opts`.)
+            return text_from_model(&self.reconstruct_model_opts(true));
         }
         let mut out = String::new();
         for page in 1..=self.page_count() as u32 {
@@ -32251,7 +32281,10 @@ mod tests {
         let doc = Document::open(&pdf).expect("valid tagged PDF");
         assert!(doc.has_semantic_structure(), "fixture must be tagged");
 
-        let model = doc.reconstruct_model();
+        // Tag-preferring variant: these tests pin the TAG-TREE reconstruction
+        // (the `to_text` path) — `reconstruct_model()` itself is now
+        // fidelity-first (always geometric; see `reconstruct_model_opts`).
+        let model = doc.reconstruct_model_opts(true);
         let image = model
             .sections
             .iter()
@@ -32439,7 +32472,10 @@ mod tests {
         let doc = Document::open(&pdf).expect("valid tagged PDF");
         assert!(doc.has_semantic_structure(), "fixture must be tagged");
 
-        let model = doc.reconstruct_model();
+        // Tag-preferring variant: these tests pin the TAG-TREE reconstruction
+        // (the `to_text` path) — `reconstruct_model()` itself is now
+        // fidelity-first (always geometric; see `reconstruct_model_opts`).
+        let model = doc.reconstruct_model_opts(true);
         let pages: Vec<&crate::model::Page> =
             model.sections.iter().flat_map(|s| s.pages.iter()).collect();
         assert_eq!(pages.len(), 2, "two model pages");
@@ -32562,7 +32598,10 @@ mod tests {
         let doc = Document::open(&pdf).expect("valid partially tagged PDF");
         assert!(doc.has_semantic_structure(), "fixture must be tagged");
 
-        let model = doc.reconstruct_model();
+        // Tag-preferring variant: these tests pin the TAG-TREE reconstruction
+        // (the `to_text` path) — `reconstruct_model()` itself is now
+        // fidelity-first (always geometric; see `reconstruct_model_opts`).
+        let model = doc.reconstruct_model_opts(true);
         let pages: Vec<&crate::model::Page> =
             model.sections.iter().flat_map(|s| s.pages.iter()).collect();
         assert_eq!(pages.len(), 2, "two model pages");
@@ -32623,7 +32662,10 @@ mod tests {
         let doc = Document::open(&pdf).expect("valid tagged PDF");
         assert!(doc.has_semantic_structure(), "fixture must be tagged");
 
-        let model = doc.reconstruct_model();
+        // Tag-preferring variant: these tests pin the TAG-TREE reconstruction
+        // (the `to_text` path) — `reconstruct_model()` itself is now
+        // fidelity-first (always geometric; see `reconstruct_model_opts`).
+        let model = doc.reconstruct_model_opts(true);
         let heading = model
             .sections
             .iter()
@@ -32882,7 +32924,10 @@ mod tests {
         let doc = Document::open(&tagged_bbox_fixture(90)).expect("valid tagged PDF");
         assert!(doc.has_semantic_structure(), "fixture must be tagged");
 
-        let model = doc.reconstruct_model();
+        // Tag-preferring variant: these tests pin the TAG-TREE reconstruction
+        // (the `to_text` path) — `reconstruct_model()` itself is now
+        // fidelity-first (always geometric; see `reconstruct_model_opts`).
+        let model = doc.reconstruct_model_opts(true);
 
         // The displayed page swaps to landscape (400×800 → 800×400).
         let geo = model.sections[0].geometry.clone();
@@ -32932,7 +32977,10 @@ mod tests {
         let doc = Document::open(&tagged_bbox_fixture(0)).expect("valid tagged PDF");
         assert!(doc.has_semantic_structure(), "fixture must be tagged");
 
-        let model = doc.reconstruct_model();
+        // Tag-preferring variant: these tests pin the TAG-TREE reconstruction
+        // (the `to_text` path) — `reconstruct_model()` itself is now
+        // fidelity-first (always geometric; see `reconstruct_model_opts`).
+        let model = doc.reconstruct_model_opts(true);
         // No swap: the displayed page equals the MediaBox.
         let geo = model.sections[0].geometry.clone();
         assert!(

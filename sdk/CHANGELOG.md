@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.120.1] - 2026-07-06
+
+### Fixed
+
+- **Exporting a tagged PDF to Office/web formats no longer loses formatting,
+  images and layout.** With 0.120.0's tagged-by-default conversions, every
+  `toDocx()` / `toOdt()` / `toXlsx()` / `toPptx()` / `reconstructModel()` of a
+  converted document collapsed to bare text (fused runs, bleeding colors, no
+  images, zero table metrics). The reconstruction behind the exporters is now
+  fidelity-first (always geometric); the tag tree still drives `toText()`'s
+  reading order and literal nested-list markers, unchanged.
+
 ## [0.120.0] - 2026-07-05
 
 ### Changed

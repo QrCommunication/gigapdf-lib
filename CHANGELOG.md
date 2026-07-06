@@ -9,6 +9,30 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.120.1] - 2026-07-06
+
+### Fixed
+
+- **PDF→Office/web exports of a tagged PDF no longer collapse to bare text.**
+  0.120.0 made Office→PDF tagged by default, which exposed a fidelity trap:
+  `reconstruct_model` — the single reconstruction every `to_docx`/`to_odt`/
+  `to_xlsx`/`to_pptx`/HTML/Markdown/RTF exporter flows through — trusted the
+  `/StructTreeRoot` whenever present and let the tag-tree block list
+  **short-circuit the geometric pipeline**. Tag-tree blocks carry declared
+  roles but no frames, no per-run styles (one fused run whose single style
+  bled over the whole paragraph), no `source_index`, no table `col_widths`
+  and no placed-image frames — so exporting any converted (or Word-authored
+  tagged) PDF lost formatting, images and layout, keeping only prose.
+  `reconstruct_model` is now **fidelity-first: always the geometric
+  pipeline**; the tag tree keeps driving **text extraction only** (`to_text`
+  still reads the author's declared reading order and literal list `/Lbl`
+  markers via the new tag-preferring `reconstruct_model_opts(true)` variant —
+  the 0.119.0/0.120.0 reading-order and nested-marker guarantees are
+  untouched, `office_lists` stays green). Pinned by
+  `tests/tagged_export_fidelity.rs` (untagged/tagged twins must reconstruct
+  identically rich: resolved+framed images, per-run colors without bleed,
+  geometric table metrics, framed text blocks, editable `source_index`).
+
 ## [0.120.0] - 2026-07-05
 
 ### Changed
