@@ -49,6 +49,14 @@ pub(crate) struct ParaContext<'a> {
     /// left margin relative to this, so a host re-lays the paragraph in the same
     /// horizontal position.
     pub page_left: f64,
+    /// The PAGE's text-zone bounds (min line-left / max line-right across every
+    /// text line of the page, points). Unlike [`group_left`](Self::group_left)
+    /// (the local prose run), these anchor the **page-position** alignment
+    /// fallback: an isolated one-liner (title, date, signature) forms its own
+    /// group, so only the page-wide zone can reveal that it is centred or
+    /// right-hugging. `content_right <= content_left` ⇒ unknown (fallback off).
+    pub content_left: f64,
+    pub content_right: f64,
     /// Bottom edge (PDF user-space `y`, lower = further down) of the previous
     /// emitted paragraph in this group, or `None` for the first. Drives
     /// `space_before_pt` from the inter-paragraph gap.
@@ -379,6 +387,61 @@ pub(crate) fn build_paragraph_styled(
 /// Assemble the [`ParagraphStyle`] for a paragraph from its geometry and the
 /// surrounding [`ParaContext`]. `y`/`h` are the paragraph's union box bottom and
 /// height in PDF user space (`top = y + h`).
+/// This paragraph's own font size: the character-weighted median of its lines'
+/// sizes (each line already medians its runs). The line-height ratio must be
+/// taken against the type the paragraph is actually set in — a small-print
+/// letterhead paragraph measured against the document body size would report
+/// an inflated multiple.
+fn paragraph_font_size(para: &[&ReconLine]) -> f64 {
+    let mut sizes: Vec<f64> = para.iter().map(|l| line_font_size(l)).collect();
+    median(&mut sizes, 12.0)
+}
+
+/// The paragraph's own baseline step: the median |Δ center_y| of consecutive
+/// lines. `0.0` for a single-line paragraph (no measurable step).
+fn intra_paragraph_leading(para: &[&ReconLine]) -> f64 {
+    let mut steps: Vec<f64> = para
+        .windows(2)
+        .map(|w| (w[0].center_y() - w[1].center_y()).abs())
+        .filter(|s| *s > 0.1)
+        .collect();
+    median(&mut steps, 0.0)
+}
+
+/// Page-position alignment fallback for a block whose internal line shape is
+/// silent: `Some(Center)` when the block's midpoint sits on the page text
+/// zone's midpoint with clear space on BOTH sides, `Some(Right)` when it hugs
+/// the zone's right edge with clear space on the left. `None` ⇒ no positional
+/// signal (plain left prose, unknown zone, or a near-full-measure block).
+fn page_position_align(para: &[&ReconLine], ctx: &ParaContext, body: f64) -> Option<Align> {
+    let (cl, cr) = (ctx.content_left, ctx.content_right);
+    if !(cr - cl).is_finite() || cr - cl < body * 4.0 {
+        return None;
+    }
+    let p_left = para.iter().map(|l| l.left()).fold(f64::INFINITY, f64::min);
+    let p_right = para
+        .iter()
+        .map(|l| l.right())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !p_left.is_finite() || !p_right.is_finite() || p_right <= p_left {
+        return None;
+    }
+    let tol = (body * 0.6).max(6.0);
+    let left_gap = p_left - cl;
+    let right_gap = cr - p_right;
+    let mid = (p_left + p_right) / 2.0;
+    let zone_mid = (cl + cr) / 2.0;
+    // Centred: midpoints agree AND the block floats clear of both edges.
+    if (mid - zone_mid).abs() <= tol && left_gap > tol * 2.0 && right_gap > tol * 2.0 {
+        return Some(Align::Center);
+    }
+    // Right-hugging: flush on the zone's right, clearly away from its left.
+    if right_gap <= tol && left_gap > tol * 4.0 {
+        return Some(Align::Right);
+    }
+    None
+}
+
 fn paragraph_style(
     para: &[&ReconLine],
     ctx: &ParaContext,
@@ -391,14 +454,20 @@ fn paragraph_style(
     let _ = right;
     let body = ctx.body.max(1.0);
 
-    // Line height: only meaningful for multi-line paragraphs whose leading is
-    // known and visibly different from single spacing. Encode as a multiple of
-    // the body size so the figure is resolution-independent.
-    let line_height = if para.len() >= 2 && ctx.leading > 0.0 {
-        let mult = ctx.leading / body;
+    // Line height: only meaningful for multi-line paragraphs. Measured from
+    // THIS paragraph's own baseline steps against ITS OWN font size — never
+    // from the page/group leading over the document body size: on a sparse
+    // page (a letter of isolated paragraphs) the page-wide "leading" is really
+    // the inter-paragraph gap, and dividing it by a body size biased small by
+    // a letterhead used to annotate 3×+ line spacing that exploded the export
+    // (`w:line="737"`). Implausible ratios stay `Normal` rather than lying.
+    let line_height = if para.len() >= 2 {
+        let own_size = paragraph_font_size(para).max(1.0);
+        let step = intra_paragraph_leading(para);
+        let mult = step / own_size;
         // Round-trip-friendly: leave Normal when it's within 3% of 1.0× (the
         // font's own single spacing) to avoid spurious 1.00× annotations.
-        if (mult - 1.0).abs() > 0.03 {
+        if step > 0.0 && (0.7..=2.5).contains(&mult) && (mult - 1.0).abs() > 0.03 {
             LineHeight::Multiple(round2(mult))
         } else {
             LineHeight::Normal
@@ -421,7 +490,25 @@ fn paragraph_style(
     let (first_line_pt, block_left) = match hang {
         Some(cont_left) => (round2(-(cont_left - opener_left)), cont_left),
         None => {
-            let indent = opener_left - ctx.group_left;
+            // A first-line indent is the opener jutting past the paragraph's
+            // OWN continuation lines. Measuring against the group left is a
+            // trap on a page-wide group: a block simply POSITIONED right of
+            // the page's prose (a letterhead beside a logo) is not
+            // first-line-indented — `indent_left_pt` already carries the
+            // position, and doubling it as `w:firstLine` used to shift the
+            // opener twice in the export. A single-line paragraph has no
+            // continuation to jut past ⇒ never a first-line indent.
+            let cont_left = para
+                .get(1..)
+                .unwrap_or(&[])
+                .iter()
+                .map(|l| l.left())
+                .fold(f64::INFINITY, f64::min);
+            let indent = if cont_left.is_finite() {
+                opener_left - cont_left
+            } else {
+                0.0
+            };
             let first = if indent > threshold {
                 round2(indent)
             } else {
@@ -452,6 +539,28 @@ fn paragraph_style(
         align
     };
 
+    // Page-position fallback: a block whose INTERNAL shape says nothing (the
+    // classifier defaults to Left — typically an isolated one-liner that forms
+    // its own group: a title, a date line, a signature) is re-read against the
+    // PAGE's text zone. Centred within it ⇒ `Center`; hugging its right edge
+    // with clear space on the left ⇒ `Right`. Word then re-lays it by intent
+    // (`w:jc`) instead of a brittle absolute indent.
+    let align = if align == Align::Left && hang.is_none() {
+        page_position_align(para, ctx, body).unwrap_or(align)
+    } else {
+        align
+    };
+
+    // An alignment-positioned block carries NO indentation: `w:jc` alone
+    // reproduces the position, and a leftover left/first-line indent would
+    // shift the centring/right-hug inside the exporters.
+    let (first_line_pt, indent_left_pt) =
+        if hang.is_none() && matches!(align, Align::Center | Align::Right) {
+            (0.0, 0.0)
+        } else {
+            (first_line_pt, indent_left_pt)
+        };
+
     // Space-before: the inter-paragraph gap beyond a normal single line step.
     // `prev_bottom` and our `top` are PDF user-space Y (larger = higher), so the
     // visual gap is `prev_bottom - top`; subtract one line of leading (the step
@@ -469,21 +578,15 @@ fn paragraph_style(
         _ => 0.0,
     };
 
-    // Space-after: the mirror figure, from this paragraph's bottom to the next
-    // paragraph's top (`ctx.next_top`). Note the recovered geometry is reported
-    // on BOTH sides of a gap (the next paragraph sees the same gap as its
-    // `space_before_pt`) — attribution is the exporters' concern.
-    let space_after_pt = match ctx.next_top {
-        Some(next_top) if ctx.leading > 0.0 => {
-            let gap = y - next_top - (ctx.leading - body).max(0.0);
-            if gap > body * 0.25 {
-                round2(gap)
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
-    };
+    // Space-after stays 0: each inter-paragraph gap is attributed ONCE, to the
+    // LOWER paragraph's `space_before_pt`. It used to be mirrored onto the
+    // upper paragraph's `space_after_pt` too ("attribution is the exporters'
+    // concern") — but Word ADDS `w:before` + `w:after`, so every exported gap
+    // doubled (a letter's big pre-footer gap pushed the footer onto a phantom
+    // second page). Single-sided attribution renders once everywhere: the
+    // model renderer and every Office/web exporter sum both sides.
+    let space_after_pt = 0.0;
+    let _ = ctx.next_top;
 
     ParagraphStyle {
         align,
@@ -2176,13 +2279,103 @@ mod tests {
         assert_eq!(paras.len(), 2, "no third line to confirm a hanging shape");
     }
 
-    // ── V3c fix 3: space_after from the gap to the next paragraph ────────────
+    // ── Page-position alignment for isolated blocks ──────────────────────────
+
+    /// A block whose internal shape is silent (an isolated one-liner) is read
+    /// against the PAGE text zone: centred ⇒ `Center`, hugging the zone's
+    /// right edge ⇒ `Right` — both with ZERO indents (`w:jc` alone carries the
+    /// position). Plain left prose stays `Left`.
+    #[test]
+    fn page_position_alignment_for_isolated_one_liners() {
+        let zone = |group_left: f64| ParaContext {
+            body: 12.0,
+            leading: 14.0,
+            group_left,
+            page_left: 0.0,
+            content_left: 72.0,
+            content_right: 523.0,
+            prev_bottom: None,
+            next_top: None,
+            links: &[],
+            ..Default::default()
+        };
+        let mut ids = IdGen::default();
+        let style_of = |runs: &[ReconRun], ctx: &ParaContext| {
+            let lines = lines_of(runs);
+            let refs: Vec<&ReconLine> = lines.iter().collect();
+            let block = build_paragraph_styled(&refs, ctx, &mut IdGen::default(), Rect::new);
+            match block.kind {
+                BlockKind::Paragraph(p) => p.style,
+                other => panic!("expected paragraph, got {other:?}"),
+            }
+        };
+        let _ = &mut ids;
+
+        // Centred title: mid 297.5 ≈ zone mid 297.5, clear of both edges.
+        let title = vec![run("ATTESTATION", 240.0, 600.0, 115.0)];
+        let st = style_of(&title, &zone(240.0));
+        assert_eq!(st.align, Align::Center, "centred one-liner");
+        assert_eq!(st.indent_left_pt, 0.0, "no indent under w:jc=center");
+        assert_eq!(st.first_line_pt, 0.0);
+
+        // Right-hugging date: right edge 523 == zone right.
+        let date = vec![run("Les Lilas, le 26/10", 396.0, 560.0, 127.0)];
+        let st = style_of(&date, &zone(396.0));
+        assert_eq!(st.align, Align::Right, "right-hugging one-liner");
+        assert_eq!(st.indent_left_pt, 0.0, "no indent under w:jc=right");
+
+        // Plain left prose is untouched.
+        let prose = vec![run("gauche ordinaire", 72.0, 520.0, 200.0)];
+        let st = style_of(&prose, &zone(72.0));
+        assert_eq!(st.align, Align::Left);
+    }
+
+    /// A block simply POSITIONED right of the page's prose (a letterhead
+    /// beside a logo) has NO first-line indent: its opener is flush with its
+    /// own continuation lines — `indent_left_pt` alone carries the position
+    /// (the group-left comparison used to double it as `w:firstLine`).
+    #[test]
+    fn positioned_block_keeps_first_line_flush() {
+        let runs = vec![
+            run("SAS au capital de 5000", 170.0, 600.0, 200.0),
+            run("Siège social : 113 Bd", 170.0, 586.0, 200.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            leading: 14.0,
+            // The page-wide prose group opens at 72 — NOT this block's left.
+            group_left: 72.0,
+            page_left: 0.0,
+            prev_bottom: None,
+            next_top: None,
+            links: &[],
+            ..Default::default()
+        };
+        let block = build_paragraph_styled(&refs, &ctx, &mut IdGen::default(), Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(
+            p.style.first_line_pt, 0.0,
+            "opener flush with its own lines ⇒ no first-line indent"
+        );
+        assert!(
+            (p.style.indent_left_pt - 170.0).abs() < 1.0,
+            "the position is carried by indent_left alone, got {}",
+            p.style.indent_left_pt
+        );
+    }
+
+    // ── Inter-paragraph gaps are attributed ONCE (to the lower side) ─────────
 
     #[test]
     fn gap_after_a_paragraph_recovers_space_after() {
-        // Mirror of the space_before test: a paragraph whose bottom sits 40 pt
-        // above the next paragraph's top, at 14 pt leading over a 12 pt body.
-        // gap = bottom − next_top − (leading − body) = 600 − 560 − 2 = 38.
+        // Single-sided attribution: the gap below a paragraph belongs to the
+        // NEXT paragraph's `space_before_pt` only. Mirroring it here as
+        // `space_after_pt` doubled every exported gap (Word ADDS `w:before` +
+        // `w:after`), pushing bottom content onto phantom pages.
         let runs = vec![run("a closing paragraph body", 72.0, 600.0, 200.0)];
         let lines = lines_of(&runs);
         let refs: Vec<&ReconLine> = lines.iter().collect();
@@ -2201,14 +2394,11 @@ mod tests {
         let BlockKind::Paragraph(p) = block.kind else {
             panic!("expected paragraph");
         };
-        assert!(
-            (p.style.space_after_pt - 38.0).abs() < 1.0,
-            "space_after ≈ 38, got {}",
-            p.style.space_after_pt
+        assert_eq!(
+            p.style.space_after_pt, 0.0,
+            "the gap is the next paragraph's space_before, never our space_after"
         );
-        // A single-step follow-on (no extra gap) stays quiet: at a 14 pt
-        // leading over 12 pt line boxes, the next line's TOP sits just
-        // `leading − body` = 2 pt under this paragraph's bottom.
+        // And a single-step follow-on (no extra gap) is just as quiet.
         let quiet = ParaContext {
             next_top: Some(600.0 - (14.0 - 12.0)),
             ..ctx

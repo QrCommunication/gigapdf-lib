@@ -689,9 +689,19 @@ pub fn column_count_from_frames(
 
     let mut left: Vec<&crate::model::Rect> = Vec::new();
     let mut right: Vec<&crate::model::Rect> = Vec::new();
+    // Wide text blocks span the would-be gutter: they never vote for a side,
+    // but they VETO a two-column verdict wherever they overlap it vertically —
+    // real two-column prose has no paragraph running across the gutter. (A
+    // one-column letter's right-hugging date/signature blocks plus a left-ish
+    // header used to fabricate `w:cols num="2"` and re-flow the whole export.)
+    let mut spanning: Vec<&crate::model::Rect> = Vec::new();
     for f in frames {
-        // Full-width blocks span all columns; degenerate boxes carry no vote.
-        if f.w <= 0.0 || f.w > page_w * COL_MAX_BLOCK_FRAC {
+        // Degenerate boxes carry no vote.
+        if f.w <= 0.0 {
+            continue;
+        }
+        if f.w > page_w * COL_MAX_BLOCK_FRAC {
+            spanning.push(f);
             continue;
         }
         let center = f.x + f.w / 2.0;
@@ -712,8 +722,18 @@ pub fn column_count_from_frames(
     if l_span < min_height || r_span < min_height {
         return 1;
     }
-    let overlap = l_bot.min(r_bot) - l_top.max(r_top);
+    let overlap_top = l_top.max(r_top);
+    let overlap_bot = l_bot.min(r_bot);
+    let overlap = overlap_bot - overlap_top;
     if overlap < l_span.min(r_span) * COL_OVERLAP_FRAC {
+        return 1;
+    }
+    // Gutter-crossing veto: any wide block vertically inside the two sides'
+    // shared band disproves the columns (it would have to sit in the gutter).
+    if spanning
+        .iter()
+        .any(|f| f.y < overlap_bot && f.y + f.h > overlap_top)
+    {
         return 1;
     }
     2
@@ -1301,5 +1321,45 @@ mod tests {
             ordered,
             vec!["topL1", "topL2", "topR1", "topR2", "FIGURE", "botL1", "botL2", "botR1", "botR2",],
         );
+    }
+
+    /// A one-column LETTER — right-hugging date/signature blocks + a shifted
+    /// letterhead — must not read as two columns: its full-measure body
+    /// paragraphs cross the would-be gutter inside the two sides' shared
+    /// vertical band, which vetoes the split (`w:cols num="2"` used to re-flow
+    /// the whole export).
+    #[test]
+    fn letter_with_right_hugging_blocks_is_not_two_columns() {
+        use crate::model::Rect;
+        let frames = vec![
+            // Letterhead-ish blocks left of centre.
+            Rect::new(170.0, 35.0, 131.0, 17.0),
+            Rect::new(72.0, 282.0, 151.0, 14.0),
+            Rect::new(72.0, 364.0, 344.0, 14.0),
+            // Date + signature hugging the right margin.
+            Rect::new(397.0, 145.0, 127.0, 14.0),
+            Rect::new(312.0, 443.0, 211.0, 14.0),
+            Rect::new(335.0, 490.0, 189.0, 14.0),
+            Rect::new(466.0, 504.0, 57.0, 14.0),
+            Rect::new(474.0, 545.0, 49.0, 12.0),
+            // Full-measure body paragraphs CROSSING the gutter (the veto).
+            Rect::new(72.0, 231.0, 451.0, 35.0),
+            Rect::new(72.0, 313.0, 451.0, 35.0),
+        ];
+        assert_eq!(column_count_from_frames(&frames, 596.0, 842.0), 1);
+    }
+
+    /// The same sides WITHOUT any gutter-crossing block keep splitting: the
+    /// veto only fires on real cross-measure content.
+    #[test]
+    fn clean_two_column_frames_still_split() {
+        use crate::model::Rect;
+        let mut frames = Vec::new();
+        for i in 0..5 {
+            let y = 100.0 + i as f64 * 60.0;
+            frames.push(Rect::new(72.0, y, 200.0, 40.0));
+            frames.push(Rect::new(330.0, y, 200.0, 40.0));
+        }
+        assert_eq!(column_count_from_frames(&frames, 596.0, 842.0), 2);
     }
 }

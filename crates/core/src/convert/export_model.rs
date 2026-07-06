@@ -1994,13 +1994,14 @@ fn docx_inline_image(img: &ImageRef, ctx: &mut DocxCtx) -> String {
     )
 }
 
-/// A floating picture anchored at its model frame, sized to the frame. The
-/// model rectangle is **lower-left origin** (PDF convention); OOXML's
-/// `wp:posOffset` measures from the **top-left** page corner, so the vertical
-/// offset is flipped about the current section's page height — the exact
-/// inverse of the importer's `docx_anchor_frame` (`y_model = page_h − (y_top +
-/// h)` ⇔ `y_top = page_h − (y_model + h)`). Emitting `r.y` raw made every
-/// anchored frame drift on each round-trip (e.g. y 625.9 → 144 on A4).
+/// A floating picture anchored at its model frame, sized to the frame. Model
+/// frames are **top-down points** (origin top-left — the convention
+/// `pdf_from_model` renders and the geometric reconstruction produces), and
+/// OOXML's `wp:posOffset` measures from the top-left page corner too, so the
+/// offsets pass through unflipped. (Both this exporter and the importer's
+/// `docx_anchor_frame` used to flip Y about the page height — two symmetric
+/// bugs that cancelled on the docx→model→docx round-trip but mirrored every
+/// anchored image of a PDF-reconstructed model to the wrong end of the page.)
 /// `behindDoc` is `0` (the picture was painted with the page content, not as a
 /// watermark) and the wrap is `wp:wrapNone`: the source PDF laid its text
 /// without any notion of wrapping, so reserving wrap bands around each picture
@@ -2014,8 +2015,7 @@ fn docx_anchored_image(img: &ImageRef, r: crate::model::Rect, ctx: &mut DocxCtx)
     let id = ctx.next_obj();
     let rid = ctx.add_image(bytes, ext);
     let (cx, cy) = (emu(r.w.max(1.0)), emu(r.h.max(1.0)));
-    let y_top = ctx.page_h - (r.y + r.h);
-    let (x, y) = (emu(r.x.max(0.0)), emu(y_top.max(0.0)));
+    let (x, y) = (emu(r.x.max(0.0)), emu(r.y.max(0.0)));
     let mut alt = String::new();
     esc(img.alt.as_deref().unwrap_or(""), &mut alt);
     let graphic = docx_pic_graphic(id, rid, cx, cy, &docx_src_rect(img.crop));
@@ -15434,15 +15434,13 @@ style:print-orientation=\"landscape\""
             xml.contains(&format!("<wp:posOffset>{}</wp:posOffset>", emu(56.7))),
             "X offset in EMU from the frame: {xml}"
         );
-        // The model frame is lower-left origin; `wp:posOffset` measures from the
-        // top-left page corner, so Y is flipped about the page height — the
-        // exact inverse of the importer's `docx_anchor_frame`.
+        // Model frames and `wp:posOffset` are BOTH top-down (origin top-left):
+        // the Y offset passes through unflipped — the old page-height flip
+        // mirrored every anchored image of a PDF-reconstructed model.
+        let _ = page_h;
         assert!(
-            xml.contains(&format!(
-                "<wp:posOffset>{}</wp:posOffset>",
-                emu(page_h - (700.0 + 85.1))
-            )),
-            "Y offset in EMU is the top-flipped frame Y: {xml}"
+            xml.contains(&format!("<wp:posOffset>{}</wp:posOffset>", emu(700.0))),
+            "Y offset in EMU is the frame's top-down Y: {xml}"
         );
         assert!(
             xml.contains(&format!(

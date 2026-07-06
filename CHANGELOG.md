@@ -9,6 +9,58 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.121.0] - 2026-07-06
+
+### Fixed — PDF→Office export layout fidelity
+
+End-to-end fidelity pass driven by a real-world letter (letterhead + logo,
+right-aligned date, centred title, mixed-style body, right-aligned signature,
+small centred footer) whose DOCX export came out visually destroyed. Seven
+reconstruction/export defects, each pinned by a test:
+
+- **Phantom two-column verdict.** A one-column letter's right-hugging blocks
+  (date, signature) + a shifted letterhead read as two columns → `w:cols
+  num="2"` re-flowed the whole export. Full-measure text blocks crossing the
+  would-be gutter inside the sides' shared vertical band now VETO the split.
+- **Body font size biased by letterhead shrapnel.** The per-run median let
+  many tiny 8pt runs out-vote the 10pt prose, so heading promotion
+  (`size ≥ body×1.15`) stamped the whole body as headings. The median is now
+  character-weighted (the size most of the TEXT is set in).
+- **Page-background fill exported as content.** The renderer's unstroked
+  full-page white rectangle became a Shape block: it blanked the first
+  exported page and dragged the estimated page margins to ~0 — poisoning
+  every re-anchored indent (`w:ind left="3033"`-style shifts on everything).
+  Unstroked ~full-page fills are dropped; invisible paths (no fill, no
+  stroke — `re W n` clip rects) are dropped too; and `estimate_page_margins`
+  now only reads CONTENT blocks (never shapes).
+- **Line spacing exploded (`w:line="737"`, 3.07×).** `line_height` was the
+  page-wide leading (really the inter-paragraph gap on a sparse letter)
+  divided by the biased body size. It is now this paragraph's own baseline
+  step over its own font size, clamped to plausible ratios.
+- **Phantom first-line indents.** The opener was measured against the
+  page-wide group left, so a block simply POSITIONED right of the prose (a
+  letterhead beside a logo) exported `w:firstLine` on top of `w:ind` and
+  shifted twice. A first-line indent now means the opener jutting past the
+  paragraph's OWN continuation lines; single-line paragraphs never carry one.
+- **No alignment intent (`w:jc` never emitted).** Isolated one-liners (title,
+  date line, signature) form their own group, so the internal-shape
+  classifier always said Left. A page-position fallback now reads them
+  against the page text zone: centred ⇒ `Align::Center`, right-hugging ⇒
+  `Align::Right` — with zero indents (`w:jc` alone carries the position).
+- **Anchored images mirrored to the wrong end of the page.** The DOCX
+  exporter flipped frame Y about the page height (and the importer flipped
+  symmetrically, cancelling on the docx round-trip only): a top-left logo in
+  a PDF-reconstructed model exported at the bottom of the page. Model frames
+  are top-down (the `pdf_from_model` convention) — both sides now pass
+  offsets through unflipped.
+- **Every inter-paragraph gap doubled.** The reconstruction reported each gap
+  on BOTH sides (`space_after` of the upper + `space_before` of the lower)
+  and Word ADDS `w:before` + `w:after` — a letter's big pre-footer gap pushed
+  the footer onto a phantom second page. Gaps are now attributed once, to the
+  lower paragraph's `space_before`.
+
+2909 unit + integration tests, clippy clean.
+
 ## [0.120.1] - 2026-07-06
 
 ### Fixed

@@ -154,11 +154,18 @@ pub(crate) fn median(values: &mut [f64], fallback: f64) -> f64 {
 /// The body (most common) font size across runs — the calibration baseline for
 /// heading promotion and leading estimates. Returns `fallback` when empty.
 pub(crate) fn body_font_size(runs: &[ReconRun], fallback: f64) -> f64 {
-    let mut sizes: Vec<f64> = runs
-        .iter()
-        .filter(|r| !r.text.trim().is_empty())
-        .map(|r| r.size.max(1.0))
-        .collect();
+    // Character-weighted median: the body size is the size most of the TEXT is
+    // set in, not the size most of the SHOW OPERATORS use. A letterhead/footer
+    // sliced into many small 8pt runs used to out-vote the 10-11pt prose on a
+    // per-run median, dragging `body` down — and then heading promotion
+    // (`size >= body×1.15`) stamped the whole body text as headings.
+    let mut sizes: Vec<f64> = Vec::new();
+    for r in runs {
+        let weight = r.text.trim().chars().count();
+        for _ in 0..weight {
+            sizes.push(r.size.max(1.0));
+        }
+    }
     median(&mut sizes, fallback)
 }
 
@@ -729,9 +736,26 @@ pub fn reconstruct_page(
 
     // Non-ruling shapes pass through (filled boxes, diagonals, curves…), and any
     // ruling line not consumed by a table also survives as a shape so nothing is
-    // silently dropped.
+    // silently dropped. Two artifact families are excluded:
+    //  * a path that paints NOTHING (no fill, no stroke — the typical `re W n`
+    //    clip rectangle a converter leaves around the page) is invisible by
+    //    definition and must not become a block;
+    //  * an UNSTROKED fill covering (nearly) the whole page is the page
+    //    background a renderer painted (our own Office→PDF white base coat),
+    //    not content — exported into a flowing document it lands as a
+    //    full-page drawing that blanks the first page and poisons
+    //    `estimate_page_margins` down to ~0.
+    let (_, _, page_w_geom, _) = geom;
+    let page_background = |vp: &VectorPath| -> bool {
+        vp.stroke.is_none()
+            && vp.bounds.is_some_and(|b| {
+                b.width >= page_w_geom * 0.9 && b.height >= page_h * 0.9
+            })
+    };
     for vp in vpaths {
-        if table_plan.uses_path(vp.index)
+        if (vp.fill.is_none() && vp.stroke.is_none())
+            || page_background(vp)
+            || table_plan.uses_path(vp.index)
             || consumed_rule_paths.contains(&vp.index)
             || claimed_decor.contains(&vp.index)
         {
@@ -1095,6 +1119,18 @@ fn resolve_text_blocks(
     // (a single-line group). See [`paragraphs::document_leading`] (gap #75 #9).
     let all_lines: Vec<&lines::ReconLine> = lines.iter().collect();
     let doc_leading = paragraphs::document_leading(&all_lines, body);
+    // The PAGE's text zone (min/max line edge across every text line): the
+    // reference frame for the page-position alignment fallback — an isolated
+    // one-liner (title/date/signature) forms its own group, so only the
+    // page-wide zone can reveal that it is centred or right-hugging.
+    let content_left = all_lines
+        .iter()
+        .map(|l| l.left())
+        .fold(f64::INFINITY, f64::min);
+    let content_right = all_lines
+        .iter()
+        .map(|l| l.right())
+        .fold(f64::NEG_INFINITY, f64::max);
 
     let flush = |pending: &mut Vec<usize>,
                  out: &mut Vec<Block>,
@@ -1109,6 +1145,7 @@ fn resolve_text_blocks(
             body,
             heading_levels,
             page_left,
+            (content_left, content_right),
             links,
             decors,
             claimed,
@@ -1141,6 +1178,9 @@ fn lower_text_group(
     body: f64,
     heading_levels: &headings::HeadingLevels,
     page_left: f64,
+    // `(content_left, content_right)` — the PAGE's text zone, threaded into
+    // every ParaContext for the page-position alignment fallback.
+    content_zone: (f64, f64),
     links: &[ParaLink],
     decors: &[paragraphs::PageDecor],
     claimed_decor: &mut std::collections::BTreeSet<usize>,
@@ -1179,6 +1219,8 @@ fn lower_text_group(
                         group_left,
                         group_right,
                         page_left,
+                        content_left: content_zone.0,
+                        content_right: content_zone.1,
                         prev_bottom,
                         // The following paragraph's top drives space_after —
                         // the mirror of `prev_bottom`/space_before.
@@ -2446,6 +2488,85 @@ mod tests {
         assert!(
             first_para < shape_pos && shape_pos < last_para,
             "the shape is read between the two paragraphs, got {kinds:?}"
+        );
+    }
+
+    /// The body size is the size most of the TEXT is set in — a letterhead /
+    /// footer sliced into many tiny 8pt runs must not out-vote the longer
+    /// 10pt prose on a per-run median (that bias used to stamp the whole body
+    /// text as headings via `size >= body×1.15`).
+    #[test]
+    fn body_font_size_weighs_characters_not_run_count() {
+        let mut runs: Vec<ReconRun> = Vec::new();
+        for i in 0..9 {
+            let mut r = run("ab", 72.0, 800.0 - i as f64 * 10.0, 8.0);
+            r.size = 8.0;
+            runs.push(r);
+        }
+        for i in 0..3 {
+            let mut r = run(
+                "a long body prose run of many many characters in the page",
+                72.0,
+                600.0 - i as f64 * 14.0,
+                10.0,
+            );
+            r.size = 10.0;
+            runs.push(r);
+        }
+        assert_eq!(body_font_size(&runs, 12.0), 10.0);
+    }
+
+    /// An UNSTROKED fill covering (nearly) the whole page is the renderer's
+    /// page background, not content: it must not become a Shape block (it
+    /// used to blank the first exported page and drag the estimated margins
+    /// to ~0).
+    #[test]
+    fn full_page_unstroked_fill_is_dropped_as_page_background() {
+        use crate::content::vector::{PathSeg, VectorPath};
+        let bg = VectorPath {
+            index: 0,
+            bounds: Some(crate::content::Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 596.0,
+                height: 842.0,
+            }),
+            segments: vec![
+                PathSeg::Move(0.0, 0.0),
+                PathSeg::Line(596.0, 0.0),
+                PathSeg::Line(596.0, 842.0),
+                PathSeg::Line(0.0, 842.0),
+                PathSeg::Close,
+            ],
+            fill: Some([1.0, 1.0, 1.0]),
+            stroke: None,
+            stroke_width: 1.0,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        };
+        let runs = vec![run("du texte ordinaire", 72.0, 600.0, 12.0)];
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_page(
+            runs,
+            &[bg],
+            &[],
+            (0.0, 0.0, 596.0, 842.0),
+            &mut ids,
+            &[],
+            None,
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Shape(_))),
+            "full-page background fill must not survive as a Shape block"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Paragraph(_))),
+            "the text still reconstructs"
         );
     }
 }

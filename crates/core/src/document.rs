@@ -9907,6 +9907,14 @@ impl Document {
         let mut max_right = f64::NEG_INFINITY;
         let mut max_bottom = f64::NEG_INFINITY;
         for b in blocks {
+            // Only CONTENT blocks define the printable inset: a decorative
+            // shape (page border, letterhead rule, background box) often hugs
+            // or covers the page edge and would drag the margins to ~0 —
+            // poisoning both the exported `w:pgMar` and every re-anchored
+            // paragraph indent downstream.
+            if matches!(b.kind, crate::model::BlockKind::Shape(_)) {
+                continue;
+            }
             if let Some(f) = b.frame {
                 min_x = min_x.min(f.x);
                 min_y = min_y.min(f.y);

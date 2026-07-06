@@ -2887,8 +2887,13 @@ fn docx_anchor_frame(
     let (w, h) = size.unwrap_or((0.0, 0.0));
     let x = off_x.unwrap_or(0.0);
     let y_top = off_y.unwrap_or(0.0);
-    // Top-left (OOXML) → lower-left (model): flip Y about the page height.
-    Some(model::Rect::new(x, page_h - (y_top + h), w, h))
+    // OOXML offsets and model frames are BOTH top-down (origin top-left — the
+    // convention `pdf_from_model` renders): pass through unflipped. The former
+    // flip here paired with a symmetric flip in `docx_anchored_image`
+    // (cancelling on the docx round-trip) but mirrored anchored images
+    // vertically everywhere else (docx→PDF render, PDF-reconstructed models).
+    let _ = page_h;
+    Some(model::Rect::new(x, y_top, w, h))
 }
 
 /// Fill each run's unset character attributes from the resolved named style
@@ -23877,13 +23882,14 @@ mod tests {
         let rect = frame.expect("floating block carries a frame");
         assert!((rect.w - 144.0).abs() < 1e-6, "width 144pt, got {}", rect.w);
         assert!((rect.h - 72.0).abs() < 1e-6, "height 72pt, got {}", rect.h);
-        // Position from `wp:posOffset` (X 914400 EMU = 72pt). Y is flipped about
-        // the A4 page height (841.89pt): y_top=36pt, h=72pt → 841.89-(36+72).
+        // Position from `wp:posOffset` (X 914400 EMU = 72pt, Y 457200 = 36pt).
+        // OOXML offsets and model frames are BOTH top-down: pass-through, no
+        // page-height flip (the old symmetric flips mirrored anchored images
+        // vertically on every non-docx consumer of the model).
         assert!((rect.x - 72.0).abs() < 1e-6, "x 72pt, got {}", rect.x);
-        let expect_y = A4_H - (36.0 + 72.0);
         assert!(
-            (rect.y - expect_y).abs() < 1e-3,
-            "y flipped to {expect_y}, got {}",
+            (rect.y - 36.0).abs() < 1e-3,
+            "y top-down 36pt, got {}",
             rect.y
         );
 

@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.121.0] - 2026-07-06
+
+### Fixed
+
+- **PDF→Office export layout fidelity** (`toDocx()`/`toOdt()`/…): a real-world
+  letter now exports true to the page instead of visually destroyed —
+  no more phantom two-column re-flow (`w:cols`), no heading-stamping of the
+  whole body, no full-page background shape blanking page 1, no 3× line
+  spacing, no doubled inter-paragraph gaps pushing content onto phantom
+  pages, no phantom first-line indents. Centred titles and right-hugging
+  date/signature lines now export with real alignment intent (`w:jc`), and
+  anchored images land at their true position (top-left logo stays top-left —
+  the exporter/importer used to mirror frame Y about the page height).
+
 ## [0.120.1] - 2026-07-06
 
 ### Fixed
