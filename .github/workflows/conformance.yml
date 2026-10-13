@@ -15,7 +15,7 @@ on:
 jobs:
   conformance:
     name: Document conformance (veraPDF / qpdf / OPC / ODF)
-    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
