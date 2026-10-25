@@ -1121,10 +1121,20 @@ pub extern "C" fn gp_text_elements_json(
                     fnum(e.rotation_deg),
                     gigapdf_core::text::direction_str(e.direction)
                 ));
+                // SECURITY: blend_mode comes from the PDF content stream and must be
+                // JSON-escaped before embedding — a crafted `/BM` value containing
+                // `"` or `\` would otherwise break out of the string literal and
+                // enable JSON injection in the host parser.
+                let mut bm_json = String::new();
+                if let Some(bm) = e.blend_mode.as_deref() {
+                    json_escape(bm, &mut bm_json);
+                } else {
+                    bm_json.push_str("null");
+                }
                 s.push_str(&format!(
                     ",\"fillAlpha\":{},\"blendMode\":{},\"strokeColor\":{},\"renderingMode\":{}",
                     fnum(e.fill_alpha),
-                    e.blend_mode.as_deref().map(|b| format!("\"{}\"", b)).unwrap_or_else(|| "null".to_string()),
+                    bm_json,
                     e.stroke_color.map(|c| format!("[{},{},{}]", fnum(c[0]), fnum(c[1]), fnum(c[2]))).unwrap_or_else(|| "null".to_string()),
                     e.rendering_mode
                 ));
