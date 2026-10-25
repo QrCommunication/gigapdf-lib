@@ -1085,7 +1085,10 @@ pub extern "C" fn gp_text_elements_json(
     page: u32,
     out_len: *mut usize,
 ) -> *mut u8 {
-    let fnum = |v: f64| if v.is_finite() { v } else { 0.0 };
+    let fnum = |v: f64| {
+        let r = (v * 1000.0).round() / 1000.0;
+        if r.is_finite() { r } else { 0.0 }
+    };
     let json = match unsafe { handle.as_ref() } {
         Some(doc) => {
             let mut s = String::from("[");
@@ -1108,7 +1111,7 @@ pub extern "C" fn gp_text_elements_json(
                 s.push_str(",\"fontId\":");
                 json_escape(&e.font_id, &mut s);
                 s.push_str(&format!(
-                    ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{},\"direction\":\"{}\",\"segments\":[",
+                    ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{},\"direction\":\"{}\"",
                     e.bold,
                     e.italic,
                     fnum(e.font_size),
@@ -1117,6 +1120,20 @@ pub extern "C" fn gp_text_elements_json(
                     fnum(e.color[2]),
                     fnum(e.rotation_deg),
                     gigapdf_core::text::direction_str(e.direction)
+                ));
+                s.push_str(&format!(
+                    ",\"fillAlpha\":{},\"blendMode\":{},\"strokeColor\":{},\"renderingMode\":{}",
+                    fnum(e.fill_alpha),
+                    e.blend_mode.as_deref().map(|b| format!("\"{}\"", b)).unwrap_or_else(|| "null".to_string()),
+                    e.stroke_color.map(|c| format!("[{},{},{}]", fnum(c[0]), fnum(c[1]), fnum(c[2]))).unwrap_or_else(|| "null".to_string()),
+                    e.rendering_mode
+                ));
+                s.push_str(&format!(
+                    ",\"scaleX\":{},\"scaleY\":{},\"skewX\":{},\"skewY\":{},\"segments\":[",
+                    fnum(e.scale_x),
+                    fnum(e.scale_y),
+                    fnum(e.skew_x),
+                    fnum(e.skew_y)
                 ));
                 // Per-run positioned fragments for justified/positioned text (empty
                 // for a normal run). Each fragment carries its own page-space box so
@@ -1129,11 +1146,13 @@ pub extern "C" fn gp_text_elements_json(
                     s.push_str("{\"text\":");
                     json_escape(&seg.text, &mut s);
                     s.push_str(&format!(
-                        ",\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+                        ",\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"wordSpacing\":{},\"charSpacing\":{}}}",
                         fnum(seg.bounds.x),
                         fnum(seg.bounds.y),
                         fnum(seg.bounds.width),
-                        fnum(seg.bounds.height)
+                        fnum(seg.bounds.height),
+                        fnum(seg.word_spacing),
+                        fnum(seg.char_spacing)
                     ));
                 }
                 s.push_str("]}");

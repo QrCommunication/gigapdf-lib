@@ -898,6 +898,13 @@ mod tests {
                 fill_alpha: None,
                 nested: false,
                 segments: Vec::new(),
+                blend_mode: None,
+                stroke_color: None,
+                rendering_mode: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                skew_x: 0.0,
+                skew_y: 0.0,
             },
             ContentElement {
                 index: 1,
@@ -914,6 +921,13 @@ mod tests {
                 fill_alpha: None,
                 nested: false,
                 segments: Vec::new(),
+                blend_mode: None,
+                stroke_color: None,
+                rendering_mode: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                skew_x: 0.0,
+                skew_y: 0.0,
             },
         ];
         // Drive only the op-owner mapping + MCID assignment (no Document needed):

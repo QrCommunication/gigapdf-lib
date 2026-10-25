@@ -2920,6 +2920,36 @@ pub struct TextElementInfo {
     ///
     /// [`index`]: TextElementInfo::index
     pub segments: Vec<crate::content::TextSegment>,
+    /// Fill opacity extracted from the active `/ExtGState /ca` at the time this
+    /// run was painted. Defaults to `1.0` when no graphics state overrides it.
+    /// Propagated so a host overlay can reproduce semi-transparent text 1:1.
+    pub fill_alpha: f64,
+    /// Blend mode (`/BM`) active when this run was painted (`"Normal"`,
+    /// `"Multiply"`, `"Screen"`, …). `None` when the graphics state does not
+    /// override the default. Lets the host match compositing behaviour that
+    /// affects how the text blends with the background.
+    pub blend_mode: Option<String>,
+    /// Stroke colour in device RGB when the text rendering mode includes a
+    /// stroke component (`Tr` = 1, 2, 5, 6). `None` for pure fill modes.
+    pub stroke_color: Option<[f64; 3]>,
+    /// Text rendering mode (`Tr` operator, ISO 32000-1 §9.3.6): 0 = fill,
+    /// 1 = stroke, 2 = fill+stroke, 3 = invisible, 4 = fill+clip, etc.
+    /// Default 0 (fill) when the operator is absent.
+    pub rendering_mode: u8,
+    /// Horizontal scale factor extracted from the text matrix decomposition.
+    /// `1.0` for uniform scaling; differs when the PDF applies anamorphic
+    /// transforms (stretched/compressed glyphs).
+    pub scale_x: f64,
+    /// Vertical scale factor extracted from the text matrix decomposition.
+    /// `1.0` for uniform scaling.
+    pub scale_y: f64,
+    /// Horizontal skew (cisaillement) in degrees, extracted from the text
+    /// matrix decomposition. Non-zero for artificially obliqued text that is
+    /// not a true italic font.
+    pub skew_x: f64,
+    /// Vertical skew in degrees (rare, usually 0). Completes the affine
+    /// decomposition so the host can reconstruct the exact CTM.
+    pub skew_y: f64,
 }
 
 /// One image element from [`Document::page_image_elements`]: its placement box
@@ -5505,14 +5535,48 @@ impl Document {
             resources: self.page_resources(page_no),
             pattern_depth: 0,
         };
+        let gstate_blend = self.page_gstate_blend(page_no);
         content::extract_elements_resolved_with_colors(
             &content,
             &fonts,
             &styles,
             &gstate_alpha,
+            &gstate_blend,
             &resolver,
             &|name| forms.get(name).cloned(),
         )
+    }
+
+    /// Map each `/ExtGState` resource name on `page_no` to its `/BM` (blend mode).
+    /// The element walker reads this when it hits a `gs` operator so text elements
+    /// carry their effective blend mode. Names without a `/BM` are skipped.
+    fn page_gstate_blend(&self, page_no: u32) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let Ok(page) = self.page_dict(page_no) else {
+            return out;
+        };
+        let gs_dict = page
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|res| res.get(b"ExtGState"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict);
+        let Some(gs_dict) = gs_dict else {
+            return out;
+        };
+        for (name, value) in &gs_dict.0 {
+            let Some(state) = self.resolve(value).as_dict() else {
+                continue;
+            };
+            if let Some(bm) = state.get(b"BM").and_then(Object::as_name) {
+                out.insert(
+                    String::from_utf8_lossy(name).into_owned(),
+                    String::from_utf8_lossy(bm).into_owned(),
+                );
+            }
+        }
+        out
     }
 
     /// Map each `/ExtGState` resource name on `page_no` to its `/ca` (non-stroking
@@ -5668,7 +5732,7 @@ impl Document {
                     font_family: scoped
                         .map(|s| s.family.clone())
                         .or_else(|| fallback.map(|s| s.family.clone()))
-                        .unwrap_or_else(|| "Helvetica".to_string()),
+                        .unwrap_or_else(|| "__MISSING__".to_string()),
                     base_font: scoped.map(|s| s.base_font.clone()).unwrap_or_default(),
                     font_id: scoped.map(|s| s.font_id.clone()).unwrap_or_default(),
                     bold: scoped
@@ -5684,6 +5748,14 @@ impl Document {
                     rotation_deg: e.rotation_deg.unwrap_or(0.0),
                     direction,
                     segments: e.segments,
+                    fill_alpha: e.fill_alpha.unwrap_or(1.0),
+                    blend_mode: e.blend_mode.clone(),
+                    stroke_color: e.stroke_color,
+                    rendering_mode: e.rendering_mode,
+                    scale_x: e.scale_x,
+                    scale_y: e.scale_y,
+                    skew_x: e.skew_x,
+                    skew_y: e.skew_y,
                 }
             })
             .collect()

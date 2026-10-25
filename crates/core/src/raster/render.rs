@@ -689,6 +689,11 @@ pub fn render_content_into_ctx(
     let mut char_spacing = 0.0f64;
     let mut word_spacing = 0.0f64;
     let mut h_scale = 1.0f64;
+    // Text rise (`Ts`, ISO 32000-1 §9.3.1): baseline shift in text-space units.
+    // Positive values move the baseline up (superscripts), negative down (subscripts).
+    // Reset to 0 by `BT` per spec. Applied as a y-translation on `tm` before each
+    // text-show so glyphs are placed at the shifted baseline.
+    let mut text_rise = 0.0f64;
 
     // Optional-content (layer) visibility stack (ISO 32000-1 §8.11.3.2). Each
     // open marked-content sequence (`BDC`/`BMC`) pushes whether it is *visible*:
@@ -974,6 +979,8 @@ pub fn render_content_into_ctx(
             b"BT" => {
                 tm = Matrix::IDENTITY;
                 tlm = Matrix::IDENTITY;
+                // ISO 32000-1 §9.3.1: BT resets text rise to 0.
+                text_rise = 0.0;
             }
             b"Tf" => {
                 if let Some(Object::Name(name)) = op.operands.first() {
@@ -1004,6 +1011,11 @@ pub fn render_content_into_ctx(
             b"Tc" if !n.is_empty() => char_spacing = n[0],
             b"Tw" if !n.is_empty() => word_spacing = n[0],
             b"Tz" if !n.is_empty() => h_scale = n[0] / 100.0,
+            // ISO 32000-1 §9.3.1: text rise (baseline shift). Positive values
+            // move the baseline up (superscripts), negative down (subscripts).
+            // Applied as a y-translation on `tm` before each text-show so
+            // glyphs are placed at the shifted baseline.
+            b"Ts" if !n.is_empty() => text_rise = n[0],
             b"Tj" | b"'" | b"\"" => {
                 if op.operator.as_slice() != b"Tj" {
                     // ' and " move to the next line first; " also sets spacing.
@@ -1027,6 +1039,7 @@ pub fn render_content_into_ctx(
                             char_spacing,
                             word_spacing,
                             h_scale,
+                            text_rise,
                             global_alpha * state.fill_alpha,
                             state.paint_clip().as_ref(),
                             state.blend,
@@ -1054,6 +1067,7 @@ pub fn render_content_into_ctx(
                                     char_spacing,
                                     word_spacing,
                                     h_scale,
+                                    text_rise,
                                     global_alpha * state.fill_alpha,
                                     clip.as_ref(),
                                     state.blend,
@@ -1205,6 +1219,9 @@ fn show_text(
     char_spacing: f64,
     word_spacing: f64,
     h_scale: f64,
+    // Text rise (`Ts`, ISO 32000-1 §9.3.1): baseline shift in text-space units.
+    // Applied as a y-translation on the text matrix before each glyph placement.
+    text_rise: f64,
     global_alpha: f64,
     clip: Option<&ClipMask>,
     blend: BlendMode,
@@ -1324,6 +1341,16 @@ fn show_text(
             // *nothing*, never the notdef box — drawing it would litter the page
             // with tofu wherever a code didn't map (e.g. a glyph absent from a
             // subset). The cursor still advances by the notdef width below.
+            // ISO 32000-1 §9.3.1: text rise (`Ts`) translates the baseline
+            // along the y-axis in text space before each glyph is placed.
+            // Compose as a pre-multiplication on a local copy of `tm` so the
+            // cursor advance below remains unaffected (rise is a per-glyph
+            // offset, not a persistent shift of the text line).
+            let tm_with_rise = if text_rise.abs() > 1e-12 {
+                Matrix::translate(0.0, text_rise).then(&tm)
+            } else {
+                *tm
+            };
             let mut edges = Vec::new();
             let polygons = if gid == 0 {
                 Vec::new()
@@ -1339,7 +1366,7 @@ fn show_text(
                     .map(|&(gx, gy)| {
                         // `off_x`/`off_y` are 0 horizontally; in vertical mode they
                         // shift the glyph by `-v` so origin 1 lands at the pen.
-                        let (ux, uy) = tm.apply(gx * s * h_scale + off_x, gy * s + off_y);
+                        let (ux, uy) = tm_with_rise.apply(gx * s * h_scale + off_x, gy * s + off_y);
                         device(ctm, base, ux, uy)
                     })
                     .collect();
