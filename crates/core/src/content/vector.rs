@@ -304,7 +304,7 @@ fn path_bounds(path: &[PathSeg]) -> Option<Bounds> {
 /// `Path`-kind element.
 pub fn vector_paths_from_ops(
     operations: &[Operation],
-    gstate: &BTreeMap<String, (Option<f64>, Option<f64>)>,
+    gstate: &BTreeMap<String, (Option<f64>, Option<f64>, Option<String>)>,
     resolver: &dyn NamedColorResolver,
 ) -> Vec<VectorPath> {
     vector_paths_from_ops_with_pos(operations, gstate, resolver)
@@ -324,7 +324,7 @@ pub fn vector_paths_from_ops(
 /// **no** `VectorPath`, so they are simply skipped — never mis-correlated).
 pub fn vector_paths_from_ops_with_pos(
     operations: &[Operation],
-    gstate: &BTreeMap<String, (Option<f64>, Option<f64>)>,
+    gstate: &BTreeMap<String, (Option<f64>, Option<f64>, Option<String>)>,
     resolver: &dyn NamedColorResolver,
 ) -> Vec<(VectorPath, usize)> {
     let mut out = Vec::new();
@@ -368,12 +368,18 @@ pub fn vector_paths_from_ops_with_pos(
             b"gs" => {
                 if let Some(Object::Name(name)) = op.operands.first() {
                     let key = String::from_utf8_lossy(name);
-                    if let Some((ca, ca_stroke)) = gstate.get(key.as_ref()) {
+                    if let Some((ca, ca_stroke, bm)) = gstate.get(key.as_ref()) {
                         if let Some(a) = ca {
                             st.fill_alpha = *a;
                         }
                         if let Some(a) = ca_stroke {
                             st.stroke_alpha = *a;
+                        }
+                        // `/BM` (blend mode) from ExtGState — propagated to the path
+                        // so a host editor can render vector overlays with the same
+                        // compositing as the rasterizer.
+                        if let Some(mode) = bm {
+                            st.blend_mode = Some(mode.clone());
                         }
                     }
                 }

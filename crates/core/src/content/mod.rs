@@ -84,6 +84,13 @@ pub struct TextSegment {
     /// host can set CSS `letter-spacing` / Fabric `charSpacing` for 1:1
     /// round-trip fidelity.
     pub char_spacing: f64,
+    /// Cumulative TJ kerning adjustments within this segment, in text-space
+    /// units (1/1000 em). Sum of all `ShowAtom::Kern(n)` values encountered
+    /// between the segment's first and last glyph. Lets the host compute the
+    /// true rendered width (`theoretical_width + total_kerning * font_size /
+    /// 1000`) and detect micro-positioning drift from justified or tracked
+    /// text. Zero when no intra-segment kerning was applied.
+    pub total_kerning: f64,
 }
 
 /// A high-level, addressable element of a page's content: text, image or shape.
@@ -1738,10 +1745,14 @@ fn run_layout(
     // mirror the rasterizer exactly (ISO 32000-1 §9.4.4): each glyph advances by
     // `(width + Tc [+ Tw for a single-byte space]) · Tz`, each `TJ` kern by
     // `-n/1000 · font_size · Tz`.
-    let mut segs: Vec<(String, f64, f64)> = Vec::new();
+    // (text, start_x, end_x, total_kerning) in text space, relative to the run's
+    // matrix. `total_kerning` accumulates intra-segment TJ adjustments (in text-space
+    // units, 1/1000 em) so the host can compute the true rendered width.
+    let mut segs: Vec<(String, f64, f64, f64)> = Vec::new();
     let mut seg_text = String::new();
     let mut seg_start = 0.0f64;
     let mut cur_x = 0.0f64;
+    let mut seg_kerning = 0.0f64;
     for atom in &atoms {
         match atom {
             ShowAtom::Glyph { bytes, .. } => {
@@ -1765,7 +1776,8 @@ fn run_layout(
                     // the next word starts at its exact rasterizer pen x. Holds for both
                     // a normal space and a wide justification space.
                     if !seg_text.is_empty() {
-                        segs.push((std::mem::take(&mut seg_text), seg_start, cur_x));
+                        segs.push((std::mem::take(&mut seg_text), seg_start, cur_x, seg_kerning));
+                        seg_kerning = 0.0;
                     }
                     cur_x += step * h_scale;
                     seg_start = cur_x;
@@ -1777,11 +1789,17 @@ fn run_layout(
             ShowAtom::Kern(n) => {
                 let disp = -n / 1000.0 * font_size * h_scale;
                 if disp.abs() > split && !seg_text.is_empty() {
-                    segs.push((std::mem::take(&mut seg_text), seg_start, cur_x));
+                    segs.push((std::mem::take(&mut seg_text), seg_start, cur_x, seg_kerning));
+                    seg_kerning = 0.0;
                     cur_x += disp;
                     seg_start = cur_x;
                 } else {
                     cur_x += disp;
+                    // Intra-segment kern: accumulate in text-space units (n is already
+                    // in 1/1000 em). The sign convention matches ISO 32000-1 §9.4.4:
+                    // positive n = negative displacement (tighter), but we store the
+                    // raw TJ value so the host can apply the same formula.
+                    seg_kerning += *n as f64;
                     // A kern between words (nothing accumulated) folds into the gap so
                     // the next word's box starts after it, not before.
                     if seg_text.is_empty() {
@@ -1792,7 +1810,7 @@ fn run_layout(
         }
     }
     if !seg_text.is_empty() {
-        segs.push((seg_text, seg_start, cur_x));
+        segs.push((seg_text, seg_start, cur_x, seg_kerning));
     }
     // `cur_x` is the run's total advance in text space — what the pen (and the
     // next run) must move by.
@@ -1809,11 +1827,11 @@ fn run_layout(
     }
     let segments = segs
         .into_iter()
-        .filter(|(text, _, _)| !text.trim().is_empty())
-        .filter_map(|(text, sx, ex)| {
+        .filter(|(text, _, _, _)| !text.trim().is_empty())
+        .filter_map(|(text, sx, ex, kern)| {
             let seg_tm = Matrix::translate(sx, 0.0).then(tm);
             text_bounds(&seg_tm, ctm, font_size, (ex - sx).max(0.0))
-                .map(|bounds| TextSegment { text, bounds, word_spacing, char_spacing })
+                .map(|bounds| TextSegment { text, bounds, word_spacing, char_spacing, total_kerning: kern })
         })
         .collect();
     (advance, segments)
@@ -4409,7 +4427,7 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         );
         let paths = vector::vector_paths_from_ops(
             &parse_content(&edited).unwrap(),
-            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::<String, (Option<f64>, Option<f64>, Option<String>)>::new(),
             &vector::NoNamedColors,
         );
         assert_eq!(paths.len(), 1);
@@ -4436,7 +4454,7 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         assert!(count(&edited, b" d") >= 1, "dash injected");
         let paths = vector::vector_paths_from_ops(
             &parse_content(&edited).unwrap(),
-            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::<String, (Option<f64>, Option<f64>, Option<String>)>::new(),
             &vector::NoNamedColors,
         );
         assert_eq!(paths.len(), 1);
@@ -4729,7 +4747,7 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         // After bringing it to the front it must STILL report the red fill — the
         // captured `rg` is re-emitted inside the new `q … Q` wrap.
         let content = b"1 0 0 rg 10 10 20 20 re f 0 0 1 rg 50 50 20 20 re f";
-        let no_color = std::collections::BTreeMap::new();
+        let no_color = std::collections::BTreeMap::<String, (Option<f64>, Option<f64>, Option<String>)>::new();
         // Sanity: before the move the first path is red.
         let before = vector::vector_paths_from_ops(
             &parse_content(content).unwrap(),
@@ -4768,7 +4786,7 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         // A stroked line whose stroke colour, width and dash are set by PRECEDING
         // ops. Send it to the back: it must keep blue / width 3 / dash [4,2].
         let content = b"0 0 1 RG 3 w [4 2] 0 d 10 10 m 110 10 l S 1 0 0 RG 0 80 m 100 80 l S";
-        let no_color = std::collections::BTreeMap::new();
+        let no_color = std::collections::BTreeMap::<String, (Option<f64>, Option<f64>, Option<String>)>::new();
 
         // Path index 1 is the dashed blue line (declared first → drawn first).
         let before = vector::vector_paths_from_ops(
@@ -4815,7 +4833,7 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         // Two red shapes, each relying on a single leading `rg`. Reordering the
         // first must not alter the appearance of the second.
         let content = b"1 0 0 rg 10 10 20 20 re f 50 50 20 20 re f";
-        let no_color = std::collections::BTreeMap::new();
+        let no_color = std::collections::BTreeMap::<String, (Option<f64>, Option<f64>, Option<String>)>::new();
         let edited = reorder_element(content, 0, true).unwrap();
         let paths = vector::vector_paths_from_ops(
             &parse_content(&edited).unwrap(),
@@ -4867,7 +4885,7 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         // captured (it is out of scope at the element's first op). The element
         // relies on no preceding colour → default black, no stray `rg` injected.
         let content = b"q 1 0 0 rg 0 0 5 5 re f Q 10 10 20 20 re f";
-        let no_color = std::collections::BTreeMap::new();
+        let no_color = std::collections::BTreeMap::<String, (Option<f64>, Option<f64>, Option<String>)>::new();
         // Element index 1 is the second (black) rectangle.
         let edited = reorder_element(content, 1, true).unwrap();
         let s = String::from_utf8_lossy(&edited);
@@ -4918,8 +4936,8 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
             content,
             &FontDecoders::new(),
             &FontStyles::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            &BTreeMap::<String, f64>::new(),
+            &BTreeMap::<String, String>::new(),
             &Sep,
             &|_| None,
         )

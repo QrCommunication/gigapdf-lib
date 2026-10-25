@@ -5605,7 +5605,7 @@ impl Document {
     fn page_gstate_alpha(&self, page_no: u32) -> BTreeMap<String, f64> {
         self.page_gstate_alpha_pair(page_no)
             .into_iter()
-            .filter_map(|(name, (ca, _))| ca.map(|v| (name, v)))
+            .filter_map(|(name, (ca, _, _))| ca.map(|v| (name, v)))
             .collect()
     }
 
@@ -5613,7 +5613,15 @@ impl Document {
     /// non-stroking and stroking alphas (each `None` when the key is absent so
     /// the walker leaves that alpha unchanged). Drives both element opacity and
     /// vector-path fill/stroke opacity.
-    fn page_gstate_alpha_pair(&self, page_no: u32) -> BTreeMap<String, (Option<f64>, Option<f64>)> {
+    /// Resolve every ExtGState entry on a page to its `/ca`, `/CA` and `/BM` values.
+    /// The returned map is keyed by the resource name (e.g. `"Gs1"`) and carries
+    /// `(fill_alpha, stroke_alpha, blend_mode)` — any field absent from the
+    /// dictionary is `None`. Blend mode is stored as the raw PDF name string
+    /// (e.g. `"Multiply"`, `"Screen"`).
+    fn page_gstate_alpha_pair(
+        &self,
+        page_no: u32,
+    ) -> BTreeMap<String, (Option<f64>, Option<f64>, Option<String>)> {
         let mut out = BTreeMap::new();
         let Ok(page) = self.page_dict(page_no) else {
             return out;
@@ -5634,8 +5642,24 @@ impl Document {
             };
             let ca = state.get(b"ca").and_then(Object::as_f64);
             let ca_stroke = state.get(b"CA").and_then(Object::as_f64);
-            if ca.is_some() || ca_stroke.is_some() {
-                out.insert(String::from_utf8_lossy(name).into_owned(), (ca, ca_stroke));
+            // `/BM` may be a single name or an array of names (PDF §11.6.3);
+            // we take the first name when present.
+            let bm = state
+                .get(b"BM")
+                .and_then(|o| match o {
+                    Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+                    Object::Array(arr) => arr.first().and_then(|first| {
+                        self.resolve(first)
+                            .as_name()
+                            .map(|n| String::from_utf8_lossy(n).into_owned())
+                    }),
+                    _ => None,
+                });
+            if ca.is_some() || ca_stroke.is_some() || bm.is_some() {
+                out.insert(
+                    String::from_utf8_lossy(name).into_owned(),
+                    (ca, ca_stroke, bm),
+                );
             }
         }
         out
@@ -8626,7 +8650,11 @@ impl Document {
         };
         // Reuse the shape extractor: the first painted path's fill (else stroke)
         // is the tile's dominant ink.
-        let paths = content::vector::vector_paths_from_ops(&ops, &BTreeMap::new(), &resolver);
+        let paths = content::vector::vector_paths_from_ops(
+            &ops,
+            &BTreeMap::<String, (Option<f64>, Option<f64>, Option<String>)>::new(),
+            &resolver,
+        );
         paths.iter().find_map(|p| p.fill.or(p.stroke))
     }
 
@@ -26590,7 +26618,7 @@ mod tests {
         // (1) An /ExtGState named like `GpGs*` now carries /ca = 0.4.
         let pairs = doc.page_gstate_alpha_pair(1);
         assert_eq!(pairs.len(), 1, "exactly one ExtGState registered");
-        let (name, (ca, _ca_stroke)) = pairs.into_iter().next().unwrap();
+        let (name, (ca, _ca_stroke, _bm)) = pairs.into_iter().next().unwrap();
         assert!(name.starts_with("GpGs"), "gstate name is GpGs*, got {name}");
         assert!((ca.unwrap() - 0.4).abs() < 1e-9, "/ca recorded as 0.4");
 
@@ -26634,7 +26662,7 @@ mod tests {
             !pairs.is_empty(),
             "ExtGState registered for the image opacity"
         );
-        let has_quarter = pairs.values().any(|(ca, ca_stroke)| {
+        let has_quarter = pairs.values().any(|(ca, ca_stroke, _bm)| {
             ca.is_some_and(|v| (v - 0.25).abs() < 1e-9)
                 && ca_stroke.is_some_and(|v| (v - 0.25).abs() < 1e-9)
         });

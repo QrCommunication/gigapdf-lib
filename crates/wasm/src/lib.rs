@@ -1156,13 +1156,14 @@ pub extern "C" fn gp_text_elements_json(
                     s.push_str("{\"text\":");
                     json_escape(&seg.text, &mut s);
                     s.push_str(&format!(
-                        ",\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"wordSpacing\":{},\"charSpacing\":{}}}",
+                        ",\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"wordSpacing\":{},\"charSpacing\":{},\"totalKerning\":{}}}",
                         fnum(seg.bounds.x),
                         fnum(seg.bounds.y),
                         fnum(seg.bounds.width),
                         fnum(seg.bounds.height),
                         fnum(seg.word_spacing),
-                        fnum(seg.char_spacing)
+                        fnum(seg.char_spacing),
+                        fnum(seg.total_kerning)
                     ));
                 }
                 s.push_str("]}");
