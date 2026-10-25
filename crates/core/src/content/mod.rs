@@ -168,6 +168,11 @@ pub struct ContentElement {
     /// Vertical skew in degrees (rare, usually `0.0`). Completes the affine
     /// decomposition so the host can reconstruct the exact text CTM.
     pub skew_y: f64,
+    /// Conservative bounding box of the active clip path at the time this
+    /// element was painted (`W`/`W*`), in page user space. `None` when no clip
+    /// was in effect. Lets the host constrain hit-testing and overlay placement
+    /// to the visible region.
+    pub clip_bounds: Option<[f64; 4]>,
 }
 
 /// A reading-order text line: the concatenated runs that share a baseline band,
@@ -1990,6 +1995,65 @@ fn accumulate_path(operator: &[u8], n: &[f64], ctm: &Matrix, bb: &mut BoundsBuil
     }
 }
 
+/// Returns the intersection of the active clip-path bounding boxes on the
+/// stack, or `None` when no clip is in effect. Each entry is an axis-aligned
+/// `[x0, y0, x1, y1]` rectangle in page user space; the intersection is the
+/// tightest rectangle contained in every active clip.
+fn active_clip_bounds(clip_stack: &[Option<[f64; 4]>]) -> Option<[f64; 4]> {
+    let mut result: Option<[f64; 4]> = None;
+    for entry in clip_stack.iter().flatten() {
+        match result {
+            Some([rx0, ry0, rx1, ry1]) => {
+                let x0 = rx0.max(entry[0]);
+                let y0 = ry0.max(entry[1]);
+                let x1 = rx1.min(entry[2]);
+                let y1 = ry1.min(entry[3]);
+                if x0 < x1 && y0 < y1 {
+                    result = Some([x0, y0, x1, y1]);
+                } else {
+                    // Empty intersection — nothing is visible.
+                    return Some([0.0, 0.0, 0.0, 0.0]);
+                }
+            }
+            None => result = Some(*entry),
+        }
+    }
+    result
+}
+
+/// Intersects an element's natural bounding box with the active clip bounds.
+/// Returns the original bounds unchanged when no clip is active, or the
+/// clipped rectangle when one is. If the intersection is empty the bounds
+/// collapse to zero area (the element is invisible but still addressable).
+fn intersect_bounds_with_clip(
+    bounds: Option<Bounds>,
+    clip: Option<[f64; 4]>,
+) -> Option<Bounds> {
+    let (b, c) = match (bounds, clip) {
+        (Some(b), Some(c)) => (b, c),
+        _ => return bounds,
+    };
+    let x0 = b.x.max(c[0]);
+    let y0 = b.y.max(c[1]);
+    let x1 = (b.x + b.width).min(c[2]);
+    let y1 = (b.y + b.height).min(c[3]);
+    if x0 < x1 && y0 < y1 {
+        Some(Bounds {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        })
+    } else {
+        Some(Bounds {
+            x: b.x,
+            y: b.y,
+            width: 0.0,
+            height: 0.0,
+        })
+    }
+}
+
 /// Group a flat operation list into addressable elements, computing each one's
 /// bounding box by interpreting the graphics + text state.
 fn elements_from_ops(
@@ -2055,6 +2119,11 @@ fn elements_from_ops_resolved(
         u8,
         Option<String>,
     )> = Vec::new();
+    // Clip-path bounding-box stack (Part C): each `W`/`W*` pushes the
+    // conservative bbox of the current path; `Q` pops it. Elements intersect
+    // their natural bounds with the active clip so the host knows the visible
+    // region. The stack is saved/restored alongside the CTM stack on `q`/`Q`.
+    let mut clip_stack: Vec<Option<[f64; 4]>> = Vec::new();
     // Text state.
     let mut tm = Matrix::IDENTITY;
     let mut tlm = Matrix::IDENTITY;
@@ -2106,14 +2175,18 @@ fn elements_from_ops_resolved(
             continue;
         }
         match operator {
-            b"q" => ctm_stack.push((
-                ctm,
-                fill_alpha,
-                fill_space.clone(),
-                stroke_color,
-                text_render_mode,
-                blend_mode.clone(),
-            )),
+            b"q" => {
+                ctm_stack.push((
+                    ctm,
+                    fill_alpha,
+                    fill_space.clone(),
+                    stroke_color,
+                    text_render_mode,
+                    blend_mode.clone(),
+                ));
+                // Save the clip stack depth so `Q` can restore it.
+                clip_stack.push(None);
+            }
             b"Q" => {
                 if let Some((m, a, cs, sc, tr, bm)) = ctm_stack.pop() {
                     ctm = m;
@@ -2123,6 +2196,8 @@ fn elements_from_ops_resolved(
                     text_render_mode = tr;
                     blend_mode = bm;
                 }
+                // Restore clip stack: pop any clips pushed since the matching `q`.
+                clip_stack.pop();
             }
             b"cm" => {
                 let n = nums(op);
@@ -2436,6 +2511,8 @@ fn elements_from_ops_resolved(
                 let font_style = current_font
                     .as_deref()
                     .and_then(|name| styles.get(name.as_bytes()).cloned());
+                let clip_bounds = active_clip_bounds(&clip_stack);
+                let bounds = intersect_bounds_with_clip(bounds, clip_bounds);
                 elements.push(ContentElement {
                     index: 0,
                     kind: ElementKind::Text,
@@ -2458,6 +2535,7 @@ fn elements_from_ops_resolved(
                     scale_y: sy,
                     skew_x: skew_x_deg,
                     skew_y: skew_y_deg,
+                    clip_bounds,
                 });
                 // Advance the pen for the next run: down the page in vertical mode
                 // (along the text-space y-axis by the run's vertical displacement),
@@ -2519,32 +2597,65 @@ fn elements_from_ops_resolved(
                 let label = name
                     .map(|n| String::from_utf8_lossy(n).into_owned())
                     .unwrap_or_default();
-                // The placement CTM's x-axis angle is the image's rotation,
-                // exactly as for a text baseline.
+                // Decompose the placement CTM into scale/rotation/skew, exactly
+                // as for text runs, so the host can reconstruct the exact affine
+                // transform applied to the image (stretched, skewed, rotated).
                 let m = ctm.0;
-                let img_rot = m[1].atan2(m[0]).to_degrees();
+                let a = m[0];
+                let b = m[1];
+                let c = m[2];
+                let d = m[3];
+                let sx = (a * a + b * b).sqrt();
+                let sy = (c * c + d * d).sqrt();
+                let rot_rad = b.atan2(a);
+                let dot = a * c + b * d;
+                let skew_x_rad = if sx > 1e-10 && sy > 1e-10 {
+                    (dot / (sx * sy))
+                        .acos()
+                        .clamp(
+                            -std::f64::consts::FRAC_PI_2,
+                            std::f64::consts::FRAC_PI_2,
+                        )
+                        - std::f64::consts::FRAC_PI_2
+                } else {
+                    0.0
+                };
+                let skew_y_rad = if sy > 1e-10 {
+                    c.atan2(d) - rot_rad
+                } else {
+                    0.0
+                };
+                let img_rot = rot_rad.to_degrees();
+                // Image bounds reflect the full placement CTM (scale/skew/rotation)
+                // and are NOT intersected with the active clip: object-fit and other
+                // layout modes rely on the unclipped dimensions. The active clip is
+                // still exposed via `clip_bounds` so the host can constrain hit-testing
+                // or overlay placement without altering the intrinsic geometry.
+                let bounds = unit_square_bounds(&ctm);
+                let clip_bounds = active_clip_bounds(&clip_stack);
                 elements.push(ContentElement {
                     index: 0,
                     kind: ElementKind::Image,
                     label,
                     op_start: i,
                     op_end: i,
-                    bounds: unit_square_bounds(&ctm),
+                    bounds,
                     font: None,
                     font_style: None,
                     color: None,
                     font_size: None,
                     rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
                     fill_alpha: Some(fill_alpha),
-                    blend_mode: None,
+                    blend_mode: blend_mode.clone(),
                     stroke_color: None,
                     rendering_mode: 0,
-                    scale_x: 1.0,
-                    scale_y: 1.0,
-                    skew_x: 0.0,
-                    skew_y: 0.0,
+                    scale_x: sx,
+                    scale_y: sy,
+                    skew_x: skew_x_rad.to_degrees(),
+                    skew_y: skew_y_rad.to_degrees(),
                     nested,
                     segments: Vec::new(),
+                    clip_bounds,
                 });
             }
             // Inline image (`BI`…`EI`): like a `Do` image it fills the unit square
@@ -2552,52 +2663,97 @@ fn elements_from_ops_resolved(
             // same bounds/rotation. The decoded pixels are produced on the render
             // path; here we only need it addressable for extraction/reconstruction.
             b"BI" => {
+                // Same QR decomposition as `Do` images above.
                 let m = ctm.0;
-                let img_rot = m[1].atan2(m[0]).to_degrees();
+                let a = m[0];
+                let b = m[1];
+                let c = m[2];
+                let d = m[3];
+                let sx = (a * a + b * b).sqrt();
+                let sy = (c * c + d * d).sqrt();
+                let rot_rad = b.atan2(a);
+                let dot = a * c + b * d;
+                let skew_x_rad = if sx > 1e-10 && sy > 1e-10 {
+                    (dot / (sx * sy))
+                        .acos()
+                        .clamp(
+                            -std::f64::consts::FRAC_PI_2,
+                            std::f64::consts::FRAC_PI_2,
+                        )
+                        - std::f64::consts::FRAC_PI_2
+                } else {
+                    0.0
+                };
+                let skew_y_rad = if sy > 1e-10 {
+                    c.atan2(d) - rot_rad
+                } else {
+                    0.0
+                };
+                let img_rot = rot_rad.to_degrees();
+                // Same as `Do` images: bounds are NOT intersected with the
+                // active clip so object-fit and layout modes see the full
+                // placement geometry. The clip is still exposed via
+                // `clip_bounds` for hit-testing / overlay constraints.
+                let bounds = unit_square_bounds(&ctm);
+                let clip_bounds = active_clip_bounds(&clip_stack);
                 elements.push(ContentElement {
                     index: 0,
                     kind: ElementKind::Image,
                     label: "inline image".to_string(),
                     op_start: i,
                     op_end: i,
-                    bounds: unit_square_bounds(&ctm),
+                    bounds,
                     font: None,
-                    font_style: None,
                     color: None,
                     font_size: None,
                     rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
                     fill_alpha: Some(fill_alpha),
-                    blend_mode: None,
+                    blend_mode: blend_mode.clone(),
                     stroke_color: None,
                     rendering_mode: 0,
-                    scale_x: 1.0,
-                    scale_y: 1.0,
-                    skew_x: 0.0,
-                    skew_y: 0.0,
+                    scale_x: sx,
+                    scale_y: sy,
+                    skew_x: skew_x_rad.to_degrees(),
+                    skew_y: skew_y_rad.to_degrees(),
                     nested,
                     segments: Vec::new(),
+                    clip_bounds,
+                    font_style: None,
                 });
             }
             _ if is_path_construction(operator) => {
                 path_start.get_or_insert(i);
                 accumulate_path(operator, &nums(op), &ctm, &mut path_bb);
             }
+            // Clip-path operators (`W`/`W*`, ISO 32000-1 §8.5.4): intersect the
+            // current clipping path with the current path and push the resulting
+            // conservative bbox onto the clip stack. The path is NOT consumed —
+            // a following paint op may still use it — so we do not reset `path_bb`.
+            b"W" | b"W*" => {
+                if let Some(cb) = path_bb.build() {
+                    let arr = [cb.x, cb.y, cb.x + cb.width, cb.y + cb.height];
+                    clip_stack.push(Some(arr));
+                }
+            }
             _ if is_path_painting(operator) => {
                 if let Some(start) = path_start.take() {
+                    let raw_bounds = path_bb.build();
+                    let clip_bounds = active_clip_bounds(&clip_stack);
+                    let bounds = intersect_bounds_with_clip(raw_bounds, clip_bounds);
                     elements.push(ContentElement {
                         index: 0,
                         kind: ElementKind::Path,
                         label: "shape".to_string(),
                         op_start: start,
                         op_end: i,
-                        bounds: path_bb.build(),
+                        bounds,
                         font: None,
                         font_style: None,
                         color: None,
                         font_size: None,
                         rotation_deg: None,
                         fill_alpha: Some(fill_alpha),
-                        blend_mode: None,
+                        blend_mode: blend_mode.clone(),
                         stroke_color: None,
                         rendering_mode: 0,
                         scale_x: 1.0,
@@ -2606,6 +2762,7 @@ fn elements_from_ops_resolved(
                         skew_y: 0.0,
                         nested,
                         segments: Vec::new(),
+                        clip_bounds: active_clip_bounds(&clip_stack),
                     });
                 }
                 path_bb = BoundsBuilder::new();
@@ -3682,6 +3839,7 @@ mod tests {
             skew_x: 0.0,
             skew_y: 0.0,
             segments: Vec::new(),
+            clip_bounds: None,
         };
         // "N" spans x=10..17 (right edge 17); "om et adresse" starts at 17 (gap 0
         // → join); "ailleurs" starts at 120 (large gap → space).
@@ -3729,6 +3887,7 @@ mod tests {
             skew_x: 0.0,
             skew_y: 0.0,
             segments: Vec::new(),
+            clip_bounds: None,
         };
         // "ASSURES" at top (y=100.5, sorts first); "cerfa" just below (y=99.5,
         // within the 0.6×h tolerance) but at the left margin (x=10).

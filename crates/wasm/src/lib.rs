@@ -1238,10 +1238,36 @@ pub extern "C" fn gp_image_elements_json(
                 ));
                 json_escape(&gigapdf_core::convert::base64(&e.data), &mut s);
                 s.push_str(&format!(
-                    ",\"rotation\":{},\"opacity\":{}}}",
+                    ",\"rotation\":{},\"opacity\":{}",
                     fnum(e.rotation),
                     fnum(e.opacity)
                 ));
+                s.push_str(",\"blendMode\":");
+                match e.blend_mode.as_deref() {
+                    Some(bm) => json_escape(bm, &mut s),
+                    None => s.push_str("null"),
+                }
+                s.push_str(&format!(
+                    ",\"scaleX\":{},\"scaleY\":{},\"skewX\":{},\"skewY\":{}",
+                    fnum(e.scale_x),
+                    fnum(e.scale_y),
+                    fnum(e.skew_x),
+                    fnum(e.skew_y)
+                ));
+                s.push_str(",\"clipBounds\":");
+                match e.clip_bounds {
+                    Some([x0, y0, x1, y1]) => {
+                        s.push_str(&format!(
+                            "[{},{},{},{}]",
+                            fnum(x0),
+                            fnum(y0),
+                            fnum(x1),
+                            fnum(y1)
+                        ));
+                    }
+                    None => s.push_str("null"),
+                }
+                s.push('}');
             }
             s.push(']');
             s
@@ -1313,7 +1339,15 @@ pub extern "C" fn gp_vector_paths_json(
                     fnum(p.stroke_alpha)
                 ));
                 s.push_str(&num_array_json(&p.dash));
-                s.push('}');
+                s.push_str(",\"blendMode\":");
+                match p.blend_mode.as_deref() {
+                    Some(bm) => json_escape(bm, &mut s),
+                    None => s.push_str("null"),
+                }
+                s.push_str(&format!(
+                    ",\"fillRule\":\"{}\",\"lineCap\":\"{}\",\"lineJoin\":\"{}\",\"miterLimit\":{}}}",
+                    p.fill_rule, p.line_cap, p.line_join, fnum(p.miter_limit)
+                ));
             }
             s.push(']');
             s

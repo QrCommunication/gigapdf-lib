@@ -1691,6 +1691,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         };
         let consumed = mark_underlines(&mut runs, &[rule]);
         assert!(runs[0].underline, "run over a thin rule is underlined");
@@ -1724,6 +1729,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         };
         let consumed = mark_underlines(&mut runs, &[rule]);
         assert!(!runs[0].underline);
@@ -1757,6 +1767,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         };
         let consumed = mark_strikes(&mut runs, &[rule]);
         assert!(runs[0].strike, "run crossed at mid-glyph is struck through");
@@ -1793,6 +1808,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         };
         // Underline rule just under the baseline (≈ box bottom): strike must ignore it.
         let mut r1 = vec![run("x", 72.0, 700.0, 12.0)];
@@ -2324,6 +2344,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         }
     }
 
@@ -2452,6 +2477,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         };
 
         let mut ids = IdGen::default();
@@ -2544,6 +2574,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         };
         let runs = vec![run("du texte ordinaire", 72.0, 600.0, 12.0)];
         let mut ids = IdGen::default();

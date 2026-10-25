@@ -50,6 +50,22 @@ pub struct VectorPath {
     pub stroke_alpha: f64,
     /// Dash pattern (`d` array), empty for a solid line.
     pub dash: Vec<f64>,
+    /// Blend mode (`/BM`) active when this path was painted (`"Normal"`,
+    /// `"Multiply"`, `"Screen"`, …). `None` when the graphics state does not
+    /// override the default. Lets the host match compositing behaviour.
+    pub blend_mode: Option<String>,
+    /// Fill rule in effect at paint time: `"nonzero"` (default, `W`) or
+    /// `"evenodd"` (`W*`). Determines how self-intersecting paths are filled.
+    pub fill_rule: String,
+    /// Line cap style (`J` operator): `"butt"` (0, default), `"round"` (1),
+    /// or `"square"` (2). Controls how open subpath endpoints are drawn.
+    pub line_cap: String,
+    /// Line join style (`j` operator): `"miter"` (0, default), `"round"` (1),
+    /// or `"bevel"` (2). Controls how consecutive segments are joined.
+    pub line_join: String,
+    /// Miter limit (`M` operator, default 10.0). When the join style is
+    /// `"miter"`, joins exceeding this ratio are converted to bevel.
+    pub miter_limit: f64,
 }
 
 /// Resolves a **named** colour space — a `cs`/`CS` operand keyed in the page's
@@ -121,6 +137,18 @@ struct GfxState {
     dash: Vec<f64>,
     fill_alpha: f64,
     stroke_alpha: f64,
+    /// Blend mode (`/BM`) from the active `/ExtGState`. `None` when default.
+    blend_mode: Option<String>,
+    /// Fill rule: `"nonzero"` (default) or `"evenodd"`. Set by `W`/`W*` context
+    /// at paint time; tracked here so the paint site can read it without
+    /// re-scanning the clip operator that preceded the path.
+    fill_rule: String,
+    /// Line cap style (`J`): 0 = butt, 1 = round, 2 = square.
+    line_cap: u8,
+    /// Line join style (`j`): 0 = miter, 1 = round, 2 = bevel.
+    line_join: u8,
+    /// Miter limit (`M`, default 10.0).
+    miter_limit: f64,
 }
 
 /// Naive subtractive CMYK → RGB: `channel = (1 − ink)(1 − black)`.
@@ -311,6 +339,11 @@ pub fn vector_paths_from_ops_with_pos(
         dash: Vec::new(),
         fill_alpha: 1.0,
         stroke_alpha: 1.0,
+        blend_mode: None,
+        fill_rule: "nonzero".to_string(),
+        line_cap: 0,
+        line_join: 0,
+        miter_limit: 10.0,
     };
     let mut stack: Vec<GfxState> = Vec::new();
 
@@ -345,7 +378,7 @@ pub fn vector_paths_from_ops_with_pos(
                     }
                 }
             }
-            // Fill colour (the shorthand operators also set the colour space).
+            // Fill colour (RGB and Gray shorthands).
             b"rg" if n.len() == 3 => {
                 st.fill = [n[0], n[1], n[2]];
                 st.fill_space = CsKind::Device(ColorSpace::Rgb);
@@ -408,6 +441,16 @@ pub fn vector_paths_from_ops_with_pos(
                 }
             }
             b"w" if !n.is_empty() => st.line_width = n[0],
+            // Line cap style (`J`, ISO 32000-1 §8.4.3.5): 0=butt, 1=round, 2=square.
+            b"J" if !n.is_empty() => st.line_cap = n[0].clamp(0.0, 2.0) as u8,
+            // Line join style (`j`, ISO 32000-1 §8.4.3.5): 0=miter, 1=round, 2=bevel.
+            b"j" if !n.is_empty() => st.line_join = n[0].clamp(0.0, 2.0) as u8,
+            // Miter limit (`M`, ISO 32000-1 §8.4.3.5): default 10.0, must be ≥ 1.
+            b"M" if !n.is_empty() => st.miter_limit = n[0].max(1.0),
+            // Fill rule: `W` sets nonzero winding (default), `W*` sets even-odd.
+            // The path is NOT consumed here — a following paint op may still use it.
+            b"W" => st.fill_rule = "nonzero".to_string(),
+            b"W*" => st.fill_rule = "evenodd".to_string(),
             b"d" => {
                 st.dash = match op.operands.first() {
                     Some(Object::Array(items)) => items
@@ -474,9 +517,8 @@ pub fn vector_paths_from_ops_with_pos(
             }
             // `n` ends the path (often after a `W` clip) without painting.
             b"n" => path.clear(),
-            // `W`/`W*` set the clip from the current path but keep it for the
-            // following paint op — do not reset.
-            b"W" | b"W*" => {}
+            // `W`/`W*` are handled above (fill_rule tracking); nothing more
+            // to do here — the path is preserved for the following paint op.
             _ if is_paint(operator) => {
                 if path.is_empty() {
                     continue;
@@ -490,6 +532,18 @@ pub fn vector_paths_from_ops_with_pos(
                 let fill = paints_fill(operator).then_some(st.fill);
                 let stroke = paints_stroke(operator).then_some(st.stroke);
                 let bounds = path_bounds(&path);
+                let line_cap = match st.line_cap {
+                    1 => "round",
+                    2 => "square",
+                    _ => "butt",
+                }
+                .to_string();
+                let line_join = match st.line_join {
+                    1 => "round",
+                    2 => "bevel",
+                    _ => "miter",
+                }
+                .to_string();
                 out.push((
                     VectorPath {
                         index: out.len(),
@@ -501,6 +555,11 @@ pub fn vector_paths_from_ops_with_pos(
                         fill_alpha: st.fill_alpha,
                         stroke_alpha: st.stroke_alpha,
                         dash: st.dash.clone(),
+                        blend_mode: st.blend_mode.clone(),
+                        fill_rule: st.fill_rule.clone(),
+                        line_cap,
+                        line_join,
+                        miter_limit: st.miter_limit,
                     },
                     op_pos,
                 ));

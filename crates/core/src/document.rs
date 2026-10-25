@@ -2983,6 +2983,24 @@ pub struct ImageElementInfo {
     /// Non-stroking fill alpha in effect (`0.0..=1.0`, `1.0` = fully opaque),
     /// from the active `/ExtGState`'s `/ca`.
     pub opacity: f64,
+    /// Blend mode (`/BM`) active when this image was painted (`"Normal"`,
+    /// `"Multiply"`, `"Screen"`, …). `None` when the graphics state does not
+    /// override the default. Lets the host match compositing behaviour.
+    pub blend_mode: Option<String>,
+    /// Horizontal scale factor from the placement CTM decomposition.
+    /// `1.0` = no horizontal scaling.
+    pub scale_x: f64,
+    /// Vertical scale factor from the placement CTM decomposition.
+    /// `1.0` = no vertical scaling.
+    pub scale_y: f64,
+    /// Horizontal skew (shear) in degrees from the placement CTM decomposition.
+    pub skew_x: f64,
+    /// Vertical skew in degrees from the placement CTM decomposition.
+    pub skew_y: f64,
+    /// Conservative bounding box of the active clip path at the time this
+    /// image was painted (`W`/`W*`), in page user space. `None` when no clip
+    /// was in effect.
+    pub clip_bounds: Option<[f64; 4]>,
 }
 
 impl Document {
@@ -5791,11 +5809,24 @@ impl Document {
         // accepted by `remove_element`/`transform_element`) through to the reported
         // index — NOT an image-local 0,1,2 counter, which would target the wrong
         // element on any page that also has text/paths.
-        let images: Vec<(usize, content::Bounds, String, f64, f64)> = elements
+        struct ImgMeta {
+            index: usize,
+            bounds: content::Bounds,
+            label: String,
+            rotation: f64,
+            opacity: f64,
+            blend_mode: Option<String>,
+            scale_x: f64,
+            scale_y: f64,
+            skew_x: f64,
+            skew_y: f64,
+            clip_bounds: Option<[f64; 4]>,
+        }
+        let images: Vec<ImgMeta> = elements
             .into_iter()
             .filter(|e| e.kind == content::ElementKind::Image)
             .map(|e| {
-                let b = e.bounds.unwrap_or(content::Bounds {
+                let bounds = e.bounds.unwrap_or(content::Bounds {
                     x: 0.0,
                     y: 0.0,
                     width: 0.0,
@@ -5803,27 +5834,46 @@ impl Document {
                 });
                 let rotation = e.rotation_deg.unwrap_or(0.0);
                 let opacity = e.fill_alpha.unwrap_or(1.0);
-                (e.index, b, e.label, rotation, opacity)
+                ImgMeta {
+                    index: e.index,
+                    bounds,
+                    label: e.label,
+                    rotation,
+                    opacity,
+                    blend_mode: e.blend_mode,
+                    scale_x: e.scale_x,
+                    scale_y: e.scale_y,
+                    skew_x: e.skew_x,
+                    skew_y: e.skew_y,
+                    clip_bounds: e.clip_bounds,
+                }
             })
             .collect();
         let mut out = Vec::new();
-        for (index, b, name, rotation, opacity) in images.into_iter() {
-            let Some((format, data, pw, ph)) = self.image_xobject_bytes(page_no, name.as_bytes())
+        for meta in images.into_iter() {
+            let Some((format, data, pw, ph)) =
+                self.image_xobject_bytes(page_no, meta.label.as_bytes())
             else {
                 continue;
             };
             out.push(ImageElementInfo {
-                index,
-                x: b.x,
-                y: b.y,
-                width: b.width,
-                height: b.height,
+                index: meta.index,
+                x: meta.bounds.x,
+                y: meta.bounds.y,
+                width: meta.bounds.width,
+                height: meta.bounds.height,
                 format,
                 pixel_width: pw,
                 pixel_height: ph,
                 data,
-                rotation,
-                opacity,
+                rotation: meta.rotation,
+                opacity: meta.opacity,
+                blend_mode: meta.blend_mode,
+                scale_x: meta.scale_x,
+                scale_y: meta.scale_y,
+                skew_x: meta.skew_x,
+                skew_y: meta.skew_y,
+                clip_bounds: meta.clip_bounds,
             });
         }
         out

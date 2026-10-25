@@ -2877,6 +2877,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         }
     }
 
@@ -3264,6 +3269,11 @@ mod tests {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             dash: Vec::new(),
+            blend_mode: None,
+            fill_rule: "nonzero".to_string(),
+            line_cap: "butt".to_string(),
+            line_join: "miter".to_string(),
+            miter_limit: 10.0,
         }
     }
 
