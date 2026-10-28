@@ -163,17 +163,17 @@ pub struct ContentElement {
     /// `bounds`/`label` already position it), and for image/path. See
     /// [`TextSegment`].
     pub segments: Vec<TextSegment>,
-    /// Horizontal scale factor from the text·CTM decomposition. `1.0` = no
-    /// horizontal scaling. Lets the host detect stretched/compressed glyphs.
+    /// Horizontal scale of the element's matrix (text·CTM, or the image CTM),
+    /// decomposed as `R(rotation) · Scale(scale_x, scale_y) · SkewX(skew_x)` —
+    /// the Fabric.js / CSS QR convention. `1.0` = unscaled.
     pub scale_x: f64,
-    /// Vertical scale factor from the text·CTM decomposition. `1.0` = no
-    /// vertical scaling.
+    /// Vertical scale in the same decomposition; signed (negative = mirrored).
     pub scale_y: f64,
-    /// Horizontal skew (shear) in degrees from the text·CTM decomposition.
-    /// Non-zero for artificially obliqued text that is not a true italic font.
+    /// Horizontal skew in degrees in the same decomposition. Non-zero for
+    /// synthetically obliqued text that is not a true italic font.
     pub skew_x: f64,
-    /// Vertical skew in degrees (rare, usually `0.0`). Completes the affine
-    /// decomposition so the host can reconstruct the exact text CTM.
+    /// Always `0.0`: rotation, both scales and `skew_x` fully determine the
+    /// 2×2 transform. Kept so hosts with a two-skew model read an explicit zero.
     pub skew_y: f64,
     /// Conservative bounding box of the active clip path at the time this
     /// element was painted (`W`/`W*`), in page user space. `None` when no clip
@@ -1799,7 +1799,7 @@ fn run_layout(
                     // in 1/1000 em). The sign convention matches ISO 32000-1 §9.4.4:
                     // positive n = negative displacement (tighter), but we store the
                     // raw TJ value so the host can apply the same formula.
-                    seg_kerning += *n as f64;
+                    seg_kerning += *n;
                     // A kern between words (nothing accumulated) folds into the gap so
                     // the next word's box starts after it, not before.
                     if seg_text.is_empty() {
@@ -2013,6 +2013,47 @@ fn accumulate_path(operator: &[u8], n: &[f64], ctm: &Matrix, bb: &mut BoundsBuil
     }
 }
 
+/// The linear part of a matrix split as `rotation · scale · skewX` — the QR
+/// convention of Fabric.js `util.qrDecompose` / `composeMatrix` and CSS — so a
+/// host feeding these values back into its own transform rebuilds the exact
+/// matrix: `[a b c d] = R(rotation) · [[scale_x, 0], [0, scale_y]] ·
+/// [[1, tan(skew_x)], [0, 1]]` (PDF column-vector order, user space).
+///
+/// Four parameters describe any 2×2 map, so no y-skew remains: elements report
+/// `skew_y = 0`. `scale_y` is signed — negative for a mirrored transform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AffineParts {
+    rotation_deg: f64,
+    scale_x: f64,
+    scale_y: f64,
+    skew_x_deg: f64,
+}
+
+fn decompose_affine(m: &Matrix) -> AffineParts {
+    let [a, b, c, d, _, _] = m.0;
+    let scale_x = a.hypot(b);
+    if scale_x < 1e-12 {
+        // Degenerate x-axis: nothing to orient the frame by.
+        return AffineParts {
+            rotation_deg: 0.0,
+            scale_x: 0.0,
+            scale_y: c.hypot(d),
+            skew_x_deg: 0.0,
+        };
+    }
+    let rotation_deg = b.atan2(a).to_degrees();
+    AffineParts {
+        rotation_deg: if rotation_deg.abs() < 1e-6 {
+            0.0
+        } else {
+            rotation_deg
+        },
+        scale_x,
+        scale_y: (a * d - b * c) / scale_x,
+        skew_x_deg: (a * c + b * d).atan2(scale_x * scale_x).to_degrees(),
+    }
+}
+
 /// Returns the intersection of the active clip-path bounding boxes on the
 /// stack, or `None` when no clip is in effect. Each entry is an axis-aligned
 /// `[x0, y0, x1, y1]` rectangle in page user space; the intersection is the
@@ -2079,13 +2120,24 @@ fn elements_from_ops(
     fonts: &FontDecoders,
     gstate_alpha: &BTreeMap<String, f64>,
 ) -> Vec<ContentElement> {
+    elements_from_ops_gstate(operations, fonts, gstate_alpha, &BTreeMap::new())
+}
+
+/// [`elements_from_ops`] that also resolves each element's blend mode through
+/// `gstate_blend` (`/ExtGState` name → `/BM`).
+fn elements_from_ops_gstate(
+    operations: &[Operation],
+    fonts: &FontDecoders,
+    gstate_alpha: &BTreeMap<String, f64>,
+    gstate_blend: &BTreeMap<String, String>,
+) -> Vec<ContentElement> {
     let mut visited: BTreeSet<(u32, u16)> = BTreeSet::new();
     elements_from_ops_resolved(
         operations,
         fonts,
         &FontStyles::new(),
         gstate_alpha,
-        &BTreeMap::new(),
+        gstate_blend,
         &vector::NoNamedColors,
         Matrix::IDENTITY,
         &|_| None,
@@ -2129,14 +2181,17 @@ fn elements_from_ops_resolved(
     // (`/Separation`, `/ICCBased`, `/Indexed`, `/DeviceN`) carry its real colour
     // instead of falling back to the last device colour (usually black).
     let mut fill_space = vector::CsKind::initial();
-    let mut ctm_stack: Vec<(
+    // `q` snapshot: (CTM, fill alpha, fill colour space, stroke colour, text
+    // rendering mode, blend mode) — restored together by `Q`.
+    type SavedGraphicsState = (
         Matrix,
         f64,
         vector::CsKind,
         Option<[f64; 3]>,
         u8,
         Option<String>,
-    )> = Vec::new();
+    );
+    let mut ctm_stack: Vec<SavedGraphicsState> = Vec::new();
     // Clip-path bounding-box stack (Part C): each `W`/`W*` pushes the
     // conservative bbox of the current path; `Q` pops it. Elements intersect
     // their natural bounds with the active clip so the host knows the visible
@@ -2478,50 +2533,16 @@ fn elements_from_ops_resolved(
                 // and skew so the host can reconstruct the exact affine transform
                 // (the previous `atan2(m[1], m[0])` was only correct for pure
                 // rotation and reported wrong angles when skew was present).
-                let m = tm.then(&ctm).0;
-                let a = m[0];
-                let b = m[1];
-                let c = m[2];
-                let d = m[3];
-                let sx = (a * a + b * b).sqrt();
-                let sy = (c * c + d * d).sqrt();
-                let rot_rad = b.atan2(a);
-                let dot = a * c + b * d;
-                // QR-style decomposition of the combined text→device matrix `m`:
-                //   scale_x  = |col1|             (already computed as `sx`)
-                //   scale_y  = |col2|             (already computed as `sy`)
-                //   rotation = atan2(b, a)        (already computed as `rot_rad`)
-                //   skew_x   = angle(col1, col2) − π/2
-                //            = acos(dot/(sx·sy)) − π/2   (clamped for safety)
-                //   skew_y   = angle(col2) − rotation
-                //            = atan2(c, d) − rot_rad
-                // This gives the host enough information to reconstruct the
-                // exact affine transform: R(rot) · S(sx,sy) · Skew(skew_x,skew_y).
-                let skew_x_rad = if sx > 1e-10 && sy > 1e-10 {
-                    (dot / (sx * sy))
-                        .acos()
-                        .clamp(
-                            -std::f64::consts::FRAC_PI_2,
-                            std::f64::consts::FRAC_PI_2,
-                        )
-                        - std::f64::consts::FRAC_PI_2
+                let m = tm.then(&ctm);
+                let parts = decompose_affine(&m);
+                // On-page glyph size: the `Tf` size times the length of the
+                // matrix's y-axis (unchanged by the decomposition above).
+                let y_axis_len = m.0[2].hypot(m.0[3]);
+                let eff_size = if y_axis_len > 0.0 {
+                    font_size * y_axis_len
                 } else {
-                    0.0
+                    font_size
                 };
-                // Residual skew on the y-axis: how much column 2 deviates from
-                // the direction perpendicular to column 1 after rotation is
-                // removed. Zero for pure rotation/scale; non-zero when the PDF
-                // producer applied an independent y-skew (rare but valid per
-                // ISO 32000-1 §8.3.3).
-                let skew_y_rad = if sy > 1e-10 {
-                    c.atan2(d) - rot_rad
-                } else {
-                    0.0
-                };
-                let eff_size = if sy > 0.0 { font_size * sy } else { font_size };
-                let rot = rot_rad.to_degrees();
-                let skew_x_deg = skew_x_rad.to_degrees();
-                let skew_y_deg = skew_y_rad.to_degrees();
                 // Resolve the run's style against the CURRENT scope's font table
                 // (`styles` is the page's at depth 0, the form's when recursing),
                 // so form-XObject text is styled with the form's fonts rather than
@@ -2542,17 +2563,17 @@ fn elements_from_ops_resolved(
                     font_style,
                     color: fill_color,
                     font_size: Some(eff_size),
-                    rotation_deg: Some(if rot.abs() < 1e-6 { 0.0 } else { rot }),
+                    rotation_deg: Some(parts.rotation_deg),
                     fill_alpha: Some(fill_alpha),
                     blend_mode: blend_mode.clone(),
                     stroke_color,
                     rendering_mode: text_render_mode,
                     nested,
                     segments,
-                    scale_x: sx,
-                    scale_y: sy,
-                    skew_x: skew_x_deg,
-                    skew_y: skew_y_deg,
+                    scale_x: parts.scale_x,
+                    scale_y: parts.scale_y,
+                    skew_x: parts.skew_x_deg,
+                    skew_y: 0.0,
                     clip_bounds,
                 });
                 // Advance the pen for the next run: down the page in vertical mode
@@ -2618,32 +2639,7 @@ fn elements_from_ops_resolved(
                 // Decompose the placement CTM into scale/rotation/skew, exactly
                 // as for text runs, so the host can reconstruct the exact affine
                 // transform applied to the image (stretched, skewed, rotated).
-                let m = ctm.0;
-                let a = m[0];
-                let b = m[1];
-                let c = m[2];
-                let d = m[3];
-                let sx = (a * a + b * b).sqrt();
-                let sy = (c * c + d * d).sqrt();
-                let rot_rad = b.atan2(a);
-                let dot = a * c + b * d;
-                let skew_x_rad = if sx > 1e-10 && sy > 1e-10 {
-                    (dot / (sx * sy))
-                        .acos()
-                        .clamp(
-                            -std::f64::consts::FRAC_PI_2,
-                            std::f64::consts::FRAC_PI_2,
-                        )
-                        - std::f64::consts::FRAC_PI_2
-                } else {
-                    0.0
-                };
-                let skew_y_rad = if sy > 1e-10 {
-                    c.atan2(d) - rot_rad
-                } else {
-                    0.0
-                };
-                let img_rot = rot_rad.to_degrees();
+                let parts = decompose_affine(&ctm);
                 // Image bounds reflect the full placement CTM (scale/skew/rotation)
                 // and are NOT intersected with the active clip: object-fit and other
                 // layout modes rely on the unclipped dimensions. The active clip is
@@ -2662,15 +2658,15 @@ fn elements_from_ops_resolved(
                     font_style: None,
                     color: None,
                     font_size: None,
-                    rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
+                    rotation_deg: Some(parts.rotation_deg),
                     fill_alpha: Some(fill_alpha),
                     blend_mode: blend_mode.clone(),
                     stroke_color: None,
                     rendering_mode: 0,
-                    scale_x: sx,
-                    scale_y: sy,
-                    skew_x: skew_x_rad.to_degrees(),
-                    skew_y: skew_y_rad.to_degrees(),
+                    scale_x: parts.scale_x,
+                    scale_y: parts.scale_y,
+                    skew_x: parts.skew_x_deg,
+                    skew_y: 0.0,
                     nested,
                     segments: Vec::new(),
                     clip_bounds,
@@ -2681,33 +2677,8 @@ fn elements_from_ops_resolved(
             // same bounds/rotation. The decoded pixels are produced on the render
             // path; here we only need it addressable for extraction/reconstruction.
             b"BI" => {
-                // Same QR decomposition as `Do` images above.
-                let m = ctm.0;
-                let a = m[0];
-                let b = m[1];
-                let c = m[2];
-                let d = m[3];
-                let sx = (a * a + b * b).sqrt();
-                let sy = (c * c + d * d).sqrt();
-                let rot_rad = b.atan2(a);
-                let dot = a * c + b * d;
-                let skew_x_rad = if sx > 1e-10 && sy > 1e-10 {
-                    (dot / (sx * sy))
-                        .acos()
-                        .clamp(
-                            -std::f64::consts::FRAC_PI_2,
-                            std::f64::consts::FRAC_PI_2,
-                        )
-                        - std::f64::consts::FRAC_PI_2
-                } else {
-                    0.0
-                };
-                let skew_y_rad = if sy > 1e-10 {
-                    c.atan2(d) - rot_rad
-                } else {
-                    0.0
-                };
-                let img_rot = rot_rad.to_degrees();
+                // Same decomposition as `Do` images above.
+                let parts = decompose_affine(&ctm);
                 // Same as `Do` images: bounds are NOT intersected with the
                 // active clip so object-fit and layout modes see the full
                 // placement geometry. The clip is still exposed via
@@ -2724,15 +2695,15 @@ fn elements_from_ops_resolved(
                     font: None,
                     color: None,
                     font_size: None,
-                    rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
+                    rotation_deg: Some(parts.rotation_deg),
                     fill_alpha: Some(fill_alpha),
                     blend_mode: blend_mode.clone(),
                     stroke_color: None,
                     rendering_mode: 0,
-                    scale_x: sx,
-                    scale_y: sy,
-                    skew_x: skew_x_rad.to_degrees(),
-                    skew_y: skew_y_rad.to_degrees(),
+                    scale_x: parts.scale_x,
+                    scale_y: parts.scale_y,
+                    skew_x: parts.skew_x_deg,
+                    skew_y: 0.0,
                     nested,
                     segments: Vec::new(),
                     clip_bounds,
@@ -2805,8 +2776,25 @@ pub fn extract_elements_with(
     fonts: &FontDecoders,
     gstate_alpha: &BTreeMap<String, f64>,
 ) -> Result<Vec<ContentElement>> {
+    extract_elements_with_gstate(content, fonts, gstate_alpha, &BTreeMap::new())
+}
+
+/// Like [`extract_elements_with`], also resolving each element's blend mode
+/// through `gstate_blend` (`/ExtGState` resource name → `/BM` name), so the
+/// top-level element list reports the same `blend_mode` as the deep one.
+pub fn extract_elements_with_gstate(
+    content: &[u8],
+    fonts: &FontDecoders,
+    gstate_alpha: &BTreeMap<String, f64>,
+    gstate_blend: &BTreeMap<String, String>,
+) -> Result<Vec<ContentElement>> {
     let operations = parse_content(content)?;
-    Ok(elements_from_ops(&operations, fonts, gstate_alpha))
+    Ok(elements_from_ops_gstate(
+        &operations,
+        fonts,
+        gstate_alpha,
+        gstate_blend,
+    ))
 }
 
 /// List all addressable elements (text, images, shapes) of a content stream,
@@ -5278,111 +5266,114 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         assert_eq!(texts[0].font_size, Some(10.0));
     }
 
-    /// Helper: decompose a 2×3 affine matrix `[a, b, c, d, e, f]` into
-    /// `(scale_x, scale_y, skew_x_deg, skew_y_deg)` using the same QR-style
-    /// decomposition as the text-element construction site. This lets us
-    /// assert the decomposition against known matrices without going through
-    /// the full content-stream parser.
+    /// Decompose `[a, b, c, d]` into `(scale_x, scale_y, skew_x_deg, rotation_deg)`
+    /// through the production [`decompose_affine`].
     fn decompose_ctm(m: [f64; 6]) -> (f64, f64, f64, f64) {
-        let [a, b, c, d, _e, _f] = m;
-        let sx = a.hypot(b);
-        let sy = c.hypot(d);
-        let rot_rad = b.atan2(a);
-        let dot = a * c + b * d;
-        let skew_x_rad = if sx > 1e-10 && sy > 1e-10 {
-            (dot / (sx * sy))
-                .acos()
-                .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2)
-                - std::f64::consts::FRAC_PI_2
-        } else {
-            0.0
-        };
-        let skew_y_rad = if sy > 1e-10 {
-            c.atan2(d) - rot_rad
-        } else {
-            0.0
-        };
-        (sx, sy, skew_x_rad.to_degrees(), skew_y_rad.to_degrees())
+        let p = decompose_affine(&Matrix(m));
+        (p.scale_x, p.scale_y, p.skew_x_deg, p.rotation_deg)
+    }
+
+    /// Rebuild `[a, b, c, d]` from the parts with the documented composition
+    /// `R(rotation) · Scale(sx, sy) · SkewX(skew_x)` (Fabric.js `composeMatrix`).
+    fn recompose(p: AffineParts) -> [f64; 4] {
+        let (sin, cos) = p.rotation_deg.to_radians().sin_cos();
+        let t = p.skew_x_deg.to_radians().tan();
+        // Scale · SkewX = [[sx, sx·t], [0, sy]] (column-vector form).
+        let (m00, m01, m11) = (p.scale_x, p.scale_x * t, p.scale_y);
+        // R · that, returned in PDF order [a, b, c, d] (columns (a,b), (c,d)).
+        [
+            cos * m00,
+            sin * m00,
+            cos * m01 - sin * m11,
+            sin * m01 + cos * m11,
+        ]
+    }
+
+    #[test]
+    fn ctm_decomposition_round_trips_every_matrix_kind() {
+        let cases: [[f64; 4]; 7] = [
+            [1.0, 0.0, 0.0, 1.0],        // identity
+            [2.0, 0.0, 0.0, 3.0],        // anamorphic scale
+            [1.5, 0.0, 0.3, 1.0],        // obliqued text (Tm)
+            [0.0, 1.0, -1.0, 0.0],       // 90° rotation
+            [1.0, 0.0, 0.0, -1.0],       // vertical mirror
+            [0.866, 0.5, -0.326, 1.024], // rotation + skew
+            [-12.0, 3.0, 4.0, 7.5],      // arbitrary
+        ];
+        for m in cases {
+            let p = decompose_affine(&Matrix([m[0], m[1], m[2], m[3], 0.0, 0.0]));
+            let back = recompose(p);
+            for k in 0..4 {
+                assert!((back[k] - m[k]).abs() < 1e-9, "{m:?} → {p:?} → {back:?}");
+            }
+        }
     }
 
     #[test]
     fn ctm_decomposition_identity() {
-        let (sx, sy, kx, ky) = decompose_ctm([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let (sx, sy, kx, rot) = decompose_ctm([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         assert!((sx - 1.0).abs() < 1e-9, "sx={}", sx);
         assert!((sy - 1.0).abs() < 1e-9, "sy={}", sy);
         assert!(kx.abs() < 1e-9, "skew_x={}", kx);
-        assert!(ky.abs() < 1e-9, "skew_y={}", ky);
+        assert_eq!(rot, 0.0);
     }
 
     #[test]
     fn ctm_decomposition_uniform_scale() {
-        let (sx, sy, kx, ky) = decompose_ctm([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        let (sx, sy, kx, rot) = decompose_ctm([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
         assert!((sx - 2.0).abs() < 1e-9, "sx={}", sx);
         assert!((sy - 2.0).abs() < 1e-9, "sy={}", sy);
         assert!(kx.abs() < 1e-9, "skew_x={}", kx);
-        assert!(ky.abs() < 1e-9, "skew_y={}", ky);
+        assert_eq!(rot, 0.0);
     }
 
     #[test]
     fn ctm_decomposition_horizontal_skew() {
-        // Pure horizontal skew of 17°: [1, 0, tan(17°), 1, 0, 0].
-        // In QR decomposition, scale_y = |col2| = sqrt(tan²(17°) + 1) = 1/cos(17°),
-        // NOT 1.0. The skew is partially absorbed into scale_y. What matters is
-        // that skew_x correctly recovers the 17° angle between the columns.
+        // Pure horizontal skew of 17°: [1, 0, tan(17°), 1] — the y-axis leans
+        // right by 17°, nothing else changes: a positive 17° skew and unit scale.
         let tan17 = 17.0_f64.to_radians().tan();
-        let expected_sy = 1.0 / 17.0_f64.to_radians().cos();
-        let (sx, sy, kx, ky) = decompose_ctm([1.0, 0.0, tan17, 1.0, 0.0, 0.0]);
+        let (sx, sy, kx, rot) = decompose_ctm([1.0, 0.0, tan17, 1.0, 0.0, 0.0]);
         assert!((sx - 1.0).abs() < 1e-9, "sx={}", sx);
-        assert!((sy - expected_sy).abs() < 1e-6, "sy={} expected {}", sy, expected_sy);
-        // The QR decomposition yields skew_x = -17° for this matrix because
-        // acos(dot/(sx·sy)) − π/2 is negative when col2 leans "right" of col1.
-        // This sign convention is consistent: the production code uses the same
-        // formula and the decomposed values reconstruct the original matrix.
-        assert!((kx + 17.0).abs() < 1e-6, "skew_x={}", kx);
-        // skew_y = atan2(c, d) − rot_rad = atan2(tan17, 1) − 0 = 17°.
-        // For a pure horizontal-skew matrix the y-column is tilted by the
-        // skew angle relative to the (unrotated) y-axis, so skew_y equals
-        // the injected skew. This is consistent with the QR decomposition:
-        // R(0) · S(1, sec17) · SkewX(-17) · SkewY(17) reconstructs the
-        // original matrix.
-        assert!((ky - 17.0).abs() < 1e-6, "skew_y={}", ky);
+        assert!((sy - 1.0).abs() < 1e-9, "sy={}", sy);
+        assert!((kx - 17.0).abs() < 1e-9, "skew_x={}", kx);
+        assert_eq!(rot, 0.0);
     }
 
     #[test]
     fn ctm_decomposition_rotation_90() {
-        // 90° rotation: [cos90, sin90, -sin90, cos90, 0, 0] = [0, 1, -1, 0, 0, 0].
-        // Scale is (1, 1) and skew_x is 0 (columns are orthogonal).
-        // skew_y = atan2(c, d) - rot_rad = atan2(-1, 0) - π/2 = -π/2 - π/2 = -π.
-        // This is a valid decomposition: the -180° skew_y combined with the 90°
-        // rotation reconstructs the original matrix. We verify round-trip instead
-        // of asserting skew_y ≈ 0.
-        let (sx, sy, kx, _ky) = decompose_ctm([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]);
+        // 90° rotation [0, 1, -1, 0]: unit scale, no skew — the previous
+        // decomposition reported a meaningless −180° y-skew here.
+        let (sx, sy, kx, rot) = decompose_ctm([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]);
         assert!((sx - 1.0).abs() < 1e-9, "sx={}", sx);
         assert!((sy - 1.0).abs() < 1e-9, "sy={}", sy);
-        assert!(kx.abs() < 1e-6, "skew_x={}", kx);
+        assert!(kx.abs() < 1e-9, "skew_x={}", kx);
+        assert!((rot - 90.0).abs() < 1e-9, "rotation={}", rot);
+    }
+
+    #[test]
+    fn ctm_decomposition_mirror_yields_negative_scale_y() {
+        let (sx, sy, kx, rot) = decompose_ctm([1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
+        assert!(
+            (sx - 1.0).abs() < 1e-9 && (sy + 1.0).abs() < 1e-9,
+            "{sx} {sy}"
+        );
+        assert!(kx.abs() < 1e-9 && rot == 0.0, "{kx} {rot}");
     }
 
     #[test]
     fn ctm_decomposition_rotation_plus_skew() {
-        // Rotation 30° then horizontal skew 10°:
-        // R(30) = [cos30, sin30, -sin30, cos30]
-        // SkewX(10) applied after = columns become:
-        //   col1 = R.col1 = (cos30, sin30)
-        //   col2 = R.col2 + tan(10°)·R.col1
-        // In QR decomposition, scale_y absorbs part of the skew (|col2| > 1).
-        // We verify that skew_x recovers the injected 10° and that scale_x = 1.
+        // R(30°) · SkewX(10°): col1 = R.col1, col2 = R.col2 + tan(10°)·R.col1.
+        // The decomposition recovers exactly the injected rotation and skew.
         let r30 = 30.0_f64.to_radians();
         let t10 = 10.0_f64.to_radians().tan();
         let a = r30.cos();
         let b = r30.sin();
         let c = -r30.sin() + t10 * r30.cos();
         let d = r30.cos() + t10 * r30.sin();
-        let (sx, _sy, kx, _ky) = decompose_ctm([a, b, c, d, 0.0, 0.0]);
-        // scale_x = |col1| = 1 (rotation preserves unit length).
-        assert!((sx - 1.0).abs() < 1e-6, "sx={}", sx);
-        // The QR decomposition yields skew_x = -10° for this matrix (same sign
-        // convention as the horizontal-skew test above). The magnitude is what
-        // matters: it correctly recovers the injected 10° skew angle.
-        assert!((kx + 10.0).abs() < 1e-6, "skew_x={}", kx);
+        let (sx, sy, kx, rot) = decompose_ctm([a, b, c, d, 0.0, 0.0]);
+        assert!((sx - 1.0).abs() < 1e-9, "sx={}", sx);
+        assert!((sy - 1.0).abs() < 1e-9, "sy={}", sy);
+        assert!((kx - 10.0).abs() < 1e-9, "skew_x={}", kx);
+        assert!((rot - 30.0).abs() < 1e-9, "rotation={}", rot);
     }
 }

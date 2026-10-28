@@ -10,6 +10,10 @@ use super::interpret::{Bounds, BoundsBuilder, Matrix};
 use super::Operation;
 use crate::object::Object;
 
+/// A page's ExtGState resources by name: `(fill_alpha /ca, stroke_alpha /CA,
+/// blend_mode /BM)`, each `None` when the dictionary omits it.
+pub type ExtGStateParams = BTreeMap<String, (Option<f64>, Option<f64>, Option<String>)>;
+
 /// A single path segment in page user space (origin bottom-left, Y up). PDF's
 /// path model has only cubic Béziers, so the `v`/`y` shorthands are expanded to
 /// `Cubic` and rectangles (`re`) to `Move`+`Line`×3+`Close`.
@@ -54,8 +58,9 @@ pub struct VectorPath {
     /// `"Multiply"`, `"Screen"`, …). `None` when the graphics state does not
     /// override the default. Lets the host match compositing behaviour.
     pub blend_mode: Option<String>,
-    /// Fill rule in effect at paint time: `"nonzero"` (default, `W`) or
-    /// `"evenodd"` (`W*`). Determines how self-intersecting paths are filled.
+    /// Fill rule selected by the painting operator: `"evenodd"` for `f*`/`B*`/
+    /// `b*`, `"nonzero"` otherwise (ISO 32000-1 §8.5.3.3). Determines how
+    /// self-intersecting paths are filled.
     pub fill_rule: String,
     /// Line cap style (`J` operator): `"butt"` (0, default), `"round"` (1),
     /// or `"square"` (2). Controls how open subpath endpoints are drawn.
@@ -139,10 +144,6 @@ struct GfxState {
     stroke_alpha: f64,
     /// Blend mode (`/BM`) from the active `/ExtGState`. `None` when default.
     blend_mode: Option<String>,
-    /// Fill rule: `"nonzero"` (default) or `"evenodd"`. Set by `W`/`W*` context
-    /// at paint time; tracked here so the paint site can read it without
-    /// re-scanning the clip operator that preceded the path.
-    fill_rule: String,
     /// Line cap style (`J`): 0 = butt, 1 = round, 2 = square.
     line_cap: u8,
     /// Line join style (`j`): 0 = miter, 1 = round, 2 = bevel.
@@ -273,6 +274,15 @@ fn paints_fill(op: &[u8]) -> bool {
 fn paints_stroke(op: &[u8]) -> bool {
     matches!(op, b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*")
 }
+/// The fill rule a painting operator selects (ISO 32000-1 §8.5.3.3): the
+/// starred fills use even-odd, every other operator non-zero winding.
+fn fill_rule_of(op: &[u8]) -> &'static str {
+    if matches!(op, b"f*" | b"B*" | b"b*") {
+        "evenodd"
+    } else {
+        "nonzero"
+    }
+}
 
 fn path_bounds(path: &[PathSeg]) -> Option<Bounds> {
     let mut bb = BoundsBuilder::new();
@@ -304,7 +314,7 @@ fn path_bounds(path: &[PathSeg]) -> Option<Bounds> {
 /// `Path`-kind element.
 pub fn vector_paths_from_ops(
     operations: &[Operation],
-    gstate: &BTreeMap<String, (Option<f64>, Option<f64>, Option<String>)>,
+    gstate: &ExtGStateParams,
     resolver: &dyn NamedColorResolver,
 ) -> Vec<VectorPath> {
     vector_paths_from_ops_with_pos(operations, gstate, resolver)
@@ -324,7 +334,7 @@ pub fn vector_paths_from_ops(
 /// **no** `VectorPath`, so they are simply skipped — never mis-correlated).
 pub fn vector_paths_from_ops_with_pos(
     operations: &[Operation],
-    gstate: &BTreeMap<String, (Option<f64>, Option<f64>, Option<String>)>,
+    gstate: &ExtGStateParams,
     resolver: &dyn NamedColorResolver,
 ) -> Vec<(VectorPath, usize)> {
     let mut out = Vec::new();
@@ -340,7 +350,6 @@ pub fn vector_paths_from_ops_with_pos(
         fill_alpha: 1.0,
         stroke_alpha: 1.0,
         blend_mode: None,
-        fill_rule: "nonzero".to_string(),
         line_cap: 0,
         line_join: 0,
         miter_limit: 10.0,
@@ -453,10 +462,11 @@ pub fn vector_paths_from_ops_with_pos(
             b"j" if !n.is_empty() => st.line_join = n[0].clamp(0.0, 2.0) as u8,
             // Miter limit (`M`, ISO 32000-1 §8.4.3.5): default 10.0, must be ≥ 1.
             b"M" if !n.is_empty() => st.miter_limit = n[0].max(1.0),
-            // Fill rule: `W` sets nonzero winding (default), `W*` sets even-odd.
+            // `W`/`W*` select the CLIPPING rule, not the fill rule (ISO 32000-1
+            // §8.5.4); the fill rule is chosen by the painting operator itself
+            // (`f*`/`B*`/`b*` = even-odd, §8.5.3.3), resolved at the paint site.
             // The path is NOT consumed here — a following paint op may still use it.
-            b"W" => st.fill_rule = "nonzero".to_string(),
-            b"W*" => st.fill_rule = "evenodd".to_string(),
+            b"W" | b"W*" => {}
             b"d" => {
                 st.dash = match op.operands.first() {
                     Some(Object::Array(items)) => items
@@ -523,8 +533,8 @@ pub fn vector_paths_from_ops_with_pos(
             }
             // `n` ends the path (often after a `W` clip) without painting.
             b"n" => path.clear(),
-            // `W`/`W*` are handled above (fill_rule tracking); nothing more
-            // to do here — the path is preserved for the following paint op.
+            // `W`/`W*` are handled above; the path is preserved for the
+            // following paint op.
             _ if is_paint(operator) => {
                 if path.is_empty() {
                     continue;
@@ -562,7 +572,7 @@ pub fn vector_paths_from_ops_with_pos(
                         stroke_alpha: st.stroke_alpha,
                         dash: st.dash.clone(),
                         blend_mode: st.blend_mode.clone(),
-                        fill_rule: st.fill_rule.clone(),
+                        fill_rule: fill_rule_of(operator).to_string(),
                         line_cap,
                         line_join,
                         miter_limit: st.miter_limit,
@@ -606,6 +616,39 @@ mod tests {
         assert_eq!(p[0].fill, None);
         assert!((p[0].stroke_width - 3.0).abs() < 1e-9);
         assert_eq!(p[0].segments.len(), 2, "Move + Line");
+    }
+
+    #[test]
+    fn fill_rule_follows_the_painting_operator_not_the_clip() {
+        // `f*`/`B*`/`b*` fill even-odd; `f`/`B`/`b`/`S` non-zero. A preceding
+        // `W*` clip must neither leak into a later `f` nor override `f*`.
+        let p = paths(
+            b"0 0 10 10 re f* 0 0 10 10 re B* 0 0 10 10 re b* \
+              0 0 10 10 re f 0 0 10 10 re S \
+              0 0 50 50 re W* n 0 0 10 10 re f \
+              0 0 50 50 re W n 0 0 10 10 re f*",
+        );
+        let rules: Vec<&str> = p.iter().map(|v| v.fill_rule.as_str()).collect();
+        assert_eq!(
+            rules,
+            ["evenodd", "evenodd", "evenodd", "nonzero", "nonzero", "nonzero", "evenodd"]
+        );
+    }
+
+    #[test]
+    fn line_cap_join_and_miter_limit_are_reported() {
+        let p = paths(b"1 J 2 j 4 M 0 0 m 10 10 l S 9 J 9 j 0.5 M 0 0 m 5 5 l S");
+        assert_eq!(
+            (p[0].line_cap.as_str(), p[0].line_join.as_str()),
+            ("round", "bevel")
+        );
+        assert!((p[0].miter_limit - 4.0).abs() < 1e-9);
+        // Out-of-range operands clamp to the last valid style; `M` floors at 1.
+        assert_eq!(
+            (p[1].line_cap.as_str(), p[1].line_join.as_str()),
+            ("square", "bevel")
+        );
+        assert!((p[1].miter_limit - 1.0).abs() < 1e-9);
     }
 
     #[test]

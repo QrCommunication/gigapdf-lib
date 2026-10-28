@@ -2882,6 +2882,14 @@ pub struct TextElementInfo {
     pub width: f64,
     pub height: f64,
     pub font_family: String,
+    /// `false` when the run's font could not be resolved (neither in the run's
+    /// own scope nor in the page `/Font` table). [`font_family`] is then
+    /// `"Helvetica"`, the standard substitution of PDF viewers, so it stays a
+    /// usable family name; a host that wants to flag or re-resolve such runs
+    /// reads this flag instead of comparing names.
+    ///
+    /// [`font_family`]: TextElementInfo::font_family
+    pub font_resolved: bool,
     /// The run's raw `/BaseFont` name with the subset prefix kept (e.g.
     /// `ABCDEF+TimesNewRomanPSMT`), resolved against the run's own scope (the page,
     /// or the form XObject it is drawn inside). Lets a host editor target the exact
@@ -2936,19 +2944,17 @@ pub struct TextElementInfo {
     /// 1 = stroke, 2 = fill+stroke, 3 = invisible, 4 = fill+clip, etc.
     /// Default 0 (fill) when the operator is absent.
     pub rendering_mode: u8,
-    /// Horizontal scale factor extracted from the text matrix decomposition.
-    /// `1.0` for uniform scaling; differs when the PDF applies anamorphic
-    /// transforms (stretched/compressed glyphs).
+    /// Horizontal scale of the text·CTM matrix, decomposed as
+    /// `R(rotation) · Scale(scale_x, scale_y) · SkewX(skew_x)` (the Fabric.js /
+    /// CSS QR convention, so a host rebuilds the exact matrix). `1.0` = unscaled.
     pub scale_x: f64,
-    /// Vertical scale factor extracted from the text matrix decomposition.
-    /// `1.0` for uniform scaling.
+    /// Vertical scale in the same decomposition; signed (negative = mirrored).
     pub scale_y: f64,
-    /// Horizontal skew (cisaillement) in degrees, extracted from the text
-    /// matrix decomposition. Non-zero for artificially obliqued text that is
-    /// not a true italic font.
+    /// Horizontal skew in degrees in the same decomposition (positive leans the
+    /// glyphs' vertical axis right). Non-zero for synthetically obliqued text.
     pub skew_x: f64,
-    /// Vertical skew in degrees (rare, usually 0). Completes the affine
-    /// decomposition so the host can reconstruct the exact CTM.
+    /// Always `0.0`: rotation, both scales and `skew_x` fully determine a 2×2
+    /// transform. Kept so hosts with a two-skew model read an explicit zero.
     pub skew_y: f64,
 }
 
@@ -2987,15 +2993,15 @@ pub struct ImageElementInfo {
     /// `"Multiply"`, `"Screen"`, …). `None` when the graphics state does not
     /// override the default. Lets the host match compositing behaviour.
     pub blend_mode: Option<String>,
-    /// Horizontal scale factor from the placement CTM decomposition.
-    /// `1.0` = no horizontal scaling.
+    /// Horizontal scale of the placement CTM, decomposed as
+    /// `R(rotation) · Scale(scale_x, scale_y) · SkewX(skew_x)` (see
+    /// [`TextElementInfo::scale_x`]); the unit image square maps to this box.
     pub scale_x: f64,
-    /// Vertical scale factor from the placement CTM decomposition.
-    /// `1.0` = no vertical scaling.
+    /// Vertical scale in the same decomposition; signed (negative = mirrored).
     pub scale_y: f64,
-    /// Horizontal skew (shear) in degrees from the placement CTM decomposition.
+    /// Horizontal skew in degrees in the same decomposition.
     pub skew_x: f64,
-    /// Vertical skew in degrees from the placement CTM decomposition.
+    /// Always `0.0` (see [`TextElementInfo::skew_y`]).
     pub skew_y: f64,
     /// Conservative bounding box of the active clip path at the time this
     /// image was painted (`W`/`W*`), in page user space. `None` when no clip
@@ -5522,7 +5528,8 @@ impl Document {
         let content = self.page_content(page_no)?;
         let fonts = self.page_font_decoders(page_no);
         let gstate_alpha = self.page_gstate_alpha(page_no);
-        content::extract_elements_with(&content, &fonts, &gstate_alpha)
+        let gstate_blend = self.page_gstate_blend(page_no);
+        content::extract_elements_with_gstate(&content, &fonts, &gstate_alpha, &gstate_blend)
     }
 
     /// All addressable elements of a page **recursing into form XObjects** (`Do`):
@@ -5618,10 +5625,7 @@ impl Document {
     /// `(fill_alpha, stroke_alpha, blend_mode)` — any field absent from the
     /// dictionary is `None`. Blend mode is stored as the raw PDF name string
     /// (e.g. `"Multiply"`, `"Screen"`).
-    fn page_gstate_alpha_pair(
-        &self,
-        page_no: u32,
-    ) -> BTreeMap<String, (Option<f64>, Option<f64>, Option<String>)> {
+    fn page_gstate_alpha_pair(&self, page_no: u32) -> crate::content::vector::ExtGStateParams {
         let mut out = BTreeMap::new();
         let Ok(page) = self.page_dict(page_no) else {
             return out;
@@ -5764,6 +5768,9 @@ impl Document {
                     height: 0.0,
                 });
                 let direction = crate::text::run_direction(&e.label);
+                let resolved_family = scoped
+                    .map(|s| s.family.clone())
+                    .or_else(|| fallback.map(|s| s.family.clone()));
                 TextElementInfo {
                     index,
                     text: e.label,
@@ -5771,10 +5778,8 @@ impl Document {
                     y: b.y,
                     width: b.width,
                     height: b.height,
-                    font_family: scoped
-                        .map(|s| s.family.clone())
-                        .or_else(|| fallback.map(|s| s.family.clone()))
-                        .unwrap_or_else(|| "__MISSING__".to_string()),
+                    font_resolved: resolved_family.is_some(),
+                    font_family: resolved_family.unwrap_or_else(|| "Helvetica".to_string()),
                     base_font: scoped.map(|s| s.base_font.clone()).unwrap_or_default(),
                     font_id: scoped.map(|s| s.font_id.clone()).unwrap_or_default(),
                     bold: scoped

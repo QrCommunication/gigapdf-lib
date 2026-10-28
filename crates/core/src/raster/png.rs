@@ -1,10 +1,13 @@
 //! A minimal, correct PNG encoder — zero dependencies.
 //!
-//! Output is 8-bit RGBA (colour type 6). The IDAT image data is wrapped in a
-//! zlib stream built entirely from **stored** (uncompressed) DEFLATE blocks, so
-//! no compressor is needed — only framing + the Adler-32/CRC-32 checksums. The
-//! result is a fully spec-valid PNG every viewer reads; compression can be added
-//! later without changing the interface.
+//! Output is 8-bit RGBA (colour type 6). Each scanline is filtered with the PNG
+//! filter (None, Sub, Up, Average or Paeth — PNG §9.2) that minimises the sum of
+//! absolute signed residuals, the standard libpng heuristic. The filtered stream
+//! is then compressed by the engine's own zlib encoder
+//! ([`crate::filters::deflate::flate_encode`]: LZ77 + fixed Huffman), so a
+//! rendered page is a small fraction of its raw `width * height * 4` bytes.
+
+use crate::filters::deflate::flate_encode;
 
 /// CRC-32 (IEEE, polynomial `0xEDB88320`) over `data`, as PNG chunks require.
 ///
@@ -22,36 +25,106 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Adler-32 over `data`, as the trailing zlib checksum requires.
-fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65521;
-    let mut a = 1u32;
-    let mut b = 0u32;
-    for &byte in data {
-        a = (a + byte as u32) % MOD;
-        b = (b + a) % MOD;
+/// Bytes per complete pixel for 8-bit RGBA — the `bpp` the PNG filters use to
+/// find the "left" neighbour.
+const BYTES_PER_PIXEL: usize = 4;
+
+/// PNG filter type bytes (PNG §9.2), in the order they are tried.
+const FILTER_NONE: u8 = 0;
+const FILTER_SUB: u8 = 1;
+const FILTER_UP: u8 = 2;
+const FILTER_AVERAGE: u8 = 3;
+const FILTER_PAETH: u8 = 4;
+const FILTERS: [u8; 5] = [
+    FILTER_NONE,
+    FILTER_SUB,
+    FILTER_UP,
+    FILTER_AVERAGE,
+    FILTER_PAETH,
+];
+
+/// The Paeth predictor (PNG §9.4): whichever of left / above / upper-left is
+/// closest to `left + above - upper_left`, ties broken in that order.
+fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
+    let p = left as i16 + above as i16 - upper_left as i16;
+    let pa = (p - left as i16).abs();
+    let pb = (p - above as i16).abs();
+    let pc = (p - upper_left as i16).abs();
+    if pa <= pb && pa <= pc {
+        left
+    } else if pb <= pc {
+        above
+    } else {
+        upper_left
     }
-    (b << 16) | a
 }
 
-/// Wrap `data` in a zlib stream using stored (type-0) DEFLATE blocks.
-fn zlib_stored(data: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x78, 0x01]; // zlib header: CM=8, no preset dict, default level
-    let mut chunks = data.chunks(0xFFFF).peekable();
-    if data.is_empty() {
-        // A single empty final stored block.
-        out.extend_from_slice(&[0x01, 0x00, 0x00, 0xFF, 0xFF]);
+/// Apply PNG filter `filter` to scanline `row` (whose predecessor is `prev`,
+/// all-zero for the first row), writing the residuals into `out`.
+fn filter_scanline(filter: u8, row: &[u8], prev: &[u8], out: &mut [u8]) {
+    for i in 0..row.len() {
+        let left = if i >= BYTES_PER_PIXEL {
+            row[i - BYTES_PER_PIXEL]
+        } else {
+            0
+        };
+        let above = prev[i];
+        let upper_left = if i >= BYTES_PER_PIXEL {
+            prev[i - BYTES_PER_PIXEL]
+        } else {
+            0
+        };
+        let predicted = match filter {
+            FILTER_SUB => left,
+            FILTER_UP => above,
+            FILTER_AVERAGE => ((left as u16 + above as u16) / 2) as u8,
+            FILTER_PAETH => paeth_predictor(left, above, upper_left),
+            _ => 0,
+        };
+        out[i] = row[i].wrapping_sub(predicted);
     }
-    while let Some(chunk) = chunks.next() {
-        let is_last = chunks.peek().is_none();
-        out.push(if is_last { 0x01 } else { 0x00 }); // BFINAL + BTYPE=00
-        let len = chunk.len() as u16;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(chunk);
+}
+
+/// Heuristic cost of a filtered scanline: the sum of its bytes read as signed
+/// residuals. Small residuals (near 0 either way) compress best.
+fn residual_cost(filtered: &[u8]) -> u64 {
+    filtered
+        .iter()
+        .map(|&b| (b as i8).unsigned_abs() as u64)
+        .sum()
+}
+
+/// Filter every scanline with the cheapest PNG filter, producing the
+/// filter-byte-prefixed stream that IDAT compresses.
+fn filter_image(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let stride = (width as usize) * BYTES_PER_PIXEL;
+    let mut raw = Vec::with_capacity((stride + 1) * height as usize);
+    let zero_row = vec![0u8; stride];
+    let mut candidate = vec![0u8; stride];
+    let mut best = vec![0u8; stride];
+    for row_index in 0..height as usize {
+        let start = row_index * stride;
+        let row = &rgba[start..start + stride];
+        let prev = if row_index == 0 {
+            &zero_row[..]
+        } else {
+            &rgba[start - stride..start]
+        };
+        let mut best_filter = FILTER_NONE;
+        let mut best_cost = u64::MAX;
+        for &filter in &FILTERS {
+            filter_scanline(filter, row, prev, &mut candidate);
+            let cost = residual_cost(&candidate);
+            if cost < best_cost {
+                best_cost = cost;
+                best_filter = filter;
+                std::mem::swap(&mut best, &mut candidate);
+            }
+        }
+        raw.push(best_filter);
+        raw.extend_from_slice(&best);
     }
-    out.extend_from_slice(&adler32(data).to_be_bytes());
-    out
+    raw
 }
 
 fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -75,15 +148,8 @@ pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // bit depth 8, colour type 6 (RGBA)
     write_chunk(&mut out, b"IHDR", &ihdr);
 
-    // Each scanline is prefixed with filter type 0 (None).
-    let stride = (width as usize) * 4;
-    let mut raw = Vec::with_capacity((stride + 1) * height as usize);
-    for row in 0..height as usize {
-        raw.push(0);
-        let start = row * stride;
-        raw.extend_from_slice(&rgba[start..start + stride]);
-    }
-    write_chunk(&mut out, b"IDAT", &zlib_stored(&raw));
+    let raw = filter_image(width, height, rgba);
+    write_chunk(&mut out, b"IDAT", &flate_encode(&raw));
     write_chunk(&mut out, b"IEND", &[]);
     out
 }
@@ -91,30 +157,13 @@ pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filters::inflate::inflate;
+    use crate::filters::inflate::flate_decode;
+    use crate::raster::png_decode::decode_png;
 
-    #[test]
-    fn crc_and_adler_known_values() {
-        // CRC-32("123456789") = 0xCBF43926; Adler-32("Wikipedia") = 0x11E60398.
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-        assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
-    }
+    const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
-    #[test]
-    fn png_round_trips_through_inflate() {
-        // 2x2 image: red, green / blue, white.
-        let rgba = [
-            255, 0, 0, 255, 0, 255, 0, 255, // row 0
-            0, 0, 255, 255, 255, 255, 255, 255, // row 1
-        ];
-        let png = encode_png(2, 2, &rgba);
-        assert_eq!(
-            &png[0..8],
-            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
-        );
-
-        // Locate the IDAT chunk, strip the 2-byte zlib header + 4-byte adler,
-        // and inflate the stored blocks back to the filtered scanlines.
+    /// The IDAT payload (zlib stream) of a single-IDAT PNG.
+    fn idat_payload(png: &[u8]) -> &[u8] {
         let idat_pos = png.windows(4).position(|w| w == b"IDAT").unwrap();
         let len = u32::from_be_bytes([
             png[idat_pos - 4],
@@ -122,20 +171,134 @@ mod tests {
             png[idat_pos - 2],
             png[idat_pos - 1],
         ]) as usize;
-        let zlib = &png[idat_pos + 4..idat_pos + 4 + len];
-        let deflated = &zlib[2..zlib.len() - 4];
-        let raw = inflate(deflated).unwrap();
-        // Two rows, each: filter byte 0 + 8 RGBA bytes.
-        assert_eq!(raw[0], 0);
-        assert_eq!(&raw[1..9], &rgba[0..8]);
-        assert_eq!(raw[9], 0);
-        assert_eq!(&raw[10..18], &rgba[8..16]);
+        &png[idat_pos + 4..idat_pos + 4 + len]
+    }
+
+    /// Deterministic xorshift noise — incompressible-ish, filter-hostile.
+    fn noise(len: usize, mut seed: u32) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn gradient(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[
+                    (x * 255 / width.max(1)) as u8,
+                    (y * 255 / height.max(1)) as u8,
+                    ((x + y) % 256) as u8,
+                    255,
+                ]);
+            }
+        }
+        rgba
+    }
+
+    fn assert_round_trip(width: u32, height: u32, rgba: &[u8]) {
+        let png = encode_png(width, height, rgba);
+        assert_eq!(&png[0..8], &PNG_SIGNATURE);
+        let decoded = decode_png(&png).expect("our own PNG must decode");
+        assert_eq!((decoded.width, decoded.height), (width, height));
+        assert_eq!(decoded.rgba, rgba, "{width}x{height} must round-trip");
+    }
+
+    #[test]
+    fn crc_known_value() {
+        // CRC-32("123456789") = 0xCBF43926.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn round_trips_pixel_exact_across_image_kinds() {
+        // Flat colour.
+        let flat: Vec<u8> = [12u8, 200, 99, 255].repeat(40 * 30);
+        assert_round_trip(40, 30, &flat);
+        // Smooth gradient (Sub / Up / Average / Paeth territory).
+        assert_round_trip(64, 48, &gradient(64, 48));
+        // Noise, including random alpha.
+        assert_round_trip(37, 23, &noise(37 * 23 * 4, 0x9E37_79B9));
+        // A single pixel.
+        assert_round_trip(1, 1, &[1, 2, 3, 4]);
+        // Odd, prime width and a single row / single column.
+        assert_round_trip(13, 7, &noise(13 * 7 * 4, 7));
+        assert_round_trip(101, 1, &gradient(101, 1));
+        assert_round_trip(1, 57, &gradient(1, 57));
+    }
+
+    #[test]
+    fn every_filter_type_round_trips_through_the_decoder() {
+        // Force each filter on every row, assemble the PNG by hand, and let the
+        // independent decoder un-filter it: pins `filter_scanline` for all five.
+        let (width, height) = (9u32, 6u32);
+        let rgba = noise((width * height * 4) as usize, 0xC0FF_EE11);
+        let stride = width as usize * BYTES_PER_PIXEL;
+        for &filter in &FILTERS {
+            let mut raw = Vec::new();
+            let zero = vec![0u8; stride];
+            let mut out = vec![0u8; stride];
+            for y in 0..height as usize {
+                let row = &rgba[y * stride..(y + 1) * stride];
+                let prev = if y == 0 {
+                    &zero[..]
+                } else {
+                    &rgba[(y - 1) * stride..y * stride]
+                };
+                filter_scanline(filter, row, prev, &mut out);
+                raw.push(filter);
+                raw.extend_from_slice(&out);
+            }
+            let mut png = PNG_SIGNATURE.to_vec();
+            let mut ihdr = Vec::new();
+            ihdr.extend_from_slice(&width.to_be_bytes());
+            ihdr.extend_from_slice(&height.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+            write_chunk(&mut png, b"IHDR", &ihdr);
+            write_chunk(&mut png, b"IDAT", &flate_encode(&raw));
+            write_chunk(&mut png, b"IEND", &[]);
+            let decoded = decode_png(&png).expect("forced-filter PNG decodes");
+            assert_eq!(decoded.rgba, rgba, "filter {filter} must invert exactly");
+        }
+    }
+
+    #[test]
+    fn heuristic_picks_a_predictive_filter_for_smooth_content() {
+        // A horizontal ramp: every row after the first is identical, so `Up`
+        // (all-zero residuals) must beat `None` on rows 1.., and row 0 must not
+        // keep `None` when `Sub` turns the ramp into a constant step.
+        let rgba = gradient(32, 4);
+        let raw = flate_decode(idat_payload(&encode_png(32, 4, &rgba))).unwrap();
+        let stride = 32 * 4 + 1;
+        let filters: Vec<u8> = (0..4).map(|row| raw[row * stride]).collect();
+        assert!(filters.iter().all(|&f| f != FILTER_NONE), "{filters:?}");
+    }
+
+    #[test]
+    fn idat_is_actually_compressed() {
+        // A blank 8.5x11in page at 144 dpi (1224x1584 RGBA = 7.7 MB raw) must
+        // shrink to well under 1 % — stored blocks used to make it ~100 %.
+        let (width, height) = (1224u32, 1584u32);
+        let raw_len = (width * height * 4) as usize;
+        let png = encode_png(width, height, &vec![0xFF; raw_len]);
+        assert!(
+            png.len() * 100 < raw_len,
+            "blank page PNG is {} bytes for {raw_len} raw bytes",
+            png.len()
+        );
+        let decoded = decode_png(&png).unwrap();
+        assert!(decoded.rgba.iter().all(|&b| b == 0xFF));
     }
 
     #[test]
     fn encode_empty_image_emits_valid_png() {
-        // A zero-height image produces empty filtered scanlines, so `zlib_stored`
-        // takes its `data.is_empty()` branch (one empty final stored block).
+        // A zero-size image has an empty filtered stream: the zlib encoder must
+        // still emit a well-formed (empty) DEFLATE stream.
         let png = encode_png(0, 0, &[]);
         // Still a spec-valid PNG: signature + IDAT chunk present.
         assert_eq!(

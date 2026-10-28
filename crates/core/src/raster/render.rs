@@ -1347,7 +1347,7 @@ fn show_text(
             // cursor advance below remains unaffected (rise is a per-glyph
             // offset, not a persistent shift of the text line).
             let tm_with_rise = if text_rise.abs() > 1e-12 {
-                Matrix::translate(0.0, text_rise).then(&tm)
+                Matrix::translate(0.0, text_rise).then(tm)
             } else {
                 *tm
             };

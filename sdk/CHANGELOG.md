@@ -6,6 +6,50 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.122.0] - 2026-10-28
+
+### Added
+
+- **1:1 element metadata, fully typed** (all keys always present):
+  - `TextElementInfo`: `fillAlpha`, `blendMode: string | null`,
+    `strokeColor`, `renderingMode: TextRenderingMode` (`0`–`7`),
+    `scaleX`/`scaleY`/`skewX`/`skewY`; text rise (`Ts`) is honoured.
+  - `TextSegment`: `wordSpacing`, `charSpacing`, `totalKerning`.
+  - `ImageElementInfo`: `blendMode`, `scaleX`/`scaleY`/`skewX`/`skewY`,
+    `clipBounds: [x0, y0, x1, y1] | null`.
+  - `VectorPathInfo`: `blendMode`, `fillRule: PathFillRule`,
+    `lineCap: PathLineCap`, `lineJoin: PathLineJoin`, `miterLimit`.
+  - The transform is decomposed as `rotate · scale · skewX`, Fabric.js's
+    `qrDecompose` convention: feeding the values back rebuilds the exact
+    matrix. `scaleY` is negative for a mirrored transform, and `skewY` is
+    always `0`.
+
+### Changed
+
+- Text elements gain `fontResolved: boolean`: `false` when the run's font
+  could not be resolved. `fontFamily` then stays `"Helvetica"` (the standard
+  viewer substitution), so it remains a usable family name; hosts that need to
+  tell a real Helvetica run from an unresolved one read the flag.
+- Numeric fields of the text-elements JSON are rounded to 3 decimals.
+
+### Fixed
+
+- **PNG output is compressed** (`renderPage()` and every PNG the engine
+  writes): adaptive per-row
+  PNG filtering + zlib, instead of uncompressed stored blocks — a blank
+  1224×1584 page shrinks from 7.7 MB to well under 1 % of that.
+- **Markdown / EPUB exports no longer wrap every run in an inline black
+  colour** (`<span style="color:#000000">`, `color:#000000`); real colours are
+  kept. In EPUB this restores the reader's dark/sepia themes.
+- **EPUB navigation title follows the publication language** (`Table des
+  matières`, `Inhaltsverzeichnis`, …; English fallback).
+- The PDF-supplied blend-mode name is JSON-escaped in the text-elements JSON
+  (a crafted `/BM` could inject keys into the parsed object).
+- `imageElements()` now reports the `blendMode` of the graphics state the
+  image was painted in (it was always `null`).
+- `fillRule` follows the painting operator (`f*`/`B*`/`b*` = even-odd); it was
+  wrongly taken from the clip operator (`W*`), leaking into later paths.
+
 ## [0.121.0] - 2026-07-06
 
 ### Fixed

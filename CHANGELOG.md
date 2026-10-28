@@ -9,6 +9,65 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.122.0] - 2026-10-28
+
+### Added — 1:1 element metadata for host overlays
+
+The element extractors now carry everything a host overlay needs to redraw a
+page element exactly as the content stream paints it (all serialized by the
+WASM JSON bridge):
+
+- **Text** (`TextElementInfo`): `fillAlpha`, `blendMode`, `strokeColor`,
+  `renderingMode` (`Tr`), and the matrix decomposed as
+  `rotate · scale · skewX` (Fabric.js `qrDecompose` convention, exact
+  round-trip; `scaleY` signed, `skewY` always `0`).
+  Text rise (`Ts`) is parsed and applied to both the element bounds and the
+  raster placement. `TextSegment` gains `wordSpacing`, `charSpacing` and
+  `totalKerning` (the sum of the `TJ` kerning adjustments inside the segment).
+- **Images** (`ImageElementInfo`): `blendMode`, `scaleX`/`scaleY`,
+  `skewX`/`skewY` and `clipBounds` (the active clip, reported separately so
+  object-fit/layout semantics of the image box are preserved).
+- **Vector paths** (`VectorPath`): `blendMode` (resolved from the ExtGState
+  `/BM`), `fillRule` (from the painting operator: `f*`/`B*`/`b*` = even-odd),
+  `lineCap`, `lineJoin`, `miterLimit`. Clip paths (`W`/`W*`) are tracked on a
+  clip stack and element bounds are intersected with the active clip's
+  axis-aligned box.
+- **SDK types:** every new key is declared on the TypeScript interfaces, with
+  literal unions for the closed sets (`TextRenderingMode`, `PathFillRule`,
+  `PathLineCap`, `PathLineJoin`).
+
+### Changed
+
+- `TextElementInfo` gains `font_resolved` (`fontResolved` in JSON): `false`
+  when the run's font cannot be resolved, so a host can tell a real Helvetica
+  run from an unresolved one. `font_family` keeps the `"Helvetica"`
+  substitution in that case (an unreleased build briefly used a
+  `"__MISSING__"` sentinel there, which hosts would have used as a CSS family).
+- Numeric fields of the text-elements JSON (`gp_text_elements_json`) are
+  rounded to 3 decimals.
+
+### Fixed
+
+- **PNG output is now compressed.** `encode_png` (page rasters, `renderPage`,
+  embedded/exported images) used to wrap the image in *stored*
+  (uncompressed) DEFLATE blocks, so a rendered page
+  weighed its full `width × height × 4` bytes. Each scanline is now filtered
+  with the PNG filter (None/Sub/Up/Average/Paeth) that minimises the sum of
+  absolute residuals, then compressed with the engine's own zlib encoder. A
+  blank 1224×1584 page drops from 7.7 MB to well under 1 % of that.
+- **Markdown and EPUB no longer paint every run black inline.** PDF-extracted
+  runs always carry a colour, so every run was wrapped in
+  `<span style="color:#000000">` (Markdown) or given `color:#000000` (EPUB
+  XHTML) — noise in Markdown, and in EPUB it defeated the reader's dark and
+  sepia themes. Black and near-black are now left to the format default; real
+  colours are kept. Office exporters (DOCX/ODT/PPTX/XLSX/ODS) are unchanged.
+- **EPUB navigation title is localised.** The `nav.xhtml` heading and title
+  were always "Table of Contents"; they now follow the publication language
+  (en, fr, de, es, it, pt, nl, he, ar, zh, ja, ru; English otherwise).
+- **WASM JSON bridge:** the PDF-supplied `blend_mode` string is JSON-escaped
+  in `gp_text_elements_json`; a crafted `/BM` name could otherwise break out
+  of the string literal and inject keys into the host's parsed object.
+
 ## [0.121.0] - 2026-07-06
 
 ### Fixed — PDF→Office export layout fidelity

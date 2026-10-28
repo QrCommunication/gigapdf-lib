@@ -1106,6 +1106,7 @@ pub extern "C" fn gp_text_elements_json(
                     fnum(e.height)
                 ));
                 json_escape(&e.font_family, &mut s);
+                s.push_str(&format!(",\"fontResolved\":{}", e.font_resolved));
                 s.push_str(",\"baseFont\":");
                 json_escape(&e.base_font, &mut s);
                 s.push_str(",\"fontId\":");

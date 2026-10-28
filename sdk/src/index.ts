@@ -1260,8 +1260,14 @@ export interface TextElementInfo {
   y: number;
   width: number;
   height: number;
-  /** Resolved `/BaseFont` family (e.g. "Helvetica", "Times New Roman"). */
+  /**
+   * Resolved `/BaseFont` family (e.g. "Helvetica", "Times New Roman").
+   * `"Helvetica"` (the standard viewer substitution) when the font could not
+   * be resolved — see {@link fontResolved}.
+   */
   fontFamily: string;
+  /** `false` when the run's font could not be resolved (`fontFamily` is then the Helvetica substitute). */
+  fontResolved: boolean;
   /**
    * The raw `/BaseFont` name with the subset prefix kept (e.g.
    * `"ABCDEF+TimesNewRomanPSMT"`), resolved against the run's own scope — the
@@ -1295,6 +1301,34 @@ export interface TextElementInfo {
    * run is only digits/punctuation/whitespace.
    */
   direction: 'ltr' | 'rtl' | 'neutral';
+  /** Non-stroking alpha (`/ExtGState` `/ca`) the run was painted with, `0..=1` (`1` = opaque). */
+  fillAlpha: number;
+  /**
+   * The `/ExtGState` `/BM` blend mode the run was painted with, verbatim from the
+   * PDF (`"Normal"`, `"Multiply"`, `"Screen"`, …), or `null` when no graphics
+   * state set one. An open string: a PDF may carry any name here.
+   */
+  blendMode: string | null;
+  /** Stroke colour `[r,g,b]` in `0..=1` when the rendering mode strokes (`Tr` 1, 2, 5, 6), else `null`. */
+  strokeColor: [number, number, number] | null;
+  /**
+   * Text rendering mode (`Tr`, ISO 32000-1 §9.3.6): `0` fill, `1` stroke,
+   * `2` fill+stroke, `3` invisible, `4`–`6` the same plus clip, `7` clip only.
+   */
+  renderingMode: TextRenderingMode;
+  /**
+   * Horizontal scale of the text matrix × CTM, decomposed as
+   * `rotate(rotation) · scale(scaleX, scaleY) · skewX(skewX)` — the convention
+   * of Fabric.js `util.qrDecompose` / `composeMatrix`, so feeding these values
+   * back rebuilds the exact matrix (in PDF user space, y up). `1` = unscaled.
+   */
+  scaleX: number;
+  /** Vertical scale in the same decomposition; negative when mirrored. */
+  scaleY: number;
+  /** Horizontal skew in degrees (positive leans the glyphs right; non-zero for synthetically obliqued text). */
+  skewX: number;
+  /** Always `0`: rotation, both scales and `skewX` fully determine the transform. */
+  skewY: number;
   /**
    * The run's visually contiguous fragments when it contains internal `TJ`
    * position jumps — justified / per-glyph-positioned text (a legal footer, a
@@ -1317,7 +1351,28 @@ export interface TextSegment {
   y: number;
   width: number;
   height: number;
+  /** Effective word spacing (`Tw`) applied to this fragment, in user-space units. */
+  wordSpacing: number;
+  /** Effective character spacing (`Tc`) applied to this fragment, in user-space units. */
+  charSpacing: number;
+  /**
+   * Sum of the raw `TJ` kerning numbers between the fragment's first and last
+   * glyph, in thousandths of an em (PDF sign convention: positive tightens).
+   * `0` when no intra-fragment kerning was applied.
+   */
+  totalKerning: number;
 }
+/**
+ * Text rendering mode (`Tr`, ISO 32000-1 §9.3.6). The engine clamps the
+ * operand to this range.
+ */
+export type TextRenderingMode = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
+/** Fill rule of a painted path, chosen by its painting operator (`f*`/`B*`/`b*` = even-odd). */
+export type PathFillRule = 'nonzero' | 'evenodd';
+/** Line cap style (`J`): `0` butt, `1` round, `2` square. */
+export type PathLineCap = 'butt' | 'round' | 'square';
+/** Line join style (`j`): `0` miter, `1` round, `2` bevel. */
+export type PathLineJoin = 'miter' | 'round' | 'bevel';
 /**
  * The aggregate language signal of a document from
  * {@link GigaPdfDoc.documentLanguage}: its dominant reading {@link
@@ -2038,6 +2093,25 @@ export interface ImageElementInfo {
   rotation: number;
   /** Non-stroking fill alpha (`/ExtGState` `/ca`), `0..=1` (`1` = opaque). */
   opacity: number;
+  /** The `/BM` blend mode the image was painted with, verbatim, or `null` when unset. */
+  blendMode: string | null;
+  /**
+   * Horizontal scale of the placement CTM, in the same decomposition as
+   * {@link TextElementInfo.scaleX} (the unit image square maps to this box).
+   */
+  scaleX: number;
+  /** Vertical scale in the same decomposition; negative when mirrored. */
+  scaleY: number;
+  /** Horizontal skew in degrees in the same decomposition. */
+  skewX: number;
+  /** Always `0` (see {@link TextElementInfo.skewY}). */
+  skewY: number;
+  /**
+   * Axis-aligned box `[x0, y0, x1, y1]` (user space) of the clip path active
+   * when the image was painted, or `null` when none was. Reported separately:
+   * the placement box above is NOT intersected with it.
+   */
+  clipBounds: [number, number, number, number] | null;
 }
 /**
  * One path segment from {@link GigaPdfDoc.vectorPaths} (page user space, origin
@@ -2083,6 +2157,16 @@ export interface VectorPathInfo {
   strokeAlpha: number;
   /** Dash pattern (`d` array); empty for a solid line. */
   dash: number[];
+  /** The `/BM` blend mode the path was painted with, verbatim, or `null` when unset. */
+  blendMode: string | null;
+  /** Fill rule selected by the painting operator. */
+  fillRule: PathFillRule;
+  /** Line cap style (`J`). */
+  lineCap: PathLineCap;
+  /** Line join style (`j`). */
+  lineJoin: PathLineJoin;
+  /** Miter limit (`M`), `≥ 1` (default `10`). */
+  miterLimit: number;
 }
 export interface TextLine extends Box {
   text: string;

@@ -47,10 +47,28 @@ fn hex(rgb: [f64; 3]) -> String {
 /// Some(_)`, even pure/near-black `Some([0,0,0])`) from an unset/default run
 /// (`None`). A document that deliberately paints a run black must round-trip
 /// that intent, so any `Some` colour emits its tag; only `None` is omitted (the
-/// format's own default — black — then applies). Applied uniformly across every
-/// exporter that colours runs (DOCX/ODT/PPTX/XLSX/ODS/Markdown/EPUB).
+/// format's own default — black — then applies). Used by the Office exporters
+/// (DOCX/ODT/PPTX/XLSX/ODS), where an explicit colour property is invisible
+/// structure, not noise. The markup exporters use [`markup_color`] instead.
 fn visible_color(style: &CharStyle) -> Option<String> {
     style.color.map(hex)
+}
+
+/// A char-style's colour as hex for **inline markup** (Markdown's HTML span,
+/// EPUB's XHTML `style`), only when it is set and not (near-)black.
+///
+/// Text extracted from a PDF always carries a colour, almost always black, so
+/// keying off `Some` here wrapped every run of an ordinary document in
+/// `<span style="color:#000000">`. In markup that inline colour is pure noise,
+/// and in EPUB it actively harms: a hard-coded black defeats the reader's dark
+/// and sepia themes. Near-black is therefore left to the format default, with
+/// the same threshold the RTF exporter uses
+/// ([`crate::convert::style::is_non_black`]).
+fn markup_color(style: &CharStyle) -> Option<String> {
+    style
+        .color
+        .filter(|&rgb| crate::convert::style::is_non_black(rgb))
+        .map(hex)
 }
 
 /// Default body font size in points when a run carries none (`size_pt == 0`).
@@ -9020,10 +9038,10 @@ fn styled_run(text: &str, style: &CharStyle) -> String {
         // CommonMark has no underline; HTML <u> is the faithful representation.
         body = format!("<u>{}</u>", body);
     }
-    // CommonMark has no portable colour syntax; GFM permits inline HTML, so an
-    // explicitly-set run colour is carried by an outer
+    // CommonMark has no portable colour syntax; GFM permits inline HTML, so a
+    // non-default (not near-black) run colour is carried by an outer
     // `<span style="color:#RRGGBB">…</span>` wrapping the emphasised body.
-    if let Some(c) = visible_color(style) {
+    if let Some(c) = markup_color(style) {
         body = format!("<span style=\"color:#{c}\">{body}</span>");
     }
     format!("{lead_ws}{body}{trail_ws}")
@@ -9874,7 +9892,7 @@ fn xhtml_char_css(style: &CharStyle) -> String {
             css.push_str(";text-decoration-style:double");
         }
     }
-    if let Some(c) = visible_color(style) {
+    if let Some(c) = markup_color(style) {
         css.push_str(&format!(";color:#{c}"));
     }
     // M2 CharStyle extensions — display-time transforms and metrics.
@@ -10191,10 +10209,36 @@ fn epub_nav(doc: &Document, chapters: &[EpubChapter]) -> String {
         nav_heading_tree(&ch.headings, &ch.file, &mut list);
         list.push_str("</li>");
     }
-    let body = format!(
-        "<nav epub:type=\"toc\" id=\"toc\"><h1>Table of Contents</h1><ol>{list}</ol></nav>"
-    );
-    epub_xhtml_doc(&lang, "Table of Contents", &body)
+    let title = toc_title(&lang);
+    let body = format!("<nav epub:type=\"toc\" id=\"toc\"><h1>{title}</h1><ol>{list}</ol></nav>");
+    epub_xhtml_doc(&lang, title, &body)
+}
+
+/// The "Table of Contents" heading in the publication's language, keyed on the
+/// primary subtag of a BCP-47 tag (`fr-FR`, `fr_CA` and `FR` all map to French).
+/// Unknown or empty tags fall back to English. Every value is plain text with
+/// no XML-special characters, so it can be emitted unescaped.
+fn toc_title(lang: &str) -> &'static str {
+    let primary = lang
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match primary.as_str() {
+        "fr" => "Table des matières",
+        "de" => "Inhaltsverzeichnis",
+        "es" => "Índice",
+        "it" => "Indice",
+        "pt" => "Índice",
+        "nl" => "Inhoudsopgave",
+        "he" | "iw" => "תוכן העניינים",
+        "ar" => "جدول المحتويات",
+        "zh" => "目录",
+        "ja" => "目次",
+        "ru" => "Содержание",
+        _ => "Table of Contents",
+    }
 }
 
 /// A node in a chapter's heading hierarchy: a heading plus the deeper headings
@@ -13752,6 +13796,70 @@ style:print-orientation=\"landscape\""
         );
     }
 
+    #[test]
+    fn epub_run_css_omits_black_but_keeps_real_colour() {
+        // An inline `color:#000000` on every PDF-extracted run would defeat the
+        // reader's dark/sepia themes; only a genuine colour is emitted.
+        let black = CharStyle {
+            color: Some([0.0, 0.0, 0.0]),
+            ..Default::default()
+        };
+        let red = CharStyle {
+            color: Some([1.0, 0.0, 0.0]),
+            ..Default::default()
+        };
+        let doc = md_doc(vec![md_para(vec![
+            styled("ink ", black),
+            styled("alert", red),
+        ])]);
+        let bytes = epub_from_model(&doc);
+        let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
+        assert!(
+            !chap.contains("color:#000000"),
+            "no black inline colour: {chap}"
+        );
+        assert!(chap.contains("ink"), "black run text kept: {chap}");
+        assert!(
+            chap.contains("color:#FF0000"),
+            "red run keeps its colour: {chap}"
+        );
+    }
+
+    #[test]
+    fn toc_title_follows_the_primary_language_subtag() {
+        assert_eq!(toc_title("fr-FR"), "Table des matières");
+        assert_eq!(toc_title("fr_CA"), "Table des matières");
+        assert_eq!(toc_title("FR"), "Table des matières");
+        assert_eq!(toc_title("he"), "תוכן העניינים");
+        assert_eq!(toc_title("de-AT"), "Inhaltsverzeichnis");
+        assert_eq!(toc_title("ja"), "目次");
+        assert_eq!(toc_title("x-klingon"), "Table of Contents");
+        assert_eq!(toc_title("tlh"), "Table of Contents");
+        assert_eq!(toc_title(""), "Table of Contents");
+    }
+
+    #[test]
+    fn epub_nav_title_is_localised() {
+        let mut doc = md_doc(vec![md_heading(1, "Chapitre")]);
+        doc.meta.lang = Some("fr-FR".to_string());
+        let nav =
+            String::from_utf8(entry(&epub_from_model(&doc), "OEBPS/nav.xhtml").unwrap()).unwrap();
+        assert!(nav.contains("<h1>Table des matières</h1>"), "{nav}");
+        assert!(nav.contains("<title>Table des matières</title>"), "{nav}");
+        assert!(!nav.contains("Table of Contents"), "{nav}");
+
+        // No language → English default, unchanged.
+        let nav_en = String::from_utf8(
+            entry(
+                &epub_from_model(&md_doc(vec![md_heading(1, "C")])),
+                "OEBPS/nav.xhtml",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(nav_en.contains("<h1>Table of Contents</h1>"), "{nav_en}");
+    }
+
     /// The OPF `dc:identifier` is unique per document and deterministic: two
     /// different documents differ; the same document is identical across runs; the
     /// `unique-identifier` attribute, `dc:identifier`, and NCX `dtb:uid` all agree.
@@ -14013,25 +14121,36 @@ style:print-orientation=\"landscape\""
     }
 
     #[test]
-    fn markdown_unset_run_emits_no_colour_span_but_explicit_black_does() {
-        // `visible_color` keys off explicit-vs-unset, not the colour value: a run
-        // whose colour is genuinely unset (`None`) emits no inline-HTML span (the
-        // format default — black — applies); an *explicitly* black run
-        // (`Some([0,0,0])`) round-trips its deliberate choice with a span (#2).
+    fn markdown_emits_colour_span_only_for_non_black_runs() {
+        // PDF-extracted runs always carry a colour, almost always black: a span
+        // around each of them is noise. Unset, explicit black and near-black all
+        // fall back to the format default; a real colour keeps its span.
         let unset = CharStyle::default(); // color: None
         let md = markdown_from_model(&md_doc(vec![md_para(vec![styled("plain", unset)])]));
         assert!(!md.contains("<span"), "no colour span for unset run: {md}");
         assert!(md.contains("plain"), "text still present: {md}");
 
-        let explicit_black = CharStyle {
-            color: Some([0.0, 0.0, 0.0]),
+        for (label, rgb) in [
+            ("black", [0.0, 0.0, 0.0]),
+            ("near-black", [0.01, 0.015, 0.0]),
+        ] {
+            let style = CharStyle {
+                color: Some(rgb),
+                ..Default::default()
+            };
+            let md = markdown_from_model(&md_doc(vec![md_para(vec![styled("ink", style)])]));
+            assert!(!md.contains("<span"), "{label} run → no colour span: {md}");
+            assert!(md.contains("ink"), "{label} text still present: {md}");
+        }
+
+        let blue = CharStyle {
+            color: Some([0.0, 0.2, 0.8]),
             ..Default::default()
         };
-        let md_black =
-            markdown_from_model(&md_doc(vec![md_para(vec![styled("ink", explicit_black)])]));
+        let md_blue = markdown_from_model(&md_doc(vec![md_para(vec![styled("sky", blue)])]));
         assert!(
-            md_black.contains("<span style=\"color:#000000\">ink</span>"),
-            "explicit black → colour span emitted: {md_black}"
+            md_blue.contains("<span style=\"color:#0033CC\">sky</span>"),
+            "real colour → span kept: {md_blue}"
         );
     }
 

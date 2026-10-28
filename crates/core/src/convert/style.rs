@@ -117,11 +117,20 @@ impl TextStyle {
 
     /// True when the colour is set and not (near-)black — worth emitting.
     pub fn has_visible_color(&self) -> bool {
-        match self.color {
-            Some([r, g, b]) => r > 0.02 || g > 0.02 || b > 0.02,
-            None => false,
-        }
+        self.color.is_some_and(is_non_black)
     }
+}
+
+/// Largest per-channel value (`0..=1`) still treated as black: text extracted
+/// from a PDF is often painted a hair off pure black, which is not a colour
+/// choice worth carrying into a format whose default is already black.
+const NEAR_BLACK_MAX: f64 = 0.02;
+
+/// True when `rgb` is distinguishable from the black text default. Shared by
+/// every exporter that skips inline colour on default-coloured text (RTF,
+/// Markdown, EPUB) so they agree on what "black" means.
+pub(crate) fn is_non_black([r, g, b]: [f64; 3]) -> bool {
+    r > NEAR_BLACK_MAX || g > NEAR_BLACK_MAX || b > NEAR_BLACK_MAX
 }
 
 /// Strip a subset prefix like `ABCDEF+` (six uppercase letters + `+`).
