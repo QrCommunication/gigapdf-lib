@@ -9,6 +9,26 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.122.1] - 2026-10-29
+
+### Changed — dependencies
+
+- `boa_engine` 0.21 → 0.22 (inline-script engine). Boa now pulls `rand` 0.10 /
+  `getrandom` 0.4; the wasm crate's custom entropy hook moves from getrandom
+  0.3 to 0.4 (same `__getrandom_v03_custom` symbol, same `env.gp_host_random`
+  host import — no SDK change).
+- `rten` / `rten-tensor` 0.24 → 0.27 (`gigapdf-ocr-rten`, native only).
+- `cargo update` within semver ranges; fixes RUSTSEC-2026-0204
+  (`crossbeam-epoch` ≥ 0.9.20) and drops the unmaintained `paste`.
+- RustCrypto stays on its current generation (`rsa` 0.9, `sha2` 0.10, `hmac`
+  0.12, `aes` 0.8, `cbc` 0.1, `des` 0.8, `der` 0.7, `spki` 0.7, `cms` 0.2,
+  `rand` 0.8): `rsa` 0.10 and `cms` 0.3 are still release candidates, and the
+  next-generation crates do not interoperate with them. RUSTSEC-2023-0071
+  (`rsa` Marvin timing side channel) has no fixed release yet.
+- SDK dev tooling: `vitest` 3.2 → 5.0 (+ explicit `vite` 8 peer), `tsup` 8.5 →
+  9.0, `typedoc` 0.28.20, `@types/node` 26 — `pnpm audit` 26 → 0. TypeScript
+  stays on 6.0 (TypeScript 7 has no compiler API for tsup's declaration build).
+
 ## [0.122.0] - 2026-10-28
 
 ### Added — 1:1 element metadata for host overlays

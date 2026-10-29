@@ -37,7 +37,7 @@ des = "0.8"
 rc2 = "0.8"
 # Embedded JavaScript engine (pure Rust) for the HTML→PDF inline-<script> path,
 # replacing the former hand-written interpreter. Unlicense/MIT.
-boa_engine = "0.21"
+boa_engine = "0.22"
 # Audited ASN.1 / X.509 / CMS (RustCrypto formats) for PDF digital signatures —
 # replaces the hand-rolled DER encoder + CMS/cert builders in sign/.
 der = "0.7"

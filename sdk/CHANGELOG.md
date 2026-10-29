@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.122.1] - 2026-10-29
+
+### Changed
+
+- Engine dependencies refreshed (Boa 0.22, `cargo update`; see the root
+  `CHANGELOG.md`). No API change.
+- Dev tooling: `vitest` 5, `tsup` 9, `typedoc` 0.28.20, `@types/node` 26;
+  `pnpm audit` 26 → 0.
+
 ## [0.122.0] - 2026-10-28
 
 ### Added

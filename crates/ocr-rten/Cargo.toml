@@ -10,8 +10,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-rten = "0.24"
-rten-tensor = "0.24"
+rten = "0.27"
+rten-tensor = "0.27"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Native-only: rasterize a PDF page (PNG) so the OCR API can take a Document + page directly,
 # restoring the end-to-end `ocr_pdf_page` surface on top of the RTen engine.

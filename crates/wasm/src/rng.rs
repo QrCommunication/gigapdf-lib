@@ -10,8 +10,9 @@
 //! the wasm module never produces entropy itself; the host injects it.
 //!
 //! Two getrandom majors are in the tree, with distinct custom-backend hooks:
-//! - **0.3** (Boa, via `rand` 0.9) — selected by the `getrandom_backend="custom"`
-//!   cfg in `.cargo/config.toml`; provides the `__getrandom_v03_custom` symbol.
+//! - **0.4** (Boa, via `rand` 0.10) — selected by the `getrandom_backend="custom"`
+//!   cfg in `.cargo/config.toml`; getrandom 0.4 keeps the 0.3 hook name, so this
+//!   crate provides the `__getrandom_v03_custom` symbol.
 //! - **0.2** (RSA, via `rand_core` 0.6) — selected by the crate's `custom`
 //!   feature; registered with `register_custom_getrandom!`.
 
@@ -22,7 +23,7 @@ extern "C" {
     fn gp_host_random(dest: *mut u8, len: usize);
 }
 
-/// getrandom 0.3 custom backend (Boa).
+/// getrandom 0.4 custom backend (Boa).
 ///
 /// # Safety
 /// `dest` must be valid for writes of `len` bytes; upheld by getrandom's caller.
