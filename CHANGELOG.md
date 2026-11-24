@@ -9,6 +9,27 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.123.0] - 2026-11-24
+
+### Fixed — RTL parentheses mirroring in text extraction
+
+`reorder_visual_rtl` now applies Unicode bidi-mirrored bracket substitution
+after reversing visual-order Hebrew/Arabic runs. Parentheses, square brackets,
+curly braces and all 64 Unicode `Bidi_Mirrored` pairs are correctly oriented
+in the extracted logical-order text. Previously, a simple `chars().rev()` left
+bracket characters in their visual positions, producing reversed parentheses
+around RTL text in the editor overlay. (8 new tests covering ASCII, CJK,
+fullwidth and nested bracket pairs.)
+
+### Fixed — Duplicate text removal in reconstruction pipeline
+
+`runs_from_elements` now deduplicates overlapping text runs with identical
+decoded content but different font sizes before emitting `ReconRun`s. Pitch
+decks and similar documents that layer shadow/glow copies of text at different
+sizes no longer produce duplicated text in extraction output. The run closest
+to the page's body font size is kept; decorative copies are discarded. (7 new
+tests covering shadow removal, same-size preservation, triple-layer dedup.)
+
 ## [0.122.0] - 2026-10-28
 
 ### Added — 1:1 element metadata for host overlays

@@ -228,7 +228,110 @@ pub fn runs_from_elements(
             strike: false,
         });
     }
-    out
+    deduplicate_runs(out)
+}
+
+/// Remove decorative duplicate runs produced by layered text effects (shadow,
+/// glow, outline copies at a different font size). Pitch decks and presentation
+/// PDFs frequently paint the same string twice — once at body size and once
+/// larger or smaller as a visual effect — and without deduplication both copies
+/// survive into the editable model as separate paragraphs.
+///
+/// Two runs are considered duplicates when:
+///   1. their bounding boxes overlap by more than 80 % of the smaller box area;
+///   2. their decoded text is identical (after trimming);
+///   3. their font sizes differ (same-size overlaps are legitimate reflows).
+///
+/// When a duplicate pair is found, the run whose size is closest to the page's
+/// character-weighted median body size wins; the other is discarded. This keeps
+/// the body copy and drops the decorative shadow/glow layer. Runs that carry no
+/// `source_index` (nested form-XObject text) participate in deduplication but
+/// never displace a top-level editable run.
+pub(crate) fn deduplicate_runs(runs: Vec<ReconRun>) -> Vec<ReconRun> {
+    if runs.len() <= 1 {
+        return runs;
+    }
+    let body = body_font_size(&runs, 12.0);
+    // Indices of runs to drop.
+    let mut drop = vec![false; runs.len()];
+    for i in 0..runs.len() {
+        if drop[i] {
+            continue;
+        }
+        for j in (i + 1)..runs.len() {
+            if drop[j] {
+                continue;
+            }
+            if !is_duplicate_run(&runs[i], &runs[j]) {
+                continue;
+            }
+            // Keep the run closer to the body size; drop the other. On a tie,
+            // prefer the smaller font (shadow/glow copies are typically larger)
+            // and then the top-level editable run (the one with a source_index).
+            let di = (runs[i].size - body).abs();
+            let dj = (runs[j].size - body).abs();
+            let keep_i = if (di - dj).abs() < f64::EPSILON {
+                if (runs[i].size - runs[j].size).abs() < f64::EPSILON {
+                    runs[i].source_index.is_some() && runs[j].source_index.is_none()
+                } else {
+                    runs[i].size <= runs[j].size
+                }
+            } else {
+                di <= dj
+            };
+            if keep_i {
+                drop[j] = true;
+            } else {
+                drop[i] = true;
+                break; // i is gone; stop comparing it.
+            }
+        }
+    }
+    runs.into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| if drop[i] { None } else { Some(r) })
+        .collect()
+}
+
+/// Whether two runs are positional+textual duplicates produced by a layered
+/// text effect. See [`deduplicate_runs`] for the contract.
+fn is_duplicate_run(a: &ReconRun, b: &ReconRun) -> bool {
+    let ta = a.text.trim();
+    let tb = b.text.trim();
+    if ta.is_empty() || tb.is_empty() || ta != tb {
+        return false;
+    }
+    // Same-size runs at the same position are legitimate (reflowed text, split
+    // operators); only flag pairs whose sizes actually differ.
+    if (a.size - b.size).abs() < 0.5 {
+        return false;
+    }
+    let overlap = rect_overlap_area(a.x, a.y, a.w, a.h, b.x, b.y, b.w, b.h);
+    let smaller = (a.w * a.h).min(b.w * b.h);
+    if smaller <= 0.0 {
+        return false;
+    }
+    overlap / smaller > 0.80
+}
+
+/// Axis-aligned rectangle overlap area (PDF user space).
+fn rect_overlap_area(
+    ax: f64,
+    ay: f64,
+    aw: f64,
+    ah: f64,
+    bx: f64,
+    by: f64,
+    bw: f64,
+    bh: f64,
+) -> f64 {
+    let x_overlap = (ax + aw).min(bx + bw) - ax.max(bx);
+    let y_overlap = (ay + ah).min(by + bh) - ay.max(by);
+    if x_overlap <= 0.0 || y_overlap <= 0.0 {
+        0.0
+    } else {
+        x_overlap * y_overlap
+    }
 }
 
 /// Resolve a text [`ContentElement`]'s recovered [`TextStyle`] — family,
@@ -2603,5 +2706,76 @@ mod tests {
                 .any(|b| matches!(b.kind, BlockKind::Paragraph(_))),
             "the text still reconstructs"
         );
+    }
+
+    // ── layered-text deduplication (pitch-deck shadow/glow copies) ───────────
+
+    /// A shadow copy at a different size overlapping the body run is dropped;
+    /// the body-sized run survives.
+    #[test]
+    fn deduplicate_runs_drops_shadow_copy_keeps_body() {
+        let body = run("Quarterly Results", 72.0, 600.0, 12.0);
+        let mut shadow = run("Quarterly Results", 71.0, 599.0, 18.0);
+        shadow.w = body.w * 1.4;
+        shadow.h = body.h * 1.4;
+        let out = deduplicate_runs(vec![body.clone(), shadow]);
+        assert_eq!(out.len(), 1, "shadow copy is removed");
+        assert_eq!(out[0].size, 12.0, "the body-sized run survives");
+    }
+
+    /// Two runs with identical text and position but the SAME size are NOT
+    /// duplicates (legitimate reflowed / split-operator text).
+    #[test]
+    fn deduplicate_runs_keeps_same_size_overlaps() {
+        let a = run("Hello", 72.0, 600.0, 12.0);
+        let b = run("Hello", 72.0, 600.0, 12.0);
+        let out = deduplicate_runs(vec![a, b]);
+        assert_eq!(out.len(), 2, "same-size overlaps are preserved");
+    }
+
+    /// Runs with different text at overlapping positions are not duplicates.
+    #[test]
+    fn deduplicate_runs_keeps_different_text() {
+        let a = run("Title", 72.0, 600.0, 24.0);
+        let b = run("Subtitle", 72.0, 598.0, 14.0);
+        let out = deduplicate_runs(vec![a, b]);
+        assert_eq!(out.len(), 2, "different text is never deduplicated");
+    }
+
+    /// Non-overlapping runs with identical text and different sizes are kept
+    /// (they are separate instances on the page, not layered effects).
+    #[test]
+    fn deduplicate_runs_keeps_non_overlapping_copies() {
+        let a = run("Note", 72.0, 700.0, 10.0);
+        let b = run("Note", 72.0, 400.0, 16.0);
+        let out = deduplicate_runs(vec![a, b]);
+        assert_eq!(out.len(), 2, "spatially separated copies survive");
+    }
+
+    /// Among three overlapping copies, only the one closest to body size
+    /// survives; both decorative layers are dropped.
+    #[test]
+    fn deduplicate_runs_handles_triple_layer() {
+        let small = run("Key Metric", 72.0, 600.0, 8.0);
+        let body = run("Key Metric", 72.0, 600.0, 12.0);
+        let large = run("Key Metric", 71.0, 599.0, 20.0);
+        let out = deduplicate_runs(vec![small, body, large]);
+        assert_eq!(out.len(), 1, "only one copy survives");
+        assert_eq!(out[0].size, 12.0, "the body-sized copy wins");
+    }
+
+    /// An empty input produces an empty output without panicking.
+    #[test]
+    fn deduplicate_runs_empty_is_safe() {
+        assert!(deduplicate_runs(Vec::new()).is_empty());
+    }
+
+    /// A single run passes through unchanged.
+    #[test]
+    fn deduplicate_runs_single_passthrough() {
+        let r = run("Solo", 72.0, 600.0, 12.0);
+        let out = deduplicate_runs(vec![r.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "Solo");
     }
 }
