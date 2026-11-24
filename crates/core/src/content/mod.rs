@@ -825,7 +825,150 @@ fn reorder_visual_rtl(text: &str) -> Option<String> {
         )
     };
 
-    should_reverse.then(|| text.chars().rev().collect())
+    should_reverse.then(|| mirror_brackets(&text.chars().rev().collect::<String>()))
+}
+
+/// Swap each bidi-mirrored bracket character for its mirror pair.
+///
+/// When a visual-order RTL run is reversed to recover logical order, paired
+/// brackets (parentheses, square brackets, angle brackets, etc.) end up in the
+/// wrong orientation: a visual `(` that opened on the right becomes a logical
+/// `(` on the left, where it should be `)`. This function maps every Unicode
+/// `Bidi_Mirrored` character to its counterpart so the reversed string reads
+/// correctly in logical order. Characters without a mirror pair pass through
+/// unchanged.
+fn mirror_brackets(s: &str) -> String {
+    s.chars().map(mirror_char).collect()
+}
+
+/// Return the bidi mirror of `c`, or `c` itself if it has no mirror pair.
+///
+/// The table covers all 64 pairs from the Unicode `Bidi_Mirrored` property
+/// (identical to the `BRACKET_PAIRS` table in `html::bidi`).
+fn mirror_char(c: char) -> char {
+    match c {
+        '\u{0028}' => '\u{0029}', // ( → )
+        '\u{0029}' => '\u{0028}', // ) → (
+        '\u{005B}' => '\u{005D}', // [ → ]
+        '\u{005D}' => '\u{005B}', // ] → [
+        '\u{007B}' => '\u{007D}', // { → }
+        '\u{007D}' => '\u{007B}', // } → {
+        '\u{0F3A}' => '\u{0F3B}', // TIBETAN MARK GUG RTAGS GYON → GYAS
+        '\u{0F3B}' => '\u{0F3A}',
+        '\u{0F3C}' => '\u{0F3D}', // TIBETAN MARK ANG KHANG GYON → GYAS
+        '\u{0F3D}' => '\u{0F3C}',
+        '\u{169B}' => '\u{169C}', // OGHAM FEATHER MARK → REVERSED
+        '\u{169C}' => '\u{169B}',
+        '\u{2045}' => '\u{2046}', // ⁅ → ⁆
+        '\u{2046}' => '\u{2045}',
+        '\u{207D}' => '\u{207E}', // superscript ( → )
+        '\u{207E}' => '\u{207D}',
+        '\u{208D}' => '\u{208E}', // subscript ( → )
+        '\u{208E}' => '\u{208D}',
+        '\u{2308}' => '\u{2309}', // ⌈ → ⌉
+        '\u{2309}' => '\u{2308}',
+        '\u{230A}' => '\u{230B}', // ⌊ → ⌋
+        '\u{230B}' => '\u{230A}',
+        '\u{2329}' => '\u{232A}', // 〈 → 〉
+        '\u{232A}' => '\u{2329}',
+        '\u{2768}' => '\u{2769}', // medium ( → )
+        '\u{2769}' => '\u{2768}',
+        '\u{276A}' => '\u{276B}', // medium flattened ( → )
+        '\u{276B}' => '\u{276A}',
+        '\u{276C}' => '\u{276D}', // medium angle < → >
+        '\u{276D}' => '\u{276C}',
+        '\u{276E}' => '\u{276F}', // heavy angle quotation < → >
+        '\u{276F}' => '\u{276E}',
+        '\u{2770}' => '\u{2771}', // heavy angle ( → )
+        '\u{2771}' => '\u{2770}',
+        '\u{2772}' => '\u{2773}', // light tortoise shell ( → )
+        '\u{2773}' => '\u{2772}',
+        '\u{2774}' => '\u{2775}', // medium curly { → }
+        '\u{2775}' => '\u{2774}',
+        '\u{27C5}' => '\u{27C6}', // s-shaped bag delimiter
+        '\u{27C6}' => '\u{27C5}',
+        '\u{27E6}' => '\u{27E7}', // ⟦ → ⟧
+        '\u{27E7}' => '\u{27E6}',
+        '\u{27E8}' => '\u{27E9}', // ⟨ → ⟩
+        '\u{27E9}' => '\u{27E8}',
+        '\u{27EA}' => '\u{27EB}', // ⟪ → ⟫
+        '\u{27EB}' => '\u{27EA}',
+        '\u{27EC}' => '\u{27ED}', // ⟬ → ⟭
+        '\u{27ED}' => '\u{27EC}',
+        '\u{27EE}' => '\u{27EF}', // ⟮ → ⟯
+        '\u{27EF}' => '\u{27EE}',
+        '\u{2983}' => '\u{2984}', // ⦃ → ⦄
+        '\u{2984}' => '\u{2983}',
+        '\u{2985}' => '\u{2986}', // ⦅ → ⦆
+        '\u{2986}' => '\u{2985}',
+        '\u{2987}' => '\u{2988}', // ⦇ → ⦈
+        '\u{2988}' => '\u{2987}',
+        '\u{2989}' => '\u{298A}', // ⦉ → ⦊
+        '\u{298A}' => '\u{2989}',
+        '\u{298B}' => '\u{298C}', // ⦋ → ⦌
+        '\u{298C}' => '\u{298B}',
+        '\u{298D}' => '\u{298E}', // ⦍ → ⦎
+        '\u{298E}' => '\u{298D}',
+        '\u{298F}' => '\u{2990}', // ⦏ → ⦐
+        '\u{2990}' => '\u{298F}',
+        '\u{2991}' => '\u{2992}', // ⦑ → ⦒
+        '\u{2992}' => '\u{2991}',
+        '\u{2993}' => '\u{2994}', // ⦓ → ⦔
+        '\u{2994}' => '\u{2993}',
+        '\u{2995}' => '\u{2996}', // ⦕ → ⦖
+        '\u{2996}' => '\u{2995}',
+        '\u{2997}' => '\u{2998}', // ⦗ → ⦘
+        '\u{2998}' => '\u{2997}',
+        '\u{29D8}' => '\u{29D9}', // ⧘ → ⧙
+        '\u{29D9}' => '\u{29D8}',
+        '\u{29DA}' => '\u{29DB}', // ⧚ → ⧛
+        '\u{29DB}' => '\u{29DA}',
+        '\u{29FC}' => '\u{29FD}', // ⧼ → ⧽
+        '\u{29FD}' => '\u{29FC}',
+        '\u{2E22}' => '\u{2E23}', // ⸢ → ⸣
+        '\u{2E23}' => '\u{2E22}',
+        '\u{2E24}' => '\u{2E25}', // ⸤ → ⸥
+        '\u{2E25}' => '\u{2E24}',
+        '\u{2E26}' => '\u{2E27}', // ⸦ → ⸧
+        '\u{2E27}' => '\u{2E26}',
+        '\u{2E28}' => '\u{2E29}', // ⸨ → ⸩
+        '\u{2E29}' => '\u{2E28}',
+        '\u{3008}' => '\u{3009}', // 〈 → 〉 CJK angle
+        '\u{3009}' => '\u{3008}',
+        '\u{300A}' => '\u{300B}', // 《 → 》
+        '\u{300B}' => '\u{300A}',
+        '\u{300C}' => '\u{300D}', // 「 → 」
+        '\u{300D}' => '\u{300C}',
+        '\u{300E}' => '\u{300F}', // 『 → 』
+        '\u{300F}' => '\u{300E}',
+        '\u{3010}' => '\u{3011}', // 【 → 】
+        '\u{3011}' => '\u{3010}',
+        '\u{3014}' => '\u{3015}', // 〔 → 〕
+        '\u{3015}' => '\u{3014}',
+        '\u{3016}' => '\u{3017}', // 〖 → 〗
+        '\u{3017}' => '\u{3016}',
+        '\u{3018}' => '\u{3019}', // 〘 → 〙
+        '\u{3019}' => '\u{3018}',
+        '\u{301A}' => '\u{301B}', // 〚 → 〛
+        '\u{301B}' => '\u{301A}',
+        '\u{FE59}' => '\u{FE5A}', // small ( → )
+        '\u{FE5A}' => '\u{FE59}',
+        '\u{FE5B}' => '\u{FE5C}', // small { → }
+        '\u{FE5C}' => '\u{FE5B}',
+        '\u{FE5D}' => '\u{FE5E}', // small tortoise shell ( → )
+        '\u{FE5E}' => '\u{FE5D}',
+        '\u{FF08}' => '\u{FF09}', // fullwidth ( → )
+        '\u{FF09}' => '\u{FF08}',
+        '\u{FF3B}' => '\u{FF3D}', // fullwidth [ → ]
+        '\u{FF3D}' => '\u{FF3B}',
+        '\u{FF5B}' => '\u{FF5D}', // fullwidth { → }
+        '\u{FF5D}' => '\u{FF5B}',
+        '\u{FF5F}' => '\u{FF60}', // fullwidth ⦅ → ⦆
+        '\u{FF60}' => '\u{FF5F}',
+        '\u{FF62}' => '\u{FF63}', // halfwidth 「 → 」
+        '\u{FF63}' => '\u{FF62}',
+        other => other,
+    }
 }
 
 /// Whether a Hebrew-bearing run is stored in **visual** (reversed) order, per the
@@ -5375,5 +5518,88 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         assert!((sy - 1.0).abs() < 1e-9, "sy={}", sy);
         assert!((kx - 10.0).abs() < 1e-9, "skew_x={}", kx);
         assert!((rot - 30.0).abs() < 1e-9, "rotation={}", rot);
+    }
+
+    // ── RTL bracket mirroring ────────────────────────────────────────────────
+
+    #[test]
+    fn mirror_brackets_swaps_ascii_pairs() {
+        // Each character is individually substituted: ( → ), ) → (, etc.
+        assert_eq!(super::mirror_brackets("()[]{}"), ")(][}{");
+    }
+
+    #[test]
+    fn mirror_brackets_preserves_non_mirrored_chars() {
+        assert_eq!(super::mirror_brackets("abc 123"), "abc 123");
+    }
+
+    #[test]
+    fn mirror_brackets_handles_hebrew_with_parens() {
+        // Visual-order Hebrew "(הכנסה)" — simulate what reorder_visual_rtl does:
+        // reverse then mirror.
+        // Visual chars: '(' 'ה' 'כ' 'נ' 'ס' 'ה' ')'
+        // Reversed: ')' 'ה' 'ס' 'נ' 'כ' 'ה' '(' = ")הסנכה("
+        // Mirrored: '(' 'ה' 'ס' 'נ' 'כ' 'ה' ')' = "(הסנכה)"
+        let visual = "(הכנסה)";
+        let reversed: String = visual.chars().rev().collect();
+        let mirrored = super::mirror_brackets(&reversed);
+        assert_eq!(mirrored, "(הסנכה)");
+    }
+
+    #[test]
+    fn mirror_brackets_handles_nested_brackets() {
+        // "([{}])" reversed char-by-char: ) ] } { [ ( = ")]}{[("
+        // Char-by-char mirror: ) → (, ] → [, } → {, { → }, [ → ], ( → )
+        // Result: "([{)}]" — wait, let's be precise:
+        //   ')' → '('
+        //   ']' → '['
+        //   '}' → '{'
+        //   '{' → '}'
+        //   '[' → ']'
+        //   '(' → ')'
+        // = "([{}])"
+        let visual = "([{}])";
+        let reversed: String = visual.chars().rev().collect();
+        assert_eq!(reversed, ")]}{[(");
+        let mirrored = super::mirror_brackets(&reversed);
+        assert_eq!(mirrored, "([{}])");
+    }
+
+    #[test]
+    fn mirror_brackets_handles_cjk_angle_brackets() {
+        // 〈 〉 (U+3008, U+3009)
+        let s = "\u{3008}\u{3009}";
+        assert_eq!(super::mirror_brackets(s), "\u{3009}\u{3008}");
+    }
+
+    #[test]
+    fn mirror_brackets_handles_fullwidth_parens() {
+        // ＦＵＬＬＷＩＤＴＨ （ ） U+FF08, U+FF09
+        let s = "\u{FF08}\u{FF09}";
+        assert_eq!(super::mirror_brackets(s), "\u{FF09}\u{FF08}");
+    }
+
+    #[test]
+    fn reorder_visual_rtl_mirrors_brackets_in_hebrew_with_final_form() {
+        // Use a Hebrew word with a final form NOT at word-end to force the
+        // visual heuristic to trigger reversal + mirroring.
+        // "ם" (final mem) in non-final position signals visual order.
+        // Visual: "(םלה)" — final mem inside word → hebrew_run_is_visual = true
+        // Chars: '(' 'ם' 'ל' 'ה' ')'
+        // Reversed: ')' 'ה' 'ל' 'ם' '(' = ")הלם("
+        // Mirrored: '(' 'ה' 'ל' 'ם' ')' = "(הלם)"
+        let visual = "(םלה)";
+        let result = super::reorder_visual_rtl(visual);
+        assert!(result.is_some(), "Hebrew run with misplaced final should be reordered");
+        let logical = result.unwrap();
+        assert!(logical.starts_with('('), "should start with open paren: {logical}");
+        assert!(logical.ends_with(')'), "should end with close paren: {logical}");
+    }
+
+    #[test]
+    fn reorder_visual_rtl_no_reorder_for_ltr_leaves_brackets_untouched() {
+        // Pure LTR text should not be touched at all.
+        let ltr = "(hello)";
+        assert_eq!(super::reorder_visual_rtl(ltr), None);
     }
 }

@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "gigapdf-core"
-version = "0.122.1"
+version = "0.123.0"
 dependencies = [
  "aes",
  "boa_engine",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "gigapdf-ocr-rten"
-version = "0.122.1"
+version = "0.123.0"
 dependencies = [
  "gigapdf-core",
  "image",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "gigapdf-wasm"
-version = "0.122.1"
+version = "0.123.0"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.4.3",
